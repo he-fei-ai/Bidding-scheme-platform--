@@ -1,0 +1,80 @@
+{
+  "common": {
+    "title": "招投标方案编写平台",
+    "loading": "加载中...",
+    "save": "保存",
+    "cancel": "取消",
+    "confirm": "确认",
+    "delete": "删除",
+    "edit": "编辑",
+    "view": "查看",
+    "export": "导出",
+    "import": "导入",
+    "upload": "上传",
+    "download": "下载",
+    "search": "搜索",
+    "filter": "筛选",
+    "next": "下一步",
+    "previous": "上一步",
+    "submit": "提交",
+    "retry": "重试",
+    "back": "返回",
+    "forward": "前进",
+    "close": "关闭",
+    "open": "打开",
+    "yes": "是",
+    "no": "否",
+    "ok": "确定",
+    "error": "错误",
+    "success": "成功",
+    "warning": "警告",
+    "info": "信息"
+  },
+  "project": {
+    "create": "创建项目",
+    "list": "项目列表",
+    "detail": "项目详情",
+    "name": "项目名称",
+    "description": "项目描述",
+    "status": "项目状态",
+    "created_at": "创建时间",
+    "updated_at": "更新时间"
+  },
+  "file": {
+    "upload": "上传文件",
+    "list": "文件列表",
+    "name": "文件名",
+    "type": "文件类型",
+    "size": "文件大小",
+    "role": "文件角色",
+    "main": "主文件",
+    "supporting": "辅助文件"
+  },
+  "section": {
+    "generate": "生成内容",
+    "pause": "暂停",
+    "resume": "恢复",
+    "title": "章节标题",
+    "content": "章节内容",
+    "status": "状态",
+    "pending": "待生成",
+    "generating": "生成中",
+    "completed": "已完成",
+    "paused": "已暂停",
+    "failed": "生成失败"
+  },
+  "export": {
+    "docx": "导出为Word",
+    "pdf": "导出为PDF",
+    "markdown": "导出为Markdown",
+    "config": "导出配置"
+  },
+  "ai": {
+    "config": "AI配置",
+    "provider": "AI提供商",
+    "model": "模型",
+    "api_key": "API密钥",
+    "temperature": "温度",
+    "max_tokens": "最大令牌数"
+  }
+}

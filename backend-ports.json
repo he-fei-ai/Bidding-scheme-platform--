@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "updated_at": "2026-10-07T19:49:48+08:00",
+  "backend": {
+    "host": "127.0.0.1",
+    "port": 8000,
+    "url": "http://127.0.0.1:8000",
+    "docs_url": "http://127.0.0.1:8000/docs",
+    "health_url": "http://127.0.0.1:8000/api/v1/health"
+  },
+  "frontend": {
+    "host": "0.0.0.0",
+    "port": 5175,
+    "url": "http://127.0.0.1:5175"
+  }
+}

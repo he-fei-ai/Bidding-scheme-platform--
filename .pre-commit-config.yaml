@@ -1,0 +1,52 @@
+# 根级 pre-commit 配置：后端用 ruff，前端用 eslint + prettier
+# 安装：pip install pre-commit && pre-commit install
+# 首次运行会自动拉取 hook 镜像。
+# 注意：前端 hook 依赖 frontend 下已安装 eslint/prettier 及对应配置文件
+#（见 frontend/.eslintrc.cjs、frontend/.prettierrc.json）。
+
+repos:
+  # ---------- 后端：ruff（lint + format） ----------
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.6.9
+    hooks:
+      - id: ruff
+        args: [--fix]
+        files: ^backend/
+        exclude: ^backend/tests/
+      - id: ruff-format
+        files: ^backend/
+
+  # ---------- 前端：eslint ----------
+  - repo: https://github.com/pre-commit/mirrors-eslint
+    rev: v8.57.0
+    hooks:
+      - id: eslint
+        files: ^frontend/(src|scripts)/.*\.(ts|tsx|js|jsx)$
+        additional_dependencies:
+          - eslint@8.57.0
+          - @typescript-eslint/parser@7.18.0
+          - @typescript-eslint/eslint-plugin@7.18.0
+          - eslint-plugin-react@7.35.0
+          - eslint-plugin-react-hooks@4.6.2
+
+  # ---------- 前端：prettier ----------
+  - repo: https://github.com/pre-commit/mirrors-prettier
+    rev: v3.1.0
+    hooks:
+      - id: prettier
+        files: ^frontend/(src|scripts)/.*\.(ts|tsx|js|jsx|json|css|md)$
+        additional_dependencies:
+          - prettier@3.3.3
+
+  # ---------- 通用：禁止提交大文件 / 密钥 ----------
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: check-added-large-files
+        args: [--maxkb=2000]
+      - id: check-json
+        exclude: ^frontend/package-lock\.json$
+      - id: check-yaml
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+        exclude: ^.*\.md$

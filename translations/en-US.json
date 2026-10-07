@@ -1,0 +1,80 @@
+{
+  "common": {
+    "title": "Bidding Proposal Platform",
+    "loading": "Loading...",
+    "save": "Save",
+    "cancel": "Cancel",
+    "confirm": "Confirm",
+    "delete": "Delete",
+    "edit": "Edit",
+    "view": "View",
+    "export": "Export",
+    "import": "Import",
+    "upload": "Upload",
+    "download": "Download",
+    "search": "Search",
+    "filter": "Filter",
+    "next": "Next",
+    "previous": "Previous",
+    "submit": "Submit",
+    "retry": "Retry",
+    "back": "Back",
+    "forward": "Forward",
+    "close": "Close",
+    "open": "Open",
+    "yes": "Yes",
+    "no": "No",
+    "ok": "OK",
+    "error": "Error",
+    "success": "Success",
+    "warning": "Warning",
+    "info": "Info"
+  },
+  "project": {
+    "create": "Create Project",
+    "list": "Project List",
+    "detail": "Project Details",
+    "name": "Project Name",
+    "description": "Description",
+    "status": "Status",
+    "created_at": "Created At",
+    "updated_at": "Updated At"
+  },
+  "file": {
+    "upload": "Upload File",
+    "list": "File List",
+    "name": "File Name",
+    "type": "File Type",
+    "size": "File Size",
+    "role": "File Role",
+    "main": "Main File",
+    "supporting": "Supporting File"
+  },
+  "section": {
+    "generate": "Generate Content",
+    "pause": "Pause",
+    "resume": "Resume",
+    "title": "Section Title",
+    "content": "Content",
+    "status": "Status",
+    "pending": "Pending",
+    "generating": "Generating",
+    "completed": "Completed",
+    "paused": "Paused",
+    "failed": "Failed"
+  },
+  "export": {
+    "docx": "Export as Word",
+    "pdf": "Export as PDF",
+    "markdown": "Export as Markdown",
+    "config": "Export Config"
+  },
+  "ai": {
+    "config": "AI Configuration",
+    "provider": "AI Provider",
+    "model": "Model",
+    "api_key": "API Key",
+    "temperature": "Temperature",
+    "max_tokens": "Max Tokens"
+  }
+}

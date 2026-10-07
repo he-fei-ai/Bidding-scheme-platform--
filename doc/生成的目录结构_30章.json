@@ -1,0 +1,3318 @@
+[
+  {
+    "id": "X",
+    "title": "项目概述",
+    "level": 1,
+    "children": [
+      {
+        "id": "X.1",
+        "title": "工程概况与建设规模",
+        "description": "",
+        "level": 2,
+        "children": [
+          {
+            "id": "X.X.1",
+            "title": "工程名称与建设地点",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.2",
+            "title": "项目规模与结构类型",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.3",
+            "title": "承包范围与合同工期",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.4",
+            "title": "质量标准与安全目标",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.5",
+            "title": "施工条件与现场环境",
+            "description": "",
+            "level": 3,
+            "children": []
+          }
+        ]
+      },
+      {
+        "id": "X.2",
+        "title": "项目建设地点与周边环境",
+        "description": "",
+        "level": 2,
+        "children": [
+          {
+            "id": "X.X.3",
+            "title": "主要工程量概况",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.4",
+            "title": "项目组织架构与人员",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "【项目特定】项目建设地点与周边环境实施要点（第3项）",
+            "level": 3,
+            "children": []
+          }
+        ]
+      },
+      {
+        "id": "X.3",
+        "title": "工程承包范围与合同工期",
+        "description": "",
+        "level": 2,
+        "children": [
+          {
+            "id": "X.X.2",
+            "title": "项目主要技术特点",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.3",
+            "title": "项目建设背景与意义",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "【项目特定】工程承包范围与合同工期实施要点（第3项）",
+            "level": 3,
+            "children": []
+          }
+        ]
+      },
+      {
+        "id": "X.4",
+        "title": "项目质量目标与安全目标",
+        "description": "",
+        "level": 2,
+        "children": [
+          {
+            "id": "X.X.1",
+            "title": "项目设计依据与标准",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.2",
+            "title": "项目主要分部分项工程",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.3",
+            "title": "项目重难点初步识别",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.4",
+            "title": "项目投资与资金来源",
+            "description": "",
+            "level": 3,
+            "children": []
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "X",
+    "title": "项目重难点分析",
+    "level": 1,
+    "children": [
+      {
+        "id": "X.1",
+        "title": "施工重难点识别与对策",
+        "description": "",
+        "level": 2,
+        "children": [
+          {
+            "id": "X.X.1",
+            "title": "外部环境风险分析",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.2",
+            "title": "资源供应风险分析",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.3",
+            "title": "组织协调难点分析",
+            "description": "",
+            "level": 3,
+            "children": []
+          }
+        ]
+      },
+      {
+        "id": "X.2",
+        "title": "技术难点分析与解决方案",
+        "description": "",
+        "level": 2,
+        "children": [
+          {
+            "id": "X.X.1",
+            "title": "季节性施工难点分析",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.2",
+            "title": "交叉作业难点分析",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.3",
+            "title": "项目风险总体评估",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.4",
+            "title": "难点应对效果预测",
+            "description": "",
+            "level": 3,
+            "children": []
+          }
+        ]
+      },
+      {
+        "id": "X.3",
+        "title": "管理难点分析与应对策略",
+        "description": "",
+        "level": 2,
+        "children": [
+          {
+            "id": "X.X.2",
+            "title": "重难点动态跟踪机制",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.3",
+            "title": "分析结论与建议汇总",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.4",
+            "title": "难点识别方法论与评分模型",
+            "description": "",
+            "level": 3,
+            "children": []
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "X",
+    "title": "工程概况",
+    "level": 1,
+    "children": [
+      {
+        "title": "工程地理位置与交通条件",
+        "level": 2,
+        "children": [
+          {
+            "title": "项目区位坐标与交通网络",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "施工现场周边道路状况",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "材料运输通道条件分析",
+            "level": 3,
+            "children": []
+          }
+        ]
+      },
+      {
+        "title": "工程规模与设计指标",
+        "level": 2,
+        "children": [
+          {
+            "title": "总建筑面积与占地面积",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "建筑层数层高与总高度",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "结构跨度与柱网尺寸",
+            "level": 3,
+            "children": []
+          }
+        ]
+      },
+      {
+        "title": "结构体系与抗震设防",
+        "level": 2,
+        "children": [
+          {
+            "title": "基础结构形式与选型",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "主体结构体系说明",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "抗震设防烈度与等级",
+            "level": 3,
+            "children": []
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "X",
+    "title": "编制依据",
+    "level": 1,
+    "children": [
+      {
+        "id": "X.3",
+        "title": "项目组织架构与人员配置",
+        "description": "",
+        "level": 2,
+        "children": [
+          {
+            "id": "X.X.1",
+            "title": "项目组织架构人员编制表",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.2",
+            "title": "项目管理体系框架图",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.3",
+            "title": "项目实施阶段划分与里程碑",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.4",
+            "title": "项目相关方沟通计划",
+            "description": "",
+            "level": 3,
+            "children": []
+          }
+        ]
+      },
+      {
+        "title": "国家法律法规引用",
+        "level": 2,
+        "children": [
+          {
+            "title": "建筑法及其实施条例",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "安全生产法相关条款",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "消防法具体规定",
+            "level": 3,
+            "children": []
+          }
+        ]
+      },
+      {
+        "title": "行业技术标准选用",
+        "level": 2,
+        "children": [
+          {
+            "title": "建筑工程施工质量验收统一标准",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "混凝土结构工程施工规范",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "钢结构工程施工规范",
+            "level": 3,
+            "children": []
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "X",
+    "title": "施工方案及技术措施",
+    "level": 1,
+    "children": [
+      {
+        "id": "X.1",
+        "title": "机电安装施工方案",
+        "description": "",
+        "level": 2,
+        "children": [
+          {
+            "id": "X.X.1",
+            "title": "施工缝后浇带处理工艺",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.2",
+            "title": "高空作业安全应急预案编制",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.3",
+            "title": "特种工序质量追溯制度规范",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.4",
+            "title": "测量放线管理与复核验线",
+            "description": "",
+            "level": 3,
+            "children": []
+          }
+        ]
+      },
+      {
+        "id": "X.2",
+        "title": "脚手架与临时设施方案",
+        "description": "",
+        "level": 2,
+        "children": [
+          {
+            "id": "X.X.2",
+            "title": "专项检测与试验方案",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.3",
+            "title": "施工进度纠偏与资源平衡",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.4",
+            "title": "施工材料质量验收与复试",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.5",
+            "title": "施工过程信息化管理平台",
+            "description": "",
+            "level": 3,
+            "children": []
+          }
+        ]
+      },
+      {
+        "id": "X.3",
+        "title": "屋面防水施工方法",
+        "description": "",
+        "level": 2,
+        "children": [
+          {
+            "id": "X.X.3",
+            "title": "基坑变形监测与预警体系",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "【项目特定】屋面防水施工方法实施要点（第2项）",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "【项目特定】屋面防水施工方法实施要点（第3项）",
+            "level": 3,
+            "children": []
+          }
+        ]
+      },
+      {
+        "id": "X.4",
+        "title": "砌体工程施工方案",
+        "description": "",
+        "level": 2,
+        "children": [
+          {
+            "id": "X.X.1",
+            "title": "高空作业吊篮与升降设备安全",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.2",
+            "title": "特种作业持证核查与交底",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.3",
+            "title": "施工全过程质量追溯体系",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.4",
+            "title": "施工测量放线精度控制方案",
+            "description": "",
+            "level": 3,
+            "children": []
+          }
+        ]
+      },
+      {
+        "id": "X.5",
+        "title": "钢结构安装工艺",
+        "description": "",
+        "level": 2,
+        "children": [
+          {
+            "id": "X.X.2",
+            "title": "土方开挖分层分段施工工艺",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.3",
+            "title": "基坑支护变形控制方案",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "【项目特定】钢结构安装工艺实施要点（第3项）",
+            "level": 3,
+            "children": []
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "X",
+    "title": "施工现场总平面布置",
+    "level": 1,
+    "children": [
+      {
+        "id": "X.1",
+        "title": "临时水电设施布置",
+        "description": "",
+        "level": 2,
+        "children": [
+          {
+            "id": "X.X.1",
+            "title": "施工分区封闭管理实施方案",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.2",
+            "title": "总平面动态调整审批表",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.3",
+            "title": "临建设施抗震验算报告",
+            "description": "",
+            "level": 3,
+            "children": []
+          }
+        ]
+      },
+      {
+        "id": "X.2",
+        "title": "消防布置与安全通道",
+        "description": "",
+        "level": 2,
+        "children": [
+          {
+            "id": "X.X.1",
+            "title": "施工道路沉降监测方案",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.2",
+            "title": "平面布置BIM仿真验证",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.3",
+            "title": "施工总平面布置原则",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.4",
+            "title": "分区与功能划分方案",
+            "description": "",
+            "level": 3,
+            "children": []
+          }
+        ]
+      },
+      {
+        "id": "X.3",
+        "title": "施工分区与围挡方案",
+        "description": "",
+        "level": 2,
+        "children": [
+          {
+            "id": "X.X.2",
+            "title": "临时道路与交通组织",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.3",
+            "title": "材料堆场与加工区布置",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.4",
+            "title": "临时办公与生活设施",
+            "description": "",
+            "level": 3,
+            "children": []
+          }
+        ]
+      },
+      {
+        "id": "X.4",
+        "title": "排水系统与环保措施",
+        "description": "",
+        "level": 2,
+        "children": [
+          {
+            "title": "【项目特定】排水系统与环保措施实施要点（第1项）",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "【项目特定】排水系统与环保措施实施要点（第2项）",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "【项目特定】排水系统与环保措施实施要点（第3项）",
+            "level": 3,
+            "children": []
+          }
+        ]
+      },
+      {
+        "id": "X.5",
+        "title": "垂直运输设备布置",
+        "description": "",
+        "level": 2,
+        "children": [
+          {
+            "title": "【项目特定】垂直运输设备布置实施要点（第1项）",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "【项目特定】垂直运输设备布置实施要点（第2项）",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "【项目特定】垂直运输设备布置实施要点（第3项）",
+            "level": 3,
+            "children": []
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "X",
+    "title": "主要分部工程施工方法",
+    "level": 1,
+    "children": [
+      {
+        "id": "X.1",
+        "title": "城市轨道交通5号线机电系统集成，含通风空调工程",
+        "description": "城市轨道交通5号线机电系统集成，含通风空调施工方案",
+        "level": 2,
+        "children": [
+          {
+            "title": "【项目特定】城市轨道交通5号线机电系统集成，含通风空实施要点（第1项）",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "【项目特定】城市轨道交通5号线机电系统集成，含通风空实施要点（第2项）",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "【项目特定】城市轨道交通5号线机电系统集成，含通风空实施要点（第3项）",
+            "level": 3,
+            "children": []
+          }
+        ]
+      },
+      {
+        "id": "X.2",
+        "title": "消防工程",
+        "description": "消防施工方案",
+        "level": 2,
+        "children": [
+          {
+            "title": "【项目特定】消防工程实施要点（第1项）",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "【项目特定】消防工程实施要点（第2项）",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "【项目特定】消防工程实施要点（第3项）",
+            "level": 3,
+            "children": []
+          }
+        ]
+      },
+      {
+        "id": "X.3",
+        "title": "给排水工程",
+        "description": "给排水施工方案",
+        "level": 2,
+        "children": [
+          {
+            "title": "【项目特定】给排水工程实施要点（第1项）",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "【项目特定】给排水工程实施要点（第2项）",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "【项目特定】给排水工程实施要点（第3项）",
+            "level": 3,
+            "children": []
+          }
+        ]
+      },
+      {
+        "id": "X.4",
+        "title": "低压配电工程",
+        "description": "低压配电施工方案",
+        "level": 2,
+        "children": [
+          {
+            "title": "【项目特定】低压配电工程实施要点（第1项）",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "【项目特定】低压配电工程实施要点（第2项）",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "【项目特定】低压配电工程实施要点（第3项）",
+            "level": 3,
+            "children": []
+          }
+        ]
+      },
+      {
+        "id": "X.5",
+        "title": "照明工程",
+        "description": "照明施工方案",
+        "level": 2,
+        "children": [
+          {
+            "title": "【项目特定】照明工程实施要点（第1项）",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "【项目特定】照明工程实施要点（第2项）",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "【项目特定】照明工程实施要点（第3项）",
+            "level": 3,
+            "children": []
+          }
+        ]
+      },
+      {
+        "id": "X.6",
+        "title": "综合监控工程",
+        "description": "综合监控施工方案",
+        "level": 2,
+        "children": [
+          {
+            "title": "【项目特定】综合监控工程实施要点（第1项）",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "【项目特定】综合监控工程实施要点（第2项）",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "【项目特定】综合监控工程实施要点（第3项）",
+            "level": 3,
+            "children": []
+          }
+        ]
+      },
+      {
+        "id": "X.7",
+        "title": "站台门等系统工程",
+        "description": "站台门等系统施工方案",
+        "level": 2,
+        "children": [
+          {
+            "title": "【项目特定】站台门等系统工程实施要点（第1项）",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "【项目特定】站台门等系统工程实施要点（第2项）",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "【项目特定】站台门等系统工程实施要点（第3项）",
+            "level": 3,
+            "children": []
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "X",
+    "title": "装配式混凝土结构（PC）工程专项方案（本项目不涉及）",
+    "level": 1,
+    "children": [
+      {
+        "id": "X.1",
+        "title": "成品保护措施",
+        "description": "",
+        "level": 2,
+        "children": [
+          {
+            "id": "X.X.1",
+            "title": "施工质量控制要点",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.2",
+            "title": "施工安全管理措施",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.3",
+            "title": "施工进度保障措施",
+            "description": "",
+            "level": 3,
+            "children": []
+          }
+        ]
+      },
+      {
+        "id": "X.2",
+        "title": "施工技术方案优化",
+        "description": "",
+        "level": 2,
+        "children": [
+          {
+            "id": "X.X.1",
+            "title": "施工成本控制措施",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.2",
+            "title": "施工环保保障措施",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.3",
+            "title": "施工技术管理措施",
+            "description": "",
+            "level": 3,
+            "children": []
+          }
+        ]
+      },
+      {
+        "title": "PC构件深化设计与BIM协同",
+        "level": 2,
+        "children": [
+          {
+            "title": "预制构件拆分与深化设计",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "预埋件与预留孔洞定位",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "连接节点设计与验算",
+            "level": 3,
+            "children": []
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "X",
+    "title": "质量保证措施和创优计划",
+    "level": 1,
+    "children": [
+      {
+        "id": "X.1",
+        "title": "质量文档与档案管理",
+        "description": "",
+        "level": 2,
+        "children": [
+          {
+            "id": "X.X.1",
+            "title": "质量策划与事前控制措施",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.2",
+            "title": "过程质量控制要点",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.3",
+            "title": "质量资料归档与验收准备",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.4",
+            "title": "质量通病专项治理方案",
+            "description": "",
+            "level": 3,
+            "children": []
+          }
+        ]
+      },
+      {
+        "id": "X.2",
+        "title": "质量奖惩与考核制度",
+        "description": "",
+        "level": 2,
+        "children": [
+          {
+            "id": "X.X.2",
+            "title": "质量控制节点与停检点设置",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.3",
+            "title": "质量追溯与终身责任制",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.4",
+            "title": "质量缺陷预防与纠偏机制",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.5",
+            "title": "质量评审与持续改进循环",
+            "description": "",
+            "level": 3,
+            "children": []
+          }
+        ]
+      },
+      {
+        "id": "X.3",
+        "title": "材料设备质量管控",
+        "description": "",
+        "level": 2,
+        "children": [
+          {
+            "id": "X.X.3",
+            "title": "首件鉴定与样板引路制度",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.4",
+            "title": "质量数据信息化管理",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "【项目特定】材料设备质量管控实施要点（第3项）",
+            "level": 3,
+            "children": []
+          }
+        ]
+      },
+      {
+        "id": "X.4",
+        "title": "分项工程验收标准",
+        "description": "",
+        "level": 2,
+        "children": [
+          {
+            "id": "X.X.2",
+            "title": "质量目标分解与考核体系",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.3",
+            "title": "质量检验批划分方案",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.4",
+            "title": "质量通病防治交底卡",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.5",
+            "title": "质量事故分析与整改闭环",
+            "description": "",
+            "level": 3,
+            "children": []
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "X",
+    "title": "施工安全措施计划",
+    "level": 1,
+    "children": [
+      {
+        "id": "X.1",
+        "title": "安全检查与隐患排查",
+        "description": "",
+        "level": 2,
+        "children": [
+          {
+            "id": "X.X.1",
+            "title": "安全风险动态预警机制",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.2",
+            "title": "安全技术交底签字存档",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.3",
+            "title": "交叉作业安全协调机制",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.4",
+            "title": "安全警示标识与防护设施",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.5",
+            "title": "安全事故责任追究制度",
+            "description": "",
+            "level": 3,
+            "children": []
+          }
+        ]
+      },
+      {
+        "id": "X.2",
+        "title": "文明施工与环境保护",
+        "description": "",
+        "level": 2,
+        "children": [
+          {
+            "id": "X.X.3",
+            "title": "安全教育培训效果评估",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.4",
+            "title": "安全隐患闭环整改流程",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "【项目特定】文明施工与环境保护实施要点（第3项）",
+            "level": 3,
+            "children": []
+          }
+        ]
+      },
+      {
+        "id": "X.3",
+        "title": "职业病防治与健康管理",
+        "description": "",
+        "level": 2,
+        "children": [
+          {
+            "id": "X.X.2",
+            "title": "安全例会会议纪要归档",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.3",
+            "title": "安全应急预案动态更新",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.4",
+            "title": "安全风险分级管控清单",
+            "description": "",
+            "level": 3,
+            "children": []
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "X",
+    "title": "文明施工措施计划",
+    "level": 1,
+    "children": [
+      {
+        "id": "X.3",
+        "title": "安全教育与宣传机制",
+        "description": "",
+        "level": 2,
+        "children": [
+          {
+            "id": "X.X.1",
+            "title": "安全培训效果跟踪机制",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.2",
+            "title": "安全隐患排查标准台账",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.3",
+            "title": "安全责任考核奖惩兑现",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.4",
+            "title": "安全标准化示范工地创建",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.5",
+            "title": "安全生产领导小组设立",
+            "description": "",
+            "level": 3,
+            "children": []
+          }
+        ]
+      },
+      {
+        "id": "X.4",
+        "title": "安全事故报告与处理",
+        "description": "",
+        "level": 2,
+        "children": [
+          {
+            "id": "X.X.3",
+            "title": "各级人员安全生产责任书",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.4",
+            "title": "安全管理组织网络搭建",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "【项目特定】安全事故报告与处理实施要点（第3项）",
+            "level": 3,
+            "children": []
+          }
+        ]
+      },
+      {
+        "title": "文明施工管理体系与标准",
+        "level": 2,
+        "children": [
+          {
+            "title": "文明施工领导小组与职责",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "文明施工管理制度建设",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "文明施工标准与考核细则",
+            "level": 3,
+            "children": []
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "X",
+    "title": "施工环保措施计划",
+    "level": 1,
+    "children": [
+      {
+        "title": "环境保护目标与责任体系",
+        "level": 2,
+        "children": [
+          {
+            "title": "环境保护目标指标设定",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "环保管理组织架构搭建",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "环保责任分工与承诺书",
+            "level": 3,
+            "children": []
+          }
+        ]
+      },
+      {
+        "title": "施工扬尘与噪音控制方案",
+        "level": 2,
+        "children": [
+          {
+            "title": "现场围挡喷淋降尘系统",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "出入车辆冲洗与密闭运输",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "易扬尘物料覆盖与洒水",
+            "level": 3,
+            "children": []
+          }
+        ]
+      },
+      {
+        "title": "施工废水处理与排放管理",
+        "level": 2,
+        "children": [
+          {
+            "title": "基坑降水沉淀回用方案",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "混凝土搅拌站废水处理",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "车辆冲洗循环沉淀池",
+            "level": 3,
+            "children": []
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "X",
+    "title": "施工总进度计划及保证措施",
+    "level": 1,
+    "children": [
+      {
+        "id": "X.1",
+        "title": "总进度计划与分项计划",
+        "description": "",
+        "level": 2,
+        "children": [
+          {
+            "id": "X.X.1",
+            "title": "进度偏差分析与纠偏措施",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.2",
+            "title": "进度协调会议与报告制度",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.3",
+            "title": "交叉作业进度统筹方案",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.4",
+            "title": "进度预警与应急响应",
+            "description": "",
+            "level": 3,
+            "children": []
+          }
+        ]
+      },
+      {
+        "id": "X.2",
+        "title": "进度资金保障机制",
+        "description": "",
+        "level": 2,
+        "children": [
+          {
+            "id": "X.X.2",
+            "title": "赶工措施与资源增配",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.3",
+            "title": "进度计划优化调整",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.4",
+            "title": "节点工期考核与奖惩",
+            "description": "",
+            "level": 3,
+            "children": []
+          }
+        ]
+      },
+      {
+        "id": "X.3",
+        "title": "进度风险识别与防控",
+        "description": "",
+        "level": 2,
+        "children": [
+          {
+            "id": "X.X.2",
+            "title": "进度数据收集与分析",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.4",
+            "title": "进度总结与经验归档",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "【项目特定】进度风险识别与防控实施要点（第3项）",
+            "level": 3,
+            "children": []
+          }
+        ]
+      },
+      {
+        "id": "X.4",
+        "title": "进度总结与经验沉淀",
+        "description": "",
+        "level": 2,
+        "children": [
+          {
+            "id": "X.X.2",
+            "title": "总进度计划与施工网络图",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.3",
+            "title": "进度计划动态调整机制",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.4",
+            "title": "进度计划滚动修订制度",
+            "description": "",
+            "level": 3,
+            "children": []
+          }
+        ]
+      },
+      {
+        "id": "X.5",
+        "title": "施工总进度计划编制",
+        "description": "",
+        "level": 2,
+        "children": [
+          {
+            "id": "X.X.2",
+            "title": "工期延误责任划分机制",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.3",
+            "title": "多专业交叉进度协调表",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "【项目特定】施工总进度计划编制实施要点（第3项）",
+            "level": 3,
+            "children": []
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "X",
+    "title": "资源配备计划",
+    "level": 1,
+    "children": [
+      {
+        "id": "X.1",
+        "title": "主要材料品牌与规格",
+        "description": "",
+        "level": 2,
+        "children": [
+          {
+            "id": "X.X.1",
+            "title": "材料仓储与物流管理",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.2",
+            "title": "资源成本分析与控制",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.3",
+            "title": "主要设备进退场计划",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.4",
+            "title": "资源需求预测调整机制",
+            "description": "",
+            "level": 3,
+            "children": []
+          }
+        ]
+      },
+      {
+        "id": "X.2",
+        "title": "机械设备进退场计划",
+        "description": "",
+        "level": 2,
+        "children": [
+          {
+            "id": "X.X.2",
+            "title": "资源总结与经验归档",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.3",
+            "title": "资源需求弹性预测模型",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.4",
+            "title": "供应商资质审查与评价",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.5",
+            "title": "材料损耗率控制与节约措施",
+            "description": "",
+            "level": 3,
+            "children": []
+          }
+        ]
+      },
+      {
+        "id": "X.3",
+        "title": "资源成本管控措施",
+        "description": "",
+        "level": 2,
+        "children": [
+          {
+            "id": "X.X.3",
+            "title": "大型设备租赁比选方案",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "【项目特定】资源成本管控措施实施要点（第2项）",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "【项目特定】资源成本管控措施实施要点（第3项）",
+            "level": 3,
+            "children": []
+          }
+        ]
+      },
+      {
+        "id": "X.4",
+        "title": "劳动力配置与进场计划",
+        "description": "",
+        "level": 2,
+        "children": [
+          {
+            "id": "X.X.1",
+            "title": "资源调配应急预案",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.2",
+            "title": "资源成本动态监控机制",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.3",
+            "title": "劳动力技能矩阵与培训体系",
+            "description": "",
+            "level": 3,
+            "children": []
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "X",
+    "title": "拟投入本工程的主要施工设备表",
+    "level": 1,
+    "children": [
+      {
+        "title": "土方与地基处理设备配置",
+        "level": 2,
+        "children": [
+          {
+            "title": "挖掘机型号数量与进场时间",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "推土机装载机配置计划",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "压路机夯实机配置计划",
+            "level": 3,
+            "children": []
+          }
+        ]
+      },
+      {
+        "title": "起重与垂直运输设备配置",
+        "level": 2,
+        "children": [
+          {
+            "title": "塔吊选型与布置方案",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "汽车吊轮胎吊配置计划",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "施工电梯选型与安装",
+            "level": 3,
+            "children": []
+          }
+        ]
+      },
+      {
+        "title": "混凝土搅拌与输送设备配置",
+        "level": 2,
+        "children": [
+          {
+            "title": "混凝土搅拌站配置方案",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "混凝土输送泵管布置",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "混凝土搅拌运输车配置",
+            "level": 3,
+            "children": []
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "X",
+    "title": "拟配备本工程的试验和检测仪器设备表",
+    "level": 1,
+    "children": [
+      {
+        "id": "X.3",
+        "title": "施工机械设备投入计划",
+        "description": "",
+        "level": 2,
+        "children": [
+          {
+            "id": "X.X.1",
+            "title": "供应商评价打分表模板",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.2",
+            "title": "材料损耗率指标分解表",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.3",
+            "title": "设备租赁比选决策流程",
+            "description": "",
+            "level": 3,
+            "children": []
+          }
+        ]
+      },
+      {
+        "title": "原材料性能检测仪器配置",
+        "level": 2,
+        "children": [
+          {
+            "title": "万能试验机与压力试验机配置",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "水泥胶砂搅拌机振实台配置",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "标准恒温恒湿养护箱配置",
+            "level": 3,
+            "children": []
+          }
+        ]
+      },
+      {
+        "title": "混凝土砂浆检测仪器配置",
+        "level": 2,
+        "children": [
+          {
+            "title": "混凝土试模与抗渗试模配置",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "砂浆稠度仪与分层度仪配置",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "回弹仪与碳化深度测量仪",
+            "level": 3,
+            "children": []
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "X",
+    "title": "主要材料及劳动力计划表",
+    "level": 1,
+    "children": [
+      {
+        "id": "X.3",
+        "title": "主要材料采购与供应方案",
+        "description": "",
+        "level": 2,
+        "children": [
+          {
+            "id": "X.X.1",
+            "title": "资源需求预测偏差修正方案",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.2",
+            "title": "供应商动态绩效评价机制",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.3",
+            "title": "劳动力需求预测与配置",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.4",
+            "title": "各阶段用工计划与进场安排",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.5",
+            "title": "施工机械设备选型与配置",
+            "description": "",
+            "level": 3,
+            "children": []
+          }
+        ]
+      },
+      {
+        "title": "钢材与水泥等主要材料计划",
+        "level": 2,
+        "children": [
+          {
+            "title": "钢筋各规格需求计划",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "型钢钢板需求计划",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "水泥各标号需求计划",
+            "level": 3,
+            "children": []
+          }
+        ]
+      },
+      {
+        "title": "砂石骨料与混凝土材料计划",
+        "level": 2,
+        "children": [
+          {
+            "title": "砂子各粒径需求计划",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "碎石各粒径需求计划",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "预拌砂浆需求计划",
+            "level": 3,
+            "children": []
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "X",
+    "title": "特殊气候季节性施工方案",
+    "level": 1,
+    "children": [
+      {
+        "id": "X.1",
+        "title": "土方开挖与基坑支护施工",
+        "description": "",
+        "level": 2,
+        "children": [
+          {
+            "id": "X.X.1",
+            "title": "施工电梯基础验算与安装方案",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.2",
+            "title": "模板对拉螺栓防腐处理工艺",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.3",
+            "title": "钢筋连接套筒进场检验标准",
+            "description": "",
+            "level": 3,
+            "children": []
+          }
+        ]
+      },
+      {
+        "id": "X.2",
+        "title": "主体结构施工方法",
+        "description": "",
+        "level": 2,
+        "children": [
+          {
+            "id": "X.X.1",
+            "title": "砌体构造柱植筋深度控制方案",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.2",
+            "title": "外墙涂装基层处理与防水节点",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.3",
+            "title": "临时用电负荷计算与配电箱布置",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.4",
+            "title": "施工垃圾清运与现场文明施工标准",
+            "description": "",
+            "level": 3,
+            "children": []
+          }
+        ]
+      },
+      {
+        "id": "X.3",
+        "title": "装饰装修工程施工工艺",
+        "description": "",
+        "level": 2,
+        "children": [
+          {
+            "id": "X.X.2",
+            "title": "复杂节点深化设计与BIM协同",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.3",
+            "title": "新材料应用与工艺创新方案",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.4",
+            "title": "施工安全动态监测与预警",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.5",
+            "title": "施工进度多级预警与应急响应",
+            "description": "",
+            "level": 3,
+            "children": []
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "X",
+    "title": "成品保护和工程保修工作的管理措施和承诺",
+    "level": 1,
+    "children": [
+      {
+        "id": "X.1",
+        "title": "专项施工方案",
+        "description": "",
+        "level": 2,
+        "children": [
+          {
+            "id": "X.X.1",
+            "title": "季节性施工保障措施",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.2",
+            "title": "成品保护具体措施",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "【项目特定】专项施工方案实施要点（第3项）",
+            "level": 3,
+            "children": []
+          }
+        ]
+      },
+      {
+        "id": "X.2",
+        "title": "施工关键工序控制",
+        "description": "",
+        "level": 2,
+        "children": [
+          {
+            "title": "【项目特定】施工关键工序控制实施要点（第1项）",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "【项目特定】施工关键工序控制实施要点（第2项）",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "【项目特定】施工关键工序控制实施要点（第3项）",
+            "level": 3,
+            "children": []
+          }
+        ]
+      },
+      {
+        "id": "X.3",
+        "title": "施工资源配置方案",
+        "description": "",
+        "level": 2,
+        "children": [
+          {
+            "title": "【项目特定】施工资源配置方案实施要点（第1项）",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "【项目特定】施工资源配置方案实施要点（第2项）",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "【项目特定】施工资源配置方案实施要点（第3项）",
+            "level": 3,
+            "children": []
+          }
+        ]
+      },
+      {
+        "id": "X.4",
+        "title": "施工节点进度计划",
+        "description": "",
+        "level": 2,
+        "children": [
+          {
+            "id": "X.X.1",
+            "title": "施工协调管理措施",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.2",
+            "title": "施工总体部署动态调整方案",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.3",
+            "title": "重大施工方案专家论证机制",
+            "description": "",
+            "level": 3,
+            "children": []
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "X",
+    "title": "危大工程及专项施工方案、紧急情况预案与风险控制措施",
+    "level": 1,
+    "children": [
+      {
+        "id": "X.1",
+        "title": "应急资源与物资保障",
+        "description": "",
+        "level": 2,
+        "children": [
+          {
+            "id": "X.X.1",
+            "title": "应急资金与后勤保障",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.2",
+            "title": "应急预案管理体系",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.3",
+            "title": "应急总结与持续改进",
+            "description": "",
+            "level": 3,
+            "children": []
+          }
+        ]
+      },
+      {
+        "id": "X.2",
+        "title": "突发事件专项处置方案",
+        "description": "",
+        "level": 2,
+        "children": [
+          {
+            "id": "X.X.1",
+            "title": "应急指挥体系与决策机制",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.2",
+            "title": "预警信息发布与响应触发",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.3",
+            "title": "应急资源储备与调配方案",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.4",
+            "title": "灾后恢复与业务连续性计划",
+            "description": "",
+            "level": 3,
+            "children": []
+          }
+        ]
+      },
+      {
+        "id": "X.3",
+        "title": "应急演练计划与评估",
+        "description": "",
+        "level": 2,
+        "children": [
+          {
+            "id": "X.X.2",
+            "title": "应急演练效果评估与改进",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.3",
+            "title": "应急联动外部机构协作机制",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.4",
+            "title": "应急物资动态盘点与更新",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.5",
+            "title": "应急响应时间指标与考核",
+            "description": "",
+            "level": 3,
+            "children": []
+          }
+        ]
+      },
+      {
+        "id": "X.4",
+        "title": "灾后恢复与总结改进",
+        "description": "",
+        "level": 2,
+        "children": [
+          {
+            "id": "X.X.3",
+            "title": "应急值班与报告制度",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "【项目特定】灾后恢复与总结改进实施要点（第2项）",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "【项目特定】灾后恢复与总结改进实施要点（第3项）",
+            "level": 3,
+            "children": []
+          }
+        ]
+      },
+      {
+        "id": "X.5",
+        "title": "应急信息报告与舆论应对",
+        "description": "",
+        "level": 2,
+        "children": [
+          {
+            "id": "X.X.1",
+            "title": "应急指挥平台运维保障",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.2",
+            "title": "应急资源跨区域调配预案",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.3",
+            "title": "应急培训效果评估标准",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.4",
+            "title": "应急响应时效考核机制",
+            "description": "",
+            "level": 3,
+            "children": []
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "X",
+    "title": "任何可能的紧急情况的处理措施、预案以及抵抗风险的措施",
+    "level": 1,
+    "children": [
+      {
+        "title": "自然灾害紧急应对措施",
+        "level": 2,
+        "children": [
+          {
+            "title": "暴雨洪水淹没应急排水",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "台风大风临时设施加固",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "地震灾害人员疏散安置",
+            "level": 3,
+            "children": []
+          }
+        ]
+      },
+      {
+        "title": "施工现场突发事故应急处理",
+        "level": 2,
+        "children": [
+          {
+            "title": "坍塌事故救援与支撑加固",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "高处坠落急救与转运",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "触电事故断电与心肺复苏",
+            "level": 3,
+            "children": []
+          }
+        ]
+      },
+      {
+        "title": "公共卫生事件应急响应",
+        "level": 2,
+        "children": [
+          {
+            "title": "传染病疫情报告与隔离",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "食物中毒应急处置与送医",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "施工现场消毒与防疫物资",
+            "level": 3,
+            "children": []
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "X",
+    "title": "对专业分包工程的配合、协调、管理、服务方案",
+    "level": 1,
+    "children": [
+      {
+        "id": "X.1",
+        "title": "专业分包协调管理",
+        "description": "",
+        "level": 2,
+        "children": [
+          {
+            "id": "X.X.1",
+            "title": "协调会议纪要标准化模板",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.2",
+            "title": "协调效果满意度调查机制",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.3",
+            "title": "协调问题升级处理流程图",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.4",
+            "title": "协调信息管理系统建设方案",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.5",
+            "title": "协调培训课件与考核体系",
+            "description": "",
+            "level": 3,
+            "children": []
+          }
+        ]
+      },
+      {
+        "id": "X.2",
+        "title": "外部关系协调与公共关系",
+        "description": "",
+        "level": 2,
+        "children": [
+          {
+            "id": "X.X.3",
+            "title": "协调问题跟踪闭环管理制度",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "【项目特定】外部关系协调与公共关系实施要点（第2项）",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "【项目特定】外部关系协调与公共关系实施要点（第3项）",
+            "level": 3,
+            "children": []
+          }
+        ]
+      },
+      {
+        "id": "X.3",
+        "title": "联席会议制度与决策流程",
+        "description": "",
+        "level": 2,
+        "children": [
+          {
+            "id": "X.X.1",
+            "title": "跨部门协调责任矩阵模板",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.2",
+            "title": "外部关系维护年度计划方案",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.3",
+            "title": "协调会议纪要标准化模板汇编",
+            "description": "",
+            "level": 3,
+            "children": []
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "X",
+    "title": "与发包人、项目管理单位、监理及设计人的配合",
+    "level": 1,
+    "children": [
+      {
+        "id": "X.3",
+        "title": "信息传递与报告机制",
+        "description": "",
+        "level": 2,
+        "children": [
+          {
+            "id": "X.X.1",
+            "title": "协调组织体系与职责分工",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.2",
+            "title": "沟通协调流程与机制",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.3",
+            "title": "例会制度与决策程序",
+            "description": "",
+            "level": 3,
+            "children": []
+          }
+        ]
+      },
+      {
+        "id": "X.4",
+        "title": "冲突处理与争议解决程序",
+        "description": "",
+        "level": 2,
+        "children": [
+          {
+            "id": "X.X.1",
+            "title": "信息传递与报告渠道",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.2",
+            "title": "冲突处理与争议解决",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.3",
+            "title": "外包协调管理方案",
+            "description": "",
+            "level": 3,
+            "children": []
+          }
+        ]
+      },
+      {
+        "id": "X.5",
+        "title": "与政府主管部门协调",
+        "description": "",
+        "level": 2,
+        "children": [
+          {
+            "id": "X.X.1",
+            "title": "政府主管部门协调",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.2",
+            "title": "社区与公众关系管理",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.3",
+            "title": "协调会议记录与档案管理",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.4",
+            "title": "协调效果评估机制",
+            "description": "",
+            "level": 3,
+            "children": []
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "X",
+    "title": "对总包管理及专业分包配合方案／与各参建方配合",
+    "level": 1,
+    "children": [
+      {
+        "title": "总包管理组织架构与职责",
+        "level": 2,
+        "children": [
+          {
+            "title": "总包项目经理部组织架构",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "总包各部门职责分工",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "总包管理制度体系建立",
+            "level": 3,
+            "children": []
+          }
+        ]
+      },
+      {
+        "title": "分包单位全过程管理措施",
+        "level": 2,
+        "children": [
+          {
+            "title": "分包招标与合同签订管理",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "分包进场与施工准备管理",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "分包施工过程监督管理",
+            "level": 3,
+            "children": []
+          }
+        ]
+      },
+      {
+        "title": "建设单位与政府部门协调",
+        "level": 2,
+        "children": [
+          {
+            "title": "建设单位重大事项请示汇报",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "质监站与安监站检查配合",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "住建局与规自局报批对接",
+            "level": 3,
+            "children": []
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "X",
+    "title": "工期优化",
+    "level": 1,
+    "children": [
+      {
+        "id": "X.1",
+        "title": "进度预警与纠偏措施",
+        "description": "",
+        "level": 2,
+        "children": [
+          {
+            "title": "【项目特定】进度预警与纠偏措施实施要点（第1项）",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "【项目特定】进度预警与纠偏措施实施要点（第2项）",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "【项目特定】进度预警与纠偏措施实施要点（第3项）",
+            "level": 3,
+            "children": []
+          }
+        ]
+      },
+      {
+        "id": "X.2",
+        "title": "节点工期考核方案",
+        "description": "",
+        "level": 2,
+        "children": [
+          {
+            "title": "【项目特定】节点工期考核方案实施要点（第1项）",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "【项目特定】节点工期考核方案实施要点（第2项）",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "【项目特定】节点工期考核方案实施要点（第3项）",
+            "level": 3,
+            "children": []
+          }
+        ]
+      },
+      {
+        "id": "X.4",
+        "title": "进度优化与网络计划",
+        "description": "",
+        "level": 2,
+        "children": [
+          {
+            "id": "X.X.3",
+            "title": "进度偏差根本原因分析",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.4",
+            "title": "进度资源动态调配方案",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "【项目特定】进度优化与网络计划实施要点（第3项）",
+            "level": 3,
+            "children": []
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "X",
+    "title": "工程资料及竣工验收管理",
+    "level": 1,
+    "children": [
+      {
+        "id": "X.1",
+        "title": "档案资料管理",
+        "description": "",
+        "level": 2,
+        "children": [
+          {
+            "id": "X.X.1",
+            "title": "资源协调管理",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.2",
+            "title": "基础保障体系建设方案",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.3",
+            "title": "实施过程风险防控措施",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.4",
+            "title": "质量控制关键节点清单",
+            "description": "",
+            "level": 3,
+            "children": []
+          }
+        ]
+      },
+      {
+        "id": "X.2",
+        "title": "成本管控措施",
+        "description": "",
+        "level": 2,
+        "children": [
+          {
+            "id": "X.X.2",
+            "title": "安全管理红线与底线要求",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.3",
+            "title": "进度管控节点考核办法",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "【项目特定】成本管控措施实施要点（第3项）",
+            "level": 3,
+            "children": []
+          }
+        ]
+      },
+      {
+        "id": "X.3",
+        "title": "环境保护措施",
+        "description": "",
+        "level": 2,
+        "children": [
+          {
+            "id": "X.X.1",
+            "title": "资源统筹调配实施方案",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.2",
+            "title": "技术保障措施清单",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.3",
+            "title": "协调管理机制运转方案",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.4",
+            "title": "基础保障体系组织架构图",
+            "description": "",
+            "level": 3,
+            "children": []
+          }
+        ]
+      },
+      {
+        "id": "X.4",
+        "title": "综合管理方案",
+        "description": "",
+        "level": 2,
+        "children": [
+          {
+            "id": "X.X.2",
+            "title": "风险防控措施责任矩阵",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.3",
+            "title": "质量控制关键节点检查表",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "【项目特定】综合管理方案实施要点（第3项）",
+            "level": 3,
+            "children": []
+          }
+        ]
+      },
+      {
+        "id": "X.5",
+        "title": "技术质量控制",
+        "description": "",
+        "level": 2,
+        "children": [
+          {
+            "id": "X.X.1",
+            "title": "安全管理红线条款清单",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.2",
+            "title": "进度管控节点考核细则",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.3",
+            "title": "资源统筹调配决策流程",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.4",
+            "title": "技术保障措施执行清单",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.5",
+            "title": "协调管理机制运转流程图",
+            "description": "",
+            "level": 3,
+            "children": []
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "X",
+    "title": "附图、附件",
+    "level": 1,
+    "children": [
+      {
+        "id": "X.1",
+        "title": "施工总进度计划横道图",
+        "description": "",
+        "level": 2,
+        "children": [
+          {
+            "id": "X.X.1",
+            "title": "劳动力动态分布热力图",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.2",
+            "title": "质量检验批次计划汇总表",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.3",
+            "title": "施工进度计划WBS分解图",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.4",
+            "title": "安全管理组织机构网络图",
+            "description": "",
+            "level": 3,
+            "children": []
+          }
+        ]
+      },
+      {
+        "id": "X.2",
+        "title": "项目管理流程图",
+        "description": "",
+        "level": 2,
+        "children": [
+          {
+            "id": "X.X.2",
+            "title": "质量保证措施落实责任表",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.3",
+            "title": "安全文明施工达标评价表",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "【项目特定】项目管理流程图实施要点（第3项）",
+            "level": 3,
+            "children": []
+          }
+        ]
+      },
+      {
+        "id": "X.3",
+        "title": "主要分部分项工程进度计划",
+        "description": "",
+        "level": 2,
+        "children": [
+          {
+            "id": "X.X.1",
+            "title": "主要分部分项工程质量控制表",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.2",
+            "title": "施工进度偏差分析报告表",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.3",
+            "title": "材料设备进场验收登记表",
+            "description": "",
+            "level": 3,
+            "children": []
+          }
+        ]
+      },
+      {
+        "id": "X.4",
+        "title": "材料设备采购计划表",
+        "description": "",
+        "level": 2,
+        "children": [
+          {
+            "id": "X.X.1",
+            "title": "劳动力技能等级分布表",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.2",
+            "title": "施工进度计划里程碑分解图",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.3",
+            "title": "安全管理组织机构职责网络图",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.4",
+            "title": "质量保证措施落实责任清单",
+            "description": "",
+            "level": 3,
+            "children": []
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "X",
+    "title": "其他",
+    "level": 1,
+    "children": [
+      {
+        "id": "X.4",
+        "title": "进度安全保障",
+        "description": "",
+        "level": 2,
+        "children": [
+          {
+            "id": "X.X.1",
+            "title": "质量控制闭环管理机制",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.2",
+            "title": "安全管理标准化建设方案",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.3",
+            "title": "基本组织方案",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.4",
+            "title": "主要实施措施",
+            "description": "",
+            "level": 3,
+            "children": []
+          }
+        ]
+      },
+      {
+        "title": "技术创新与BIM应用方案",
+        "level": 2,
+        "children": [
+          {
+            "title": "BIM模型搭建与深化应用",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "智慧工地管理系统建设",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "新技术新产品推广应用",
+            "level": 3,
+            "children": []
+          }
+        ]
+      },
+      {
+        "title": "绿色施工与低碳建造措施",
+        "level": 2,
+        "children": [
+          {
+            "title": "绿色施工目标与实施路径",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "节能降耗与水资源节约",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "节地与土地资源保护",
+            "level": 3,
+            "children": []
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "X",
+    "title": "BIM技术应用",
+    "level": 1,
+    "children": [
+      {
+        "title": "总体方案",
+        "level": 2,
+        "children": [
+          {
+            "title": "总体施工思路",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "施工区段划分",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "施工顺序安排",
+            "level": 3,
+            "children": []
+          }
+        ]
+      },
+      {
+        "title": "专项措施",
+        "level": 2,
+        "children": [
+          {
+            "title": "专项技术方案",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "特殊工艺措施",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "质量控制措施",
+            "level": 3,
+            "children": []
+          }
+        ]
+      },
+      {
+        "title": "管理制度",
+        "level": 2,
+        "children": [
+          {
+            "title": "管理制度体系",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "岗位职责划分",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "工作流程制定",
+            "level": 3,
+            "children": []
+          }
+        ]
+      }
+    ]
+  },
+  {
+    "id": "X",
+    "title": "绿色施工措施",
+    "level": 1,
+    "children": [
+      {
+        "id": "X.1",
+        "title": "模板工程专项方案",
+        "description": "",
+        "level": 2,
+        "children": [
+          {
+            "id": "X.X.1",
+            "title": "外墙保温施工要点",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "【项目特定】模板工程专项方案实施要点（第2项）",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "【项目特定】模板工程专项方案实施要点（第3项）",
+            "level": 3,
+            "children": []
+          }
+        ]
+      },
+      {
+        "id": "X.2",
+        "title": "钢筋工程专项方案",
+        "description": "",
+        "level": 2,
+        "children": [
+          {
+            "id": "X.X.1",
+            "title": "脚手架搭设与拆除方案",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.2",
+            "title": "施工降排水方案",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.3",
+            "title": "季节性施工措施",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.4",
+            "title": "预制构件吊装与连接工艺",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.5",
+            "title": "大体积混凝土温控方案",
+            "description": "",
+            "level": 3,
+            "children": []
+          }
+        ]
+      },
+      {
+        "id": "X.3",
+        "title": "混凝土工程专项方案",
+        "description": "",
+        "level": 2,
+        "children": [
+          {
+            "id": "X.X.3",
+            "title": "深基坑监测与信息化施工",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.4",
+            "title": "高空作业安全技术措施",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.5",
+            "title": "施工临时设施搭设规范",
+            "description": "",
+            "level": 3,
+            "children": []
+          }
+        ]
+      },
+      {
+        "id": "X.4",
+        "title": "施工测量方案与精度控制",
+        "description": "",
+        "level": 2,
+        "children": [
+          {
+            "id": "X.X.3",
+            "title": "特种工序质量检验标准",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "id": "X.X.4",
+            "title": "新材料新工艺应用方案",
+            "description": "",
+            "level": 3,
+            "children": []
+          },
+          {
+            "title": "【项目特定】施工测量方案与精度控制实施要点（第3项）",
+            "level": 3,
+            "children": []
+          }
+        ]
+      }
+    ]
+  }
+]

@@ -1,0 +1,49 @@
+{
+  "base_dir": "J:\\编程\\招投标方案平台\\backend",
+  "files": [
+    {
+      "path": "app/routers/sse/sse_outline.py",
+      "eol": "keep",
+      "backup": true,
+      "edits": [
+        {
+          "old": "    save_v51_state_to_db,\n\n)",
+          "new": "    save_v51_state_to_db,\n\n    set_v51_active_run,\n\n)",
+          "expect": 1
+        },
+        {
+          "old": "                # BUG 修复：将 v51_state 暴露给 finally 块和兜底分支\n\n                v51_state_ref[0] = v51_state",
+          "new": "                # BUG 修复：将 v51_state 暴露给 finally 块和兜底分支\n\n                v51_state_ref[0] = v51_state\n\n                # BUG-FIX 2026-09-15（高）：标记「该项目有 V5.1 任务在跑」。\n                # 不加这个标记的话，别处（例如 GET /tasks/v51/recovery）调用\n                # load_v51_state_from_db 会**用 DB 行重建并覆盖**这个对象 ——\n                # 覆盖后 cancel_v51_task / resume_v51_task 改的是新对象，\n                # 而正在跑的工作流检查的是旧对象，「停止生成」静默失效。\n                set_v51_active_run(project_id, True)",
+          "expect": 1
+        },
+        {
+          "old": "                # ===== ENHANCE 2026-09-15（Task 9）：收尾心跳 / 快照 / 锁 =====\n                if hb_task is not None and not hb_task.done():\n                    hb_task.cancel()\n                    try:\n                        await hb_task\n                    except (asyncio.CancelledError, Exception):\n                        pass",
+          "new": "                # ===== ENHANCE 2026-09-15（Task 9）：收尾心跳 / 快照 / 锁 =====\n                if hb_task is not None and not hb_task.done():\n                    hb_task.cancel()\n                    try:\n                        await hb_task\n                    except (asyncio.CancelledError, Exception):\n                        pass\n\n                # 解除「活跃运行」标记，之后 load_v51_state_from_db 才能正常\n                # 从 DB 重建状态（否则会一直返回这份内存对象）。\n                set_v51_active_run(project_id, False)",
+          "expect": 1
+        }
+      ]
+    },
+    {
+      "path": "app/services/v51_state.py",
+      "eol": "keep",
+      "backup": true,
+      "edits": [
+        {
+          "old": "        # BUG-O-02 修复：乐观锁版本号，每次 resume_v51_task 时递增\n        self._confirm_version: int = 0",
+          "new": "        # BUG-FIX 2026-09-15（高）：标记该项目是否有**正在运行**的 V5.1 生成任务。\n        # 供 load_v51_state_from_db 判断「能否用 DB 行重建覆盖内存状态」——\n        # 运行中的工作流持有的是旧对象，覆盖会让 cancel/resume 打到空处。\n        self.active_run: bool = False\n        # BUG-O-02 修复：乐观锁版本号，每次 resume_v51_task 时递增\n        self._confirm_version: int = 0",
+          "expect": 1
+        },
+        {
+          "old": "    state.resume_event.set()\n    logger.info(\"V5.1 任务已取消: project=%d\", project_id)\n    return True",
+          "new": "    state.resume_event.set()\n    logger.info(\"V5.1 任务已取消: project=%d\", project_id)\n    return True\n\n\ndef set_v51_active_run(project_id: int, active: bool) -> bool:\n    \"\"\"标记/解除「该项目有 V5.1 任务在运行」。\n\n    BUG-FIX 2026-09-15（高）：`load_v51_state_from_db` 原本在结尾无条件执行\n    `_v51_states[project_id] = state`。若该项目正在生成，工作流持有的是**旧**\n    的 `V51TaskState` 对象，而 `cancel_v51_task` / `resume_v51_task` 都是\n    「先 get_v51_state() 再改字段」—— 覆盖之后：\n\n    - `cancel_v51_task` 把新对象的 `cancelled` 置 True，工作流检查的是旧对象\n      → **「停止生成」静默失效**（用户以为停了，AI 还在烧）；\n    - `resume_v51_task` 把 `resume_event` 设在新对象上，工作流等的是旧对象\n      → 审核永远等不到（走 `auto_confirm=False` 的路径时）。\n\n    Returns:\n        bool: 是否找到并修改了状态对象（无状态时返回 False，调用方无需分支）。\n    \"\"\"\n    with _v51_states_lock:\n        state = _v51_states.get(project_id)\n        if state is None:\n            return False\n        state.active_run = bool(active)\n    return True",
+          "expect": 1
+        },
+        {
+          "old": "    # ---- 一次性扫全表清理所有过期脏行 ----",
+          "new": "    # BUG-FIX 2026-09-15（高）：该项目已有**正在运行**的 V5.1 任务时，\n    # 直接返回内存里那份，**不要**用 DB 行重建覆盖。\n    # 内存那份一定比 DB 行更新更全（DB 只在 finally 写一次），而且运行中的\n    # 工作流持有它的引用 —— 覆盖会让 cancel/resume 打到空处（详见\n    # set_v51_active_run 的注释）。\n    with _v51_states_lock:\n        _active = _v51_states.get(project_id)\n    if _active is not None and _active.active_run:\n        logger.info(\n            \"V5.1 任务正在运行，跳过 DB 重载以免覆盖活跃状态: project=%d\", project_id\n        )\n        return _active\n\n    # ---- 一次性扫全表清理所有过期脏行 ----",
+          "expect": 1
+        }
+      ]
+    }
+  ]
+}

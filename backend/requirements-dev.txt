@@ -1,0 +1,5 @@
+# 后端开发/质量门禁依赖（锁定版本，确保团队环境一致）
+# 安装：在 backend/ 下 `pip install -r requirements-dev.txt`
+ruff==0.6.9
+pytest==8.3.3
+httpx==0.27.0

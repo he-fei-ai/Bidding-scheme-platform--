@@ -1,0 +1,132 @@
+version: '3.8'
+
+services:
+  # 后端服务
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: bid-assistant-backend
+    environment:
+      - BID_ASSISTANT_HOST=0.0.0.0
+      - BID_ASSISTANT_PORT=8000
+      - REDIS_URL=redis://redis:6379/0
+      - DATABASE_PATH=/data/bid_assistant.sqlite3
+      - DATA_DIR=/data
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - backend_data:/data
+    restart: unless-stopped
+    depends_on:
+      redis:
+        service_started: true
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: '2.0'
+        reservations:
+          memory: 512M
+          cpus: '0.5'
+
+  # 前端服务
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+    container_name: bid-assistant-frontend
+    ports:
+      - "127.0.0.1:5173:80"
+    restart: unless-stopped
+    depends_on:
+      backend:
+        service_started: true
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost/index.html"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '1.0'
+
+  # Redis缓存服务
+  redis:
+    image: redis:7-alpine
+    container_name: bid-assistant-redis
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '1.0'
+
+  # Celery任务队列（可选）
+  celery_worker:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: bid-assistant-celery-worker
+    environment:
+      - BID_ASSISTANT_HOST=0.0.0.0
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - DATABASE_PATH=/data/bid_assistant.sqlite3
+      - DATA_DIR=/data
+    volumes:
+      - backend_data:/data
+    depends_on:
+      redis:
+        service_started: true
+    restart: unless-stopped
+    command: celery -A app.celery_app worker --loglevel=info
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: '1.0'
+
+  # Celery定时任务beat（可选）
+  celery_beat:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: bid-assistant-celery-beat
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - DATABASE_PATH=/data/bid_assistant.sqlite3
+      - DATA_DIR=/data
+    volumes:
+      - backend_data:/data
+    depends_on:
+      redis:
+        service_started: true
+    restart: unless-stopped
+    command: celery -A app.celery_app beat --loglevel=info
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '0.5'
+
+volumes:
+  backend_data:
+  redis_data:

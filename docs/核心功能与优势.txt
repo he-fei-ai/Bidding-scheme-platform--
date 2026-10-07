@@ -1,0 +1,44 @@
+<table>
+  <tr>
+    <td width="33%" valign="top">
+      <strong>🧩 开源可控</strong><br>
+      开源 AI标书 项目，可自行部署、二次开发和适配团队流程。
+    </td>
+    <td width="33%" valign="top">
+      <strong>💻 本地桌面工作区</strong><br>
+      配置、缓存和生成结果保存在本机，适合 Windows 标书文件处理。
+    </td>
+    <td width="33%" valign="top">
+      <strong>📄 多方式文档解析</strong><br>
+      支持本地解析与 MinerU 解析配置，兼顾常规文档和复杂文件。
+    </td>
+  </tr>
+  <tr>
+    <td width="33%" valign="top">
+      <strong>📚 知识库复用</strong><br>
+      沉淀企业资料、历史案例和方案素材，让标书AI更贴合业务。
+    </td>
+    <td width="33%" valign="top">
+      <strong>🧩 图文与图表</strong><br>
+      支持 Mermaid 预览、正文配图和图表转 Word，增强方案表达。
+    </td>
+    <td width="33%" valign="top">
+      <strong>🔄 后台任务恢复</strong><br>
+      解析、生成等耗时任务持续落盘，切换页面后仍可恢复进度。
+    </td>
+  </tr>
+  <tr>
+    <td width="33%" valign="top">
+      <strong>🛡️ 风险检查入口</strong><br>
+      预留标书查重、废标项检查工作区，聚焦重复表达和响应完整性。
+    </td>
+    <td width="33%" valign="top">
+      <strong>⚙️ 自定义AI配置</strong><br>
+      支持文本模型、生图模型和文件解析方式配置，适配团队习惯。
+    </td>
+    <td width="33%" valign="top">
+      <strong>✏️ 可编辑工作流</strong><br>
+      目录、正文和扩写结果可持续调整，方便 AI写标书 后人工定稿。
+    </td>
+  </tr>
+</table>

@@ -1,0 +1,65 @@
+# 后端质量门禁配置（ruff：lint + format 一体化，替代 flake8/black/isort）
+# 说明：用 ruff 同时做 lint 与格式化，单工具、快、零依赖冲突。
+# 运行：在 backend/ 下执行 `ruff check .` 与 `ruff format .`
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["app"]
+exclude = ["__pycache__", ".venv", "venv", "env", "migrations", "*.pyc"]
+
+[tool.ruff.lint]
+# 选型说明（按严重度与收益挑选，不追求全开以免噪音过大）
+select = [
+    "E",    # pycodestyle 错误（空格/导入等基础规范）
+    "W",    # pycodestyle 警告
+    "F",    # pyflakes（未使用导入、未定义名——最该开）
+    "I",    # isort（导入排序）
+    "B",    # flake8-bugbear（常见 bug 模式）
+    "C4",   # flake8-comprehensions（更优推导式）
+    "UP",   # pyupgrade（现代化语法）
+    "SIM",  # flake8-simplify（简化冗余代码）
+    "RUF",  # ruff 自带规则
+    "ASYNC",# flake8-async（本项目大量 async，针对性强）
+    "PTH",  # flake8-use-pathlib（用 pathlib 替代 os.path）
+]
+# 明确忽略的规则（避免误伤 FastAPI 惯用法与项目现状）
+ignore = [
+    "E501", # 行长由 formatter 统一处理，不单独报错
+    "B008", # FastAPI 在默认参数里调用 Query()/Body() 是标准写法，误报
+    "B904", # 允许直接 raise 原有异常（本项目有意为之）
+    "SIM105", # 允许 try/except 后赋值
+    "PTH123", # 个别 os 调用路径合理
+    "RUF001", # 中文注释/字符串中的全角字符被误判为歧义 Unicode
+    "RUF002", # 同上（docstring）
+    "RUF003", # 同上（comment）
+]
+
+[tool.ruff.lint.per-file-ignores]
+# 测试文件放宽：允许未使用导入、重复定义（fixture 常见）
+"tests/*" = ["F401", "F811", "B", "RUF"]
+"**/__init__.py" = ["F401"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["app"]
+lines-after-imports = 2
+force-sort-within-sections = true
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "lf"
+docstring-code-format = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+# backend/.pytest_cache 在中文路径下偶发 WinError 5 写入崩溃（间歇性 Killing 进程），
+# 将缓存移到 tests/ 子目录规避
+cache_dir = "tests/.pytest_cache"
+
+[tool.coverage.run]
+source = ["app"]
+omit = ["tests/*", "**/__init__.py"]
