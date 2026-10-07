@@ -104,7 +104,16 @@ body {
   background: transparent;
 }
 
-/* 结构树区域（章节树等） */
+/* 结构树区域（章节树等）
+   - 独立纵向滚动条；overscroll-behavior 阻断滚动链，滚轮不会带动外层/右侧区域
+   - scrollbar-gutter 预留滚动条槽位，出现/消失时不产生宽度跳动 */
+.section-tree-scroll {
+  overscroll-behavior: contain;
+  overscroll-behavior-y: contain;
+  scrollbar-gutter: stable;
+  scrollbar-width: thin;
+  scrollbar-color: #cdd4e0 transparent;
+}
 .section-tree-scroll::-webkit-scrollbar {
   width: 8px;
 }
@@ -116,6 +125,27 @@ body {
   border-radius: 8px;
   border: 2px solid transparent;
   background-clip: content-box;
+}
+.section-tree-scroll::-webkit-scrollbar-thumb:hover {
+  background: #a8b2c4;
+  background-clip: content-box;
+  border: 2px solid transparent;
+}
+
+/* ====== 章节编写页：双栏各自独立滚动，互不干扰 ======
+   可用高度 = 视口 - 顶栏(56px) - 内容区上下内边距(24px + 40px) */
+.section-editor-shell {
+  height: calc(100vh - 120px);
+  min-height: 420px;
+}
+/* 右栏：正文区自行滚动，且滚动不外溢到页面 */
+.section-editor-main {
+  overflow-y: auto !important;
+  overflow-x: hidden;
+  overscroll-behavior: contain;
+}
+.section-editor-main > * {
+  flex-shrink: 0;
 }
 
 /* 内容预览区域（生成正文 HTML） */

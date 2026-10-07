@@ -1481,7 +1481,7 @@ export default React.memo(function SectionEditorPage() {
   }
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 0, flex: 1, minHeight: 0, overflow: "hidden" }}>
+    <div className="section-editor-shell" style={{ display: "flex", flexDirection: "column", gap: 0, flex: 1, minHeight: 0, overflow: "hidden" }}>
       {/* 后台任务恢复提示（全宽） */}
       <RecoveryBanner projectId={projectId} />
 
@@ -1496,7 +1496,20 @@ export default React.memo(function SectionEditorPage() {
             </Button>
             <Typography.Text strong style={{ marginLeft: 4 }}>{projectName}</Typography.Text>
           </div>
-          <div className="section-tree-scroll" style={{ flex: 1, overflowY: "auto", overflowX: "hidden", minHeight: 0 }}>
+          {/* 目录树滚动区：自带纵向滚动条，滚动不外溢到右栏 */}
+          <div
+            className="section-tree-scroll"
+            style={{
+              flex: 1,
+              minHeight: 0,
+              height: "100%",
+              overflowY: "auto",
+              overflowX: "hidden",
+              overscrollBehavior: "contain",
+              paddingRight: 4,
+              paddingBottom: 16,
+            }}
+          >
             {tree.length > 0 ? (
               renderTreeList(annotatedTree)
             ) : (
@@ -1505,8 +1518,8 @@ export default React.memo(function SectionEditorPage() {
           </div>
         </div>
 
-        {/* 右列 flex:1：顶部横条 + 按钮栏 + 主内容 */}
-        <div style={{ flex: 1, display: "flex", flexDirection: "column", minWidth: 0, overflow: "hidden" }}>
+        {/* 右列 flex:1：顶部横条 + 按钮栏 + 主内容（自身独立滚动） */}
+        <div className="section-editor-main" style={{ flex: 1, display: "flex", flexDirection: "column", minWidth: 0, overflowX: "hidden", paddingBottom: 12 }}>
           {/* 顶部横条：字数预算 + 生成进度 */}
           <div style={{ display: "flex", gap: 8, padding: "6px 12px", flexShrink: 0, borderBottom: "1px solid #f0f0f0" }}>
           {wordBudget && (
