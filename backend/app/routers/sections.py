@@ -31,7 +31,7 @@ from ..config import (
     CONTENT_USE_ORCHESTRATION_DEFAULT,
     CONTENT_USE_WORD_SAMPLING_DEFAULT,
 )
-from ..db import get_db
+from ..db import DatabaseWriteLockTimeout, get_db
 from ..models import ReorderRequest, SectionCreate, SectionUpdate
 from ..security.auth import get_current_user
 from ..services.generation_manager import generation_manager
@@ -483,11 +483,38 @@ async def review_outline_with_autofix_route(project_id: int, current_user: Annot
     result = await _review_outline_with_autofix(provider, scoring_points, outline)
     if isinstance(result, dict) and result.get('repaired') and result.get('fixed_outline'):
         from .sse.sse_db_ops import _clear_and_save_outline
-        try:
-            await asyncio.to_thread(_clear_and_save_outline, project_id, result['fixed_outline'])
-        except Exception as e:
-            logger.error('自动修复结果落库失败 project=%d: %s', project_id, e, exc_info=True)
-            raise HTTPException(status_code=500, detail=f'自动修复结果保存失败: {e!s}') from e
+
+        # BUG-FIX 2026-10-07：日志实证 8 次
+        #   app.routers.sections:489 自动修复结果落库失败 project=990308: db locked
+        # `_clear_and_save_outline` 是「删除旧目录 + 批量插入 + 正文回填」的长写事务，
+        # 需要长时间持有 db.py 的进程级写锁；与之并发的正文生成 SSE 流水线
+        # （_save_section_to_db 持续写 sections）会把它挤到 8 秒超时。
+        # 这是纯粹的瞬时争用 —— 整个函数在单个事务内执行，失败必然回滚，
+        # 因此整体重跑是安全的。这里做有限次数退避重试，避免把争用直接暴露成 500。
+        _MAX_AUTOFIX_SAVE_RETRIES = 3
+        _save_err: Exception | None = None
+        for _attempt in range(1, _MAX_AUTOFIX_SAVE_RETRIES + 1):
+            try:
+                await asyncio.to_thread(_clear_and_save_outline, project_id, result["fixed_outline"])
+                _save_err = None
+                break
+            except DatabaseWriteLockTimeout as e:
+                _save_err = e
+                if _attempt >= _MAX_AUTOFIX_SAVE_RETRIES:
+                    break
+                logger.warning(
+                    "自动修复结果落库遇写锁争用，第 %d/%d 次重试 project=%d: %s",
+                    _attempt, _MAX_AUTOFIX_SAVE_RETRIES, project_id, e,
+                )
+                await asyncio.sleep(_attempt * 0.8)
+        if _save_err is not None:
+            logger.error(
+                "自动修复结果落库失败 project=%d: %s", project_id, _save_err, exc_info=True
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="自动修复结果保存失败：数据库正忙（并发写入），请稍后重试",
+            ) from _save_err
         result['tree'] = await asyncio.to_thread(build_tree, project_id)
     return {'status': 'completed', 'result': result}
 

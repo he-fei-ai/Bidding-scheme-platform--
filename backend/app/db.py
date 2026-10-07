@@ -20,9 +20,27 @@ _db_write_lock = threading.RLock()
 # 而不是让后续 100+ 请求白等 60s 再一起超时。
 _db_write_lock_timeout = 8.0
 
+#: 进程内全局写锁争用的可重试异常。
+#: BUG-FIX 2026-10-07：此前写锁超时抛的是裸 RuntimeError，而 `_is_io_error`
+#: 只识别 sqlite3.OperationalError，于是这条**典型的瞬时争用**既不会被
+#: query_retry / get_db_with_retry 重试，也不会宽带为 5xx 语义，直接变成 500。
+#: 生产日志实证（logs/backend.log，8 次）：
+#:   app.routers.sections:489 自动修复结果落库失败 project=990308: db locked
+#: 成因是正文生成的 SSE 流水线持续写入 sections，而 `_clear_and_save_outline`
+#: 是「DELETE + 批量 INSERT + 正文回填」的长事务，两者抢同一把进程级写锁。
+#: 抽成专用类型后，重试装饰器能明确把它当作可重试的瞬时错误。
+class DatabaseWriteLockTimeout(RuntimeError):
+    """获取进程级数据库写锁超时（通常与并发写入争用有关，可安全重试）。"""
+
 logger = logging.getLogger(__name__)
 
-__all__ = ["get_db", "get_db_with_retry", "query_retry", "init_db"]
+__all__ = [
+    "DatabaseWriteLockTimeout",
+    "get_db",
+    "get_db_with_retry",
+    "init_db",
+    "query_retry",
+]
 
 # get_db / get_db_with_retry 共用的重入状态（线程本地）：
 # depth>0 表示本线程已存在未退出的 db 上下文（嵌套时内层只借用连接，
@@ -523,7 +541,15 @@ def _load_table_columns(table: str) -> set[str]:
 
 
 def _is_io_error(exc: Exception) -> bool:
-    """检查是否是 SQLite I/O 错误（可重试）"""
+    """检查是否是「可重试」的数据库瞬时错误。
+
+    包含两类：
+      1. SQLite 自身报告的 I/O / 锁冲突（OperationalError）；
+      2. 本模块进程级写锁争用的超时（DatabaseWriteLockTimeout）——
+         BUG-FIX 2026-10-07：见该类上方的日志实证说明。
+    """
+    if isinstance(exc, DatabaseWriteLockTimeout):
+        return True
     if isinstance(exc, sqlite3.OperationalError):
         error_msg = str(exc).lower()
         return any(
@@ -653,7 +679,9 @@ def get_db(readonly: bool = False):
                 # 执行，写串行化失效（此前非 RuntimeError 异常被静默忽略）。
                 acquired = _db_write_lock.acquire(timeout=_db_write_lock_timeout)
                 if not acquired:
-                    raise RuntimeError(f"获取数据库写锁超时（{_db_write_lock_timeout}秒）")
+                    raise DatabaseWriteLockTimeout(
+                        f"获取数据库写锁超时（{_db_write_lock_timeout}秒），可能存在并发写入"
+                    )
                 write_locked = True
 
             yield conn
@@ -716,7 +744,9 @@ def get_db_with_retry(
             if not readonly:
                 acquired = _db_write_lock.acquire(timeout=_db_write_lock_timeout)
                 if not acquired:
-                    raise RuntimeError(f"获取数据库写锁超时（{_db_write_lock_timeout}秒）")
+                    raise DatabaseWriteLockTimeout(
+                        f"获取数据库写锁超时（{_db_write_lock_timeout}秒），可能存在并发写入"
+                    )
                 write_locked = True
         except Exception:
             if outermost:
