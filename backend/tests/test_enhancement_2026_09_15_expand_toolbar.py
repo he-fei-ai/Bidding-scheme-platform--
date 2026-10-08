@@ -31,17 +31,31 @@ class TestSectionExpandThreshold:
         assert section_expand_threshold({"target_words": 1000, "level": 3}, 2000) == 800
 
     def test_level_tier_when_no_target(self):
-        # L3 无 target → 分档 300×80% = 240（旧实现会被全局 max 拉到 ~2800）
+        # 2026-10-09 方案三契约更新：字数控制下沉到三级目录（L3）自身正文——
+        # L1/L2 父节点不参与扩写（阈值 0）；L3 无 target / 无档位 →
+        # L3 自身正文 300 字 × 80% = 240。
         assert section_expand_threshold({"level": 3}, 2000) == 240
-        assert section_expand_threshold({"level": 2}, 2000, level2_default=3500) == 2000  # 2800 → 钳到平铺
-        assert section_expand_threshold({"level": 2}, 5000, level2_default=3500) == 2800
+        assert section_expand_threshold({"level": 2}, 2000, level2_default=3500) == 0
+        assert section_expand_threshold({"level": 2}, 5000, level2_default=3500) == 0
+
+    def test_l4_falls_back_to_default_tier(self):
+        # 方案三：四档是「L3 子树总字数」口径；L4+ 深层叶子无显式配置时
+        # 回落默认档位（standard 1200）× 80% = 960，而不是被 L3 的 300 拉低。
+        assert section_expand_threshold({"level": 4}, 2000) == 960
+        assert section_expand_threshold({"level": 4}, 2000, writing_length="detailed") == 1600
+
+    def test_l3_explicit_tier_wins_over_l3_own(self):
+        # L3 显式指定档位时按档位（子树总字数）× 80% 计算，不走 L3 自身 300。
+        assert section_expand_threshold({"level": 3, "word_count_tier": "detailed"}, 2000) == 1600
 
     def test_floor_200(self):
         # 极小 target 也要保底 200，避免阈值过小永远「达标」
         assert section_expand_threshold({"target_words": 100}, 2000) == 200
 
     def test_flat_minimum_caps_everything(self):
-        assert section_expand_threshold({"target_words": 9000, "level": 2}, 2000) == 2000
+        # 2026-10-08 契约更新：阈值仅对 L3+ 生效（L2 返回 0），
+        # 平铺阈值封顶用 L3 验证：min(2000, 9000×80%) = 2000
+        assert section_expand_threshold({"target_words": 9000, "level": 3}, 2000) == 2000
 
 
 # ======================= B. 不足章节筛选 =======================
@@ -112,9 +126,10 @@ class TestExpandContentFallback:
         return results, sections_by_id
 
     def test_all_deficient_sections_expanded_in_one_call(self):
-        # 旧实现 max_expansion_rounds=1 只能救 1 章；新实现一次调用全部达标
-        # 2026-10-07 契约更新：writing_length="standard" 时 L3 阈值按模式取
-        # 1500×80%=1200（与正文生成同一口径），300/280/900 三章均不足。
+        # 旧实现 max_expansion_rounds=1 只能救 1 章；新实现一次调用全部达标。
+        # 2026-10-08 契约更新：单节点 target_words 优先于全局档位——
+        # target 1000 → 阈值 800，300/280 两章不足触发扩写；
+        # 章节3（900 ≥ 800）本就达标，不消耗 AI 调用。
         results, sections_by_id = self._prepare()
         provider = FakeProvider()
         out = asyncio.run(
@@ -125,7 +140,7 @@ class TestExpandContentFallback:
         )
         reached = [r["id"] for r in out if r["id"] in (1, 2, 3) and len(r["content"]) > 300]
         assert sorted(reached) == [1, 2, 3]
-        assert len(provider.calls) == 3
+        assert len(provider.calls) == 2
 
     def test_cancel_event_blocks_all_calls(self):
         results, sections_by_id = self._prepare()
@@ -198,10 +213,10 @@ class TestExpandContentFallback:
                 on_section_done=lambda sid, title: done.append(sid),
             )
         )
-        # 2026-10-07 契约更新：standard 模式 L3 阈值 1200。
-        # 回调仅在达标后触发：章 3（900→2700 字）达标回调；章 1/2 单轮扩至
-        # 900/840 字仍不足（max_expansion_rounds=1），不回调、继续留待下轮。
-        assert sorted(done) == [3]
+        # 2026-10-08 契约更新：单节点 target 1000 → 阈值 800。
+        # 回调仅在达标后触发：章 1（300→900）、章 2（280→840）单轮扩写后
+        # 均 ≥ 800 达标回调；章 3（900）本就达标不进入扩写、无扩写回调。
+        assert sorted(done) == [1, 2]
 
     def test_no_deficient_short_circuits(self):
         results, sections_by_id = self._prepare()

@@ -60,7 +60,9 @@ def extract_docx_plain(file_path: str) -> str:
 
         return "\n".join(paragraphs)
     finally:
-        doc.part._element.clear()
+        # BUG-FIX 2026-10-08：此前使用 doc.part._element.clear() 依赖 python-docx
+        # 内部私有 API，版本升级时可能失效。改为安全删除文档对象，让 GC 回收。
+        del doc
 
 
 def extract_docx_docx2python(file_path: str) -> str:

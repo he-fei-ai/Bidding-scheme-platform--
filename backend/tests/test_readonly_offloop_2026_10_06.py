@@ -184,28 +184,31 @@ class TestWordCountContractPreserved:
         from app.routers.word_count import overview
 
         pid = _new_project("预检-overview-契约")
-        _seed_section(pid, title="A", content="一" * 100, target_words=200)
-        _seed_section(pid, title="B", content="二" * 300, target_words=200, sort_order=1)
+        # 2026-10-08 契约：目标字数仅对 L3+ 生效；达标判定为 ±10% 容差。
+        # B 300/300 在容差内 → 达标；A 100/300 缺字；C（L1 父节点）无目标。
+        _seed_section(pid, title="A", level=3, content="一" * 100, target_words=300)
+        _seed_section(pid, title="B", level=3, content="二" * 300, target_words=300, sort_order=1)
         _seed_section(pid, title="C", content="", sort_order=2)
 
         result = _run(overview(pid, user=User(OWNER, "o", "user")))
         assert result["status"] == "ok"
         assert result["project_id"] == pid
         assert result["total_sections"] == 3
-        assert result["on_target_sections"] == 1      # B 达标
+        assert result["on_target_sections"] == 1      # B 达标（300/300 ±10% 内）
         assert result["below_target_sections"] == 1   # A 缺字
         assert result["empty_sections"] == 1          # C 空
-        assert result["stats"]["per_level"]["level_1"] == 400
+        assert result["stats"]["per_level"]["level_3"] == 400
         assert "per_status" in result["stats"]
 
     def test_sections_contract_and_sort_layering(self):
         from app.routers.word_count import section_stats
 
         pid = _new_project("预检-sections-契约")
+        # 2026-10-08 契约：L1/L2 父节点无目标（排最后）；目标字数仅对 L3+ 生效。
         _seed_section(pid, title="无目标", content="字" * 10)
-        _seed_section(pid, title="已达标", content="字" * 300, target_words=200, sort_order=1)
-        _seed_section(pid, title="大缺口", content="字" * 10, target_words=300, sort_order=2)
-        _seed_section(pid, title="小缺口", content="字" * 150, target_words=200, sort_order=3)
+        _seed_section(pid, title="已达标", level=3, content="字" * 300, target_words=200, sort_order=1)
+        _seed_section(pid, title="大缺口", level=3, content="字" * 10, target_words=300, sort_order=2)
+        _seed_section(pid, title="小缺口", level=3, content="字" * 150, target_words=200, sort_order=3)
 
         result = _run(section_stats(pid, user=User(OWNER, "o", "user")))
         assert result["status"] == "ok"

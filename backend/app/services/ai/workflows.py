@@ -8,16 +8,6 @@
 # ruff: noqa: F401
 
 from ...utils.json_parser import extract_json_from_text as parse_json_response
-from .workflows_analysis import normalize_writing_targets
-from .workflows_base import (
-    _adaptive_controller,
-    _fill_template,
-    _get_heading_spec,
-    _normalize_outline_list_response,
-    _safe_asyncio_run,
-    collect_json_response,
-    with_timeout,
-)
 from .outline_common import (
     FIXED_28_CHAPTERS,
     _classify_chapter_type,
@@ -30,13 +20,22 @@ from .outline_common import (
     generate_nodes_distribution,
     sanitize_framework_titles,
 )
+from .workflows_analysis import normalize_writing_targets
+from .workflows_base import (
+    _adaptive_controller,
+    _fill_template,
+    _get_heading_spec,
+    _normalize_outline_list_response,
+    _safe_asyncio_run,
+    collect_json_response,
+    with_timeout,
+)
 from .workflows_outline_utils import (
     _L2_TITLE_PATTERNS,
     _L3_TITLE_PATTERNS,
     normalize_outline_items,
     validate_outline_business,
 )
-from .workflows_quality import review_outline, review_outline_with_autofix
 from .workflows_outline_v51 import (
     _auto_fix_issues,
     _call_ai_v51,
@@ -53,6 +52,8 @@ from .workflows_outline_v51 import (
     generate_outline_v51,
     should_use_direct_outline,
 )
+from .workflows_quality import review_outline, review_outline_with_autofix
+
 
 # generate_outline → alias to generate_outline_v51 (V5.1 is now the only path)
 generate_outline = generate_outline_v51
@@ -72,16 +73,27 @@ def _is_outline_complete(outline: list) -> bool:
                 if not l3.get("title", "").strip():
                     return False
     return True
+from .workflows_analysis import _extract_array_from_response
+
+# BUG-FIX 2026-10-08（P0·后生成一致性审计整条链路失效）：此前本 facade 只
+# re-export 了 `estimate_total_words_from_probe`，**漏掉了 `consistency_audit_content`**。
+# 而 `routers/sse/sse_content.py`（正文生成 SSE 的后生成审计块）恰恰是
+# `from ...services.ai.workflows import consistency_audit_content` —— 于是每次
+# 带 `use_consistency_audit=true` 生成正文，走到该分支必然抛 ImportError，
+# 又被外层裸 `except Exception` 吞成一条 `logger.warning("一致性审计失败")`。
+# 后果：**用户勾选了「全文一致性审计」，实际一次都没跑过，且全程无任何用户可见报错**
+# （SSE 仍正常推 completed，退出码 0）。已复现：ImportError: cannot import name
+# 'consistency_audit_content' from 'app.services.ai.workflows'。
+# 修复：补齐 re-export。
+from .workflows_expand import consistency_audit_content, estimate_total_words_from_probe
 from .workflows_sections import (
     SectionContentCache,
     _section_content_cache,
+    extract_section_charts,
     generate_section_content,
     generate_sections,
     orchestrate_content,
-    extract_section_charts,
 )
-from .workflows_expand import estimate_total_words_from_probe
-from .workflows_analysis import _extract_array_from_response
 
 
 # ---------------------------------------------------------------------------

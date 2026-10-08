@@ -24,8 +24,11 @@ ERROR 的 276/1650。失败信息统一为：
 （加性增 Additive Increase / 乘性减 Multiplicative Decrease）自适应并发：
 
 - **令牌桶（RPM）**：按 `base_url` 维度限制「每分钟最多 N 次请求」。
-  N 取配置 `rate_limit_per_min`（0/未配置=不限流），默认 `AI_RATE_LIMIT_RPM`，
-  默认 60 —— 与日志中 Agnes 免费套餐口径一致。
+  N 取配置 `rate_limit_per_min`；**0/未配置 = 跟随默认闸门**（`AI_RATE_LIMIT_RPM`，
+  默认 60，与日志中 Agnes 免费套餐口径一致）。
+  需要真正关闭限流时必须显式设置 `AI_RATE_LIMIT_DISABLED=1`
+  （FIX 2026-10-08：不再把「0」解释成不限流——多数部署的 `rate_limit_per_min`
+  默认为 0/未填，照旧语义一改等于全局解除限流，直接引发 429 风暴）。
 - **自适应并发**：初始上限取配置 `concurrency`（缺省 5）。一旦收到 429，
   立即**乘性减半**（下限 1）并进入冷却窗口（优先采信服务端 `Retry-After`）；
   连续成功达阈值则**加性恢复**（+1），恢复到初始上限为止。
@@ -198,6 +201,8 @@ class _RateGate:
     def __init__(self, enabled: bool | None = None) -> None:
         self._states: dict[str, _GateState] = {}
         self._enabled = _env_flag("AI_RATE_GATE_ENABLED", True) if enabled is None else enabled
+        # FIX 2026-10-08（遗留1）：显式解除 RPM 限流的唯一开关（默认关闭=保持限流）。
+        self._rpm_disabled = _env_flag("AI_RATE_LIMIT_DISABLED", False)
         self._rpm_override = _env_int("AI_RATE_LIMIT_RPM", DEFAULT_RPM)
         self._conc_override = _env_int("AI_RATE_CONCURRENCY", DEFAULT_CONCURRENCY)
 
@@ -211,6 +216,9 @@ class _RateGate:
         eff_rpm = float(rpm) if rpm and rpm > 0 else float(self._rpm_override)
         if not self._enabled:
             eff_rpm = 0.0  # 0 = 不限流
+        if self._rpm_disabled:
+            # FIX 2026-10-08（遗留1）：显式开关优先，覆盖任何传入值。
+            eff_rpm = 0.0
         eff_conc = int(concurrency) if concurrency and concurrency > 0 else self._conc_override
 
         st = self._states.get(key)
@@ -269,8 +277,14 @@ class _RateGate:
             return
 
         # 1) 冷却窗口（on_rate_limited 设置）
-        cooldown = st.cooldown_until - time.monotonic()
-        if cooldown > 0:
+        # BUG-FIX 2026-10-08（P1）：原实现只睡一次且封顶 _MAX_SLEEP(30s)——
+        # 服务端 Retry-After: 60 的冷却实际只等 30s 就放行进令牌桶，与
+        # openai_compatible「三方取大」的等待设计相悖。改为循环分片睡到冷却结束
+        # （每片 ≤ _MAX_SLEEP，可被 cancel_event 随时打断）。
+        while True:
+            cooldown = st.cooldown_until - time.monotonic()
+            if cooldown <= 0:
+                break
             await _interruptible_sleep(min(cooldown, _MAX_SLEEP), cancel_event)
 
         # 2) 令牌桶（RPM）：不足则排队等攒够 1 个令牌

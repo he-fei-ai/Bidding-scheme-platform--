@@ -250,8 +250,21 @@ def _flatten_outline_tree(
             "scoring_point_id": node.get("scoring_point_id"),
         }
         flat.append(item)
-        children = node.get("children", [])
-        if children:
+        # BUG-FIX 2026-10-08（目录树错误 · children 非 list 静默丢子树）：
+        # 原实现只判 `if children:`。AI / 直出 JSON 偶尔把 children 序列化成
+        # **对象**（`{"0": {...}, "1": {...}}`，部分模型对纯数组会这么吐），
+        # 此时 dict 为真值 → 递归进去迭代出的是 **字符串 key**，
+        # 被上面的 `isinstance(node, dict)` 全量 continue 掉，
+        # 结果该节点**整棵子树无声消失**（不报错、无日志），落库后目录缺章。
+        # 改为严格要求 list；非 list 且非空时告警留痕，便于事后追责。
+        children = node.get("children")
+        if children and not isinstance(children, list):
+            logger.warning(
+                "目录节点 children 类型非法（期望 list，实际 %s），已忽略其子树: %s",
+                type(children).__name__,
+                item.get("title", ""),
+            )
+        if isinstance(children, list) and children:
             flat.extend(_flatten_outline_tree(children, temp_id, level + 1))
     return flat
 
@@ -274,8 +287,17 @@ def _renumber_items(items: list[dict], parent_number: str = "") -> list[dict]:
         new_item = dict(item)  # 不修改原对象
         new_item["number"] = num
         # 保持 title 纯文本，不附加"1."、"1.1."、"1.2.3."等数字前缀
-        children = new_item.get("children", [])
-        if children:
+        # BUG-FIX 2026-10-08（编号冲突/目录树错误）：同 _flatten_outline_tree，
+        # children 为 dict（真值）时原实现递归后被 isinstance 守卫全量跳过，
+        # 子树连同其编号一起消失；现严格要求 list 并对异常形态留痕。
+        children = new_item.get("children")
+        if children and not isinstance(children, list):
+            logger.warning(
+                "目录节点 children 类型非法（期望 list，实际 %s），其子树编号已跳过: %s",
+                type(children).__name__,
+                new_item.get("title", ""),
+            )
+        if isinstance(children, list) and children:
             new_item["children"] = _renumber_items(children, f"{num}.")
         result.append(new_item)
     return result
@@ -293,6 +315,20 @@ def normalize_outline_items(items: list[dict], default_level: int = 1) -> list[d
     BUG-O-03 修复：将递归实现改为迭代（栈式 DFS 遍历），彻底消除 RecursionError 风险
     """
     result: list[dict] = []
+
+    # BUG-FIX 2026-10-08（空数据容错）：落库链路会传 `outline or []`，但直出/
+    # 直调路径可能传 None。原实现 `len(current_items)` 对 None 抛
+    # TypeError → 整个目录归一化 500。现统一降级为空结果。
+    if items is None:
+        return result
+    if not isinstance(items, list):
+        if isinstance(items, dict):
+            items = [items]
+        else:
+            logger.warning(
+                "归一化：入参类型非法（期望 list，实际 %s），已按空目录处理", type(items).__name__
+            )
+            return result
 
     # 使用显式栈实现 DFS 遍历：每个栈帧包含 (items, level, parent_list, index)
     # index 跟踪当前处理位置，确保先处理子节点再处理兄弟节点（与递归一致）
@@ -355,6 +391,22 @@ def normalize_outline_items(items: list[dict], default_level: int = 1) -> list[d
 
         # 如果有子节点，压入栈中先处理子节点（DFS：深度优先）
         children = normalized.get("children")
+        # BUG-FIX 2026-10-08（目录树错误 · 归一化收口）：原实现对非 list 的
+        # children 只是「不进 if」，却把原值原样留在 normalized["children"] 里
+        # 继续向下游传。于是 dict 形态的 children 会一路穿过本函数 →
+        # sse_db_ops._save_nodes 的 `for sort_order, node in enumerate(nodes)`
+        # 迭代出的是字符串 key → node.get(...) 抛 AttributeError → 整条目录
+        # 生成落库链路 500（而不是像 _flatten_outline_tree 那样静默丢子树）。
+        # 归一化的职责就是消灭形态差异：非 list 一律收敛为 [] 并留痕。
+        if "children" in normalized and not isinstance(children, list):
+            if children:
+                logger.warning(
+                    "归一化：节点 children 类型非法（期望 list，实际 %s），已置空: %s",
+                    type(children).__name__,
+                    normalized.get("title", ""),
+                )
+            normalized["children"] = []
+            children = []
         if isinstance(children, list) and children:
             # 创建新的子列表用于存储处理后的子节点
             child_result: list[dict] = []

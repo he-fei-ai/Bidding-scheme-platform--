@@ -102,6 +102,11 @@ export interface SectionTreeNode {
   section_type: string;
   scoring_point_id: string | null;
   target_words?: number | null;
+  // 2026-10-08 新增：字数档位（三级目录控制）
+  word_count_tier?: string | null;
+  tier_label?: string | null;
+  tier_target?: number | null;
+  cumulative_word_count?: number;
   status: string;
   children: SectionTreeNode[];
   has_content: boolean;
@@ -152,6 +157,8 @@ export interface SectionUpdate {
   parent_id?: number | null;
   content?: string;
   target_words?: number | null;
+  // 2026-10-08 新增：字数档位覆盖（null=清除，跟随全局默认）
+  word_count_tier?: string | null;
   status?: string;
   section_type?: string;
   scoring_point_id?: string | null;

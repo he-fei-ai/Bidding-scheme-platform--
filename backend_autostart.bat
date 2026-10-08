@@ -128,25 +128,28 @@ echo [%date% %time%] ===== watchdog started ===== >> "%WATCHDOG_LOG%"
 
     goto START_BACKEND
 
-:WAIT_BACKEND_READY
-    set "WAIT_COUNT=0"
-    set "WAIT_MAX=30"
-    :WAIT_LOOP
-        for /f "tokens=5" %%p in ('netstat -ano 2^>nul ^| findstr ":%BACKEND_PORT%.*LISTENING"') do (
-            set "FOUND_PID=%%p"
-        )
-        if defined FOUND_PID (
-            REM Check the health endpoint
-            %PYTHON_EXEC% -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:%BACKEND_PORT%/api/v1/health', timeout=3)" 2>nul
-            if !ERRORLEVEL! EQU 0 (
-                exit /b 0
-            )
-        )
-        set "FOUND_PID="
-        timeout /t 1 /nobreak >nul
-        set /a WAIT_COUNT+=1
-        if !WAIT_COUNT! LSS !WAIT_MAX! goto :WAIT_LOOP
-        exit /b 1
+ :WAIT_BACKEND_READY
+     set "WAIT_COUNT=0"
+     set "WAIT_MAX=45"
+     :WAIT_LOOP
+         for /f "tokens=5" %%p in ('netstat -ano 2^>nul ^| findstr ":%BACKEND_PORT%.*LISTENING"') do (
+             set "FOUND_PID=%%p"
+         )
+         if defined FOUND_PID (
+             REM Backend process exists, check the health endpoint
+             %PYTHON_EXEC% -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:%BACKEND_PORT%/api/v1/health', timeout=3)" 2>nul
+             if !ERRORLEVEL! EQU 0 (
+                 exit /b 0
+             )
+         ) else if !WAIT_COUNT! EQU 0 (
+             REM No backend process on port on the very first check: skip the wait and start it immediately
+             exit /b 1
+         )
+         set "FOUND_PID="
+         timeout /t 1 /nobreak >nul
+         set /a WAIT_COUNT+=1
+         if !WAIT_COUNT! LSS !WAIT_MAX! goto :WAIT_LOOP
+         exit /b 1
 
 :CHECK_BACKEND_HEALTH
     %PYTHON_EXEC% -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:%BACKEND_PORT%/api/v1/health', timeout=5)" 2>nul

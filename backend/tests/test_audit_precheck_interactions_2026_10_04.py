@@ -85,11 +85,12 @@ class TestWordCountOverviewComputation:
         from app.routers.word_count import overview
 
         pid = _new_project("字数-聚合")
-        # 章节1：有正文 + 达标目标
-        _seed_section(pid, title="第一章", level=1, sort_order=0,
-                      content="一二三四五六七八九十", status="completed", target_words=5)
+        # 2026-10-08 契约更新：字数控制下沉到 L3——目标字数仅对 L3+ 生效。
+        # 章节1：有正文 + 达标目标（10/10 在 ±10% 容差内）
+        _seed_section(pid, title="第一章", level=3, sort_order=0,
+                      content="一二三四五六七八九十", status="completed", target_words=10)
         # 章节2：有正文 + 未达标（缺字）
-        _seed_section(pid, title="第二章", level=2, sort_order=1,
+        _seed_section(pid, title="第二章", level=3, sort_order=1,
                       content="一二三", status="completed", target_words=100)
         # 章节3：空正文 → empty
         _seed_section(pid, title="第三章", level=1, sort_order=2,
@@ -100,22 +101,22 @@ class TestWordCountOverviewComputation:
         assert result["empty_sections"] == 1
         assert result["on_target_sections"] == 1
         assert result["below_target_sections"] == 1
-        # 总目标 = 5 + 100 + 0
-        assert result["total_target"] == 105
+        # 总目标 = 10 + 100 + 0（L3 才有目标，2026-10-08 契约）
+        assert result["total_target"] == 110
         # 总字数 = 第一章(10) + 第二章(3) = 13（count_words 中文逐字计数）
         assert result["total_words"] == 13
         assert result["completed_sections"] == 2
         assert isinstance(result["stats"]["per_level"], dict)
         assert isinstance(result["stats"]["per_status"], dict)
         # 分组键存在性
-        assert "level_1" in result["stats"]["per_level"]
+        assert "level_3" in result["stats"]["per_level"]
         assert "completed" in result["stats"]["per_status"]
 
     def test_coverage_math_matches_words_and_target(self):
         from app.routers.word_count import overview
 
         pid = _new_project("字数-覆盖率自洽")
-        _seed_section(pid, title="A", level=1, sort_order=0,
+        _seed_section(pid, title="A", level=3, sort_order=0,
                       content="一二三", status="completed", target_words=6)
         result = _run(overview(pid, user=User(OWNER, "o", "user")))
         total_words = result["total_words"]
@@ -135,9 +136,9 @@ class TestWordCountSectionStats:
         from app.routers.word_count import section_stats
 
         pid = _new_project("字数-明细")
-        _seed_section(pid, title="达标章", level=1, sort_order=0,
+        _seed_section(pid, title="达标章", level=3, sort_order=0,
                       content="一二三四", status="completed", target_words=4)
-        _seed_section(pid, title="缺字章", level=2, sort_order=1,
+        _seed_section(pid, title="缺字章", level=3, sort_order=1,
                       content="一二", status="completed", target_words=10)
 
         result = _run(section_stats(pid, user=User(OWNER, "o", "user")))
@@ -180,13 +181,15 @@ class TestWordCountSectionStats:
         from app.routers.word_count import section_stats
 
         pid = _new_project("字数-排序分层")
+        # 2026-10-08 契约：目标字数仅对 L3+ 生效——「无目标」用 L1 父节点表达，
+        # 三个 L3 章节分别覆盖 已达标 / 小缺口 / 大缺口。
         _seed_section(pid, title="无目标", level=1, sort_order=0,
                       content="一二三", status="completed", target_words=None)
-        _seed_section(pid, title="已达标", level=1, sort_order=1,
+        _seed_section(pid, title="已达标", level=3, sort_order=1,
                       content="一二三", status="completed", target_words=2)
-        _seed_section(pid, title="小缺口", level=1, sort_order=2,
+        _seed_section(pid, title="小缺口", level=3, sort_order=2,
                       content="一", status="completed", target_words=3)   # 缺2
-        _seed_section(pid, title="大缺口", level=1, sort_order=3,
+        _seed_section(pid, title="大缺口", level=3, sort_order=3,
                       content="一", status="completed", target_words=10)  # 缺9
 
         result = _run(section_stats(pid, user=User(OWNER, "o", "user")))

@@ -51,6 +51,12 @@
   --ease-standard: cubic-bezier(0.2, 0.8, 0.2, 1);
 }
 
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
 html,
 body,
 #root {
@@ -112,31 +118,34 @@ body {
   overscroll-behavior-y: contain;
   scrollbar-gutter: stable;
   scrollbar-width: thin;
-  scrollbar-color: #cdd4e0 transparent;
+  scrollbar-color: #94a3b8 #eef1f5;
 }
 .section-tree-scroll::-webkit-scrollbar {
-  width: 8px;
+  -webkit-appearance: none;
+  width: 12px;
 }
 .section-tree-scroll::-webkit-scrollbar-track {
-  background: transparent;
+  background: #eef1f5;
+  border-radius: 6px;
 }
 .section-tree-scroll::-webkit-scrollbar-thumb {
-  background: #d3d9e3;
-  border-radius: 8px;
-  border: 2px solid transparent;
+  background: #b6c0cf;
+  border-radius: 6px;
+  border: 3px solid #eef1f5;
   background-clip: content-box;
+  min-height: 32px;
 }
+.section-tree-scroll:hover::-webkit-scrollbar-thumb,
 .section-tree-scroll::-webkit-scrollbar-thumb:hover {
-  background: #a8b2c4;
+  background: #8a97ab;
   background-clip: content-box;
-  border: 2px solid transparent;
 }
 
-/* ====== 章节编写页：双栏各自独立滚动，互不干扰 ======
-   可用高度 = 视口 - 顶栏(56px) - 内容区上下内边距(24px + 40px) */
+/* ====== 章节编写页：高度沿 flex 链由父级 .is-fluid 传入，双栏各自独立滚动 ======
+   shell 填满受限高度的父容器；min-height:0 让内部滚动区可被压缩出滚动条。 */
 .section-editor-shell {
-  height: calc(100vh - 120px);
-  min-height: 420px;
+  height: 100%;
+  min-height: 0;
 }
 /* 右栏：正文区自行滚动，且滚动不外溢到页面 */
 .section-editor-main {
@@ -416,6 +425,15 @@ body {
 }
 .app-content__inner.is-fluid {
   max-width: none;
+  height: 100%;
+  min-height: 0;
+  padding-top: 12px;
+  padding-bottom: 12px;
+  overflow: hidden;
+}
+.app-content__inner.is-fluid > * {
+  flex: 1 1 auto;
+  min-height: 0;
 }
 @keyframes view-enter {
   from { opacity: 0; transform: translateY(6px); }

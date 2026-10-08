@@ -264,7 +264,19 @@ def refresh_conflict_states(conn, project_id: int, sections: dict[int, str]) -> 
         present = [
             str(value)
             for value in values
-            if str(value) and any(str(value) in content for content in sections.values())
+            if str(value)
+            and any(
+                # BUG-FIX 2026-10-08（判定口径不一致 → 谎报「仍待处理」）：
+                # 原实现用裸子串 `str(value) in content` 找取值，而确定性修复路径
+                # （`consistency_auditor.apply_autofix` → `text_patch.replace_values`）
+                # 走的是带**数字边界保护**的 `find_value_occurrences`。两边口径不一致
+                # 导致：冲突值「30」在正文只写成「工期300天」时，裸子串判定
+                # 「30 仍在正文里」→ 冲突被永久判为 still_open，尽管 AI 补丁
+                # 其实已经把该值统一掉了。反向亦然（子串漏判可致误标已解决）。
+                # 现统一到 `text_patch` 的同一套定位口径。
+                text_patch.find_value_occurrences(content, str(value))
+                for content in sections.values()
+            )
         ]
         unique_present = list(dict.fromkeys(present))
         if len(unique_present) <= 1:

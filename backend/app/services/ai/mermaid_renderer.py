@@ -146,6 +146,26 @@ def render_mermaid_to_bytes(
         # 非 JSON → 纯 Mermaid 代码，无需归一化
         pass
 
+    # ---------- BUG-2026-1008-01（P0）：Mermaid 语法预处理 ----------
+    # AI 生成 Mermaid 代码时经常违反语法规范（节点标签未加引号、含中文冒号/
+    # 日期/百分号、连写多节点、行末分号、中文节点 ID），导致 HTTP 渲染服务与
+    # PIL v2 解析器都失败，图表被静默降级为纯文本。
+    # 预处理策略：仅对 Mermaid 语法代码生效（JSON 数据载荷不进入本层）；
+    # 仅当检测到需要清洗的字符模式时才调用 sanitize，避免对合规代码做无用功。
+    if not code.lstrip().startswith("{"):
+        from .mermaid_sanitizer import SANITIZER
+
+        if SANITIZER.needs_sanitization(code):
+            _sanitized = SANITIZER.sanitize(code)
+            if _sanitized != code:
+                logger.info(
+                    "[渲染] MermaidSanitizer 生效: chart_type=%s 原长=%d 新长=%d",
+                    chart_type,
+                    len(code),
+                    len(_sanitized),
+                )
+                code = _sanitized
+
     # =========================================================
     # 渲染管道优先级（商业级最优策略 — 无降级 V5.0）
     # =========================================================

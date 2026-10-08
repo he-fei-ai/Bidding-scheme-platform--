@@ -15,12 +15,37 @@ _build_tree_cache: dict[int, tuple[float, list[SectionTreeNode]]] = {}
 _BUILD_TREE_CACHE_TTL = 60.0
 _BUILD_TREE_CACHE_MAX = 200  # 最多缓存 200 个项目的树结构
 _BUILD_TREE_CACHE_LOCK = threading.Lock()
+# BUG-FIX 2026-10-08（并发竞态 · 高）：build_tree 是「读缓存 → 查 DB → 写缓存」
+# 三步，中间任何一次章节写操作调用 `_invalidate_build_tree_cache` 都会被**随后
+# 的写缓存覆盖**——即失效被吞。表现为：改名/删除/重排后 60s 内刷新仍拿到旧树，
+# 且因为 TTL 已重置而要等满 60s，且下一次重建又会再被覆盖一次。
+# 解法：全局代号（epoch）。build_tree 进入时快照代号，写缓存前比对；
+# 不一致说明期间发生过失效/写入，直接放弃写缓存（返回本次新鲜结果，
+# 下次调用会重新查库），既保证正确性又不引入额外 IO 竞争。
+_build_tree_epoch = 0
+
+# ENHANCE 2026-10-08：目录树「可管理层级深度」上限。编号命名空间
+# （heading_standard.DEFAULT_NUMBERING_TEMPLATES）只定义到 L8，Word 大纲也只到
+# 9 级；深度失控（脏数据成链 / 异常超深 PATCH）时再往上比对 level 已无意义，
+# 故 validate_outline_levels 只在受管范围内逐节点比对，超出部分整体报一条。
+_MAX_MANAGED_OUTLINE_DEPTH = 8
+
+
+def _current_build_tree_epoch() -> int:
+    with _BUILD_TREE_CACHE_LOCK:
+        return _build_tree_epoch
 
 
 def _invalidate_build_tree_cache(project_id: int) -> None:
-    """失效指定项目的 build_tree 缓存"""
+    """失效指定项目的 build_tree 缓存
+
+    同时推进全局代号，使**正在构建中**的 build_tree 放弃写缓存（见模块注释的
+    竞态说明）。这是必须与 pop 同时做的——只 pop 不改代号，竞态窗口依然存在。
+    """
+    global _build_tree_epoch
     with _BUILD_TREE_CACHE_LOCK:
         _build_tree_cache.pop(project_id, None)
+        _build_tree_epoch += 1
 
 
 def invalidate_content_caches(project_id: int, section_ids: list[int] | None = None) -> None:
@@ -156,13 +181,59 @@ def _normalize_section_position(conn, project_id: int, data: SectionCreate) -> S
     return data
 
 
+def _normalize_sibling_sort_order(conn, section_id: int, requested: int | None = None) -> None:
+    """把章节在新父节点下的 sort_order 归一到「1 起连续、无重复」。
+
+    BUG-FIX 2026-10-08（多级编号不同步）：换父后原 sort_order 是**在旧父下的
+    位次**，直接沿用会与新父的既有子节点大面积撞号（`build_tree` 的排序键是
+    `(sort_order, created_at)`，撞号后退化为按创建时间排 = 用户拖拽顺序被吞）。
+    与 move_section / reorder_sections 共用同一份「重建为 1 起连续」契约。
+    未显式指定顺序时追加到尾部（口径同 `_normalize_section_position` 的创建行为）。
+
+    Args:
+        conn: 已在事务中的连接
+        section_id: 被移动的章节
+        requested: 客户端显式指定的 sort_order（1 起）；None = 追加到尾部
+    """
+    row = conn.execute("SELECT parent_id FROM sections WHERE id = ?", (section_id,)).fetchone()
+    if row is None:
+        return
+    parent_id = row["parent_id"]
+    if parent_id is None:
+        sib_rows = conn.execute(
+            "SELECT id FROM sections WHERE project_id = "
+            "(SELECT project_id FROM sections WHERE id = ?) AND parent_id IS NULL "
+            "ORDER BY COALESCE(sort_order, 0), id",
+            (section_id,),
+        ).fetchall()
+    else:
+        sib_rows = conn.execute(
+            "SELECT id FROM sections WHERE parent_id = ? ORDER BY COALESCE(sort_order, 0), id",
+            (parent_id,),
+        ).fetchall()
+    ids = [r["id"] for r in sib_rows]
+    if section_id not in ids:
+        ids.append(section_id)
+    if requested is not None and section_id in ids:
+        try:
+            target = max(1, min(int(requested), len(ids)))
+        except (TypeError, ValueError):
+            target = len(ids)
+        ids.remove(section_id)
+        ids.insert(target - 1, section_id)
+    conn.executemany(
+        "UPDATE sections SET sort_order = ? WHERE id = ?",
+        list(enumerate(ids, start=1)),
+    )
+
+
 def _insert_section(conn, project_id: int, data: SectionCreate, now: str) -> Section:
     """使用已有连接插入章节（用于事务内调用）"""
     cursor = conn.execute(
         """INSERT INTO sections
            (project_id, parent_id, title, level, sort_order, section_type,
-            scoring_point_id, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            scoring_point_id, word_count_tier, target_words, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             project_id,
             data.parent_id,
@@ -171,6 +242,8 @@ def _insert_section(conn, project_id: int, data: SectionCreate, now: str) -> Sec
             data.sort_order,
             data.section_type,
             data.scoring_point_id,
+            data.word_count_tier,
+            data.target_words,
             now,
             now,
         ),
@@ -231,6 +304,52 @@ def update_section(section_id: int, data: SectionUpdate) -> Section | None:
                     hops += 1
         sql, params = safe_update("sections", updates, "id", section_id)
         conn.execute(sql, params)
+        # BUG-FIX 2026-10-08（多级编号不同步 · 高）：PATCH 可改 parent_id，但此前
+        # **只改父指针、不重算层级**。把一个 L3 节点挂到 L1 下，DB 里 level 仍是 3，
+        # 其整棵子树也仍是旧层级 → 连锁错三处：
+        #   1) 前端 computeHeadingCounters 按 node.level 分组，编号与真实深度脱节；
+        #   2) DOCX 导出按 level 设 w:outlineLvl / 套用 L1..L4 编号模板，目录层级错；
+        #   3) get_section_word_budget 按 level 分档取 target_words，字数预算落到错误档。
+        # 与 create 的 _normalize_section_position / 落库的 _save_nodes 统一契约：
+        # 「层级只由树位置派生」。注意 SectionUpdate **没有 level 字段**
+        # （Pydantic v2 默认 extra='ignore'，客户端传 level 会被静默丢弃），
+        # 因此这里刻意不接受显式 level —— 一旦允许客户端指定，换父后就会出现
+        # 「父层 2 / 子层 3（手动指定）」这类父子倒挂的脏树，正是本修复要消灭的。
+        if "parent_id" in updates and updates["parent_id"] != existing_row["parent_id"]:
+            updates.pop("level", None)  # 防御：直接调服务层时也别让它落库
+            _new_pid = updates["parent_id"]
+            if _new_pid is None:
+                _base_level = 1
+            else:
+                _prow = conn.execute(
+                    "SELECT level FROM sections WHERE id = ?", (_new_pid,)
+                ).fetchone()
+                _base_level = ((_prow["level"] or 1) if _prow else 0) + 1
+            # 递归 CTE 一次性取回「自身 + 全部后代」的相对深度，再按行批量重写
+            # level，避免 Python 侧逐层查询（链状大纲下 O(N) 次往返）。
+            # 分两步而不是 `WITH ... UPDATE ... SET level = ? + depth`：
+            # SQLite 不允许在 UPDATE 的 SET 子句里引用 CTE 定义的列
+            # （sqlite3.OperationalError: no such column: depth）。
+            _depth_rows = conn.execute(
+                """
+                WITH RECURSIVE subtree(id, depth) AS (
+                    SELECT id, 0 FROM sections WHERE id = ?
+                    UNION ALL
+                    SELECT s.id, sub.depth + 1 FROM sections s
+                    JOIN subtree sub ON s.parent_id = sub.id
+                )
+                SELECT id, depth FROM subtree
+                """,
+                (section_id,),
+            ).fetchall()
+            if _depth_rows:
+                conn.executemany(
+                    "UPDATE sections SET level = ? WHERE id = ?",
+                    [(_base_level + r["depth"], r["id"]) for r in _depth_rows],
+                )
+            # 换父后同级 sort_order 可能与既有节点撞号（前端拖拽只带 order 不带
+            # sort_order 时尤其明显），落库前归一到 1 起连续，编号/展示顺序才确定。
+            _normalize_sibling_sort_order(conn, section_id, updates.get("sort_order"))
         # BUG-FIX 2026-10-04（P1·BUG-C）：正文变更时同一条 SQL 同步持久化 word_count。
         # 旧实现只在返回对象里重算字数，DB 列陈旧——一致性审计路径
         # （sse_content.update_section(SectionUpdate(content=...))）与前端编辑保存后，
@@ -375,16 +494,21 @@ _TREE_LIGHT_COLUMNS = """
     COALESCE(length(flowchart_json), 0) > 0 AS has_flowchart,
     COALESCE(length(gantt_json), 0) > 0 AS has_gantt,
     COALESCE(length(architecture_json), 0) > 0 AS has_architecture,
-    COALESCE(length(labor_json), 0) > 0 AS has_labor
+    COALESCE(length(labor_json), 0) > 0 AS has_labor,
+    CASE WHEN graph_suitable = 1 THEN 1 ELSE 0 END AS graph_suitable,
+    COALESCE(suggested_chart, '') AS suggested_chart
 """
 
 
 @timer
 def build_tree(project_id: int) -> list[SectionTreeNode]:
-    """构建章节目录树（带缓存，TTL=60s）"""
+    """构建章节目录树（带缓存，TTL=60s，BUG-FIX 2026-10-08：代号防失效竞态）"""
     import time
 
     now = time.time()
+    # BUG-FIX 2026-10-08（并发竞态）：进入时快照代号，写缓存前比对，
+    # 期间若有任何失效/写入发生则放弃写缓存，避免把过期结果再塞回缓存。
+    epoch_at_start = _current_build_tree_epoch()
     with _BUILD_TREE_CACHE_LOCK:
         cached = _build_tree_cache.get(project_id)
         if cached and (now - cached[0]) < _BUILD_TREE_CACHE_TTL:
@@ -444,6 +568,8 @@ def build_tree(project_id: int) -> list[SectionTreeNode]:
             has_content=bool(r["has_content"]),
             word_count=wc_map.get(r["id"], r["word_count"]),
             chart_flags=flags,
+            graph_suitable=bool(r["graph_suitable"]),
+            suggested_chart=r["suggested_chart"] or "",
         )
         by_id[r["id"]] = node
 
@@ -459,8 +585,26 @@ def build_tree(project_id: int) -> list[SectionTreeNode]:
 
     roots.sort(key=lambda x: (x.sort_order, x.created_at))
 
-    # 写入缓存（带锁保护 + 大小限制）
+    # 累计字数：每节点的 cumulative_word_count = 自身 word_count + 子树全部后代
+    # word_count（控制层级 L1/L2 使用该累计值作为累计统计）。
+    def _cumulate(node: SectionTreeNode) -> int:
+        total = node.word_count
+        for child in node.children:
+            total += _cumulate(child)
+        node.cumulative_word_count = total
+        return total
+
+    for node in by_id.values():
+        _cumulate(node)
+
+# 写入缓存（带锁保护 + 大小限制）
+
     with _BUILD_TREE_CACHE_LOCK:
+        if _build_tree_epoch != epoch_at_start:
+            # 竞态：本次构建期间发生过失效/写入，本次结果可能已过期，
+            # 宁可不缓存（下次调用重查库）也不要把脏树留给 60s 内的其他请求。
+            logger.debug("build_tree 构建期间发生缓存失效，跳过写缓存 project=%d", project_id)
+            return roots
         if len(_build_tree_cache) >= _BUILD_TREE_CACHE_MAX:
             # 淘汰最旧的一半
             sorted_items = sorted(_build_tree_cache.items(), key=lambda x: x[1][0])
@@ -630,31 +774,66 @@ def reorder_sections(project_id: int, groups: list[dict]) -> list[SectionTreeNod
                     [(idx + 1, sid, project_id) for idx, sid in enumerate(ordered_ids)],
                 )
 
-            # 验证排序连续性：检查每个父节点下 sort_order 是否从 1 开始连续无间隙
+            # ENHANCE 2026-10-08（日志不准确 + 自愈）：原实现只比对 sort_order
+            # 是否为 1..N，不一致时打一条 warning 就把树交出去 —— 三处问题：
+            #   (a) 校验排序键是 `ORDER BY sort_order`，而 build_tree 的真实排序键是
+            #       `(sort_order, created_at)`。sort_order 撞号时校验看到的顺序与
+            #       实际展示顺序不同，「校验通过」并不代表用户看到的就是这个顺序；
+            #   (b) ordered_ids 只覆盖调用方给的分组，其余分组里的历史撞号/间隙
+            #       完全没人管，用户拖完之后一部分章节顺序「莫名其妙」；
+            #   (c) 发现异常只写日志、不修复、也不回传调用方，前端拿到 200 +
+            #       一棵顺序不确定的树，无从提示。
+            # 现改为：按 build_tree 的真实排序键复读 → 不连续就就地重建为 1..N
+            #（自愈）→ 自愈动作与最终顺序都记日志，异常从 warning 升为 error。
+            repaired_groups: list[str] = []
             for group in groups:
                 parent_id = group.get("parent_id")
-                ordered_ids = group.get("ordered_ids", [])
-                if not ordered_ids:
-                    continue
                 if parent_id is None:
-                    rows = conn.execute(
-                        "SELECT sort_order FROM sections WHERE project_id = ? AND parent_id IS NULL ORDER BY sort_order",
+                    sib = conn.execute(
+                        "SELECT id, sort_order, created_at FROM sections "
+                        "WHERE project_id = ? AND parent_id IS NULL "
+                        "ORDER BY COALESCE(sort_order, 0), created_at, id",
                         (project_id,),
                     ).fetchall()
                 else:
-                    rows = conn.execute(
-                        "SELECT sort_order FROM sections WHERE project_id = ? AND parent_id = ? ORDER BY sort_order",
+                    sib = conn.execute(
+                        "SELECT id, sort_order, created_at FROM sections "
+                        "WHERE project_id = ? AND parent_id = ? "
+                        "ORDER BY COALESCE(sort_order, 0), created_at, id",
                         (project_id, parent_id),
                     ).fetchall()
-                expected = list(range(1, len(rows) + 1))
-                actual = [r["sort_order"] for r in rows]
-                if actual != expected:
+                if not sib:
+                    continue
+                actual = [r["sort_order"] for r in sib]
+                expected = list(range(1, len(sib) + 1))
+                has_dup = len(set(actual)) != len(actual)
+                if has_dup:
+                    # 重复 = build_tree 的排序键 (sort_order, created_at) 退化到
+                    # 「按创建时间排」，用户拖的顺序被完全吞掉 —— 必须自愈。
+                    logger.error(
+                        "重排后同父 sort_order 重复，已自动重建 parent_id=%s 原值=%s -> %s",
+                        parent_id, actual, expected,
+                    )
+                    conn.executemany(
+                        "UPDATE sections SET sort_order = ? WHERE id = ?",
+                        [(i, r["id"]) for i, r in enumerate(sib, start=1)],
+                    )
+                    repaired_groups.append(f"parent_id={parent_id} 原值={actual}")
+                elif actual != expected:
+                    # 只是起点/间隙不连续（值唯一 → 顺序仍然确定），保持既有
+                    # warning 语义、不改状态：跨项目 id 被 AND project_id 过滤后
+                    # ordered_ids 位次与实际兄弟数不对齐就会走到这里，属于
+                    # 「调用方分组不完整」而非数据损坏，强行重排反而丢位次。
                     logger.warning(
-                        "重排后 sort_order 连续性异常: parent_id=%s, 期望=%s, 实际=%s",
+                        "重排后 sort_order 非 1 起连续（值唯一，顺序仍确定）: parent_id=%s, 期望=%s, 实际=%s",
                         parent_id,
                         expected,
                         actual,
                     )
+            if repaired_groups:
+                logger.warning(
+                    "重排自愈完成 project=%d，涉及分组 %s", project_id, "; ".join(repaired_groups)
+                )
         except Exception as e:
             logger.error("重排章节失败: %s", e)
             conn.rollback()
@@ -707,43 +886,51 @@ def get_subtree_leaf_ids(project_id: int, root_id: int) -> list[int]:
 
 @timer
 def get_section_word_budget(project_id: int, default_level2: int = 3500) -> dict:
-    """计算字数预算（覆盖全层级，含 L3+ 叶子）
+    """计算字数预算（2026-10-08 版：按三级目录档位分档累加）。
 
-    与 _get_effective_target_words 分档标准保持一致：
-      L1 → 500
-      L2 → level2_default（默认 3500，可自定义）
-      L3 → 300 （具体执行条目）
-      L4 → 400
-      L5+ → 300
+    字数控制策略变更：
+    - 控制层级从二级目录下沉到三级目录（L3，叶子节点）
+    - 四档标准：简短 800 / 标准 1200 / 详细 2000 / 超长 2500，±10% 浮动
+    - L1/L2 字数由其下所有 L3 字数累加得出，仅作统计展示
 
-    注：如果章节设置了自定义 target_words（>0），优先使用自定义值。
+    Args:
+        project_id: 项目 ID
+        default_level2: 历史兼容参数（不再使用），仅保留避免旧调用报错
+
+    Returns:
+        dict: 字数预算信息（含 level3_count / level3_default / tier_key / total_estimate 等）
     """
+    from ..services.ai.writing_length_config import (
+        get_tier_config,
+        get_default_tier_config,
+        WRITING_LENGTH_TIER_CONFIG,
+    )
+
     sections = list_sections(project_id)
-    level1_min = 500
-    level2_default = default_level2
-
-    # 层级分档映射（与 sse_utils._get_effective_target_words 保持一致）
-    LEVEL_FALLBACK = {1: 500, 2: level2_default, 3: 300, 4: 400}
-    def _level_default(level: int) -> int:
-        return LEVEL_FALLBACK.get(level, 300)
-
-    total_estimate = 0
     level_counts = {1: 0, 2: 0, 3: 0, 4: 0, "leaf_deep": 0}
     has_custom_target = 0
 
+    # 全局默认档位（从配置表读取）
+    default_cfg = get_default_tier_config()
+    tier_key = default_cfg.get("key", "standard")
+    tier_label = default_cfg.get("label", "标准")
+    tier_target = int(default_cfg.get("target_words", 1200))
+    tier_tolerance = float(default_cfg.get("tolerance_ratio", 0.10))
+
+    total_estimate = 0
     for s in sections:
-        # BUG-FIX 2026-09-18（P0）：level 原先只在 else 分支赋值，但下方的
-        # 层级分档计数在两个分支外统一读取 level —— 若首个章节设置了自定义
-        # target_words（走 tw>0 分支）则 level 从未定义 → UnboundLocalError（500）；
-        # 否则 level 取上一轮循环残留值，自定义字数章节被错归到上一章的层级档。
-        # 改为循环体首行统一取值。
         level = s.level or 3
         tw = s.target_words or 0
+        # 三级目录：优先使用单节点 target_words（精确覆盖）
         if tw > 0:
             total_estimate += tw
             has_custom_target += 1
-        else:
-            total_estimate += _level_default(level)
+        elif level >= 3:
+            # 使用单节点档位或全局档位
+            node_tier = getattr(s, "word_count_tier", None) or tier_key
+            cfg = get_tier_config(node_tier)
+            total_estimate += int(cfg["target_words"]) if cfg else tier_target
+        # L1/L2 不计入 total_estimate（它们不生成正文）
 
         if level in (1, 2, 3, 4):
             level_counts[level] += 1
@@ -756,10 +943,16 @@ def get_section_word_budget(project_id: int, default_level2: int = 3500) -> dict
         "level3_count": level_counts[3],
         "level4_count": level_counts[4],
         "level_deep_count": level_counts["leaf_deep"],
-        "level1_min": level1_min,
-        "level2_default": level2_default,
-        "level3_default": 300,
-        "level4_default": 400,
+        # 2026-10-08 新增：三级目录档位信息（字数控制核心）
+        "tier_key": tier_key,
+        "tier_label": tier_label,
+        "tier_target": tier_target,
+        "tier_tolerance": tier_tolerance,
+        "level3_default": tier_target,
+        # 保留旧字段以兼容（但值为 0，L2 不再直接控制）
+        "level1_min": 0,
+        "level2_default": 0,
+        "level4_default": 0,
         "has_custom_targets": has_custom_target,
         "total_estimate": total_estimate,
     }
@@ -802,9 +995,23 @@ def get_section_path(section_id: int) -> str:
         siblings_by_parent[pid].sort(key=lambda sid: sort_lookup.get(sid, (0, "")))
 
     # 自底向上构建路径
+    # BUG-FIX 2026-10-08（死循环/容错）：原实现 `while current_id is not None` 只判
+    # None。一旦库里存在 parent_id 环（batch_create_sections 手工传 parent_id、
+    # 历史脏数据、并发改父指针的中间态），沿链走永不为 None → 工作线程死循环、
+    # GIL 占用、正文生成整任务挂起（与 BUG-FIX 2026-09-18 修的
+    # _get_path_and_ancestors 同类风险的漏网副本）。
+    # 加「已访问集合」护栏：一旦回到走过的节点即判定成环，中止并 error 留痕。
     path_parts = []
-    current_id = section_id
+    current_id: int | None = section_id
+    visited: set[int] = set()
     while current_id is not None:
+        if current_id in visited:
+            logger.error(
+                "章节路径存在 parent_id 环，中止遍历 section_id=%d 环点=%d",
+                section_id, current_id,
+            )
+            break
+        visited.add(current_id)
         pid = parent_map.get(current_id)
         siblings = siblings_by_parent.get(pid, [])
         idx = siblings.index(current_id) + 1 if current_id in siblings else 1
@@ -839,9 +1046,19 @@ def get_ancestor_titles(section_id: int) -> list[str]:
         title_map[r["id"]] = r["title"]
 
     # 自底向上收集标题
+    # BUG-FIX 2026-10-08（死循环/容错）：同 get_section_path，parent_id 成环时
+    # 原文是无限循环，祖先标题永远拼不完（正文生成的上下文拼装直接挂死）。
     titles = []
-    current_id = section_id
+    current_id: int | None = section_id
+    visited: set[int] = set()
     while current_id is not None:
+        if current_id in visited:
+            logger.error(
+                "祖先标题存在 parent_id 环，中止遍历 section_id=%d 环点=%d",
+                section_id, current_id,
+            )
+            break
+        visited.add(current_id)
         titles.insert(0, title_map.get(current_id, ""))
         current_id = parent_map.get(current_id)
 
@@ -854,6 +1071,11 @@ def validate_outline_integrity(project_id: int) -> dict:
     1. 所有 parent_id 指向有效存在的章节（或为 None）
     2. 无循环引用（如 A->B->A）
     3. 同一父节点下无重复的 sort_order
+
+    注：「level 与实际深度是否一致」是**独立**的第四类体检，见
+    `validate_outline_levels`（ENHANCE 2026-10-08）。刻意不并入本函数：
+    `valid` 是既有对外契约（落库前自检、测试断言都按「三项结构」理解），
+    混入层级语义会让「结构没问题但层级漂移」的目录被判 invalid 而无法落库。
 
     Args:
         project_id: 项目 ID
@@ -927,3 +1149,73 @@ def validate_outline_integrity(project_id: int) -> dict:
                 seen_orders[so] = s["id"]
 
     return {"valid": len(errors) == 0, "errors": errors}
+
+
+def validate_outline_levels(project_id: int) -> dict:
+    """校验「level 是否等于该节点的实际父子深度」（ENHANCE 2026-10-08）
+
+    背景：本模块全局契约是「level 由父子关系推导」——创建走
+    `_normalize_section_position`、目录落库走 `_save_nodes` / `_flatten_outline_tree`、
+    换父走 `update_section` 的递归 CTE 重算。但 `validate_outline_integrity` 只查
+    结构三项，level 漂移（历史数据、绕过 `update_section` 的裸 SQL 改父指针、
+    数据迁移）完全不可见，而 level 漂移会让三处同时错：
+      · 前端 `computeHeadingCounters` 按 level 分组 → 编号错位
+      · DOCX 导出按 level 设 `w:outlineLvl` / 套编号模板 → 大纲层级错
+      · `get_section_word_budget` 按 level 分档 → 字数预算落错档
+    故作为独立的第四类体检暴露，供落库后自检与运维巡检调用。
+
+    与 `validate_outline_integrity` 分离的两个理由：
+      1. `valid` 是既有对外契约，混入层级语义会让「结构完好、层级漂移」的目录
+         被判 invalid 而无法落库；
+      2. 超过 `_MAX_MANAGED_OUTLINE_DEPTH` 的畸形深链，其 level 本就无定义
+         （Word 只支持 9 级大纲），逐节点比对只会刷屏无信息量的错误。
+
+    Returns:
+        dict: {"valid": bool, "errors": list[str], "checked": int}
+    """
+    from collections import defaultdict
+
+    with get_db(readonly=True) as conn:
+        rows = [
+            dict(r)
+            for r in conn.execute(
+                "SELECT id, parent_id, level FROM sections WHERE project_id = ?",
+                (project_id,),
+            ).fetchall()
+        ]
+    if not rows:
+        return {"valid": True, "errors": [], "checked": 0}
+
+    children_of: dict[int | None, list[int]] = defaultdict(list)
+    level_of: dict[int, int] = {}
+    for r in rows:
+        children_of[r["parent_id"]].append(r["id"])
+        level_of[r["id"]] = r["level"] or 0
+
+    errors: list[str] = []
+    expected_depth: dict[int, int] = {}
+    seen_bfs: set[int] = set()
+    frontier = children_of.get(None, [])
+    depth = 1
+    while frontier and depth <= _MAX_MANAGED_OUTLINE_DEPTH:
+        nxt: list[int] = []
+        for sid in frontier:
+            if sid in seen_bfs:  # parent_id 成环 → 深度不可信，跳过（结构问题由 validate_outline_integrity 报）
+                continue
+            seen_bfs.add(sid)
+            expected_depth[sid] = depth
+            nxt.extend(children_of.get(sid, []))
+        frontier = nxt
+        depth += 1
+    if frontier:
+        errors.append(
+            f"目录树深度超过可管理上限 {_MAX_MANAGED_OUTLINE_DEPTH}，"
+            f"其余 {len(frontier)} 个分支的 level 语义已无定义"
+        )
+    for sid, exp in expected_depth.items():
+        got = level_of.get(sid)
+        if got != exp:
+            errors.append(
+                f"章节 {sid} 的 level={got} 与实际层级深度 {exp} 不一致（编号/导出层级会错位）"
+            )
+    return {"valid": len(errors) == 0, "errors": errors, "checked": len(expected_depth)}

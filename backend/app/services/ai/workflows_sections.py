@@ -28,7 +28,11 @@ from .writing_length_config import (
     WRITING_LENGTH_RANGE,
     WRITING_LENGTH_LABEL,
     normalize_writing_length,
+    get_l3_own_tolerance,
+    get_l3_own_target,
     level_target,
+    get_tier_config,
+    get_default_tier_config,
 )
 from .providers.base import AIMessage
 from .workflows_base import EmptyAIResponseError
@@ -61,22 +65,31 @@ except ImportError:  # pragma: no cover - 兜底路径
 logger = logging.getLogger(__name__)
 
 
-# ENHANCE 2026-10-05（D-4）：章节正文 system 提示词兜底默认值。
-# 正本注册在 `prompts/content.py::CONTENT_SECTION_SYSTEM`（提示词管理页可编辑）；
-# 此处仅作注册表未覆盖时的兜底，保证零配置环境下行为不变。
-_DEFAULT_SECTION_SYSTEM = (
-    "你是资深招投标技术标专家。紧扣评分点，撰写专业详实的章节，数据准确、逻辑清晰。"
-    "注意避免与同级章节内容重复，突出本章节的独特性。"
-    "【事实铁律】若提供了『事实变量』，其中的项目名称、工期、人数、面积、型号、标准编号等"
-    "必须与之一字不差地一致；未提供具体数值时，禁止编造或杜撰数字，改用定性描述。"
-    "【表格与配图规范】若下方『正文编排决策』提到表格，请在合适位置插入 Markdown 表格；"
-    "如提到配图，正文内容应自然为配图做铺垫，并在配图应出现的位置按规范单独一行写出 "
-    "`<<CHART:类型>>` 标记（不要输出 Mermaid 代码块或图表数据）。"
-    "配图标记类型取值：GANTT（进度计划/工期）、FLOWCHART（施工工序/验收流程）、"
-    "ARCHITECTURE（组织管理/管理体系/WBS）、LABOR（劳动力配置）、"
-    "COMPARISON（占比/方案比选）、LAYOUT（总平面布置）、TIMELINE（关键里程碑）。"
-    "约束：每章最多 2 个且类型不重复；仅当正文已给出足以支撑该图的数据时才标注。"
-)
+def _resolve_section_system_prompt() -> str:
+    """解析章节正文 system 提示词（唯一正本：prompts/content.py）。
+
+    FIX 2026-10-08（遗留9）：此处原先存在一份「兜底提示词」，其配图口径是
+    `<<CHART:类型>>` 文本标记（并要求「不要输出 Mermaid 代码块」），与注册正本
+    `CONTENT_SECTION_SYSTEM` 的 **mermaid/chart-json 围栏**口径完全相反。
+    一旦提示词注册表不可用（模块导入失败/提示词未注册），生成会静默切到错误口径，
+    AI 输出的配图形态与 `content_cleaning` 的解析口径错配 → 图表被判坏块删除。
+
+    与其静默降级到矛盾文案，不如明确失败：注册正本缺失属于严重配置缺陷，
+    必须被听见。
+    """
+    if get_prompt is not None:
+        try:
+            _prompt = get_prompt("CONTENT_SECTION_SYSTEM")
+        except Exception as _e:  # 注册表损坏：与缺失同等对待
+            logger.error("[提示词] CONTENT_SECTION_SYSTEM 读取失败: %s", _e)
+            _prompt = None
+        if _prompt:
+            return _prompt
+    raise RuntimeError(
+        "CONTENT_SECTION_SYSTEM 提示词不可用（prompts 注册表未加载或提示词为空）。"
+        "已拒绝使用历史兜底文案（其配图口径与注册正本相反）。"
+        "请检查 app/services/ai/prompts/content.py 是否可正常导入并已注册。"
+    )
 
 
 class SectionContentCache:
@@ -389,6 +402,34 @@ def extract_section_charts(content: str, section_title: str = "", summary: str =
     from ...services.content_cleaning import iter_chart_fences, iter_chart_markers, resolve_chart_marker
 
     charts = []
+    # FIX 2026-10-08（P1 空壳载荷）：{"type":"gantt"} 这类只有 type/标题、
+    # 无任何数据字段的 dict 不得当作真实数据落库——落库后 _auto_generate_charts
+    # 判定「已有真实图」整体跳过编排管线，该图永不生成、导出渲染失败静默丢图。
+    # 归一为提示条目（_hint）交配图编排生成真实数据。
+    _CHART_DATA_FIELDS = (
+        "nodes", "edges", "tasks", "milestones", "phases", "zones", "tree",
+        "code", "data", "rows", "columns", "series", "values", "items", "steps",
+    )
+
+    def _chart_has_real_data(d: dict) -> bool:
+        return any(d.get(_f) for _f in _CHART_DATA_FIELDS)
+
+    def _real_data_or_none(d: dict) -> dict | None:
+        """真实可用数据返回 dict；空壳或结构校验未通过返回 None（需降级为提示条目）。
+
+        FIX 2026-10-08（遗留3）：把 `_validate_chart_data` 真正接进落库前的判定链，
+        终结「两套校验都零调用」的状态。畸形数据不再伪装成真实图表堵住配图编排。
+        """
+        if not isinstance(d, dict) or not _chart_has_real_data(d):
+            return None
+        _ok, _err = _validate_chart_data(str(d.get("type") or ""), d)
+        if not _ok:
+            logger.info(
+                "[图表降级] 数据结构校验未通过，降级为配图提示: type=%s reason=%s",
+                d.get("type"), _err,
+            )
+            return None
+        return d
     # ENHANCE 2026-10-04（D2）：```mermaid / ```chart-json 围栏块 → 真实数据条目。
     # 数据链路与 <<CHART:{JSON}>> 标记完全同构：type + 平铺字段（code/tree/tasks...）
     # 落库 sections.*_json；导出端标记与围栏两条路径载荷一致（缓存键剔除图号）。
@@ -401,8 +442,19 @@ def extract_section_charts(content: str, section_title: str = "", summary: str =
         except (json.JSONDecodeError, TypeError):
             continue
         if isinstance(_desc_obj, dict) and _desc_obj.get("type"):
-            _desc_obj["_marker"] = _body
-            charts.append(_desc_obj)
+            if _real_data_or_none(_desc_obj) is not None:
+                _desc_obj["_marker"] = _body
+                charts.append(_desc_obj)
+            else:
+                # 空壳（只有 type）：降级为提示条目，交配图编排生成真实数据
+                charts.append({
+                    "type": _desc_obj.get("type"),
+                    "chart_title": _desc_obj.get("title") or _desc_obj.get("chart_title") or "",
+                    "title": _desc_obj.get("title") or _desc_obj.get("chart_title") or "",
+                    "_hint": True,
+                    "_inferred": True,
+                    "_marker": _body,
+                })
     for marker, prefix, raw in iter_chart_markers(content):
         data = None
 
@@ -410,7 +462,10 @@ def extract_section_charts(content: str, section_title: str = "", summary: str =
         try:
             parsed = json.loads(raw)
             if isinstance(parsed, dict):
-                data = parsed
+                # FIX 2026-10-08（P1 空壳载荷）：只有 type/标题、无数据字段的 dict
+                # 归为「配图位置提示」（走 Strategy C），不当真实数据落库。
+                # FIX 2026-10-08（遗留3）：结构校验未通过同样降级。
+                data = _real_data_or_none(parsed)
         except (json.JSONDecodeError, TypeError):
             pass
 
@@ -462,7 +517,7 @@ def extract_section_charts(content: str, section_title: str = "", summary: str =
             try:
                 parsed = json.loads(fixed2)
                 if isinstance(parsed, dict):
-                    data = parsed
+                    data = _real_data_or_none(parsed)
             except (json.JSONDecodeError, TypeError):
                 pass
         # Strategy C: 无内联数据 → 解析为「配图位置提示」（类型 / 标题，不含数据）
@@ -510,29 +565,61 @@ def _extract_charts_from_content(content: str) -> list:
 
 
 def _validate_chart_data(chart_type: str, data: dict) -> tuple:
-    """验证图表数据有效性 (chart_type, data) -> (is_valid, error_msg)"""
+    """验证图表数据有效性 (chart_type, data) -> (is_valid, error_msg)
+
+    FIX 2026-10-08（遗留3）：历史上存在两套互不一致的校验实现（本函数与
+    `services/chart_validators.py`），且两套都**零调用**，形同虚设——毫无校验地
+    把 AI 输出落库，正是「空壳/畸形数据伪装成真实图表」类缺陷的土壤。
+
+    现统一口径：**`chart_validators` 为唯一权威**，本函数退化为薄适配层：
+      - 未覆盖的图表类型 → 视为通过（保持对既有数据形态的兼容）；
+      - 校验器不可导入（循环依赖/模块缺失）→ 视为通过并告警，
+        不因工具链问题阻断生成主链路。
+    """
     if not isinstance(data, dict):
         return False, "数据必须是字典"
-    if chart_type == "flowchart":
-        nodes = data.get("nodes", [])
-        if not isinstance(nodes, list) or len(nodes) < 2:
-            return False, "flowchart.nodes 必须是 ≥2 个节点的列表"
-        if not all(isinstance(n, dict) and "id" in n for n in nodes):
-            return False, "每个节点必须有 id"
-    elif chart_type == "gantt":
-        tasks = data.get("tasks", [])
-        if not isinstance(tasks, list) or len(tasks) < 2:
-            return False, "gantt.tasks 必须是 ≥2 个任务的列表"
-    elif chart_type == "timeline":
-        duration = data.get("duration", [])
-        if not isinstance(duration, list):
-            return False, "timeline.duration 必须是列表"
+
+    _VALIDATOR_BY_TYPE = {
+        "flowchart": "validate_flowchart_structure",
+        "gantt": "validate_gantt_plan",
+        "timeline": "validate_timeline_data",
+        "labor": "validate_labor_data",
+        "layout": "validate_layout_data",
+        "architecture": "validate_architecture_tree",
+    }
+    _fn_name = _VALIDATOR_BY_TYPE.get((chart_type or "").strip().lower())
+    if not _fn_name:
+        return True, ""
+    try:
+        import importlib
+
+        _mod = importlib.import_module("app.services.chart_validators")
+        _fn = getattr(_mod, _fn_name, None)
+    except Exception as _e:  # pragma: no cover - 校验器不可用
+        logger.warning("[图表校验] %s 校验器不可用，跳过校验: %s", _fn_name, _e)
+        return True, ""
+    if _fn is None:
+        return True, ""
+    try:
+        _ok, _errors = _fn(data)
+    except Exception as _e:
+        logger.warning("[图表校验] %s 执行异常，跳过校验: %s", _fn_name, _e)
+        return True, ""
+    if isinstance(_ok, bool) and not _ok:
+        _detail = "; ".join(str(x) for x in (list(_errors or [])[:3]))
+        return False, (_detail or "数据结构校验未通过")
     return True, ""
 
 
 def _generate_fallback_chart(chart_type: str, section_title: str = "", 
                              summary: str = "", nodes: list = None, date: str = "") -> dict:
-    """生成兜底图表数据"""
+    """DEPRECATED 2026-10-08（遗留3）：**不得接入任何主链路**，保留仅为兼容引用。
+
+    这是历史上的「凭空构造图表数据」实现，与当前的无降级原则直接冲突
+    （`resolve_chart_marker` 文档明确：宁缺毋假，真实数据一律来自配图编排管线
+    写入的 `sections.*_json`）。全仓零调用方；新代码请走
+    `extract_section_charts` → 配图编排（hint 条目）链路。
+    """
     if chart_type == "flowchart":
         return {
             "type": "flowchart",
@@ -724,10 +811,9 @@ def build_chapter_content_messages(chapter_info: dict, facts: Any = None,
     # ==================================================================
     # --- [0] system（恒定，跨章节完全一致 → 缓存命中区间起点）---
     # ENHANCE 2026-10-05（D-4）：文案正本注册在 prompts/content.py 的
-    # CONTENT_SECTION_SYSTEM，提示词管理页可编辑；本常量仅作注册表未覆盖时的兜底。
-    sys_prompt = (
-        get_prompt("CONTENT_SECTION_SYSTEM") if get_prompt is not None else None
-    ) or _DEFAULT_SECTION_SYSTEM
+    # CONTENT_SECTION_SYSTEM，提示词管理页可编辑。
+    # FIX 2026-10-08（遗留9）：注册表不可用时明确报错，不再回落到矛盾口径的兜底文案。
+    sys_prompt = _resolve_section_system_prompt()
     messages.append(AIMessage(role="system", content=sys_prompt))
 
     # --- [1] 项目稳定上下文（同项目内完全不变 → 缓存命中区间）---
@@ -822,6 +908,21 @@ def build_chapter_content_messages(chapter_info: dict, facts: Any = None,
                 role="user", content="同级章节（请避免内容重复，突出本章节独特性）:\n" + "\n".join(_s_lines)
             ))
 
+    # --- [3.5] 下级目录章节（仅作交叉引用，禁止复述）---
+    _child_chapters = chapter_info.get("child_chapters") or []
+    if _child_chapters:
+        _c_lines = []
+        for _c in _child_chapters:
+            _ct = _c.get("title", "")
+            _cd = (_c.get("description") or "")[:80]
+            _cl = _c.get("level", 4)
+            _c_lines.append(f"  - [{_cl}L] {_ct}" + (f"（{_cd}）" if _cd else ""))
+        if _c_lines:
+            messages.append(AIMessage(
+                role="user",
+                content="下级目录章节（仅作交叉引用参考，禁止复述其文字；文字由下级章节在独立任务中生成）:\n" + "\n".join(_c_lines)
+            ))
+
     # --- [4] 当前章节任务（唯一随章节变化的部分）---
     # SECURITY-FIX 2026-10-06：章节标题/概要/评分要点均来自解析结果（用户内容），做元标记中和。
     safe_title = sanitize_prompt_value(title) if sanitize_prompt_value else title
@@ -833,41 +934,115 @@ def build_chapter_content_messages(chapter_info: dict, facts: Any = None,
         safe_scoring = sanitize_prompt_value(filtered_scoring[:600]) if sanitize_prompt_value else filtered_scoring[:600]
         prompt_parts.append(f"评分要点: {safe_scoring}")
 
-    # 写作长度模式实际控制「二级目录及以下」章节字数（取区间中间值，±10% 弹性）。
-    # 无论章节是否已有显式 target_words，L2+ 一律由写作长度模式决定，确保
-    # 「选中某模式」时能真正改变二级目录章节的字数生成，而非沿用旧目标。
+    # 字数控制（2026-10-09 方案三）：三级目录 L3 自身正文 300 \u00b1 20%（240~360）
+    #   - L3 叶子（无下级目录章节）：自身正文 300 字；测量口径=自身正文，四档 800/1200/2000/2500
+    #     作为「L3 子树总字数」口径仅在 L3 存在下级目录章节（L4+）时参与校验。
+    #   - L3 非叶子（存在 L4+）：按四档「子树总字数」控制；正文不含下级目录章节，
+    #     下级目录章节由下级章节在独立任务中生成并自行控制字数。
+    #   - L1/L2 是父节点，不生成正文，不注入字数指令。
     _chapter_level = int(chapter_info.get("level", 3) or 3)
     _mode = normalize_writing_length(kw_writing_length)
-    if _chapter_level >= 2:
-        _mid = level_target(_mode, _chapter_level, 300)
-        lo = max(50, int(_mid * 0.9))
-        hi = int(_mid * 1.1)
-        target_wc = f"{lo}-{hi}"
-        target_note = (
-            f"（{WRITING_LENGTH_LABEL.get(_mode, _mode)}模式·"
-            f"L{_chapter_level}目标 {_mid} 字，弹性 ±10%）"
-        )
+    if _chapter_level == 3 and chapter_info.get("is_l3_own"):
+        # L3 叶子：自身正文 300 \u00b1 20%
+        _tier_key = None
+        _tier_label = "L3 自身正文"
+        _tier_target = get_l3_own_target()
+        _tolerance = float(get_l3_own_tolerance())
+    elif _chapter_level >= 3:
+        # L3 非叶子：四档子树总字数（含下级目录章节）；
+        # L4+ 深层叶子跟随同一档位，测量口径为自身正文。
+        _tier_key = chapter_info.get("word_count_tier") or _mode
+        _tier_cfg = get_tier_config(_tier_key) or get_default_tier_config()
+        _tier_label = _tier_cfg.get("label", _mode)
+        _tier_target = int(_tier_cfg.get("target_words", 1200))
+        _tolerance = float(_tier_cfg.get("tolerance_ratio", 0.10))
+    elif _chapter_level == 2:
+        # L2 是父节点，不生成正文；实际生成路径不会进入 L2
+        # 保留原提示词格式以兼容旧流程
+        _tier_key = chapter_info.get("word_count_tier") or _mode
+        _tier_cfg = get_tier_config(_tier_key) or get_default_tier_config()
+        _tier_label = _tier_cfg.get("label", _mode)
+        _tier_target = int(_tier_cfg.get("target_words", 1200))
+        _tolerance = float(_tier_cfg.get("tolerance_ratio", 0.10))
     else:
-        # L1 / 异常层级：沿用章节既有精确目标（封面 / 概述等顶层章节），
-        # 未设置时再按写作长度模式的区间兜底。
-        explicit_target = chapter_info.get("target_words")
-        if isinstance(explicit_target, int) and explicit_target > 0:
-            # 留 ±15% 弹性：target=300 → 区间 250-350；target=3500 → 区间 3000-4000
-            lo = max(50, int(explicit_target * 0.85))
-            hi = int(explicit_target * 1.15)
-            target_wc = f"{lo}-{hi}"
-            target_note = f"（章节层级精确目标 {explicit_target} 字，弹性 ±15%）"
-        else:
-            _lo, _hi = WRITING_LENGTH_RANGE.get(_mode, (2000, 5000))
-            target_wc = f"{_lo}-{_hi}"
-            target_note = ""
+        # L1 顶层章节：不注入字数指令，由 AI 自由决定体量
+        _tier_target = 0
+        _tolerance = 0.0
+        _tier_label = ""
+        _tier_key = None
 
-    prompt_parts.append(
-        f"请撰写本章节完整内容，目标 {target_wc} 字{target_note}。"
-        f"要求：① 结构清晰有小标题；② 数据详实有具体参数；③ 专业术语准确；"
-        f"④ 紧扣评分点。"
+    lo = int(_tier_target * (1 - _tolerance))
+    hi = int(_tier_target * (1 + _tolerance))
+    target_wc = f"{lo}-{hi}"
+    target_note = (
+        f"（{_tier_label}档位·目标 {_tier_target} 字，"
+        f"允许浮动 \u00b1{int(_tolerance * 100)}%）"
     )
 
+    # 字数控制核心指令
+    if _chapter_level >= 3:
+        prompt_parts.append(
+            f"请撰写本章节完整内容，目标 {target_wc} 字{target_note}。"
+            f"要求：① 结构清晰有小标题；② 数据详实有具体参数；③ 专业术语准确；"
+            f"④ 紧扣评分点。"
+        )
+        # 字数控制红线（防止堆砌与省略）
+        if _chapter_level == 3 and chapter_info.get("is_l3_own"):
+            # L3 自身正文：300 \u00b1 20%，测量口径=自身正文，不含下级目录章节
+            prompt_parts.append(
+                "【字数控制红线】"
+                f"本章节为三级目录（L3），目标字数 {_tier_target} 字"
+                f"（允许浮动 \u00b1{int(_tolerance * 100)}%，{lo}~{hi} 字）。"
+                "测量口径为 L3 自身正文（标题、描述、项目数据、全局事实、专项方案名称相关内容），"
+                "不含下级目录章节。必须严格遵守："
+                "① 不得为凑字数而堆砌空话套话、不重复表述同一意思；"
+                "② 不得为省字数而省略必含要素（项目概况、评分要点响应、施工部署、"
+                "质量控制、安全保证、进度安排、资源配置、应急预案、验收标准等）；"
+                "③ 不得出现【待补充】等占位内容；"
+                "④ 详细/超长档位应体现更多细节（工艺参数、时间节点、责任人、验收标准、"
+                "可视化数据表）而非堆砌；简短/标准档位应精炼而非遗漏关键要素；"
+                "⑤ 严禁复述、转述或包含下级目录章节内容——下级目录章节仅由下级章节独立生成，"
+                "本节正文只引用其数据，不复述其标题或正文；"
+                "⑥ 数据详实、结构清晰、专业术语准确，紧扣评分点。"
+            )
+        elif _chapter_level == 3:
+            # L3 存在下级目录章节：子树总字数控制
+            prompt_parts.append(
+                "【字数控制红线】"
+                f"本章节为三级目录（L3，非叶子），目标字数 {_tier_target} 字（{_tier_label}档位，"
+                f"允许浮动 \u00b1{int(_tolerance * 100)}%），测量口径为 L3 子树总字数（含下级目录章节）。"
+                "必须严格遵守："
+                "① 不得为凑字数而堆砌空话套话、不重复表述同一意思；"
+                "② 不得为省字数而省略必含要素（项目概况、评分要点响应、施工部署、"
+                "质量控制、安全保证、进度安排、资源配置、应急预案、验收标准等）；"
+                "③ 不得复述、转述下级目录章节的文字——下级目录章节由独立章节任务生成并自行控制字数；"
+                "④ 数据详实、结构清晰、专业术语准确，紧扣评分点。"
+            )
+        else:
+            # L4+ 深层叶子：跟随同一档位，测量口径为自身正文
+            prompt_parts.append(
+                "【字数控制红线】"
+                f"本章节为第 {_chapter_level} 级目录，目标字数 {_tier_target} 字"
+                f"（{_tier_label}档位，允许浮动 \u00b1{int(_tolerance * 100)}%，{lo}~{hi} 字）。必须严格遵守："
+                "① 不得为凑字数而堆砌空话套话；"
+                "② 不得为省字数而省略必含要素；"
+                "③ 不得出现【待补充】等占位内容；"
+                "④ 数据详实、结构清晰、专业术语准确，紧扣评分点。"
+            )
+    elif _chapter_level == 2:
+        # L2 是父节点，不生成正文；实际生成路径不会进入 L2
+        # 保留原提示词格式以兼容旧流程
+        prompt_parts.append(
+            f"请撰写本章节完整内容，目标 {target_wc} 字{target_note}。"
+            f"要求：① 结构清晰有小标题；② 数据详实有具体参数；③ 专业术语准确；"
+            f"④ 紧扣评分点。"
+        )
+    else:
+        # L1 顶层章节：不注入字数指令，由 AI 自由决定体量
+        prompt_parts.append(
+            "请撰写本章节完整内容。要求：① 结构清晰有小标题；"
+            "② 数据详实有具体参数；③ 专业术语准确；④ 紧扣评分点。"
+        )
     # ENHANCE 2026-10-05（P-9）：已有方案 vs 无方案差异化指令
     if kw_construction_method:
         prompt_parts.append(

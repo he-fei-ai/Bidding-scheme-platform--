@@ -474,6 +474,11 @@ class TestD3KeyCustody:
             ],
             capture_output=True,
             text=True,
+            # 遗留项 2026-10-08：Windows 默认 GBK 解码含中文/非 ASCII 输出的
+            # 子进程会抛 UnicodeDecodeError（读取线程崩溃告警）。脚本输出
+            # 皆为 UTF-8，显式指定并用 replace 兜底，杜绝解码线程异常。
+            encoding="utf-8",
+            errors="replace",
             cwd=str(backend),
             timeout=180,
         )

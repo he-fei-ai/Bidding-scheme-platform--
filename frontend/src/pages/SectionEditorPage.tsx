@@ -1,5 +1,5 @@
 import React, { useEffect, useState, useCallback, useRef, useMemo } from "react";
-import { useParams, useNavigate } from "react-router-dom";
+import { useParams, useNavigate, useSearchParams } from "react-router-dom";
 import {
   Button, Card, Skeleton, message, Space, Typography, Tag, Empty,
   Spin, Select, Tabs, Divider, Alert, InputNumber, Tooltip, Badge, Row, Col, Checkbox,
@@ -27,15 +27,18 @@ import ContentPreview from "../components/ContentPreview";
 import RichTextEditor from "../components/RichTextEditor";
 import RecoveryBanner from "../components/RecoveryBanner";
 import VersionHistory from "../components/VersionHistory";
-import { extractApiError, annotateOutlineWithNumbers, getLevelColor, getLevelLabel, findNodeInTree, updateNodeInTree, collectLeafIds, countSubtreeLeaves, getLeafCount, getPendingFailedLeafCount, getWordDeficientStats, upsertSectionProgressItem } from "../utils";
+import { extractApiError, annotateOutlineWithNumbers, getLevelColor, getLevelLabel, findNodeInTree, updateNodeInTree, collectLeafIds, countSubtreeLeaves, getLeafCount, getPendingFailedLeafCount, getWordDeficientStats, upsertSectionProgressItem, resolveTargetForNode, resolveToleranceForNode, getWordCountRange } from "../utils";
 const { Text } = Typography;
 
-/** 兜底扩写的平铺阈值下限（与后端 expand_content_impl 的 minimum_words 映射一致） */
+/** 兜底扩写的平铺阈值下限（2026-10-08：按三级目录档位控制） */
 const EXPAND_FLAT_MINIMUM: Record<string, number> = {
+  brief: 800,
+  standard: 1200,
+  detailed: 2000,
+  long: 2500,
+  // 兼容旧 key
   short: 800,
-  standard: 2000,
-  detailed: 4000,
-  extra_long: 6000,
+  extra_long: 2500,
 };
 
 const getExpandFlatMinimum = (writingLength: string): number =>
@@ -55,24 +58,19 @@ function getStatusIcon(status: string) {
   }
 }
 
-function getWordCountStatus(wordCount: number, targetWords: number | null | undefined, level: number): "ok" | "warning" | "none" {
+function getWordCountStatus(
+  wordCount: number,
+  targetWords: number | null | undefined,
+  level: number,
+  toleranceRatio: number = 0.10,
+): "ok" | "warning" | "none" {
+  // 方案三 2026-10-09：L1/L2 是父节点，不参与字数控制，只做累计统计展示。
+  if (level < 3) return "none";
   if (!wordCount || wordCount === 0) return "none";
-  let effectiveTarget = targetWords;
-  if (!effectiveTarget || effectiveTarget <= 0) {
-    // 与后端 sse_utils._get_effective_target_words 分档保持一致
-    if (level === 1) effectiveTarget = 500;
-    else if (level === 2) effectiveTarget = 3500;
-    else if (level === 3) effectiveTarget = 300;
-    else if (level === 4) effectiveTarget = 400;
-    else if (level >= 5) effectiveTarget = 300;
-    else return "none";
-  }
-  if (level === 1) {
-    return wordCount >= effectiveTarget ? "ok" : "warning";
-  }
-  const deviation = Math.abs(wordCount - effectiveTarget) / effectiveTarget;
-  if (deviation > 0.15) return "warning";
-  return "ok";
+  if (!targetWords || targetWords <= 0) return "none";
+  // 达标区间与工具栏/后端同口径（L3 自身正文 ±20%，四档 ±10%）
+  const [lo, hi] = getWordCountRange(targetWords, toleranceRatio);
+  return wordCount >= lo && wordCount <= hi ? "ok" : "warning";
 }
 
 interface WordBudgetInfo {
@@ -84,8 +82,14 @@ interface WordBudgetInfo {
 }
 
 export default React.memo(function SectionEditorPage() {
-  const { id } = useParams<{ id: string }>();
+const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
+  // ENHANCE 2026-10-08（跨模块调用链·章节深链）：支持 `?section=<id>` 直接定位到
+  // 某个章节。此前一致性校核页的「涉及章节」只是不可点的文本标签，用户看到冲突
+  // 后还得自己在目录树里一层层翻找 offending 章节 —— 审计结论与正文之间断链。
+  // 现在校核页/评分达标页点章节标签即跳到 `/projects/:id/sections?section=<id>`。
+  const [searchParams] = useSearchParams();
+  const deepLinkSectionId = Number(searchParams.get("section")) || 0;
   const projectId = Number(id);
   const isProjectIdValid = !isNaN(projectId) && projectId > 0;
 
@@ -108,10 +112,18 @@ export default React.memo(function SectionEditorPage() {
   const [isPaused, setIsPaused] = useState(false);
   const isPausedRef = useRef(false);
   const [progressItems, setProgressItems] = useState<ProgressItem[]>([]);
-  const [progressTotal, setProgressTotal] = useState(0);
+const [progressTotal, setProgressTotal] = useState(0);
+  // BUG-FIX 2026-10-08（P0 进度 >100%）：这三个计数器原先在 SSE 事件回调里做 +1，
+  // 而后端重试循环会对同一 section_id 先发 failed 再发 completed —— 该章节被同时
+  // 计入 success 与 failed，done > total，ProgressPanel 渲染出 133%。
+  // 现统一由 progressItems（按 section_id 去重的 upsert）派生，见下方派生 useMemo；
+  // 保留 setter 仅供「重置 / 全局终态用后端权威数字」两处显式赋值使用。
   const [progressSuccess, setProgressSuccess] = useState(0);
   const [progressFailed, setProgressFailed] = useState(0);
   const [progressCancelled, setProgressCancelled] = useState(0);
+  // BUG-FIX 2026-10-08（P1 响应竞态）：章节详情请求序号。每次 loadSectionDetail /
+  // 章节级 completed 回填都会 ++；响应回来时序号不一致即丢弃，避免慢响应覆盖新选择。
+  const loadSeqRef = useRef(0);
   const [collapsedIds, setCollapsedIds] = useState<Set<number>>(() => {
     const s = new Set<number>();
     // 初始默认展开所有一级和二级节点，折叠三级（避免过深）
@@ -119,13 +131,38 @@ export default React.memo(function SectionEditorPage() {
   });
   const eventSourceRef = useRef<{ close: () => void; detach?: () => void; markTerminalEvent: () => void; promise: Promise<void> } | null>(null);
   const isMountedRef = useRef(true);
+// BUG-FIX 2026-10-08（高）：selectedSectionRef 原先只在 useEffect 里同步，
+  // 而 effect 在 commit **之后**才跑。handleSelectSection 里 setSelectedSection(node) 之后，
+  // 同一 tick 内 SSE 的章节级 completed 回调仍能读到**上一个**章节的 ref →
+  // 「用户点 B、A 的完成事件把 A 的正文写进 B 的编辑区」。
+  // 改为在选择入口同步写入 ref，effect 仅作兜底。
   useEffect(() => {
     selectedSectionRef.current = selectedSection;
   }, [selectedSection]);
+
+  // 防止进度计数器双重更新：全局 completed 事件到达后置 true，阻止章节级事件重复计数
+  // 注意：必须在下方 derivedProgress 的 useMemo 之前声明——useMemo 回调在渲染期
+  // 同步执行，若声明在后会触发 TDZ（Cannot access before initialization）。
+  const globalCompletedReceivedRef = useRef(false);
+  // BUG-FIX 2026-10-08（P0 进度 >100%）：运行中的 success/failed/cancelled 一律由
+  // progressItems（按 section_id 去重）派生，重试产生的重复事件不会重复计数；
+  // 非运行态（全局 completed / stopped）用后端给出的权威数字覆盖。
+  const derivedProgress = useMemo(() => {
+    if (!isGenerating && globalCompletedReceivedRef.current) {
+      return { success: progressSuccess, failed: progressFailed, cancelled: progressCancelled };
+    }
+    let success = 0;
+    let failed = 0;
+    let cancelled = 0;
+    for (const it of progressItems) {
+      if (it.status === "completed") success += 1;
+      else if (it.status === "failed") failed += 1;
+      else if (it.status === "cancelled") cancelled += 1;
+    }
+    return { success, failed, cancelled };
+  }, [progressItems, isGenerating, progressSuccess, progressFailed, progressCancelled]);
   // 用户主动停止生成时标记，防止 onerror 触发错误弹窗
   const userStoppedRef = useRef(false);
-  // 防止进度计数器双重更新：全局 completed 事件到达后置 true，阻止章节级事件重复计数
-  const globalCompletedReceivedRef = useRef(false);
   // 修复：树更新批处理——累积 pending updates，在微任务结束时批量应用一次 setTree
   const treeUpdateBatchRef = useRef<Map<number, Partial<SectionTreeNode>>>(new Map());
   const treeBatchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -394,13 +431,23 @@ export default React.memo(function SectionEditorPage() {
     }
   }, [isGenerating]);
 
-  const loadSectionDetail = async (sectionId: number) => {
+const loadSectionDetail = async (sectionId: number) => {
+    // BUG-FIX 2026-10-08（P1 响应竞态）：原先无任何并发保护。
+    // 「先点 A 再点 B，A 的响应后到」→ 编辑区显示 A 的正文、表头却是 B；
+    // 章节级 completed 回填与用户点击并发时还会丢失刚生成的新内容。
+    // 现在用单调递增的 seq 丢弃过期响应，并在落地前复核当前选中章节。
+    const seq = ++loadSeqRef.current;
     try {
       const section = await getSection(projectId, sectionId);
+      if (!isMountedRef.current) return;
+      if (seq !== loadSeqRef.current) return;
+      if (selectedSectionRef.current && selectedSectionRef.current.id !== sectionId) return;
       setSectionDetail(section);
       setSectionContent(section.content || "");
       // 图表全部自动生成：正文以内嵌围栏代码块（```mermaid / ```chart-json）承载，
       // 导出时按需渲染；不再提供/加载独立的人工配图、流程图、甘特图面板。
+      // BUG-FIX 2026-10-08（P1）：只在**用户显式点选**时切回正文页签，
+      // 否则生成完成/停止后的刷新会把用户从「版本历史」里拽出来。
       setActiveTab("text");
     } catch {
       // ignore
@@ -447,7 +494,11 @@ export default React.memo(function SectionEditorPage() {
     }
   }, [projectId, selectedSection]);
 
-  const handleSelectSection = (node: SectionTreeNode) => {
+const handleSelectSection = (node: SectionTreeNode) => {
+    // BUG-FIX 2026-10-08（P0 错章节写入）：ref 必须在 setState **同步**更新。
+    // 只靠 useEffect([selectedSection]) 同步会有一个 render+effect 的滞后窗口，
+    // 该窗口内 SSE 章节级回调读到的仍是上一个选中章节。
+    selectedSectionRef.current = node;
     setSelectedSection(node);
     const hasChildren = node.children && node.children.length > 0;
     if (!hasChildren) {
@@ -457,6 +508,40 @@ export default React.memo(function SectionEditorPage() {
       setSectionContent("");
     }
   };
+
+  // ENHANCE 2026-10-08（跨模块调用链·章节深链）：树加载完成后，若 URL 带
+  // `?section=<id>` 且尚未消费，自动展开祖先并选中该章节。
+  // - 只消费一次（deepLinkConsumedRef），避免用户手动切章节后被参数拽回去；
+  // - 章节 id 不存在/尚未生成时静默跳过，不打断正常编辑流程；
+  // - 展开祖先通过 collapse 集合的补集计算，保证深链章节在树里可见。
+  const deepLinkConsumedRef = useRef(false);
+  useEffect(() => {
+    if (!deepLinkSectionId || deepLinkConsumedRef.current) return;
+    if (!tree.length) return;
+
+    const locate = (
+      nodes: SectionTreeNode[],
+    ): { node: SectionTreeNode; ancestorIds: number[] } | null => {
+      for (const n of nodes) {
+        if (n.id === deepLinkSectionId) return { node: n, ancestorIds: [] };
+        const children = n.children || [];
+        const hit = locate(children);
+        if (hit) return { node: hit.node, ancestorIds: [n.id, ...hit.ancestorIds] };
+      }
+      return null;
+    };
+
+    const hit = locate(tree);
+    if (!hit) return; // 章节不存在（可能仍在生成）—— 保持现状，不消费，允许树更新后重试
+    deepLinkConsumedRef.current = true;
+    // 祖先默认都是展开态（collapsedIds 初值为空集），此处仅确保不折叠它们
+    setCollapsedIds((prev) => {
+      const next = new Set(prev);
+      hit.ancestorIds.forEach((cid) => next.delete(cid));
+      return next;
+    });
+    handleSelectSection(hit.node);
+  }, [tree, deepLinkSectionId]);
 
   const handleSaveContent = async () => {
     if (!selectedSection) return;
@@ -545,11 +630,25 @@ export default React.memo(function SectionEditorPage() {
       preferMermaid: orchPreferMermaid,
       sectionPerSegment: orchSectionPerSegment,
     } : undefined);
-    eventSourceRef.current = eventSource;
+eventSourceRef.current = eventSource;
     let finishedNormally = false;
     let hasConnected = false;
     let connectTimeout: ReturnType<typeof setTimeout> | null = null;
     globalCompletedReceivedRef.current = false;
+
+    // BUG-FIX 2026-10-08（P0 无限重连不可见）：createContentStream 在自动重连时会回调
+    // onerror({type:"reconnecting"|"reconnect_exhausted"})，但本页**从未挂载 onerror**
+    // （全仓唯一挂载点是 OutlineEditorPage）→ 用户看到的是「进度条不动、按钮一直转圈」，
+    // 完全不知道后台在重连。这里补上提示，让「慢」与「断」可区分。
+    eventSource.onerror = (err: unknown) => {
+      if (!isMountedRef.current) return;
+      const e = err as { type?: string; attempt?: number; maxAttempts?: number } | null;
+      if (e?.type === "reconnecting") {
+        message.warning(`连接中断，正在重连（第 ${e.attempt}/${e.maxAttempts} 次）…`, 2);
+      } else if (e?.type === "reconnect_exhausted") {
+        message.warning("连接多次中断，生成任务可能仍在后台继续，请稍候刷新查看进度", 6);
+      }
+    };
 
     const clearAllTimeouts = () => {
       // BUG-FIX 2026-09-16（低）：删除从未赋值的 errorTimeout 死代码残留
@@ -565,7 +664,7 @@ export default React.memo(function SectionEditorPage() {
         if (!isMountedRef.current) return;
         const d = JSON.parse(data);
 
-        if (d.section_id) {
+if (d.section_id != null) {
           // 抽取为纯函数 upsertSectionProgressItem（与 utils 单测钉住）：
           // 按 section_id 浅合并更新，不存在则追加，返回新数组不原地修改
           setProgressItems((prev) => upsertSectionProgressItem(prev, d));
@@ -587,13 +686,21 @@ export default React.memo(function SectionEditorPage() {
               has_content: true,
               word_count: d.word_count || 0,
             });
-            if (!globalCompletedReceivedRef.current) {
-              setProgressSuccess((s) => s + 1);
-            }
+            // BUG-FIX 2026-10-08（P0 进度 >100%）：原实现按**事件**做 setProgressSuccess(s=>s+1)，
+            // 而后端重试循环会对同一 section_id 先发一次 failed、再发一次 completed
+            // （sse_content.py 的 retry_round 分支）→ 该章节被同时计入 success 与 failed，
+            // done > total，ProgressPanel 渲染出 133% 这类越界进度，并把树节点标红。
+            // 改为按 section_id 去重的 upsertSectionProgressItem 作为唯一真相，
+            // 三个计数器统一由 progressItems 派生（见下方 useMemo 派生逻辑）。
             if (selectedSectionRef.current && selectedSectionRef.current.id === d.section_id) {
               if (!selectedSectionRef.current.children || selectedSectionRef.current.children.length === 0) {
+                // BUG-FIX 2026-10-08（P1 响应竞态）：补 seq + 当前选中校验，
+                // 否则「先点 A 再点 B、A 的响应后到」会把 A 的正文写进 B 的编辑区。
+                const seq = ++loadSeqRef.current;
                 getSection(projectId, d.section_id).then((sec) => {
                   if (!isMountedRef.current) return;
+                  if (seq !== loadSeqRef.current) return;
+                  if (selectedSectionRef.current?.id !== d.section_id) return;
                   setSectionDetail(sec);
                   setSectionContent(sec.content || "");
                 }).catch(() => {});
@@ -610,13 +717,11 @@ export default React.memo(function SectionEditorPage() {
             }, 2000);
           }
 
-          if (d.status === "failed") {
+if (d.status === "failed") {
             scheduleTreeUpdate(d.section_id, {
               status: "failed",
             });
-            if (!globalCompletedReceivedRef.current) {
-              setProgressFailed((f) => f + 1);
-            }
+            // 计数由 progressItems 派生（见上方 completed 分支的说明），此处不再按事件累加
           }
 
           if (d.status === "cancelled") {
@@ -625,9 +730,6 @@ export default React.memo(function SectionEditorPage() {
             scheduleTreeUpdate(d.section_id, {
               status: "cancelled",
             });
-            if (!globalCompletedReceivedRef.current) {
-              setProgressCancelled((c) => c + 1);
-            }
           }
 
           return;
@@ -691,8 +793,11 @@ export default React.memo(function SectionEditorPage() {
           clearAllTimeouts();
           flushTreeUpdates();
           setIsGenerating(false);
-          globalCompletedReceivedRef.current = true;
-          setProgressTotal(0);
+globalCompletedReceivedRef.current = true;
+          // BUG-FIX 2026-10-08（P1 进度归零）：原实现 setProgressTotal(0)，
+          // 而后端 stopped 事件是带 total 的。结果 ProgressPanel 渲染 percent=0%，
+          // 标签显示「0总 89存」——一次跑到 90% 的生成被显示成 0%。
+          setProgressTotal(d.total ?? 0);
           setProgressSuccess(d.success || 0);
           setProgressFailed(d.failed || 0);
           setProgressCancelled(d.cancelled || 0);
@@ -1128,7 +1233,14 @@ export default React.memo(function SectionEditorPage() {
       const hasChildren = node.children && node.children.length > 0;
       const isCollapsed = collapsedIds.has(node.id);
       const isSelected = selectedSection?.id === node.id;
-      const wcStatus = getWordCountStatus(node.word_count, node.target_words, node.level);
+      // 方案三 2026-10-09：L1/L2 是父节点，不参与字数控制，仅展示子树累计字数统计
+      const isParentNode = node.level < 3;
+      const displayWordCount = isParentNode ? (node.cumulative_word_count || 0) : node.word_count;
+      // 方案三 2026-10-09：目标与容差统一走 resolveTargetForNode / resolveToleranceForNode，
+      // 树列表、详情面板、达标判定共用同一份口径（L3 自身正文 300 ±20%）。
+      const nodeTarget = resolveTargetForNode(node, writingLength);
+      const nodeTolerance = resolveToleranceForNode(node);
+      const wcStatus = getWordCountStatus(displayWordCount, nodeTarget, node.level, nodeTolerance);
       const isLevel1 = node.level === 1;
       // 检查一级节点是否是同级中的第一个/最后一个
       const isFirstL1 = idx === 0;
@@ -1217,28 +1329,23 @@ export default React.memo(function SectionEditorPage() {
             >
               <span style={{ color: "#999", marginRight: 4, fontWeight: 400 }}>{node.number}</span>{node.title}
             </Text>
-            {node.word_count > 0 && (
+            {displayWordCount > 0 && (
               <Tooltip title={
-                node.level >= 1
-                  ? (() => {
-                      let target = node.target_words;
-                      let source = "";
-                      if (target && target > 0) {
-                        source = "自定义";
-                      } else {
-                        if (node.level === 1) { target = 500; source = "L1 固定分档"; }
-                        else if (node.level === 2) { target = level2DefaultWords; source = "L2 默认分档"; }
-                        else if (node.level === 3) { target = 300; source = "L3 默认分档"; }
-                        else if (node.level === 4) { target = 400; source = "L4 默认分档"; }
-                        else { target = 300; source = "L5+ 默认分档"; }
-                      }
+                isParentNode
+                  ? `累计 ${displayWordCount} 字（本章及其所有下级目录章节合计）· L1/L2 父节点不参与字数控制`
+                  : (() => {
+                      const target = nodeTarget;
+                      const tolerance = nodeTolerance;
+                      const [lo, hi] = getWordCountRange(target, tolerance);
                       if (target && target > 0) {
                         const dev = Math.round((node.word_count - target) / target * 100);
-                        return `当前 ${node.word_count} 字 / 目标 ${target} 字（${dev >= 0 ? "+" : ""}${dev}%）· 来源：${source}`;
+                        const source = node.target_words && node.target_words > 0 ? "自定义"
+                          : (node.word_count_tier ? `档位：${node.word_count_tier}`
+                            : node.level === 3 ? `L3 自身正文 300 字` : `档位：${writingLength || "standard"}`);
+                        return `当前 ${node.word_count} 字 / 目标 ${target} 字（区间 ${lo}~${hi} 字）· 偏差 ${dev >= 0 ? "+" : ""}${dev}% · 来源：${source}`;
                       }
                       return `${node.word_count} 字`;
                     })()
-                  : `${node.word_count} 字`
               }>
                 <span style={{
                   fontSize: 11,
@@ -1248,7 +1355,8 @@ export default React.memo(function SectionEditorPage() {
                   gap: 2,
                 }}>
                   {wcStatus === "warning" ? <WarningFilled /> : wcStatus === "ok" ? <CheckOutlined /> : null}
-                  {node.word_count}
+                  {isParentNode ? <span style={{ fontSize: 10, color: "#bbb" }}>累计</span> : null}
+                  {displayWordCount}
                 </span>
               </Tooltip>
             )}
@@ -1348,10 +1456,12 @@ export default React.memo(function SectionEditorPage() {
                 <Text strong style={{ fontSize: 13 }}>目标字数：</Text>
                 <Space.Compact>
                   <InputNumber
-                    min={3000}
-                    max={10000}
-                    step={500}
-                    value={selectedSection.target_words && selectedSection.target_words > 0 ? selectedSection.target_words : level2DefaultWords}
+                    min={100}
+                    max={5000}
+                    step={50}
+                    value={selectedSection.target_words && selectedSection.target_words > 0 ? selectedSection.target_words : (
+                      resolveTargetForNode(selectedSection, writingLength) ?? undefined
+                    )}
                     onChange={handleSetTargetWords}
                     disabled={savingTargetWords === selectedSection.id}
                     style={{ width: 120 }}
@@ -1359,9 +1469,15 @@ export default React.memo(function SectionEditorPage() {
                   <Button disabled>字</Button>
                 </Space.Compact>
                 <Text type="secondary" style={{ fontSize: 12 }}>
-                  （目标字数，AI 按 ±15% 弹性生成，超出范围时橙色预警）
+                  {(() => {
+                    if (selectedSection.level < 3) return "L1/L2 父节点不参与字数控制，仅统计子树累计";
+                    const t = resolveTargetForNode(selectedSection, writingLength) ?? 0;
+                    const tol = resolveToleranceForNode(selectedSection);
+                    const [lo, hi] = getWordCountRange(t, tol);
+                    return `目标 ${t} 字（达标区间 ${lo}~${hi} 字），AI 按 ±${Math.round(tol * 100)}% 弹性生成`;
+                  })()}
                 </Text>
-                {selectedSection.target_words && selectedSection.target_words !== level2DefaultWords && (
+                {selectedSection.target_words && selectedSection.target_words > 0 && (
                   <Button
                     type="link"
                     size="small"
@@ -1374,15 +1490,34 @@ export default React.memo(function SectionEditorPage() {
               </Space>
             </div>
           )}
-          {selectedSection.level === 1 && (
-            <Alert
-              message="一级目录章节字数规则"
-              description="正文字数不少于 500 字，超过部分由 AI 根据内容丰富度自动扩展。"
-              type="info"
-              showIcon
-              style={{ marginBottom: 12 }}
-            />
-          )}
+          {(() => {
+            // 方案三 2026-10-09：L1/L2 是父节点（只做累计统计），L3 是字数控制单元
+            if (selectedSection.level < 3) {
+              return (
+                <Alert
+                  message="父节点字数规则（方案三）"
+                  description="一级/二级目录是父节点，不参与字数控制，仅统计其下所有目录章节的累计字数；字数控制在三级目录（L3）执行。"
+                  type="info"
+                  showIcon
+                  style={{ marginBottom: 12 }}
+                />
+              );
+            }
+            if (selectedSection.level === 3) {
+              const t = resolveTargetForNode(selectedSection, writingLength) ?? 300;
+              const [lo, hi] = getWordCountRange(t, resolveToleranceForNode(selectedSection));
+              return (
+                <Alert
+                  message="三级目录（L3）字数规则（方案三）"
+                  description={`L3 自身正文目标 ${t} 字，达标区间 ${lo}~${hi} 字（±20%）。下级目录章节（L4+）由独立章节任务生成，不计入本 L3 自身正文字数。`}
+                  type="info"
+                  showIcon
+                  style={{ marginBottom: 12 }}
+                />
+              );
+            }
+            return null;
+          })()}
           <div style={{ position: "relative", flex: 1, display: "flex", flexDirection: "column", overflow: "hidden" }}>
             <div style={{ marginBottom: 8, display: "flex", alignItems: "center", gap: 8 }}>
               <Button
@@ -1426,23 +1561,31 @@ export default React.memo(function SectionEditorPage() {
               <Tag color="blue" icon={<SaveOutlined />}>生成内容已自动保存</Tag>
               {(() => {
                 const wc = sectionContent.length;
-                let target: number | null = null;
-                if (selectedSection.level === 1) target = selectedSection.target_words || 500;
-                else if (selectedSection.level === 2) target = selectedSection.target_words || level2DefaultWords;
-                const wcStat = getWordCountStatus(wc, target, selectedSection.level);
+                // 方案三 2026-10-09：L1/L2 无字数目标（只做累计统计）；
+                // L3 自身正文 300 字 ±20%，L4+ 走四档（子树总字数口径）。
+                const target = resolveTargetForNode(selectedSection, writingLength);
+                const tolerance = resolveToleranceForNode(selectedSection);
+                const [lo, hi] = getWordCountRange(target, tolerance);
+                const wcStat = getWordCountStatus(wc, target, selectedSection.level, tolerance);
                 return (
                   <>
-                    {target && target > 0 && (
+                    {target && target > 0 ? (
                       <Text type={wcStat === "warning" ? "danger" : wcStat === "ok" ? "success" : "secondary"}>
                         {wc} / {target} 字
                         {wc > 0 && target > 0 && (
                           <span style={{ marginLeft: 4 }}>
-                            ({wc >= target ? "+" : ""}{Math.round((wc - target) / target * 100)}%)
+                            区间 {lo}~{hi} 字 · {wc >= target ? "+" : ""}{Math.round((wc - target) / target * 100)}%
                           </span>
                         )}
                       </Text>
+                    ) : selectedSection.level < 3 ? (
+                      <Text type="secondary">
+                        累计 {selectedSection.cumulative_word_count || 0} 字（含下级章节）
+                        {wc > 0 && <span style={{ marginLeft: 4 }}>本节点正文 {wc} 字</span>}
+                      </Text>
+                    ) : (
+                      <Text type="secondary">{wc} 字</Text>
                     )}
-                    {(!target || target <= 0) && <Text type="secondary">{wc} 字</Text>}
                   </>
                 );
               })()}
@@ -1483,7 +1626,9 @@ export default React.memo(function SectionEditorPage() {
   return (
     <div className="section-editor-shell" style={{ display: "flex", flexDirection: "column", gap: 0, flex: 1, minHeight: 0, overflow: "hidden" }}>
       {/* 后台任务恢复提示（全宽） */}
-      <RecoveryBanner projectId={projectId} />
+      <div style={{ flexShrink: 0 }}>
+        <RecoveryBanner projectId={projectId} />
+      </div>
 
       {/* 真正的左右两列 */}
       <div style={{ display: "flex", flex: 1, minHeight: 0, overflow: "hidden" }}>
@@ -1502,11 +1647,10 @@ export default React.memo(function SectionEditorPage() {
             style={{
               flex: 1,
               minHeight: 0,
-              height: "100%",
               overflowY: "auto",
               overflowX: "hidden",
               overscrollBehavior: "contain",
-              paddingRight: 4,
+              paddingRight: 6,
               paddingBottom: 16,
             }}
           >
@@ -1611,12 +1755,12 @@ export default React.memo(function SectionEditorPage() {
                 </Space>
               }
             >
-              <ProgressPanel
+<ProgressPanel
                 items={progressItems}
                 total={progressTotal}
-                success={progressSuccess}
-                failed={progressFailed}
-                cancelled={progressCancelled}
+                success={derivedProgress.success}
+                failed={derivedProgress.failed}
+                cancelled={derivedProgress.cancelled}
                 isRunning={isGenerating}
               />
             </Card>

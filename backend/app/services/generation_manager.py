@@ -20,6 +20,27 @@ from . import task_lock
 logger = logging.getLogger(__name__)
 
 
+def _task_group_lock_still_ours(lock_key: str, owner_id: str, project_id: int) -> bool:
+    """判断「任务组锁」是否仍由本任务持有（同步执行，调用方需在线程池里跑）。
+
+    FIX 2026-10-08（遗留8）：暂停 >30min（超过 `DEFAULT_TTL_SECONDS`）后恢复，
+    锁可能已被 `reclaim_stale` 回收或被他进程抢走。此时继续复用旧任务 = 放行
+    第二个并发写循环。判定：锁 live **且** owner 仍是自己。
+    """
+    if not lock_key or not owner_id:
+        return False
+    try:
+        if not task_lock.is_lock_live(lock_key):
+            return False
+        active = task_lock.get_active_lock("content-generation", project_id=project_id)
+    except Exception as e:  # 查询失败：交由调用方按保守策略处理
+        logger.warning("[generation_manager] 任务组锁状态查询失败 key=%s: %s", lock_key, e)
+        raise
+    if not active:
+        return False
+    return (active.get("owner_id") or "") == owner_id
+
+
 @dataclass
 class SectionProgress:
     """单章节进度"""
@@ -129,27 +150,75 @@ class GenerationManager:
         reuse_task: GenerationTask | None = None
         async with self._lock:
             existing = self._tasks.get(project_id)
+            # BUG-FIX 2026-10-08（高）：原条件只有 `not existing.attached`，不看 status。
+            # attached 是「是否有活循环在驱动」的标志，而 resume_task() 会把 status 置回
+            # running 却**故意不置 attached**（置 True 会让本函数走抢锁分支、用新 owner
+            # 与自己持有的锁冲突 → 恢复 100% 失败）。于是内存里存在一个
+            # 「status=running 且 attached=False」的中间态：此刻任何一次 /generate-content
+            # 都会被判为「续跑」而静默复用同一 generation_id，抢锁被跳过。
+            # 后果：并发两个生成循环同写一批 sections；或一个已终态但尚未 finalize 的任务
+            # 被当作可续跑任务复用，section_states / 锁凭据全部错位。
+            # 现在只允许「paused」或「已恢复待挂载（running 且未挂载）」两种状态复用，
+            # 其余（completed/failed/cancelled）先清出内存再走正常抢锁路径。
             if existing is not None and not existing.attached:
-                reuse_task = GenerationTask(
-                    generation_id=existing.generation_id,
-                    project_id=project_id,
-                    outline_version=outline_version or existing.outline_version,
-                    started_at=existing.started_at,
-                    resumed_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    writing_length=config.get("writing_length", existing.writing_length),
-                    concurrency=int(config.get("concurrency", existing.concurrency) or existing.concurrency),
-                    # 锁凭据必须原样继承：锁在 DB 里仍挂在这个 owner 名下
-                    lock_key=existing.lock_key,
-                    lock_owner=existing.lock_owner,
-                    last_heartbeat_at=time.time(),
-                )
-                self._tasks[project_id] = reuse_task
-                generation_id = existing.generation_id
-                logger.info(
-                    "[generation_manager] 复用暂停任务续跑: project=%d, generation=%s",
-                    project_id,
-                    generation_id,
-                )
+                # FIX 2026-10-08（遗留8）：暂停 >30min 后恢复必须校验任务组锁存活性。
+                # 原实现校验了 status/attached 却**不校验锁**——锁被 reclaim_stale 回收
+                # 或被他进程抢走时，这里仍照旧复用，恢复出的新循环会与其它持锁者
+                # 并发 UPDATE 同一批 sections（正是任务组锁要防的场景）。
+                # 校验方式：锁仍 live + owner 仍是本任务；查询失败时保守放行（不改既有行为）。
+                _lock_valid = True
+                if existing.lock_key:
+                    try:
+                        _lock_valid = await loop.run_in_executor(
+                            None,
+                            functools.partial(
+                                _task_group_lock_still_ours,
+                                existing.lock_key, existing.lock_owner, project_id,
+                            ),
+                        )
+                    except Exception as _lk_e:
+                        logger.warning(
+                            "[generation_manager] 任务组锁存活性查询异常，按既有行为放行: "
+                            "project=%d: %s", project_id, _lk_e,
+                        )
+                        _lock_valid = True
+                if not _lock_valid:
+                    logger.warning(
+                        "[generation_manager] 任务组锁已失效或易主，放弃复用并按新任务处理: "
+                        "project=%d, generation=%s, lock_key=%s",
+                        project_id, existing.generation_id, existing.lock_key,
+                    )
+                    self._tasks.pop(project_id, None)
+                elif existing.status in ("paused", "running"):
+                    reuse_task = GenerationTask(
+                        generation_id=existing.generation_id,
+                        project_id=project_id,
+                        outline_version=outline_version or existing.outline_version,
+                        started_at=existing.started_at,
+                        resumed_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        writing_length=config.get("writing_length", existing.writing_length),
+                        concurrency=int(config.get("concurrency", existing.concurrency) or existing.concurrency),
+                        # 锁凭据必须原样继承：锁在 DB 里仍挂在这个 owner 名下
+                        lock_key=existing.lock_key,
+                        lock_owner=existing.lock_owner,
+                        last_heartbeat_at=time.time(),
+                    )
+                    self._tasks[project_id] = reuse_task
+                    generation_id = existing.generation_id
+                    logger.info(
+                        "[generation_manager] 复用暂停任务续跑: project=%d, generation=%s",
+                        project_id,
+                        generation_id,
+                    )
+                else:
+                    logger.warning(
+                        "[generation_manager] 清理已终态的僵尸任务后重新创建: "
+                        "project=%d, generation=%s, status=%s",
+                        project_id,
+                        existing.generation_id,
+                        existing.status,
+                    )
+                    self._tasks.pop(project_id, None)
 
         if reuse_task is not None:
             await loop.run_in_executor(None, self._persist_task, reuse_task)
@@ -318,6 +387,16 @@ class GenerationManager:
                 return None
             task.status = "running"
             task.resumed_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            # BUG-FIX 2026-10-08（高·不变式说明）：这里**刻意不置 attached=True**。
+            # attached=True 表示「已有活 SSE 循环在驱动」，但此刻还没有——前端拿到本接口
+            # 的 generation_id 之后才会去调 /generate-content 建流。若在此置 True，
+            # create_task 会走「抢 content-generation 组锁」分支，而锁此刻仍由本任务的
+            # lock_owner 持有且 owner_id 是新 uuid → 必然 TaskLockConflict，
+            # 「暂停→恢复」将 100% 失败（这正是 2026-09-16 修复的那个坑）。
+            # 因此保持 attached=False，由 create_task 的复用分支在**锁内原子地**
+            # 翻成 running + attached=True（复用本身是互斥的：第二个并发请求会看到
+            # attached=True 从而走抢锁分支并被正确拒绝）。
+            task.attached = False
 
         logger.info("恢复生成任务: project=%d, generation=%s", project_id, task.generation_id)
         # 持久化在锁外执行
@@ -536,11 +615,21 @@ class GenerationManager:
                            WHERE generation_id = ?""",
                         (task["generation_id"],),
                     )
-                    # 将所有 progress 表中仍在 processing 的章节标记为 failed
+# 将 progress 表中仍在「生成中」的章节标记为 failed。
+                    # BUG-FIX 2026-10-08（P0 死代码）：原条件是 status = 'processing'，
+                    # 但本表的 status 由 update_section_progress() 写入，取值是 SSE 的
+                    # 章节状态串 —— 'generating' / 'completed' / 'failed' / 'cancelled'，
+                    # **'processing' 从来不会被写入**（只有 uploaded_files/tasks 用这个词）。
+                    # 于是这条 UPDATE 恒匹配 0 行：进程被 OOM/kill 后 section_generation_progress
+                    # 里的行永远停在 'generating'，而 get_pending_sections 的
+                    # 「status IN ('pending','failed','cancelled')」又把它们排除 →
+                    # 这些章节既不是「在飞」也不是「待生成」，断点续跑会静默跳过它们，
+                    # 且 total_sections 少算，任务可能被提前判为 completed。
+                    # 现同时兼容新旧两种字面量（老版本可能已落库 'processing'）。
                     conn.execute(
                         """UPDATE section_generation_progress
                            SET status = 'failed', last_error = '服务异常中断'
-                           WHERE generation_id = ? AND status = 'processing'""",
+                           WHERE generation_id = ? AND status IN ('generating', 'processing')""",
                         (task["generation_id"],),
                     )
                     # 将 sections 表中所有 generating 状态章节标记为 failed
@@ -882,7 +971,7 @@ class GenerationManager:
 
         清理动作（单事务）：
         1. sections 表: status='generating' → 'failed' + error_message
-        2. section_generation_progress 表: status='processing' → 'failed'
+        2. section_generation_progress 表: status='generating'（兼容旧 'processing'）→ 'failed'
 
         Args:
             project_id: 项目 ID
@@ -916,13 +1005,17 @@ class GenerationManager:
                         )
                         sections_affected = cursor1.rowcount
 
-                        # 清理 generation_progress 表中的 processing 残留
+# 清理 generation_progress 表中的「生成中」残留。
+                        # BUG-FIX 2026-10-08（P0）：见 get_project_progress 同名修复的说明 ——
+                        # 该表 status 由 SSE 章节状态串写入（'generating'），不是 'processing'，
+                        # 原 WHERE 恒匹配 0 行，回滚形同虚设。同时兼容旧字面量。
                         if generation_id:
                             cursor2 = conn.execute(
                                 """UPDATE section_generation_progress
                                    SET status = 'failed',
                                        last_error = '任务异常中断，已自动回滚'
-                                   WHERE generation_id = ? AND status = 'processing'""",
+                                   WHERE generation_id = ?
+                                     AND status IN ('generating', 'processing')""",
                                 (generation_id,),
                             )
                         else:
@@ -933,7 +1026,7 @@ class GenerationManager:
                                    WHERE generation_id IN (
                                        SELECT generation_id FROM generation_tasks
                                        WHERE project_id = ? AND status IN ('running', 'paused')
-                                   ) AND status = 'processing'""",
+                                   ) AND status IN ('generating', 'processing')""",
                                 (project_id,),
                             )
                         progress_affected = cursor2.rowcount

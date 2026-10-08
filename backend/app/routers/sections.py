@@ -408,6 +408,60 @@ async def update_section_target_words_route(project_id: int, section_id: int, ta
     logger.info('更新章节目标字数: section=%d, target_words=%s', section_id, section.target_words)
     return {'status': 'ok', 'section_id': section_id, 'target_words': section.target_words}
 
+@router.patch('/{section_id}/word-count-tier')
+async def update_section_word_count_tier_route(
+    project_id: int,
+    section_id: int,
+    word_count_tier: str = Query(default='', description='档位 key: brief/standard/detailed/long；空串=清除覆盖，跟随全局默认'),
+    current_user: Annotated[Any, Depends(get_current_user)] = None,
+):
+    """更新章节字数档位（三级目录控制）
+
+    2026-10-08 新增：字数控制下沉到三级目录（L3）后，每个 L3 可独立设置
+    档位（brief/standard/detailed/long）。传空串表示清除覆盖，跟随全局默认。
+
+    Args:
+        project_id: 项目 ID
+        section_id: 章节 ID
+        word_count_tier: 档位 key（brief/standard/detailed/long），空串=清除覆盖
+
+    Returns:
+        dict: {status, section_id, word_count_tier, tier_label, tier_target}
+    """
+    from ..services.ai.writing_length_config import get_tier_config, get_default_tier_config
+
+    # 校验档位 key
+    valid_keys = {'brief', 'standard', 'detailed', 'long', ''}
+    if word_count_tier not in valid_keys:
+        raise HTTPException(status_code=400, detail=f'无效的档位 key: {word_count_tier}，可选值: {sorted(valid_keys - {""})}')
+
+    if current_user:
+        await require_project_permission(project_id, current_user)
+    _reject_if_generation_running(project_id)
+    _ensure_section_in_project(project_id, section_id)
+
+    # 空串 = 清除覆盖（设为 None）
+    tier_value = word_count_tier if word_count_tier else None
+    section = await asyncio.to_thread(
+        update_section, section_id, SectionUpdate(word_count_tier=tier_value)
+    )
+    if not section:
+        raise HTTPException(status_code=404, detail='章节不存在')
+
+    # 返回解析后的档位信息
+    effective_tier = section.word_count_tier or 'standard'
+    tier_cfg = get_tier_config(effective_tier) or get_default_tier_config()
+
+    logger.info('更新章节档位: section=%d, word_count_tier=%s', section_id, section.word_count_tier)
+    return {
+        'status': 'ok',
+        'section_id': section_id,
+        'word_count_tier': section.word_count_tier,
+        'tier_label': tier_cfg.get('label'),
+        'tier_target': tier_cfg.get('target_words'),
+        'tier_tolerance': tier_cfg.get('tolerance_ratio'),
+    }
+
 @router.post('/reorder', dependencies=[limit_per_endpoint])
 async def reorder_sections_route(project_id: int, data: ReorderRequest, current_user: Annotated[Any, Depends(get_current_user)]=None):
     """重排序章节
@@ -507,13 +561,37 @@ async def review_outline_with_autofix_route(project_id: int, current_user: Annot
                     _attempt, _MAX_AUTOFIX_SAVE_RETRIES, project_id, e,
                 )
                 await asyncio.sleep(_attempt * 0.8)
+            except Exception as e:
+                # BUG-FIX 2026-10-08（容错/500 语义）：此前只捕获
+                # DatabaseWriteLockTimeout，其余异常（sqlite3.OperationalError
+                # "database is locked" 的原生形态、IntegrityError、OSError 磁盘满、
+                # 快照/回填链路内部断言……）全部裸穿出路由：
+                #   · TestClient 场景直接 raise → 表现为「测试炸红」；
+                #   · 生产场景 Starlette 返回无结构的 500，前端拿不到任何可读原因，
+                #     且此时**目录已被 DELETE 清空、正文尚未回填**（_clear_and_save_outline
+                #     内部单事务，失败必回滚，故目录仍是旧的）——用户看到的是
+                #     「AI 修复成功了，但页面目录没变」，前后端状态分裂且无从排查。
+                # 现按「可重试争用」与「不可重试失败」分治：前者 503 提示稍后重试，
+                # 后者 500 且 detail 含「保存失败」与原因，前端可提示用户重试/联系管理员。
+                _save_err = e
+                logger.error(
+                    "自动修复结果落库失败（非写锁争用）project=%d attempt=%d: %s",
+                    project_id, _attempt, e, exc_info=True,
+                )
+                break
         if _save_err is not None:
-            logger.error(
-                "自动修复结果落库失败 project=%d: %s", project_id, _save_err, exc_info=True
-            )
+            if isinstance(_save_err, DatabaseWriteLockTimeout):
+                logger.error(
+                    "自动修复结果落库重试耗尽（写锁争用）project=%d: %s", project_id, _save_err
+                )
+                raise HTTPException(
+                    status_code=503,
+                    detail="自动修复结果保存失败：数据库正忙（并发写入），请稍后重试",
+                ) from _save_err
+            logger.error("自动修复结果落库失败 project=%d: %s", project_id, _save_err, exc_info=True)
             raise HTTPException(
-                status_code=503,
-                detail="自动修复结果保存失败：数据库正忙（并发写入），请稍后重试",
+                status_code=500,
+                detail=f"自动修复结果保存失败：{_save_err!s}",
             ) from _save_err
         result['tree'] = await asyncio.to_thread(build_tree, project_id)
     return {'status': 'completed', 'result': result}

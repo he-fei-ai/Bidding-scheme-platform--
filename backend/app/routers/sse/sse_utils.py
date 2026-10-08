@@ -12,7 +12,12 @@ from ...db import get_db
 from ...services.ai.provider_factory import get_ai_config
 from ...models import SectionUpdate
 from ...services.ai.industry_profiles import get_industry_profile
-from ...services.ai.writing_length_config import level_target
+from ...services.ai.writing_length_config import (
+    get_l3_own_target,
+    get_l3_own_range,
+    get_tier_config,
+    get_default_tier_config,
+)
 from ...services.ai.workflows import generate_outline as _run_outline_workflow
 from ...services.ai.workflows import generate_sections as _run_sections
 from ...services.content_field_contract import parse_extraction_fields_record
@@ -180,108 +185,80 @@ def _get_path_and_ancestors(
 
     return ".".join(path_parts), titles
 
+def _resolve_tier_label(word_count_tier: str | None, writing_length: str | None) -> str | None:
+    """解析档位中文标签（简短/标准/详细/超长），用于提示词与前端展示。
+
+    优先级：单节点 word_count_tier > 全局 writing_length > 默认档位。
+    """
+    key = word_count_tier or writing_length
+    if not key:
+        cfg = get_default_tier_config()
+        return cfg.get("label") if cfg else None
+    cfg = get_tier_config(key)
+    return cfg.get("label") if cfg else None
+
+
 def _get_effective_target_words(
-
     section: dict,
-
     level2_default: int = 3500,
-
     writing_length: str | None = None,
-
 ) -> int | None:
+    """计算章节的有效目标字数（2026-10-08 版：字数控制下沉到三级目录 L3）。
 
-    """计算章节的有效目标字数（全层级分档版）
-
-
-
-    字数分档标准（用户定制 2026-09-04 更新）：
-
-      L1  (第一章/第一节)  → 500 字（章节标题+引导语+子章节概览）
-
-      L2  (一、/第一节)    → level2_default（默认 3500 字）
-
-      L3  (1、)            → 300 字（200~400，AI 自判定；**不再从父级 L2 均摊**）
-
-      L4  (1.1、)          → 400 字（300~500，AI 自判定）
-
-      L5  (1.1.1、)        → 300 字（200~400，AI 自判定）
-
-      L6  (1）)            → 300 字（200~400，AI 自判定）
-
-      L7  (a、)            → 300 字（200~400，AI 自判定）
-
-
-
-    注：L3 下的子目录（L4+）均为叶子生成，各自独立，不继承父级均摊关系。
-
-    BUG-FIX 2026-09-18（低）：`sections_by_id` / `children_map` 两个形参是
-    **死参数** —— 原「父级 L2 字数均摊给子章节」的实现需要它们做树上溯，
-    该逻辑已被上面的「L3 独立 300 字」取代（见 L3 分支注释），但形参和 docstring
-    的 Args 说明都留了下来。后果：调用方以为本函数会用到整棵目录树，
-    误以为传入的映射是必需的。现在按实际使用情况收敛为两个参数。
-
-
+    策略：
+      - **只对三级目录（L3）作为字数控制单位**：L3 是叶子生成中最常见的层级，
+        其目标字数由档位（brief/standard/detailed/long）决定，四档标准
+        800/1200/2000/2500，允许 ±10% 浮动。
+      - **L1 / L2 不参与字数控制**：它们是不生成正文的父节点，`target_words`
+        字段仅作为统计/展示用途（其累计字数由子树所有 L3 累加得出）。
+      - **优先级**：单节点 `target_words` 精确覆盖 > 单节点 `word_count_tier`
+        > 全局 `writing_length` 档位 > 默认档位（standard=1200）。
+      - **L4+ 叶子**：若目录深度 >3，其目标字数按父 L3 档位同步（避免深层
+        叶子脱离档位控制）。当前系统默认 L3 即为最深叶子，此兜底较少触发。
 
     Args:
-
-        section: 章节数据字典
-
-        level2_default: 二级章节默认字数
-
-
+        section: 章节字典（含 level / target_words / word_count_tier 等）
+        level2_default: 历史兼容参数，L2 已不再使用该值；仅保留以免旧调用报错
+        writing_length: 全局档位 key（brief/standard/detailed/long，兼容 short/extra_long）
 
     Returns:
-
-        int | None: 目标字数（None 表示未设置）
-
+        int | None: 目标字数；对 L1/L2 返回 None（不参与控制）
     """
+    level = section.get("level", 3) or 3
 
-    level = section.get("level", 0)
+    # L1 / L2 是父节点，不生成正文 -> 不参与字数控制
+    if level < 3:
+        return None
 
-    # 写作长度模式实际控制二级目录及以下（L2+）：优先取该模式的层级目标中间值，
-    # 确保「选中某模式」时叶子章节的目标字数随之变化（不再沿用陈旧 / 默认目标）。
-    if writing_length and level >= 2:
-        return level_target(writing_length, level)
-
-    tw = section.get("target_words")
-
-    if tw and tw > 0:
-
-        return tw
-
-
-
-    # === 层级分档 ===
-
-    if level == 1:
-
-        return 500
-
-    if level == 2:
-
-        return level2_default
-
+    # 三级目录（L3）：字数控制核心
     if level == 3:
+        # 1) 单节点精确覆盖（用户显式设置的 target_words）> 最高优先级
+        tw = section.get("target_words")
+        if isinstance(tw, int) and tw > 0:
+            return tw
+        # 2) L3 自身正文（方案三 2026-10-09）：300 字左右 ±20%（240~360 字）
+        #    四档 800/1200/2000/2500 作为「L3 子树总字数」口径，仅在 L3
+        #    存在下级目录章节（L4+）时参与校验；无下级的 L3 以自身正文
+        #    300 ± 20% 为唯一测量口径，生成层与校验层必须一致。
+        return get_l3_own_target()
 
-        # L3 固定 200~400 字范围，取中间值 300；由 AI 在范围内自判定
+    # L4+ 深层叶子：跟随其父 L3 的档位（简化实现：直接用当前全局档位）
+    # 实际系统中 L4+ 极少出现；此处保持与 L3 相同分档策略
+    tw = section.get("target_words")
+    if isinstance(tw, int) and tw > 0:
+        return tw
+    tier_key = section.get("word_count_tier")
+    if tier_key:
+        cfg = get_tier_config(tier_key)
+        if cfg:
+            return int(cfg["target_words"])
+    if writing_length:
+        cfg = get_tier_config(writing_length)
+        if cfg:
+            return int(cfg["target_words"])
+    default_cfg = get_default_tier_config()
+    return int(default_cfg.get("target_words", 1200))
 
-        # 覆盖原父级均摊逻辑：原 max(500, parent_tw // count) 兜底 800 过高，
-
-        # 且 L3 已定位为"具体执行条目"，正文体量应独立管控
-
-        return 300
-
-    if level == 4:
-
-        return 400  # L4: 300~500，取中间值
-
-    if level >= 5:
-
-        return 300  # L5-L7: 200~400，取中间值
-
-
-
-    return None
 
 def _resolve_chart_field(chart_type: str) -> str | None:
 
@@ -1138,6 +1115,28 @@ def _build_leaf_dicts(
                 "level": leaf.get("level", 3),
 
                 "target_words": effective_target,
+
+                # 2026-10-08 新增：字数档位信息（用于提示词注入与前端展示）
+                "word_count_tier": leaf.get("word_count_tier"),
+                "tier_label": _resolve_tier_label(leaf.get("word_count_tier"), writing_length),
+
+                # L3 自身正文（三级目录）：用于生成与校验的独立标识
+                # L3 自身正文不含下级目录章节；只有存在 L4+ 子目录时
+                # 四档口径（子树总字数）才参与校验。
+                "is_l3_own": leaf.get("level") == 3,
+                # L3 下级目录章节（仅当存在 L4+ 时才有真实子目录）
+                "child_chapters": [
+                    {
+                        "id": str(c.get("id")),
+                        "title": c.get("title"),
+                        "level": c.get("level", 4),
+                        "description": c.get("description") or "",
+                        "status": c.get("status", ""),
+                        "section_type": c.get("section_type"),
+                        "content": c.get("content") or "",
+                    }
+                    for c in children_map.get(leaf["id"], [])
+                ],
 
                 "parent_chapters": parent_chapters,
 

@@ -470,16 +470,13 @@ class TestPptComGuardrails:
 
     def test_timeout_falls_back_to_hint(self, tmp_path, monkeypatch):
         """COM 卡死超过 PPT_COM_TIMEOUT 时必须放弃等待并返回降级提示，不能挂住请求"""
-        import time
-
-        def _hang(_p):
-            time.sleep(5)
-            return "永远拿不到的文本"
-
         monkeypatch.setattr(files_mod, "PPT_COM_ENABLED", True)
         monkeypatch.setattr(files_mod, "PPT_COM_TIMEOUT", 0)
-        # 超时包装在 _ppt_via_powerpoint_com 里，挂死的是它内部的同步 COM 调用
-        monkeypatch.setattr(files_mod, "_ppt_com_extract_sync", _hang)
+        # BUG-FIX 2026-10-08：强制可用性探测为 True，使无 Office 的 CI 也能走到
+        # 真实的超时包装逻辑（否则注册表探测会直接跳过 COM，无法验证超时护栏）
+        monkeypatch.setattr(files_mod, "_ppt_com_available", lambda: True)
+        # 子进程模式：跨进程 monkeypatch 不生效，改用环境变量让子进程挂死 60s
+        monkeypatch.setenv("PPT_COM_INJECT_HANG", "1")
 
         p = tmp_path / "b.ppt"
         p.write_bytes(b"\xd0\xcf\x11\xe0fake")
@@ -494,7 +491,9 @@ class TestPptComGuardrails:
 
     def test_success_path_returns_text(self, tmp_path, monkeypatch):
         monkeypatch.setattr(files_mod, "PPT_COM_ENABLED", True)
-        monkeypatch.setattr(files_mod, "_ppt_com_extract_sync", lambda _p: "幻灯片正文")
+        monkeypatch.setattr(files_mod, "_ppt_com_available", lambda: True)
+        # 子进程模式：通过环境变量把结果注入给子进程（跨进程 monkeypatch 不生效）
+        monkeypatch.setenv("PPT_COM_INJECT_RESULT", "幻灯片正文")
         p = tmp_path / "c.ppt"
         p.write_bytes(b"\xd0\xcf\x11\xe0fake")
         assert files_mod._extract_ppt(str(p)) == "幻灯片正文"

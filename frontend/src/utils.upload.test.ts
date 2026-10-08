@@ -31,8 +31,8 @@ describe("classifyUploadResult（上传结果分类）", () => {
     expect(classifyUploadResult(undefined)).toBe("error");
   });
 
-  it("缺少 status 字段（旧后端）不误判为失败", () => {
-    expect(classifyUploadResult({} as { status?: string })).toBe("ok");
+  it("缺少 status 字段（旧后端）不再默认为成功，返回 parse_failed", () => {
+    expect(classifyUploadResult({} as { status?: string })).toBe("parse_failed");
   });
 });
 

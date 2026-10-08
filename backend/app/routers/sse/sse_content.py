@@ -164,7 +164,7 @@ async def generate_content_impl(
         False = 两类按 priority 合并竞争同一配额（商务标等偏照片场景）
         orch_section_per_segment: 分段择优的段长（越小图片分布越均匀）
 
-        level2_default: 二级章节默认目标字数
+        level2_default: [已废弃 2026-10-08] 字数控制已下沉到三级目录（L3）档位，此参数不再使用
 
         use_word_sampling: 是否使用字数采样预估（先采样3个小节）
 
@@ -725,6 +725,24 @@ async def generate_content_impl(
         chart_workers = [asyncio.create_task(_chart_worker(), name=f'chart-worker-{i}')
                         for i in range(_chart_worker_count)]
 
+        async def _converge_chart_workers():
+            # BUG-FIX 2026-10-08（P1 worker 泄漏）：早退/编排取消路径位于 try@1090
+            # 之外，内层 finally（唯一收敛点）不会执行 → 2~4 个 _chart_worker 以
+            # 2s 周期无限轮询到进程重启（CPU/FD 泄漏，即 2026-09-14「BUG-FIX 高」
+            # 描述的原始症状——该修复只覆盖了 try@1090 内的路径）。幂等，可多处调用。
+            try:
+                chart_done_event.set()
+                for _w in chart_workers:
+                    if not _w.done():
+                        _w.cancel()
+                if chart_workers:
+                    await asyncio.wait_for(
+                        asyncio.gather(*chart_workers, return_exceptions=True),
+                        timeout=2.0,
+                    )
+            except Exception:
+                pass
+
         # CLEANUP 2026-10-04：删除死变量 chart_success_count/chart_fail_count
         # （全文件仅定义无引用，配图成失统计实际由 worker 内部日志与
         # chart_done_event 汇总承载）。
@@ -918,7 +936,10 @@ async def generate_content_impl(
 
                     status,
 
-                    100,
+                    # BUG-FIX 2026-10-08（P2 数据不一致）：failed/cancelled 章节原先
+                    # 也持久化 progress=100（SSE 事件侧是 0），断点续生/进度面板
+                    # 读 DB 时失败章节显示 100% 进度，与 SSE 呈现矛盾。
+                    100 if status == "completed" else 0,
 
                     content=content if status == "completed" else None,
 
@@ -1012,6 +1033,17 @@ async def generate_content_impl(
 
                 finished = True
 
+                # BUG-FIX 2026-10-08（P2 状态错标）：早退分支原先只置 finished——
+                # SSE 主循环收到 stopped 事件 break 后，finally 走
+                # `elif finished: finalize_task("completed")`，把用户主动停止
+                # 写成 completed 入库。与下方 CancelledError 分支（置 stopped）
+                # 对齐。
+                stopped = True
+
+                # BUG-FIX 2026-10-08（P1 worker 泄漏）：本路径位于 try@1090 之外，
+                # 内层 finally 不会执行，先收敛配图 worker 再退出。
+                await _converge_chart_workers()
+
                 await queue.put({"status": "stopped", "message": "生成已取消"})
 
                 return
@@ -1080,6 +1112,15 @@ async def generate_content_impl(
                     # 同时写入 plan(table/mermaid/image 决策) + illustration_type + section_type
                     if isinstance(orchestration_result, list):
                         apply_orchestration_to_leaves(leaf_dicts, orchestration_result)
+
+                except asyncio.CancelledError:
+
+                    # BUG-FIX 2026-10-08（P1 worker 泄漏）：取消落在编排 await 上
+                    # （位于 try@1090 之外），内层 finally 不执行——先收敛配图
+                    # worker 再继续抛出。
+                    await _converge_chart_workers()
+
+                    raise
 
                 except Exception as e:
 
@@ -2564,6 +2605,8 @@ async def generate_content_impl(
 
                     async def _drain_queue():
 
+                        _drain_started = asyncio.get_running_loop().time()
+
                         try:
 
                             while True:
@@ -2586,7 +2629,17 @@ async def generate_content_impl(
 
                                 except TimeoutError:
 
-                                    break
+                                    # BUG-FIX 2026-10-08（P3）：30s 无事件不再直接退出——
+                                    # 单章 AI 长调用即可造成静默窗口，提前退出会让后续
+                                    # 事件在无界 queue 滞留至任务结束（与「防堆积」设计
+                                    # 意图不符）。终态事件（completed/error/stopped）
+                                    # 必达，由其驱动退出；兜底 4h 总时长上限（与 SSE
+                                    # 硬熔断一致）。
+                                    if asyncio.get_running_loop().time() - _drain_started >= 14400:
+
+                                        break
+
+                                    continue
 
                         except Exception as _e:
 
@@ -2743,6 +2796,17 @@ async def expand_content_impl(
             raise
         if not lock_record.get("acquired"):
             lock_record = {}  # 未登记分组等占位结果，无需释放
+
+        # BUG-FIX 2026-10-08（P1 锁失效）：扩写超时预算可达 4h > 锁 TTL 30min，
+        # 且本路径没有 update_section_progress 心跳 → 锁被 reclaim_stale 回收后，
+        # 同项目新的「生成正文」create_task 可抢锁成功，与仍在跑的扩写并发
+        # UPDATE 同一批 sections（正是上方注释要防的场景）。启动后台续约线程
+        # （与导出侧 start_keepalive 同机制），收尾时先 stop 再 release。
+        _stop_lock_keepalive = lambda: None  # noqa: E731 默认空操作
+        if lock_record.get("acquired"):
+            _stop_lock_keepalive = _task_lock.start_keepalive(
+                lock_record.get("lock_key", ""), lock_record.get("owner_id", "")
+            )
 
         # 注册取消事件
 
@@ -3358,6 +3422,8 @@ async def expand_content_impl(
                     logger.warning("[兜底扩写] 章节缓存失效失败（忽略）: %s", _inv_e)
 
                 # 4) 释放任务组锁（ENHANCE 2026-09-15）
+                # BUG-FIX 2026-10-08：先停 keepalive 再释放，避免续约与释放交错
+                _stop_lock_keepalive()
                 if lock_record.get("lock_key"):
 
                     try:

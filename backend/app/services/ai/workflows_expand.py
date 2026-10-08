@@ -6,6 +6,22 @@ import logging
 from typing import Any
 
 from ...utils import count_words as _count_words
+
+
+def _words_excluding_chart_payload(content: str) -> int:
+    """FIX 2026-10-08（P2 字数口径）：剔除图表围栏载荷（```mermaid / ```chart-json
+    代码体）后再计字数。图表代码字符（节点定义、任务表等）不计入正文字数，
+    否则大图表章节被误判「字数达标」而跳过扩写；探测字数同理失真。"""
+    try:
+        from ...services.content_cleaning import iter_chart_fences
+
+        text = content
+        for _lang, body, _mt in iter_chart_fences(content):
+            if body:
+                text = text.replace(body, "")
+        return _count_words(text)
+    except Exception:
+        return _count_words(content)
 from ...utils.json_parser import extract_json_from_text
 from .providers.base import AIMessage
 
@@ -216,29 +232,70 @@ def section_expand_threshold(
     level2_default: int = 3500,
     writing_length: str | None = None,
 ) -> int:
-    """单章节的扩写阈值（ENHANCE 2026-09-15，统一两处口径）。
+    """单章节的扩写阈值（2026-10-09 版：按三级目录 L3 自身正文口径）。
 
-    旧实现有两个互相矛盾且有问题的口径：
-    - 生成流程内用 `max(全章节 target)×80%` 做全局阈值 → L3 小节（分档目标 300 字）
-      也会被强拉到 ~2800 字，浪费大量 token 且违背字数分档标准；
-    - 独立「兜底扩写」端点用 writing_length 平铺阈值（standard=2000）→ 同样无视章节自身 target。
-    统一为：有 target 用 `target×80%`；无 target 按层级分档（L1=500/L2=level2_default/
-    L3=300/L4=400）；两者都不超过平铺阈值，且保底 200 字。
+    策略：
+      - **L1/L2**：父节点，不生成正文，不参与扩写，返回 0。
+      - **L3 自身正文**：目标 300 ± 20%（240~360 字）为唯一测量口径；
+        扩写达标线 = 300 × 80% = **240 字**。无下级目录章节的 L3
+        按此口径控制，生成层与校验层必须一致。
+      - **L3 非叶子（存在 L4+）**：四档 800/1200/2000/2500 作为
+        「L3 子树总字数」口径参与校验；扩写阈值按该子树目标 × 80% 计算。
+      - 优先级：单节点 target_words 精确覆盖 > 单节点 word_count_tier
+        > 全局 writing_length 档位 > 默认档位（L3 默认 300）。
 
-    ENHANCE 2026-10-07：新增 `writing_length` —— 二级目录及以下章节在正文生成阶段
-    已改由写作长度模式（简短/标准/详细/超长）实际控制字数，故此处对 L2+ 同样优先
-    取该模式的层级目标（中间值），避免「生成按模式、扩写又拉回旧目标」的自相矛盾。
+    Args:
+        section: 章节字典（含 level / target_words / word_count_tier）
+        flat_minimum: 平铺阈值（所有档位共享的扩写上限）
+        level2_default: [已废弃] 不再使用
+        writing_length: 全局档位 key（brief/standard/detailed/long）
+
+    Returns:
+        int: 扩写达标线（字数不足此值则触发扩写）；L1/L2 返回 0
     """
+    from .writing_length_config import (
+        get_l3_own_tolerance,
+        get_l3_own_target,
+        get_tier_config,
+        get_default_tier_config,
+    )
+
     level = int((section or {}).get("level") or 3)
-    if writing_length and level >= 2:
-        # 与正文生成一致：L2+ 由写作长度模式控制（中间值 ×80% 作为扩写达标线）
-        from .writing_length_config import level_target
-        _t = level_target(writing_length, level)
-        if _t:
-            return max(200, min(int(flat_minimum), int(_t * 0.8)))
+
+    # L1/L2 是父节点，不生成正文，不参与扩写
+    if level < 3:
+        return 0
+
+    # L3+：解析有效目标字数
+    # 1) 单节点 target_words（精确覆盖，用户显式设置）> 最高优先级
     target = int((section or {}).get("target_words") or 0)
     if target <= 0:
-        target = {1: 500, 2: level2_default, 3: 300, 4: 400}.get(level, 300)
+        # 2) 单节点 word_count_tier
+        tier_key = (section or {}).get("word_count_tier")
+        if tier_key:
+            cfg = get_tier_config(tier_key)
+            if cfg:
+                target = int(cfg["target_words"])
+        # 3) 全局 writing_length 档位
+        if target <= 0 and writing_length:
+            cfg = get_tier_config(writing_length)
+            if cfg:
+                target = int(cfg["target_words"])
+        # 4) 默认口径（前 3 步都未命中时才回落）：
+        #    - L3 自身正文 300 ± 20%（240~360）为唯一口径；
+        #    - 四档 800/1200/2000/2500 是「L3 子树总字数」口径，仅在 L3
+        #      存在下级目录章节（L4+）时参与校验；
+        #    - L4+ 深层叶子回落默认档位（standard 1200），与 sse_utils /
+        #      word_count._resolve_target_for_section 同口径。
+        if target <= 0:
+            if level == 3:
+                target = get_l3_own_target()
+            else:
+                default_cfg = get_default_tier_config()
+                target = int(default_cfg.get("target_words", 1200))
+
+
+    # 扩写达标线 = 目标字数 × 80%，不超过平铺阈值，保底 200 字
     return max(200, min(int(flat_minimum), int(target * 0.8)))
 
 
@@ -265,7 +322,7 @@ def collect_deficient_sections(
         if not section:
             continue
         threshold = section_expand_threshold(section, flat_minimum, level2_default, writing_length)
-        words = _count_words(content)
+        words = _words_excluding_chart_payload(content)
         if words < threshold:
             deficient.append(
                 {
@@ -344,7 +401,7 @@ async def expand_content_fallback(
             for round_idx in range(max(1, max_expansion_rounds)):
                 if cancel_event and cancel_event.is_set():
                     return
-                words = _count_words(content)
+                words = _words_excluding_chart_payload(content)
                 if words >= threshold:
                     break
                 expansion_target = max(words * 2, words + MIN_SECTION_EXPANSION_INCREMENT)
@@ -405,7 +462,7 @@ async def expand_content_fallback(
                 except Exception as e:
                     logger.warning("兜底扩写：%s 第 %d 轮失败: %s", title, round_idx + 1, e)
                     break
-            if _count_words(content) >= threshold:
+            if _words_excluding_chart_payload(content) >= threshold:
                 reached += 1
                 if on_section_done is not None:
                     try:

@@ -88,9 +88,14 @@ export default function FileUploadPage() {
   // ENHANCE 2026-10-05（G8 数据链闭环）：后端 GET /tasks/files/status 的项目级解析
   // 状态聚合此前前端完全没有消费方。上传在途期间按 1.5s 轮询，让批量上传有可见进度。
   const [parseStatus, setParseStatus] = useState<FileParsingStatus | null>(null);
+  const loadFilesRef = useRef(false);
 
   const loadFiles = useCallback(async () => {
     if (!projectId) return;
+    // BUG-FIX 2026-10-08：批量上传时多个 handleUpload 并发调用 loadFiles，
+    // 导致竞态和不必要的网络请求。用 ref 标记在途状态，已有请求在途时跳过。
+    if (loadFilesRef.current) return;
+    loadFilesRef.current = true;
     try {
       const data = await fetchFiles(projectId);
       setFiles(data || []);
@@ -98,6 +103,7 @@ export default function FileUploadPage() {
       // 静默处理
     } finally {
       setLoading(false);
+      loadFilesRef.current = false;
     }
   }, [projectId]);
 
@@ -134,6 +140,14 @@ export default function FileUploadPage() {
   const handleUpload = async (options: UploadRequestOptions) => {
     const { file, onSuccess, onError } = options;
     if (!projectId) return;
+
+    // BUG-FIX 2026-10-08：客户端文件大小校验，避免超大文件先读入内存再被后端拒绝
+    const MAX_FILE_SIZE = 50 * 1024 * 1024; // 50MB，与后端 MAX_FILE_SIZE 对齐
+    if ((file as File).size > MAX_FILE_SIZE) {
+      message.error(`${(file as File).name} 文件大小超过 50MB 限制`);
+      onError?.(new Error("文件大小超过 50MB 限制"));
+      return;
+    }
 
     pendingRef.current += 1;
     setUploadingCount(pendingRef.current);

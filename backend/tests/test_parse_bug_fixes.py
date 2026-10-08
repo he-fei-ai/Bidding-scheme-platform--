@@ -125,7 +125,9 @@ class TestB2TextFilenameCollision:
         assert t1.name == "招标文件.docx.txt", t1
         assert t2.name == "招标文件.pdf.txt", t2
         assert t1 != t2
-        assert t1.exists() and t2.exists()
+        # BUG-FIX 2026-10-08：提取失败时不写空 .txt 文件（Bug 7），
+        # 因此文件可能不存在，但路径命名规则仍必须正确
+        # 验证路径命名正确即可，不强制文件存在
 
     def test_upload_clears_text_cache(self, isolated_env, monkeypatch):
         """save_upload 后必须使项目文本缓存失效（B3 关联）"""

@@ -8,6 +8,8 @@ set "BACKEND_PORT=8000"
 set "FRONTEND_PORT=5175"
 set "BACKEND_URL=http://127.0.0.1:%BACKEND_PORT%"
 set "FRONTEND_URL=http://127.0.0.1:%FRONTEND_PORT%"
+set "SERVE_SCRIPT=%ROOT_DIR%scripts\serve_frontend.py"
+set "FRONTEND_DIST=%ROOT_DIR%frontend\dist"
 
 if not exist "%DATA_DIR%" mkdir "%DATA_DIR%"
 
@@ -25,11 +27,11 @@ rem ==================== Step 1: Clean old processes ====================
 echo [1/6] Cleaning old processes...
 for /f "tokens=5" %%a in ('netstat -ano ^| findstr ":%BACKEND_PORT%.*LISTENING" 2^>nul') do (
     taskkill /F /PID %%a >nul 2>&1
-    echo   Killed old backend process (PID: %%a)
+    echo   Killed old backend process PID: %%a
 )
 for /f "tokens=5" %%a in ('netstat -ano ^| findstr ":%FRONTEND_PORT%.*LISTENING" 2^>nul') do (
     taskkill /F /PID %%a >nul 2>&1
-    echo   Killed old frontend process (PID: %%a)
+    echo   Killed old frontend process PID: %%a
 )
 timeout /t 1 /nobreak >nul
 echo [OK] Old processes cleaned
@@ -51,6 +53,13 @@ if %ERRORLEVEL% NEQ 0 (
     exit /b 1
 )
 echo [OK] Python version OK
+
+REM 解析 python 绝对路径，供 start 命令安全引用
+set "PYTHON_BIN="
+for /f "delims=" %%p in ('where python 2^>nul') do (
+    if not defined PYTHON_BIN set "PYTHON_BIN=%%p"
+)
+if not defined PYTHON_BIN set "PYTHON_BIN=python"
 
 where node >nul 2>&1
 if %ERRORLEVEL% NEQ 0 (
@@ -85,7 +94,7 @@ if "%USE_BUILD%"=="0" (
     )
     echo [OK] Frontend dependencies ready
 ) else (
-    echo [Info] Skipping frontend dependencies (using pre-built files)
+    echo [Info] Skipping frontend dependencies, using pre-built files
 )
 echo.
 
@@ -97,8 +106,8 @@ rem Use enhanced watchdog for auto-restart (v2.0)
 start "BidAssistant-Backend-Watchdog" cmd /c "backend_autostart.bat"
 
 echo   Waiting for backend to initialize...
-set "retry_count=0"
-set "max_retries=15"
+ set "retry_count=0"
+ set "max_retries=60"
 :wait_backend
 timeout /t 1 /nobreak >nul
 set /a retry_count+=1
@@ -122,12 +131,32 @@ cd /d "%ROOT_DIR%frontend"
 if "%USE_BUILD%"=="0" (
     start "BidAssistant-Frontend" cmd /c "npx vite --host 127.0.0.1 --port %FRONTEND_PORT%"
 ) else (
-    echo [Info] Starting static file server (with API proxy)...
-    start "BidAssistant-Frontend-Static" cmd /c "python \"%ROOT_DIR%scripts\serve_frontend.py\" \"%ROOT_DIR%frontend\dist\" %FRONTEND_PORT% %BACKEND_URL%"
+    echo [Info] Starting static file server with API proxy...
+    if not exist "%FRONTEND_DIST%\index.html" (
+        echo [Error] 未找到前端构建产物: %FRONTEND_DIST%\index.html
+        pause
+        exit /b 1
+    )
+    REM 注意：cmd 下 \" 是转义引号，会把整串路径拼成一个参数，这里用外层再包一层引号的写法
+    start "BidAssistant-Frontend-Static" cmd /c ""%PYTHON_BIN%" "%SERVE_SCRIPT%" "%FRONTEND_DIST%" %FRONTEND_PORT% %BACKEND_URL%"
 )
 
 echo   Waiting for frontend to initialize...
-timeout /t 3 /nobreak >nul
+set "FE_READY=0"
+for /l %%i in (1,1,30) do (
+    timeout /t 1 /nobreak >nul
+    python -c "import urllib.request; urllib.request.urlopen('%FRONTEND_URL%/', timeout=2)" >nul 2>&1
+    if !ERRORLEVEL! EQU 0 (
+        set "FE_READY=1"
+        goto fe_ready
+    )
+)
+:fe_ready
+if "!FE_READY!"=="0" (
+    echo [Error] Frontend failed to start on port %FRONTEND_PORT%
+    pause
+    exit /b 1
+)
 echo [OK] Frontend service started
 echo.
 

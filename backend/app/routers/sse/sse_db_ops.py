@@ -107,6 +107,20 @@ def _save_section_to_db(
 
             # 导致 DB 存储的 word_count 与前端进度条/日志显示的字数不符。
 
+            # BUG-2026-1008-02 修复（P1）：正文清洗——移除重复标题、Markdown
+            # 标记、首行编号前缀，避免导出文档中出现双重标题。
+            if content:
+                try:
+                    _title_row = conn.execute(
+                        "SELECT title FROM sections WHERE id = ?", (section_id,)
+                    ).fetchone()
+                    _section_title = _title_row["title"] if _title_row else ""
+                    from ...services.content_cleaning import ContentCleaner
+
+                    content = ContentCleaner().clean(_section_title, content)
+                except Exception as _e:
+                    logger.debug("[SSE] 正文清洗失败（忽略，保留原内容）: %s", _e)
+
             word_count = _count_words(content) if content else 0
 
             conn.execute(
@@ -626,9 +640,9 @@ def _clear_and_save_outline(project_id: int, outline: list) -> list:
 
                 cursor = conn.execute(
 
-                    """INSERT INTO sections (project_id, parent_id, title, level, sort_order, section_type, scoring_point_id, target_words, status)
+                    """INSERT INTO sections (project_id, parent_id, title, level, sort_order, section_type, scoring_point_id, target_words, status, graph_suitable, suggested_chart)
 
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active')""",
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)""",
 
                     (
 
@@ -652,6 +666,15 @@ def _clear_and_save_outline(project_id: int, outline: list) -> list:
                         # 预算全部丢失，_get_effective_target_words 只能回退层级默认值，
                         # 前端「字数预算」面板与实际生成预算不一致。
                         node.get("target_words"),
+
+                        # ENHANCE 2026-10-08（跨模块数据链修复）：目录生成阶段由 AI 标注的
+                        # 「是否适合配图 / 建议图表类型」此前只存在于内存树，落库时被整条
+                        # 丢弃（INSERT 不含这两列），图表模块无从读取 → 跨模块数据传递丢失。
+                        # 现落库并随 saved_node 透出，下游图表模块可据此直接复用目录阶段的
+                        # 图表预测（PRD §2.2.1 的 chart_predictions 意图）。
+                        1 if node.get("graph_suitable") else 0,
+
+                        str(node.get("suggested_chart") or ""),
 
                     ),
 
@@ -711,6 +734,12 @@ def _clear_and_save_outline(project_id: int, outline: list) -> list:
                     "sort_order": sort_order,
 
                     "status": "active",
+
+                    # ENHANCE 2026-10-08（跨模块数据链修复）：把目录阶段 AI 标注的图表适配
+                    # 信号随节点透出，build_tree / 前端 / 图表模块均可读取（此前被丢弃）。
+                    "graph_suitable": bool(node.get("graph_suitable")),
+
+                    "suggested_chart": str(node.get("suggested_chart") or ""),
 
                     # ENHANCE 2026-09-18：回填了旧正文的节点如实上报，避免前端
                     # 把「已保留正文」的章节显示成空白待生成。
@@ -790,6 +819,46 @@ def _clear_and_save_outline(project_id: int, outline: list) -> list:
                 logger.error(
                     "目录重建后完整性自检异常 project=%d：悬空父节点 %d，同父重复 sort_order %d",
                     project_id, _orphans, _dup_orders,
+                )
+            # ENHANCE 2026-10-08（层级完整率可观测）：结构三项之外再查
+            # 「level == 实际父子深度」。_save_nodes 本就按深度写 level，正常
+            # 链路恒通过；一旦触发说明写入链路被绕过/数据被旁路改过 —— 而 level
+            # 漂移会让前端编号分组、DOCX outlineLvl、字数分档三处同时错，
+            # 却是此前完全不可见的盲区（对齐上方注释「必须留痕」的自检意图）。
+            # 必须复用**同一个 conn**：此刻写事务仍持有 db.py 的进程级写锁，
+            # 另开连接（哪怕 readonly）会直接拿到 "database is locked"，
+            # 自检就从「兜底留痕」退化成「每次都失败刷日志」。故用递归 CTE 在
+            # 同连接上一次性算出深度，口径同 services.sections.validate_outline_levels。
+            _level_mismatch = conn.execute(
+                "WITH RECURSIVE dep(id, depth) AS ("
+                "  SELECT id, 1 FROM sections WHERE project_id = ? AND parent_id IS NULL"
+                "  UNION ALL"
+                "  SELECT s.id, dep.depth + 1 FROM sections s"
+                "  JOIN dep ON s.parent_id = dep.id WHERE dep.depth < 8"
+                ") SELECT COUNT(*) FROM sections s JOIN dep ON s.id = dep.id"
+                " WHERE COALESCE(s.level, 0) <> dep.depth",
+                (project_id,),
+            ).fetchone()[0]
+            _max_depth = conn.execute(
+                "WITH RECURSIVE dep(id, depth) AS ("
+                "  SELECT id, 1 FROM sections WHERE project_id = ? AND parent_id IS NULL"
+                "  UNION ALL"
+                "  SELECT s.id, dep.depth + 1 FROM sections s"
+                "  JOIN dep ON s.parent_id = dep.id WHERE dep.depth < 64"
+                ") SELECT COALESCE(MAX(depth), 0) FROM dep",
+                (project_id,),
+            ).fetchone()[0]
+            if _level_mismatch:
+                logger.error(
+                    "目录重建后层级自检异常 project=%d：%d 个节点的 level 与实际层级深度不一致"
+                    "（前端编号/DOCX 大纲层级/字数分档会错位）",
+                    project_id, _level_mismatch,
+                )
+            if _max_depth > 8:
+                logger.error(
+                    "目录重建后层级自检异常 project=%d：最大层级深度 %d 超出可管理上限 8"
+                    "（编号命名空间只定义到 L8，导出大纲层级将失真）",
+                    project_id, _max_depth,
                 )
         except Exception as _chk_e:
             logger.warning("目录重建后完整性自检失败（忽略）project=%d: %s", project_id, _chk_e)

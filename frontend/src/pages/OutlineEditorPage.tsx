@@ -19,17 +19,25 @@ import {
   type OutlineMode, getStoredOutlineMode, storeOutlineMode,
 } from "../api";
 import type { SectionTreeNode } from "../types";
-import { extractApiError, annotateOutlineWithNumbers, getLevelColor, getLevelLabel, findNodeInTree, updateNodeInTree, OUTLINE_STEPS_V51, reduceOutlineGeneratingEvent } from "../utils";
+import { extractApiError, annotateOutlineWithNumbers, getLevelColor, getLevelLabel, findNodeInTree, updateNodeInTree, OUTLINE_STEPS_V51, reduceOutlineGeneratingEvent, outlineDictToTreeNodes, nextFreeSortOrder, allocTempNodeId } from "../utils";
 import RecoveryBanner from "../components/RecoveryBanner";
 import VersionHistory from "../components/VersionHistory";
 
 const { Text, Title } = Typography;
 
 function countTotalNodes(nodes: SectionTreeNode[]): number {
+  // BUG-FIX 2026-10-08（超深层级）：原实现自递归，深目录树（AI 生成异常或
+  // 用户手工拖出的长链）在数百层后触发 JS 调用栈上限，页面直接崩白。
+  // 改为显式栈迭代，任意深度不爆栈。
   let c = 0;
-  for (const n of nodes) {
-    c++;
-    if (n.children && n.children.length > 0) c += countTotalNodes(n.children);
+  const stack: SectionTreeNode[][] = Array.isArray(nodes) ? [nodes] : [];
+  while (stack.length > 0) {
+    const current = stack.pop()!;
+    for (const n of current) {
+      if (!n) continue;
+      c += 1;
+      if (Array.isArray(n.children) && n.children.length > 0) stack.push(n.children);
+    }
   }
   return c;
 }
@@ -60,22 +68,6 @@ function addChildToTree(
     }
     return n;
   });
-}
-
-/** 将后端 outline 字典转换为 SectionTreeNode 格式 */
-function outlineDictToTreeNodes(nodes: any[]): SectionTreeNode[] {
-  return nodes.map((n: any, idx: number) => ({
-    id: n.id ?? -(idx + 1),
-    title: n.title || "",
-    level: n.level ?? 1,
-    sort_order: n.sort_order ?? idx,
-    section_type: n.section_type || "text",
-    scoring_point_id: n.scoring_point_id ?? null,
-    status: "active",
-    children: n.children ? outlineDictToTreeNodes(n.children) : [],
-    has_content: false,
-    word_count: 0,
-  }));
 }
 
 export default React.memo(function OutlineEditorPage() {
@@ -708,6 +700,23 @@ export default React.memo(function OutlineEditorPage() {
           <span style={{ color: getLevelColor(node.level), fontSize: 11, fontWeight: 600, minWidth: 48, flexShrink: 0 }}>
             {getLevelLabel(node.level)}
           </span>
+          {/* ENHANCE 2026-10-08（功能缺口 · 编号命名空间统一）：annotatedTree 一直
+              在算、却从未被渲染，导致本模块自己派生的标准编号（第一节、/ 1.1、）
+              在目录编辑页完全看不到 —— 用户核对目录结构时只能靠层级标签，
+              与导出 DOCX 的编号无法对照。正文编辑页已渲染 node.number，
+              这里补齐同一口径（两者都出自 annotateOutlineWithNumbers）。 */}
+          {node.number && (
+            <span
+              style={{
+                color: "#8c8c8c",
+                fontSize: 11,
+                flexShrink: 0,
+                fontVariantNumeric: "tabular-nums",
+              }}
+            >
+              {node.number}
+            </span>
+          )}
           <Text
             ellipsis
             style={{
@@ -767,18 +776,22 @@ export default React.memo(function OutlineEditorPage() {
     setPendingReviewTree(newTree);
   };
 
-  const handleReviewAddNode = () => {
+const handleReviewAddNode = () => {
     if (!pendingReviewTree) return;
-    // BUG-FIX-TEMPID-01：取现有最小 ID 再递减，避免"添加→删除→再添加"产生重复临时 ID
-    const minId = pendingReviewTree.reduce(
-      (min, n) => (n.id < min ? n.id : min),
-      0
-    );
+    // BUG-FIX 2026-10-08（原实现取「顶层节点的最小 id 再递减」）：
+    //  (a) 只扫了顶层，L2/最终审核阶段子节点带的是另一批临时 id，取顶层最小值
+    //      必然与某个子节点撞号 → 同 id 节点共用一份 reviewEditTitles 记录，
+    //      又一次「改一个改名一片」；
+    //  (b) 顶层最小 id 每次新增都复用同一个值，「添加→删除→再添加」会与残留
+    //      id 冲突（BUG-FIX-TEMPID-01 只解决了顶层，未覆盖新增子节点）。
+    // 改用与 outlineDictToTreeNodes 同一个全局单调递减分配器，永不撞号。
     const newNode: SectionTreeNode = {
-      id: minId - 1, // 临时负 ID
+      id: allocTempNodeId(),
       title: "新章节",
       level: 1,
-      sort_order: pendingReviewTree.length,
+      // sort_order 原用 pendingReviewTree.length：与已有节点的 sort_order 撞号
+      // 时落库排序不确定。改为 1 起找第一个空位（与 outlineDictToTreeNodes 口径一致）。
+      sort_order: nextFreeSortOrder(pendingReviewTree),
       section_type: "text",
       scoring_point_id: null,
       status: "pending",
@@ -793,7 +806,7 @@ export default React.memo(function OutlineEditorPage() {
     if (!pendingReviewTree) return;
 
     // 应用编辑后的标题（递归应用到所有层级）
-    const applyTitles = (nodes: SectionTreeNode[]): SectionTreeNode[] =>
+const applyTitles = (nodes: SectionTreeNode[]): SectionTreeNode[] =>
       nodes.map((node) => ({
         ...node,
         // BUG-FIX-EMPTYTITLE-01：区分"未编辑"与"编辑为空"，
@@ -801,14 +814,21 @@ export default React.memo(function OutlineEditorPage() {
         title:
           reviewEditTitles[node.id] !== undefined
             ? reviewEditTitles[node.id]
-            : node.title,
+            : typeof node.title === "string"
+              ? node.title
+              : normalizeNodeTitle(node.title),
         children: node.children ? applyTitles(node.children) : [],
       }));
     const finalTree = applyTitles(pendingReviewTree);
 
-    // 检查是否有空标题（递归检查所有层级）
+// 检查是否有空标题（递归检查所有层级）
+    // BUG-FIX 2026-10-08（空数据/编码）：原实现 `!n.title.trim()` 在 title
+    // 非字符串（null/数字）时抛 TypeError，整个审核确认流程中断且无提示。
+    // 统一用 String(...) 归一化后再判空。
+    const titleOf = (n: SectionTreeNode): string =>
+      typeof n.title === "string" ? n.title.trim() : String(n.title ?? "").trim();
     const hasEmptyTitle = (nodes: SectionTreeNode[]): boolean =>
-      nodes.some((n) => !n.title.trim() || (n.children ? hasEmptyTitle(n.children) : false));
+      nodes.some((n) => !titleOf(n) || (n.children ? hasEmptyTitle(n.children) : false));
     if (hasEmptyTitle(finalTree)) {
       message.warning("存在空标题，请完善后再确认");
       return;

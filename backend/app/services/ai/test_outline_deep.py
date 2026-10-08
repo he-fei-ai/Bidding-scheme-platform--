@@ -1,5 +1,5 @@
 import sys
-sys.path.insert(0, "..\..\..")
+sys.path.insert(0, r"..\..\..")  # 遗留项 2026-10-08：raw string 消除 SyntaxWarning
 
 # === 测试 1: _auto_fix_issues 重复标题修复 ===
 from workflows_outline_v51 import _auto_fix_issues

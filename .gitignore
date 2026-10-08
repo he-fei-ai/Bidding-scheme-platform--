@@ -54,3 +54,5 @@ test_output/
 acl-repair/
 .trae-html-share-packages/
 frontend_vitest_*.txt
+
+/_*.txt

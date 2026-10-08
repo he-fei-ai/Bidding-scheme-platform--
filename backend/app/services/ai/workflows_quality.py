@@ -15,6 +15,36 @@ from .providers.base import AIMessage
 logger = logging.getLogger(__name__)
 
 
+def _strip_chart_payloads(content: str) -> str:
+    """剔除图表围栏载荷（```mermaid / ```chart-json 代码体）后的正文。
+
+    FIX 2026-10-08（遗留7）：质量统计口径必须排除图表代码——mermaid 节点定义、
+    chart-json 的任务表往往几百字符，计入 `char_count` 会让大图表章节的
+    「字数达成」虚高（权重 0.35 的维度失真）。
+    """
+    if not content or "```" not in content:
+        return content
+    try:
+        from ..content_cleaning import CHART_FENCE_SCAN_PATTERN
+
+        # 整块移除（含 ```mermaid / ```chart-json 的标记行），不留任何残渣
+        return CHART_FENCE_SCAN_PATTERN.sub("", content)
+    except Exception:  # 解析不可用：退化为原文（向后兼容）
+        return content
+
+
+def _count_chart_fences(content: str) -> int:
+    """统计正文里的图表围栏块数量（用于「标记使用」维度）。"""
+    if not content or "```" not in content:
+        return 0
+    try:
+        from ..content_cleaning import iter_chart_fences
+
+        return sum(1 for _ in iter_chart_fences(content))
+    except Exception:
+        return 0
+
+
 from .workflows_base import _fill_template, collect_json_response, with_timeout
 from .workflows_outline_utils import _title_similarity
 
@@ -447,8 +477,11 @@ def score_section_quality_local(
     维度与权重：字数达成 0.35 / 段落结构 0.20 / 具体性 0.15 / 重复度 0.20 / 标记使用 0.10
     """
     text = content or ""
+    # FIX 2026-10-08（遗留7）：先剔除图表围栏载荷，再进入后续度量。
+    # 否则 mermaid/chart-json 代码体会计入字数/段落/重复句/具体性四大维度。
+    _text_no_charts = _strip_chart_payloads(text)
     # 去 HTML 标签与 Markdown 修饰符，保留正文语义
-    plain = re.sub(r"<[^>]+>", "", text)
+    plain = re.sub(r"<[^>]+>", "", _text_no_charts)
     plain = re.sub(r"[#*`>|]", " ", plain)
     char_count = len(re.sub(r"\s", "", plain))
 
@@ -487,9 +520,13 @@ def score_section_quality_local(
         dup_ratio = 1.0 - (len(set(sentences)) / float(len(sentences)))
     repeat_score = max(0.0, 100.0 - dup_ratio * 200.0)
 
-    # 5) 标记使用：图表标记 + 列表项
-    marker_hits = len(re.findall(r"<<CHART:", text)) + len(
-        re.findall(r"^\s*(?:[-*]|\d+[.、])", plain, re.M)
+    # 5) 标记使用：图表标记 + 图表围栏 + 列表项
+    # FIX 2026-10-08（遗留7）：提示词已改为 mermaid/chart-json 围栏产出，
+    # 旧实现只数 `<<CHART:` → 围栏式章节本维度恒为 0 分。
+    marker_hits = (
+        len(re.findall(r"<<CHART:", text))
+        + _count_chart_fences(text)
+        + len(re.findall(r"^\s*(?:[-*]|\d+[.、])", plain, re.M))
     )
     marker_score = min(100.0, marker_hits / 6.0 * 100.0)
 

@@ -62,7 +62,16 @@ def test_analysis_tender_summary_wires_sanitize_desensitize():
             captured.update(kwargs)
         return f"sys_or_user::{key}"
 
-    with patch.object(wa, "get_prompt", _fake_get_prompt):
+    async def _fake_call_ai_text(provider, messages, **kwargs):
+        return "生成的招标摘要文本"
+
+    # F-P0-2（2026-10-07）后 generate_tender_summary 走 call_ai_text 且
+    # require_nonempty=True —— 空响应会抛 EmptyAIResponseError。
+    # 本测试只验证提示词管道的 sanitize/desensitize 传参，须把 AI 调用替身
+    # 一并 mock（原测试用返回 "" 的 Provider，在 F-P0-2 落地后必然失败）。
+    with patch.object(wa, "get_prompt", _fake_get_prompt), patch.object(
+        wa, "call_ai_text", new=_fake_call_ai_text
+    ):
         asyncio.run(
             wa.generate_tender_summary(
                 _FakeProvider(),

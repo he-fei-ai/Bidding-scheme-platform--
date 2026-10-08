@@ -618,9 +618,14 @@ function StackedBars({ phases, matrix, categories, max }: { phases: string[]; ma
         const cx = padX + p * colW + colW / 2;
         const barW = colW * 0.6;
         let cum = 0;
+        // BUG-FIX 2026-10-08（P0 白屏）：matrix[p] 在载荷不完整时可能为 undefined
+        // （phases 比 data 行数长），`matrix[p].map` 直接抛 TypeError。
+        // App.tsx 的 ErrorBoundary 会把**整个 SPA**（含登录壳）替换成「页面出现问题」
+        // 且 hasError 永不复位 → 一次畸形图表数据就让整个标签页报废、编辑内容全丢。
+        const stack = matrix[p] || [];
         return (
           <g key={p}>
-            {matrix[p].map((v, c) => {
+            {stack.map((v, c) => {
               const h = (v / max) * chartH;
               const y = padY + chartH - cum - h;
               cum += h;
@@ -668,7 +673,11 @@ function LineChart({ phases, values, max }: { phases: string[]; values: number[]
     return { x, y, v };
   });
   const path = points.map((p, i) => `${i === 0 ? "M" : "L"} ${p.x} ${p.y}`).join(" ");
-  const fillPath = `${path} L ${points[points.length - 1].x} ${padY + chartH} L ${points[0].x} ${padY + chartH} Z`;
+  // BUG-FIX 2026-10-08（P0 白屏）：values 为空数组时 points 为空，
+  // `points[points.length - 1].x` 抛 TypeError → 整个 SPA 被 ErrorBoundary 接管。
+  const fillPath = points.length
+    ? `${path} L ${points[points.length - 1].x} ${padY + chartH} L ${points[0].x} ${padY + chartH} Z`
+    : "";
   const gradId = uniqueSvgId("laborFillGrad");
   return (
     <svg width="100%" viewBox={`0 0 ${W} ${H}`} style={{ display: "block", background: "#fafafa", borderRadius: 4 }}>
@@ -689,7 +698,7 @@ function LineChart({ phases, values, max }: { phases: string[]; values: number[]
           <circle cx={p.x} cy={p.y} r={3.5} fill="#1D4ED8" stroke="#fff" strokeWidth={1.5} />
           <text x={p.x} y={p.y - 7} textAnchor="middle" fontSize={9} fill="#1E3A5F" fontWeight={600}>{p.v}</text>
           <text x={p.x} y={padY + chartH + 10} textAnchor="middle" fontSize={9} fill="#374151" style={{ fontFamily: CHART_FONT }}>
-            {truncate(phases[i], 6)}
+            {truncate(phases[i] || "", 6)}
           </text>
         </g>
       ))}
@@ -1412,26 +1421,91 @@ function ChartBlock({ text, sectionCharts }: { text: string; sectionCharts?: Sec
   }
 }
 
-function parseContent(content: string): { type: "table" | "chart" | "text"; value: string }[] {
-  const blocks: { type: "table" | "chart" | "text"; value: string }[] = [];
+type PreviewBlock = { type: "table" | "chart" | "text" | "mermaid"; value: string };
+
+/** 图表围栏起始行：与后端 content_cleaning.CHART_FENCE_OPEN_PATTERN 同口径
+ *  （支持 ``` / ~~~ 两种围栏与 chart-json / chart_json / chartjson 三种标签）。 */
+const CHART_FENCE_OPEN = /^(?:`{3,}|~{3,})[ \t]*(mermaid|chart[-_]?json)[ \t]*(?:\{[^}]*\})?[ \t]*$/i;
+const FENCE_CLOSE = /^(?:`{3,}|~{3,})[ \t]*$/;
+const CHART_FENCE_HARD_LINE_LIMIT = 5000;
+/** 标记聚合上限：与后端 CHART_MARKER 40 行 / 表格 60 行对齐 */
+const MARKER_AGGREGATE_LIMIT = 60;
+
+function parseContent(content: string): PreviewBlock[] {
+  const blocks: PreviewBlock[] = [];
   const lines = content.split("\n");
   let i = 0;
+
+  /** 把一行按 text 块追加（相邻 text 合并） */
+  const pushText = (line: string) => {
+    const last = blocks[blocks.length - 1];
+    if (last && last.type === "text") last.value += "\n" + line;
+    else blocks.push({ type: "text", value: line });
+  };
 
   while (i < lines.length) {
     const line = lines[i];
 
-    if (/^<<表格[:：]/.test(line)) {
-      const tableLines: string[] = [line];
-      i++;
-      while (i < lines.length) {
-        const tline = lines[i].trim();
-        if (tline.endsWith(">>")) {
-          tableLines.push(tline);
-          i++;
+    // ---- BUG-FIX 2026-10-08（P0 围栏原文暴露）----
+    // 正文生成提示词明确要求 AI 用 ```mermaid / ```chart-json 围栏输出图表
+    // （backend/app/services/ai/prompts/content.py），而本函数此前**只认**
+    // <<表格…>> / <<CHART:…>> 标记，没有任何围栏分支 →
+    // 围栏整块落入 text 分支被 pre-wrap 原样显示，用户在章节编写页看到的是
+    // "```mermaid / graph TD / A-->B" 这种源码，而不是图表。
+    const fenceOpen = CHART_FENCE_OPEN.exec(line.trim());
+    if (fenceOpen) {
+      const lang = fenceOpen[1].toLowerCase();
+      const body: string[] = [];
+      let j = i + 1;
+      let closed = false;
+      while (j < lines.length) {
+        if (FENCE_CLOSE.test(lines[j].trim())) {
+          closed = true;
           break;
         }
-        if (tline) tableLines.push(tline);
+        // 遇到下一个围栏起始行 → 视为本块未闭合
+        if (/^(?:`{3,}|~{3,})/.test(lines[j].trim())) break;
+        body.push(lines[j]);
+        j += 1;
+        if (j - i > CHART_FENCE_HARD_LINE_LIMIT) break;
+      }
+      const payload = body.join("\n").trim();
+      if (closed && payload) {
+        if (/^mermaid$/.test(lang)) {
+          blocks.push({ type: "mermaid", value: payload });
+        } else {
+          try {
+            const obj = JSON.parse(payload);
+            // 归一成后端/parseChartPayload 认识的标记形态，交给既有 ChartBlock 通道
+            blocks.push({ type: "chart", value: `<<CHART:${JSON.stringify(obj)}>>` });
+          } catch {
+            // 载荷非法：绝不把 JSON 源码当正文显示（与后端"坏块删除"口径一致）
+            i = j + 1;
+            continue;
+          }
+        }
+        i = j + 1;
+        continue;
+      }
+      // 未闭合 / 空载荷：按后端口径删除坏块，绝不把源码写进预览
+      i = j + 1;
+      continue;
+    }
+
+    if (/^<<表格[:：]/.test(line)) {
+      // BUG-FIX 2026-10-08（P1 未闭合标记吞后文）：原实现无上限地聚合到
+      // 文末（只判断 endsWith(">>")），AI 输出被 token 截断时一个缺失的 ">>"
+      // 会把**后面所有正文**吞进表格块 → 预览里下方内容整片消失且无任何报错。
+      // 现在三重退出条件：空行、新标记起始、聚合上限。
+      const tableLines: string[] = [line];
+      i++;
+      while (i < lines.length && tableLines.length <= MARKER_AGGREGATE_LIMIT) {
+        const tline = lines[i].trim();
+        if (!tline) break; // 空行 = 块边界
+        if (/^<<|^\[\[/.test(tline)) break; // 新的标记起始
+        tableLines.push(tline);
         i++;
+        if (tline.endsWith(">>")) break;
       }
       blocks.push({ type: "table", value: tableLines.join("\n") });
       continue;
@@ -1447,13 +1521,18 @@ function parseContent(content: string): { type: "table" | "chart" | "text"; valu
         continue;
       }
       // 多行图表（JSON 中可能包含换行）
+      // BUG-FIX 2026-10-08（P1）：同表格 —— 加上空行/新标记/行数上限三重退出条件，
+      // 避免一个未闭合标记把整章正文吞进 chart 块。
       const chartLines: string[] = [line];
       i++;
       const isDoubleBracket = line.trim().startsWith("[[");
       const endMarker = isDoubleBracket ? "]]" : ">>";
-      while (i < lines.length) {
+      while (i < lines.length && chartLines.length <= MARKER_AGGREGATE_LIMIT) {
+        const nline = lines[i].trim();
+        if (!nline) break;
+        if (/^<<|^\[\[/.test(nline)) break;
         chartLines.push(lines[i]);
-        if (lines[i].trim().endsWith(endMarker)) {
+        if (nline.endsWith(endMarker)) {
           i++;
           break;
         }
@@ -1463,11 +1542,7 @@ function parseContent(content: string): { type: "table" | "chart" | "text"; valu
       continue;
     }
 
-    if (blocks.length > 0 && blocks[blocks.length - 1].type === "text") {
-      blocks[blocks.length - 1].value += "\n" + line;
-    } else {
-      blocks.push({ type: "text", value: line });
-    }
+    pushText(line);
     i++;
   }
 
@@ -1534,6 +1609,11 @@ export default React.memo(function ContentPreview({ content, sectionCharts }: Co
           }
           if (block.type === "chart") {
             return <ChartBlock key={idx} text={block.value} sectionCharts={sectionCharts} />;
+          }
+          if (block.type === "mermaid") {
+            // BUG-FIX 2026-10-08（P0）：正文围栏里的 mermaid 源码直接出图，
+            // 不再以 pre-wrap 文本显示给用户。
+            return <MermaidInlineBlock key={idx} code={block.value} />;
           }
           return (
             <p key={idx} style={{ margin: "6px 0", whiteSpace: "pre-wrap", textAlign: "justify" }}>

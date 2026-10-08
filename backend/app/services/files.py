@@ -93,6 +93,10 @@ def normalize_file_role(file_role: str, filename: str = "") -> str:
 # BUG-FIX-71: MinerU 单例初始化锁，防止多线程并发创建多个实例
 _mineru_lock = threading.Lock()
 
+# BUG-FIX 2026-10-08：MinerU 解析器单例从函数属性改为模块级变量，
+# 避免模块重载时属性丢失导致重复创建实例（内存泄漏风险）
+_mineru_parser_instance = None
+
 # BUG-FIX 2026-10-04（P2 并发竞态）：save_upload 经 asyncio.to_thread 走线程池，
 # 同一项目并发上传同名文件时，"存在性检查→重命名→write_bytes" 非原子：两个线程
 # 可能同时通过 exists() 判定、选中同一目标路径与同一文本文件名（f"{filename}.txt"），
@@ -114,12 +118,22 @@ def _get_upload_write_lock(project_id: int) -> threading.Lock:
 
 
 def _get_file_hash(file_path: str) -> str:
-    """计算文件的快速哈希（基于文件大小和修改时间）"""
+    """计算文件的快速哈希（基于文件大小、修改时间与前 4KB 内容）"""
     try:
         stat = os.stat(file_path)
-        # 使用文件大小和修改时间作为快速标识
         raw = f"{stat.st_size}_{stat.st_mtime_ns}"
-        return hashlib.md5(raw.encode()).hexdigest()
+        digest = hashlib.md5(raw.encode()).hexdigest()
+        # BUG-FIX 2026-10-08（CF-03 哈希碰撞）：仅靠 size+mtime_ns 在「同大小 +
+        # 同一 mtime 刻度」的两个不同文件上必然碰撞（全量回归实测复现：
+        # 两个 9 字节临时文件连续创建命中同一刻度 → 哈希相同 → 解析缓存把
+        # A 文件的解析结果错配给 B 文件）。旧兜底只在 st_mtime_ns==0 时追加
+        # 内容哈希，覆盖不了 mtime 刻度粒度粗的文件系统。现无条件追加前 4KB
+        # 内容哈希：4KB 读取开销可忽略；哈希值变化仅使解析缓存一次性失效，无
+        # 持久化兼容性影响（该哈希不落库，仅作缓存键）。
+        with open(file_path, "rb") as fh:
+            head = fh.read(4096)
+        digest = hashlib.md5(digest.encode() + head).hexdigest()
+        return digest
     except (OSError, FileNotFoundError):
         return ""
 
@@ -443,10 +457,14 @@ def save_upload(project_id: int, filename: str, content: bytes, file_role: str =
     # 保存提取文本（文件名含完整原名+扩展名，避免同名不同扩展名文件互相覆盖）
     text_filename = f"{Path(filename).name}.txt"
     text_path = texts_dir / text_filename
-    try:
-        text_path.write_text(extracted_text, encoding="utf-8")
-    except Exception as e:
-        logger.error("保存提取文本失败: %s", e)
+    # BUG-FIX 2026-10-08：提取失败时不写空 .txt 文件，避免下游误判文件存在
+    if extracted_text.strip():
+        try:
+            text_path.write_text(extracted_text, encoding="utf-8")
+        except Exception as e:
+            logger.error("保存提取文本失败: %s", e)
+    else:
+        logger.info("跳过空文本文件写入: %s (status=%s)", filename, status)
 
     # 写入数据库
     file_type = ext.lstrip(".")
@@ -570,7 +588,9 @@ def _sniff_zip_extension(file_path: str) -> str:
         return ".xlsx"
     if "ppt/presentation.xml" in names:
         return ".pptx"
-    return ""
+    # BUG-FIX 2026-10-08：非 Office ZIP 返回 .zip 而非空串，
+    # 让调用方获知真实容器类型（空串会使调用方误认为应按声明扩展名解析）
+    return ".zip"
 
 
 def _sniff_extension(file_path: str) -> str:
@@ -650,8 +670,16 @@ def _read_text_auto(file_path: str) -> str:
         return _strip_invisible(path.read_text(encoding="gb18030"))
     except UnicodeDecodeError:
         pass
-    # 最终兜底：忽略无法解码的字节，保证不中断上传流程
-    return _strip_invisible(path.read_text(encoding="utf-8", errors="ignore"))
+    # 最终兜底：用替换符保留无法解码的字节，保证不中断上传流程
+    # BUG-FIX 2026-10-08：此前 errors="ignore" 会静默丢弃字节，用户无感知数据丢失
+    _fallback_text = path.read_text(encoding="utf-8", errors="replace")
+    _replace_count = _fallback_text.count("\ufffd")
+    if _replace_count:
+        logger.warning(
+            "[编码] %s 无法以任何已知编码解码，使用 UTF-8 替换模式（%d 个字节被替换）",
+            path.name, _replace_count,
+        )
+    return _strip_invisible(_fallback_text)
 
 
 def _is_under_projects_dir(file_path: str | Path) -> bool:
@@ -695,7 +723,9 @@ def extract_text_from_path(file_path: str) -> str:
 
     # 检查缓存（仅缓存支持的格式）
     # BUG-FIX-74/74c: 补全缓存格式列表并统一引用模块级常量
-    if ext in _PARSE_CACHEABLE_EXTS:
+    # BUG-FIX 2026-10-08：file_hash 为空（_get_file_hash 失败）时跳过缓存，
+    # 否则空哈希字符串会导致不同文件碰撞命中同一缓存条目
+    if ext in _PARSE_CACHEABLE_EXTS and file_hash:
         with _parse_cache_lock:
             cached = _parse_result_cache.get(file_path)
         if cached and cached[0] == file_hash:
@@ -723,13 +753,13 @@ def extract_text_from_path(file_path: str) -> str:
     elapsed = time.monotonic() - _t0
 
     # 存储缓存（仅缓存支持的格式）
-    if ext in _PARSE_CACHEABLE_EXTS:
+    if ext in _PARSE_CACHEABLE_EXTS and file_hash:
         with _parse_cache_lock:
             if len(_parse_result_cache) >= _PARSE_CACHE_MAX:
-                # 淘汰最旧的缓存
-                sorted_items = sorted(_parse_result_cache.items(), key=lambda x: x[1][1])
-                for key, _ in sorted_items[: len(sorted_items) // 2]:
-                    _parse_result_cache.pop(key, None)
+                # BUG-FIX 2026-10-08：此前一次淘汰半数缓存（cache thrashing），
+                # 现改为仅淘汰最旧的 1 条（LRU 单条淘汰）
+                oldest = min(_parse_result_cache.items(), key=lambda x: x[1][1])
+                _parse_result_cache.pop(oldest[0], None)
             _parse_result_cache[file_path] = (file_hash, time.time(), result)
 
     logger.info("[文件解析] %s 解析完成，提取 %d 字符, 耗时 %.2fs", ext, len(result), elapsed)
@@ -754,7 +784,10 @@ def _do_extract_text(file_path: str, ext: str, declared_ext: str = "") -> str:
     # （避免损坏/伪造文件被无谓拉起 antiword/catdoc/PowerPoint COM 试错）。
     if ext in _LEGACY_OLE_EXTS and _is_ole2_file(file_path) and ext in (
         declared_ext,
-        _sniff_extension(file_path),
+        # BUG-FIX 2026-10-08：_sniff_extension 在 extract_text_from_path 中已调用过，
+        # 此处避免重复的文件 I/O（Bug 11 冗余调用）。
+        # 用 Path 后缀做快速判断，仅在 declared_ext 为空时嗅探。
+        _sniff_extension(file_path) if not declared_ext else "",
     ):
         return _extract_legacy_ole_chain(file_path, declared_ext)
     if ext == ".docx":
@@ -1033,11 +1066,12 @@ def _extract_pdf(file_path: str) -> str:
             from .ocr_parser import MinerUParser
 
             # 模块级单例，避免每次创建新实例导致缓存失效
-            # BUG-FIX-71: 加锁防止多线程并发创建多个 MinerU 实例
+            # BUG-FIX 2026-10-08：从函数属性改为模块级变量，避免模块重载时属性丢失
+            global _mineru_parser_instance
             with _mineru_lock:
-                if not hasattr(_extract_pdf, "_mineru_parser"):
-                    _extract_pdf._mineru_parser = MinerUParser()
-            parser = _extract_pdf._mineru_parser
+                if _mineru_parser_instance is None:
+                    _mineru_parser_instance = MinerUParser()
+            parser = _mineru_parser_instance
             if parser.is_available():
                 ocr_text = parser.parse_pdf(file_path)
                 if ocr_text and len(ocr_text.strip()) >= 100:
@@ -1073,10 +1107,21 @@ def _extract_doc(file_path: str) -> str:
                 if name == "worddocument":
                     data = ole.openstream(stream_name).read()
                     # Unicode 文本通常以 \0 分隔，尝试解码
+                    # BUG-FIX 2026-10-08：errors="ignore"→"replace"，
+                    # 配合 isprintable() 过滤保留真实字符、丢弃二进制噪声
                     try:
-                        raw = data.decode("utf-16-le", errors="ignore")
-                        # 过滤掉控制字符，只保留可读文本
-                        clean = "".join(c for c in raw if c.isprintable() or c in "\n\r\t")
+                        raw = data.decode("utf-16-le", errors="replace")
+                        clean = "".join(c for c in raw if (c.isprintable() and c != '\ufffd') or c in "\n\r\t")
+                        if clean.strip():
+                            text_parts.append(clean)
+                    except Exception as _e:
+                        logger.debug("[silent-except] files.py: line 452 - %s", _e)
+                # 表格、文本流等
+                elif "text" in name or "table" in name:
+                    data = ole.openstream(stream_name).read()
+                    try:
+                        raw = data.decode("utf-16-le", errors="replace")
+                        clean = "".join(c for c in raw if (c.isprintable() and c != '\ufffd') or c in "\n\r\t")
                         if clean.strip():
                             text_parts.append(clean)
                     except Exception as _e:
@@ -1230,8 +1275,18 @@ def _extract_xlsx_raw_xml(file_path: str) -> str:
                 if sheet_rows:
                     rows.append(f"=== 工作表: {Path(sheet_file).stem} ===")
                     rows.extend(sheet_rows)
+    except FileNotFoundError as e:
+        logger.error("Excel 文件不存在: %s - %s", file_path, e)
+        return f"[Excel 文件不存在] {e}"
+    except PermissionError as e:
+        logger.error("Excel 文件权限不足: %s - %s", file_path, e)
+        return f"[Excel 权限不足] {e}"
+    except zipfile.BadZipFile as e:
+        logger.error("Excel 文件损坏（非 ZIP 容器）: %s - %s", file_path, e)
+        return f"[Excel 文件损坏] {e}"
     except Exception as e:
-        rows.append(f"[Excel 解析错误] {e}")
+        logger.error("Excel 解析失败: %s - %s", file_path, e, exc_info=True)
+        return f"[Excel 解析错误] {e}"
 
     return "\n".join(rows)
 
@@ -1319,8 +1374,47 @@ def _extract_pptx(file_path: str) -> str:
 
         return "\n".join(text_parts)
     except Exception as e:
-        logger.error("PPTX提取失败: %s", e, exc_info=True)
-        raise
+        logger.error("PPTX python-pptx 提取失败: %s", e, exc_info=True)
+        # BUG-FIX 2026-10-08：python-pptx 解析失败时回退到原始 XML 解析，
+        # 避免单个损坏文件导致整个上传管线崩溃（与 _extract_xlsx_openpyxl 同口径）
+        try:
+            fallback = _extract_pptx_raw_xml(file_path)
+            if fallback:
+                logger.warning("PPTX 原始 XML 回退解析成功: %s (%d 字符)", file_path, len(fallback))
+                return fallback
+        except Exception as fe:
+            logger.warning("PPTX 原始 XML 回退解析也失败: %s", fe)
+        return f"[PPTX 解析错误] {e}"
+
+
+def _extract_pptx_raw_xml(file_path: str) -> str:
+    """原始 XML 回退解析 PPTX（python-pptx 失败时兜底）
+
+    PPTX 是 ZIP 容器，幻灯片文本在 ppt/slides/slideN.xml 的 <a:t> 元素中。
+    与 _extract_xlsx_raw_xml 同口径，用 stdlib zipfile + ElementTree 解析。
+    """
+    try:
+        import re
+        from xml.etree import ElementTree as ET
+
+        slide_texts: list[str] = []
+        with zipfile.ZipFile(file_path) as z:
+            slide_names = sorted(
+                n for n in z.namelist()
+                if re.match(r"ppt/slides/slide\d+\.xml$", n)
+            )
+            for slide_name in slide_names:
+                with z.open(slide_name) as f:
+                    tree = ET.parse(f)
+                root = tree.getroot()
+                # <a:t> 包含所有文本
+                ns_a = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
+                texts = [t.text or "" for t in root.iter(f"{ns_a}t") if t.text]
+                if texts:
+                    slide_texts.append("\n".join(texts))
+        return "\n\n".join(slide_texts)
+    except Exception:
+        return ""
 
 
 # 遗留修复 2026-10-06（L1）：.ppt COM 自动化的降级提示（多处共用，文案保持一致）
@@ -1330,14 +1424,30 @@ _PPT_FALLBACK_HINT = (
 
 
 def _ppt_com_extract_sync(file_path: str) -> str:
-    """同步执行 PowerPoint COM 提取（**可能长时间不返回**，只应由
-    :func:`_ppt_via_powerpoint_com` 在带超时的线程里调用）
+    """在独立子进程里同步执行 PowerPoint COM 提取（**可能长时间不返回**）。
 
-    拆成独立函数的理由：COM 调用是唯一可能挂死的部分，把它与「超时包装」解耦后，
+    调用方 :func:`_ppt_via_powerpoint_com` 会把它放进可超时的子进程执行
+    （原生崩溃只杀子进程，不连累解析进程）。
+
+    拆成独立函数的理由：COM 调用是唯一可能挂死 / 原生崩溃的部分，把它与「超时包装」解耦后，
     超时逻辑才可以被单测直接覆盖（见 tests/test_import_enhancements_2026_10_05.py
     的 TestPptComGuardrails）。
+
+    测试钩子（仅测试使用，生产绝不设置）：
+      - ``PPT_COM_INJECT_RESULT``：直接返回该文本，跳过真实 COM；
+      - ``PPT_COM_INJECT_HANG``：睡眠 60s，用于验证超时护栏。
     """
     import os
+
+    # —— 测试注入钩子（默认不触发）——
+    _inject = os.environ.get("PPT_COM_INJECT_RESULT")
+    if _inject is not None:
+        return _inject
+    if os.environ.get("PPT_COM_INJECT_HANG") == "1":
+        import time
+
+        time.sleep(60)
+        return ""
 
     powerpoint = None
     presentation = None
@@ -1385,30 +1495,123 @@ def _ppt_com_extract_sync(file_path: str) -> str:
         return ""
 
 
-def _ppt_via_powerpoint_com(file_path: str) -> str:
-    """把 PowerPoint COM 提取放进可超时的后台线程
+def _ppt_com_child_target(q, file_path):
+    """子进程入口：抑制自身控制台输出（含 faulthandler 原生崩溃堆栈），执行提取并回传。
 
-    为什么必须放线程：COM 调用（Dispatch / Presentations.Open）在损坏文件、
-    超大文件或 PowerPoint 弹出模态框（修复模式、密码框）时可能永不返回，
-    而 `Thread.join(timeout)` 是唯一能为它加上界的手段（Python 线程无法被强杀）。
-    超时的线程被标为 daemon 留在后台，进程退出即回收，不影响上传主流程。
+    关键加固（TD-A / 最优容错）：PowerPoint COM 在「注册表残留但无可用二进制」的机器上
+    会触发**原生访问违规**，其堆栈由 faulthandler 写向 fd=2。把子进程 fd 1/2 重定向到
+    devnull 并禁用 faulthandler，可彻底避免污染解析（父）进程控制台；原生崩溃也只杀死
+    子进程，不影响解析主流程（父进程 join 超时 / 收不到结果即返回降级）。
     """
-    box: list = []
+    import faulthandler
+    import os
 
-    def _worker() -> None:
-        box.append(_ppt_com_extract_sync(file_path))
+    try:
+        faulthandler.disable()
+    except Exception:
+        pass
+    try:
+        _devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(_devnull, 1)
+        os.dup2(_devnull, 2)
+    except Exception:
+        pass
+    try:
+        q.put(_ppt_com_extract_sync(file_path))
+    except BaseException:
+        try:
+            q.put("")
+        except Exception:
+            pass
 
-    worker = threading.Thread(target=_worker, name="ppt-com-extract", daemon=True)
-    worker.start()
-    worker.join(timeout=PPT_COM_TIMEOUT)
 
-    if worker.is_alive():
+def _ppt_com_terminate(proc) -> None:
+    try:
+        proc.terminate()
+    except Exception:
+        pass
+    try:
+        proc.close()
+    except Exception:
+        pass
+
+
+def _ppt_via_powerpoint_com(file_path: str) -> str:
+    """把 PowerPoint COM 提取放进**独立子进程**并限时等待（TD-A 最优加固）。
+
+    为什么必须放子进程：COM 调用在损坏文件 / 超大文件 / 弹出模态框时可能永不返回，
+    也可能触发**原生访问违规**（线程里会拖垮整个 Python 进程并打印 fatal exception）。
+    子进程可被 ``join(timeout)`` 上界约束；超时或原生崩溃都只影响子进程，父（解析）进程
+    始终返回 ""（由 :func:`_extract_ppt` 转为降级提示），绝不挂死 / 崩溃 / 污染控制台。
+
+    向后兼容：行为与原线程版一致（超时 / COM 不可用 → 返回 "" → 降级提示）；仅执行载体
+    由线程升级为子进程，对「注册表残留但无可用 PowerPoint」的机器额外消除了原生崩溃噪声。
+    """
+    import multiprocessing as mp
+
+    ctx = mp.get_context("spawn")
+    q = ctx.Queue(maxsize=1)
+    proc = ctx.Process(target=_ppt_com_child_target, args=(q, file_path), daemon=True)
+    proc.start()
+    proc.join(timeout=PPT_COM_TIMEOUT)
+
+    if proc.is_alive():
         logger.error(
             "PowerPoint COM 转换超时（>%ds），放弃等待并返回降级提示: %s",
             PPT_COM_TIMEOUT, Path(file_path).name,
         )
+        _ppt_com_terminate(proc)
         return ""
-    return (box[0] or "") if box else ""
+
+    try:
+        text = q.get(timeout=1)
+    except Exception:
+        text = ""
+    _ppt_com_terminate(proc)
+    return text or ""
+
+
+_PPT_OFFICE_PROBE: bool | None = None
+
+
+def _ppt_com_available() -> bool:
+    """探测本进程是否可安全驱动 PowerPoint COM。
+
+    BUG-FIX 2026-10-08（P2 容错）：此前 ``_extract_ppt`` 仅在 ``sys.platform ==
+    'win32' and PPT_COM_ENABLED`` 时尝试 ``win32com.client.Dispatch(
+    "PowerPoint.Application")``。在没有安装 Office 的服务器/CI 上，该 Dispatch 会
+    触发**原生访问违规**（COM RPC 失败，非 Python 异常），在 daemon 线程里打印
+    ``Windows fatal exception: code 0x800706be / 0x800706ba`` 并可能拖垮解析进程，
+    而超时护栏无法兜住原生崩溃（只能兜住「挂死」）。
+
+    现加一道**注册表可用探测**：Office 未安装时 ``HKEY_CLASSES_ROOT\\PowerPoint.Application``
+    不存在，直接判定不可用、跳过 COM、返回降级提示，彻底避免原生崩溃。开关
+    ``PPT_COM_ENABLED`` 与平台 ``win32`` 在每次调用时实时判断（不进缓存），只有
+    昂贵的「pywin32 可导入 + 注册表存在 PowerPoint CLSID」探测结果进程内缓存，
+    避免每次解析都重复探测、且不受开关切换影响。
+    """
+    import sys
+
+    if not PPT_COM_ENABLED or sys.platform != "win32":
+        return False
+    global _PPT_OFFICE_PROBE
+    if _PPT_OFFICE_PROBE is None:
+        try:
+            import win32com  # noqa: F401  (仅验证可导入，真正崩溃点在 Dispatch)
+        except ImportError:
+            _PPT_OFFICE_PROBE = False
+        else:
+            try:
+                import winreg
+
+                _key = winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, "PowerPoint.Application")
+                winreg.CloseKey(_key)
+                _PPT_OFFICE_PROBE = True
+            except OSError:
+                _PPT_OFFICE_PROBE = False
+    if not _PPT_OFFICE_PROBE:
+        logger.info("[文件解析] 注册表无 PowerPoint.Application，跳过 COM 提取")
+    return bool(_PPT_OFFICE_PROBE)
 
 
 def _extract_ppt(file_path: str) -> str:
@@ -1418,12 +1621,12 @@ def _extract_ppt(file_path: str) -> str:
       - ``PPT_COM_ENABLED=false`` → 直接降级，不再拉起 PowerPoint；
       - ``PPT_COM_TIMEOUT``       → COM 在 daemon 线程执行并限时等待，超时返回降级
         提示，绝不把上传请求挂死。
-    向后兼容：默认 ``PPT_COM_ENABLED=true`` + 120s 超时，非 Windows 或没装
-    pywin32/Office 时行为与修复前完全一致（返回同一句降级提示）。
+    BUG-FIX 2026-10-08（P2）：再加 ``_ppt_com_available`` 注册表探测 —— 未安装
+    Office 时直接跳过 COM，避免 Dispatch 触发原生访问违规（见该 helper）。
+    向后兼容：默认 ``PPT_COM_ENABLED=true`` + 120s 超时，非 Windows / 未装
+    pywin32 / 未装 Office 时行为与修复前一致（返回同一句降级提示）。
     """
-    import sys
-
-    if sys.platform == "win32" and PPT_COM_ENABLED:
+    if _ppt_com_available():
         text = _ppt_via_powerpoint_com(file_path)
         if text:
             return text
@@ -1487,10 +1690,11 @@ def _ocr_with_mineru(file_path: str) -> str:
     try:
         from .ocr_parser import MinerUParser
 
+        global _mineru_parser_instance
         with _mineru_lock:
-            if not hasattr(_extract_pdf, "_mineru_parser"):
-                _extract_pdf._mineru_parser = MinerUParser()
-        parser = _extract_pdf._mineru_parser
+            if _mineru_parser_instance is None:
+                _mineru_parser_instance = MinerUParser()
+        parser = _mineru_parser_instance
     except ImportError:
         logger.debug("[图片OCR] MinerU 模块未安装，跳过该引擎")
         return ""
@@ -1617,6 +1821,13 @@ def _extract_html(file_path: str) -> str:
         def handle_endtag(self, tag):
             if tag in self.skip_tags and self.skip_depth > 0:
                 self.skip_depth -= 1
+            # BUG-FIX 2026-10-08：畸形 HTML（未闭合标签、标签不匹配）会导致
+            # skip_depth 不同步，把后续内容误判为 skip 区域。每次 endtag 后
+            # 做一次归零安全检查：若 skip_depth 已为 0 而仍收到 endtag，
+            # 说明之前有未闭合的 skip 标签，强制归零恢复同步。
+            elif tag in self.skip_tags and self.skip_depth == 0:
+                # 不匹配的 endtag（无对应 starttag），忽略，不做任何操作
+                pass
 
         @property
         def skip(self) -> bool:
@@ -1659,8 +1870,8 @@ def _extract_wps(file_path: str) -> str:
                 if any(kw in name_lower for kw in ["document", "text", "content"]):
                     try:
                         data = ole.openstream(stream_name).read()
-                        raw = data.decode("utf-16-le", errors="ignore")
-                        clean = "".join(c for c in raw if c.isprintable() or c in "\n\r\t")
+                        raw = data.decode("utf-16-le", errors="replace")
+                        clean = "".join(c for c in raw if (c.isprintable() and c != '\ufffd') or c in "\n\r\t")
                         if clean.strip():
                             text_parts.append(clean)
                     except Exception as _e:
@@ -1872,11 +2083,11 @@ def _text_cache_get(project_id: int) -> str | None:
 
 def _text_cache_set(project_id: int, text: str) -> None:
     with _text_cache_lock:
-        # 达到上限时淘汰最旧的一半
+        # BUG-FIX 2026-10-08：此前一次淘汰半数缓存（cache thrashing），
+        # 现改为仅淘汰最旧的 1 条（LRU 单条淘汰）
         if len(_text_cache) >= _TEXT_CACHE_MAX:
-            sorted_items = sorted(_text_cache.items(), key=lambda x: x[1][1])
-            for key, _ in sorted_items[: len(sorted_items) // 2]:
-                _text_cache.pop(key, None)
+            oldest = min(_text_cache.items(), key=lambda x: x[1][1])
+            _text_cache.pop(oldest[0], None)
         _text_cache[project_id] = (text, time.time())
 
 

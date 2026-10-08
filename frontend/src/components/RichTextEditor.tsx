@@ -24,29 +24,128 @@ interface RichTextEditorProps {
   onInsertImage?: (dataUrl: string) => void;
 }
 
-/** 清理 HTML 中的危险元素和属性，防止 XSS 攻击 */
+/** 富文本允许的标签（白名单；黑名单永远补不齐漏洞） */
+const ALLOWED_TAGS = new Set([
+  "P", "BR", "DIV", "SPAN", "B", "STRONG", "I", "EM", "U", "S", "STRIKE", "DEL", "INS",
+  "UL", "OL", "LI", "H1", "H2", "H3", "H4", "H5", "H6",
+  "BLOCKQUOTE", "PRE", "CODE",
+  "TABLE", "THEAD", "TBODY", "TFOOT", "TR", "TD", "TH", "CAPTION",
+  "IMG", "A", "FONT", "HR",
+]);
+
+/** 各标签允许的属性；"*" 表示通用属性 */
+const ALLOWED_ATTRS: Record<string, Set<string>> = {
+  "*": new Set(["style", "class"]),
+  A: new Set(["href", "title", "target", "rel"]),
+  IMG: new Set(["src", "alt", "title", "width", "height"]),
+  TD: new Set(["colspan", "rowspan"]),
+  TH: new Set(["colspan", "rowspan"]),
+  OL: new Set(["start"]),
+};
+
+/** style 里允许的属性（其余一律丢弃，防止 position:fixed 全屏覆盖等 UI 伪造） */
+const ALLOWED_STYLE_PROPS = new Set([
+  "text-align", "text-indent", "font-weight", "font-style", "text-decoration",
+  "color", "background-color", "font-size", "line-height",
+  "margin", "margin-left", "margin-right", "margin-top", "margin-bottom",
+  "padding", "padding-left", "padding-right",
+]);
+
+/** a[href] 允许的协议（相对地址与锚点放行） */
+const SAFE_HREF = /^(?:https?:\/\/|mailto:|tel:|#|\/(?!\/)|\.{1,2}\/)/i;
+/** img[src]：只放行 base64 内联图片与 http(s) */
+const SAFE_IMG = /^(?:https?:\/\/|data:image\/(?:png|jpe?g|gif|webp|bmp);base64,[A-Za-z0-9+/=\s]+$)/i;
+
+/**
+ * 清理富文本 HTML，防止 XSS / UI 伪造。
+ *
+ * BUG-FIX 2026-10-08（P0 安全）：旧实现是纯正则黑名单，实测可被以下载荷绕过：
+ *   <a href=" javascript:alert(1)">            前导空格 → 浏览器会先剥空格再解析协议
+ *   <a href="jav&#x09;ascript:alert(1)">      实体编码的制表符
+ *   <a href="javascript&colon;alert(1)">      实体编码的冒号
+ *   <div style="position:fixed;inset:0;z-index:99999"><button>登录</button></div>
+ *                                               style 完全不受限 → 全屏 UI 伪造
+ *   <input name=p>                             标签白名单缺失，表单元素可直接注入
+ * 根本原因：正则无法处理「HTML 实体 / 空白 / 协议解析」这些需要 HTML 解析器语义的东西。
+ * 修复：改用浏览器原生解析器（DOMParser）先做实体解码与标签规范化，再按
+ * **标签白名单 + 属性白名单 + 协议白名单 + style 属性白名单** 重建 DOM。
+ * 非浏览器环境（SSR/单测无 DOM）退回正则兜底，仅保证不抛异常。
+ */
 function sanitizeHtml(html: string): string {
   if (!html) return "";
-  let clean = html;
-  // 1) 移除可承载脚本/行为的容器标签及其内容（含 svg/math 等可注入点）
-  clean = clean.replace(
-    /<(script|iframe|object|embed|form|style|link|meta|svg|math|base|body|html|head)\b[^<]*(?:(?!<\/\1>)<[^<]*)*<\/\1>/gi,
-    "",
-  );
-  // 2) 移除危险的自闭合/无结束标签
-  clean = clean.replace(
-    /<(script|iframe|object|embed|form|style|link|meta|svg|math|base)\b[^>]*\/?>/gi,
-    "",
-  );
-  // 3) 移除所有 on* 事件处理属性 (onerror, onclick, onload 等)
-  clean = clean.replace(/\s+on\w+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, "");
-  // 4) 中和任意属性值中的 javascript: 危险协议（带/不带引号、任意属性名）
-  //    注意：保留 data: 协议以支持 base64 内联图片（如 <img src="data:image/png;base64,...">）
-  clean = clean.replace(
-    /(=\s*)(?:"javascript:[^"]*"|'javascript:[^']*'|javascript:[^\s>]+)/gi,
-    '$1"#"',
-  );
-  return clean;
+  const hasDom = typeof DOMParser !== "undefined" && typeof document !== "undefined";
+  if (!hasDom) {
+    // 兜底：至少去掉事件属性与 script 类容器（不追求完备，仅保证不在无 DOM 环境崩溃）
+    return html
+      .replace(/<(script|iframe|object|embed|form|style|link|meta|svg|math|base)\b[^>]*>[\s\S]*?<\/\1>/gi, "")
+      .replace(/<(script|iframe|object|embed|form|style|link|meta|svg|math|base)\b[^>]*\/?>/gi, "")
+      .replace(/\s+on\w+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, "");
+  }
+
+  const doc = new DOMParser().parseFromString(`<body>${html}</body>`, "text/html");
+  const root = doc.body;
+
+  const cleanStyle = (value: string): string => {
+    const out: string[] = [];
+    for (const decl of value.split(";")) {
+      const idx = decl.indexOf(":");
+      if (idx <= 0) continue;
+      const prop = decl.slice(0, idx).trim().toLowerCase();
+      const val = decl.slice(idx + 1).trim();
+      if (!ALLOWED_STYLE_PROPS.has(prop) || !val) continue;
+      // 值里不允许 url()/expression()/注释（expression 已被白名单挡掉，这里防 url 泄漏外链）
+      if (/url\s*\(|expression\s*\(|javascript:/i.test(val)) continue;
+      out.push(`${prop}:${val}`);
+    }
+    return out.join(";");
+  };
+
+  const sanitizeNode = (node: Element) => {
+    // 先摘除子树中的危险节点（SVG/MathML 命名空间也一并丢弃）
+    for (const child of Array.from(node.children)) sanitizeNode(child as Element);
+
+    for (const el of Array.from(node.querySelectorAll("*"))) {
+      const tag = el.tagName.toUpperCase();
+      const isForeign = el.namespaceURI && el.namespaceURI.indexOf("http://www.w3.org/2000/svg") === 0;
+      if (!ALLOWED_TAGS.has(tag) || isForeign) {
+        el.remove();
+        continue;
+      }
+      const allowed = new Set([...(ALLOWED_ATTRS["*"] || []), ...(ALLOWED_ATTRS[tag] || [])]);
+      for (const attr of Array.from(el.attributes)) {
+        const name = attr.name.toLowerCase();
+        if (name.startsWith("on")) {
+          el.removeAttribute(attr.name);
+          continue;
+        }
+        if (!allowed.has(name)) {
+          el.removeAttribute(attr.name);
+          continue;
+        }
+        if (name === "style") {
+          const s = cleanStyle(attr.value);
+          if (s) el.setAttribute("style", s);
+          else el.removeAttribute("style");
+          continue;
+        }
+        if (name === "href") {
+          if (!SAFE_HREF.test(attr.value.trim())) {
+            el.removeAttribute("href");
+            el.setAttribute("href", "#");
+          } else if (tag === "A") {
+            el.setAttribute("rel", "noopener noreferrer");
+          }
+          continue;
+        }
+        if (name === "src" && !SAFE_IMG.test(attr.value.trim())) {
+          el.removeAttribute("src");
+        }
+      }
+    }
+  };
+
+  sanitizeNode(root);
+  return root.innerHTML;
 }
 
 /**

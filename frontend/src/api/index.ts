@@ -1462,6 +1462,9 @@ export function createContentStream(
   let reconnectAttempts = 0;
   const MAX_RECONNECT_ATTEMPTS = 3;
   const RECONNECT_DELAYS = [1000, 2000, 4000]; // 指数退避：1s, 2s, 4s
+  // BUG-FIX 2026-10-08（P0）：本次连接是否已读到响应体内容。
+  // 只有「读到字节」才算一次健康连接；仅拿到 HTTP 200 不算（中途断流同样会先给 200）。
+  let _gotFirstFrame = false;
   // BUG-F-03 修复：追踪 fetch 是否已启动，防止 close() 在 fetch 启动前丢失 abort 信号
   let fetchStarted = false;
   // 流正常结束后标记，防止 close() 在结束后仍 abort 触发 ERR_ABORTED
@@ -1487,7 +1490,21 @@ export function createContentStream(
   const detach = () => {
     detached = true;
     aborted = true; // 标记已断开，不再处理流数据
-    // 不调用 controller.abort()，后端任务继续运行
+    // BUG-FIX 2026-10-08（P1 连接泄漏）：旧实现**故意不 abort**，理由是「不调用
+    // controller.abort()，后端任务继续运行」。但这是误解：abort 只是关闭本端的
+    // HTTP 响应体，后端 run_generation 是独立 asyncio 任务，客户端断开时它本来就会
+    // 转入后台续跑（见 sse_content.py 的 _drain_queue）。不 abort 的话响应体一直挂着，
+    // 直到后端下一次写；浏览器同源连接上限约 6 条 —— 「生成中刷新/切页」6 次就把整个
+    // 标签页的连接池耗尽（后续所有请求排队）。
+    // 对齐 expandContent（同文件 cleanup 分支）的做法：abort 释放 socket。
+    if (controller) {
+      try {
+        controller.abort();
+      } catch {
+        /* 已结束，忽略 */
+      }
+      controller = null;
+    }
   };
 
   let resolve: (() => void) | null = null;
@@ -1524,35 +1541,66 @@ export function createContentStream(
         return;
       }
 
-      // 连接成功，重置重连计数器
-      reconnectAttempts = 0;
+      // BUG-FIX 2026-10-08（P0 无限重连 + 伪报失败）：旧实现在这里（**刚拿到 HTTP 200、
+      // 一个字节的响应体都还没读**）就 `reconnectAttempts = 0`。
+      // 而 SSE 场景最常见的失败不是「连不上」，而是「连上了、然后中途断了」
+      // （nginx proxy_read_timeout、worker 重启、笔记本休眠）。
+      // 于是每次中途断开 → 计数 +1 → 重连 → 又拿到 200 → 计数清零 → 再断 → 再 +1 …，
+      // MAX_RECONNECT_ATTEMPTS=3 永远达不到，变成**无上限重连循环**。
+      // 更糟的是每次重连都是对 /generate-content 的**同一个 GET**（会触发生成），
+      // 极易撞上后端任务组互斥，后端推 `{"status":"error","code":"TASK_LOCK_CONFLICT"}`，
+      // 前端把它当终态 → 弹「生成失败」并把所有节点标红，而后端任务其实在正常跑完所有章节。
+      // 修复：计数器**只在真正读到响应体第一帧之后**才重置（`_gotFirstFrame`），
+      // 这样「中途断流」会被连续计数，3 次后走 exhausted 分支。
+      // 后端任务在断流期间继续运行（后台续跑），因此 exhausted 时不伪造失败，
+      // 而是 reject 一个带 `connectionLost` 标记的错误，由调用方降级为状态轮询。
 
       const reader = response.body.getReader();
       const decoder = new TextDecoder("utf-8");
       let buffer = "";
 
+      // BUG-FIX 2026-10-08（P1 SSE 分帧）：旧实现按「行」切分并逐行回调
+      // （buf.split("\n")），不是按 SSE 帧解析：
+      //   - 多行 data: 帧会被拆成多条非法 JSON；
+      //   - `data:`（无空格）会连前缀一起丢给 JSON.parse；
+      //   - `: keep-alive` 注释、event:/id:/retry: 行也会被当数据；
+      //   - 每个 chunk 都重新处理整个未截断 buffer（O(n²)）。
+      // 这里按规范：以空行分帧、合并多行 data、跳过注释与其它字段。
+      // 与本文件 exportDocxStream 的 processLine 口径一致。
       // eslint-disable-next-line no-loop-func
-      const processBuffer = (buf: string, cb: ((event: { data: string }) => void) | null) => {
-        if (!cb || !buf.trim()) return;
-        // BUG 修复：SSE 数据行以 "data: " 开头，需剥离前缀后再 JSON.parse。
-        // 原实现直接传原始行给 cb，导致 JSON.parse(data: {...}) 始终 SyntaxError，
-        // connected 事件被静默丢弃 → hasConnected 永不为 true → 15s 后超时报错。
-        // 参考 exportDocxStream 的 processLine 实现（index.ts:1261-1301）。
-        const lines = buf.split("\n").filter((l) => l.trim());
-        for (const line of lines) {
+      const processBuffer = (buf: string, cb: ((event: { data: string }) => void) | null, flush: boolean) => {
+        if (!cb || !buf) return;
+        // 归一化换行：SSE 规范允许 \r\n / \r
+        const normalized = buf.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+        const frames = normalized.split("\n\n");
+        // 最后一段可能是未闭合的半帧；flush=false 时留到下一批
+        const tail = flush ? "" : frames[frames.length - 1];
+        const complete = flush ? frames : frames.slice(0, -1);
+        for (const frame of complete) {
+          if (!frame.trim()) continue;
+          const dataLines: string[] = [];
+          for (const raw of frame.split("\n")) {
+            const line = raw.trimEnd();
+            if (!line || line.startsWith(":")) continue; // keep-alive 注释
+            if (line.startsWith("data:")) {
+              dataLines.push(line.slice(5).replace(/^ /, ""));
+            }
+            // event:/id:/retry: 本流未使用，忽略
+          }
+          if (dataLines.length === 0) continue;
           try {
-            const content = line.startsWith("data: ") ? line.slice(6) : line;
-            cb({ data: content });
+            cb({ data: dataLines.join("\n") });
           } catch {
-            // 忽略单行处理异常
+            // 忽略单帧处理异常
           }
         }
+        buffer = tail;
       };
 
       // 流正常结束时，处理缓冲区残留数据
       const flushBuffer = () => {
-        if (buffer.length > 0 && (stream as any)._onmessage) {
-          processBuffer(buffer, (stream as any)._onmessage);
+        if (buffer.length > 0) {
+          processBuffer(buffer, (stream as any)._onmessage, true);
           buffer = "";
         }
       };
@@ -1562,15 +1610,14 @@ export function createContentStream(
         if (aborted) break;
         const { value, done } = await reader.read();
         if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        if ((stream as any)._onmessage) {
-          processBuffer(buffer, (stream as any)._onmessage);
+        const chunk = decoder.decode(value, { stream: true });
+        if (!_gotFirstFrame && chunk.length > 0) {
+          // 真的读到了响应体内容 → 这次连接是健康的，重置计数器
+          _gotFirstFrame = true;
+          reconnectAttempts = 0;
         }
-        const lastNewline = buffer.lastIndexOf("\n");
-        if (lastNewline >= 0) {
-          buffer = buffer.slice(lastNewline + 1);
-        }
-        // lastNewline < 0 时保留不完整数据在 buffer，等下一批 chunk 拼合后再处理
+        buffer += chunk;
+        processBuffer(buffer, (stream as any)._onmessage, false);
       }
 
       // 流正常结束时，flush 缓冲区残留数据（防止最后一条事件被丢弃）
@@ -1623,8 +1670,35 @@ export function createContentStream(
         }
         await new Promise((r) => setTimeout(r, delay));
         if (!aborted && !detached) {
+          // BUG-FIX 2026-10-08（P0）：重连前先释放上一条连接，并复位「已读到首帧」标记，
+          // 否则新连接的首帧不会重置计数器（_gotFirstFrame 仍是 true）。
+          if (controller) {
+            try {
+              controller.abort();
+            } catch {
+              /* 忽略 */
+            }
+            controller = null;
+          }
+          _gotFirstFrame = false;
           await doFetch(); // 递归重连
         }
+      } else if (_gotFirstFrame) {
+        // BUG-FIX 2026-10-08（P0 伪报失败）：连接中途断开且重连次数耗尽。
+        // 后端任务仍在后台继续跑（已落库的章节不回滚），此时**不能** reject 一个
+        // 裸错误让调用方弹「生成失败」——那正是旧 bug：用户以为失败、手动重试，
+        // 实际上一轮已在写盘。改为 reject 带 `connectionLost` 标记的错误，
+        // 调用方据此降级为「连接中断，后台继续」+ 状态轮询，而不是标红。
+        const lost = Object.assign(
+          new Error(
+            `SSE 连接中断（已重连 ${MAX_RECONNECT_ATTEMPTS} 次），生成任务可能仍在后台继续，请稍候查看进度`
+          ),
+          { connectionLost: true, cause: e },
+        );
+        if ((stream as any)._onerror) {
+          (stream as any)._onerror({ type: "reconnect_exhausted", attempts: MAX_RECONNECT_ATTEMPTS });
+        }
+        if (reject) reject(lost);
       } else {
         // 重连次数耗尽或用户主动关闭
         if (reject) reject(e);
@@ -1784,6 +1858,30 @@ export async function setSectionTargetWords(
     `/projects/${projectId}/sections/${sectionId}/target-words`,
     null,
     { params: { target_words: targetWords ?? 0 } },
+  );
+  return res.data;
+}
+
+/**
+ * 设置章节字数档位（2026-10-08 新增：三级目录控制）
+ * tier: 'brief' | 'standard' | 'detailed' | 'long' | ''（空串=清除覆盖，跟随全局默认）
+ */
+export async function setSectionWordCountTier(
+  projectId: number,
+  sectionId: number,
+  tier: string,
+): Promise<{
+  status: string;
+  section_id: number;
+  word_count_tier: string | null;
+  tier_label: string;
+  tier_target: number;
+  tier_tolerance: number;
+}> {
+  const res = await http.patch(
+    `/projects/${projectId}/sections/${sectionId}/word-count-tier`,
+    null,
+    { params: { word_count_tier: tier } },
   );
   return res.data;
 }
@@ -2910,29 +3008,95 @@ export interface Conflict {
   sources: string[];
   severity: string;
   description: string;
+  /**
+   * BUG-FIX 2026-10-08：后端此前把已解决（resolved=1）的历史冲突与待处理冲突
+   * 一并返回，前端表格混排、用户无法分辨哪些还要动手。现后端默认只回未解决，
+   * 并显式下发状态字段供 UI 区分与筛选。
+   */
+  /** 0=未解决 / 1=已解决（历史保留） */
+  resolved?: number;
+  /** 规范化状态名：open | resolved */
+  state?: string;
+  created_at?: string;
+  resolved_value?: string | null;
+  resolved_at?: string | null;
 }
 
 export interface AuditResult {
   status: string;
+  /**
+   * BUG-FIX 2026-10-08（P1·谎报成功）：`status` 恒表示「HTTP 请求是否成功」，
+   * 审计本身的结论在 `audit_status`（completed / completed_no_conflicts / failed）。
+   * 此前后端审计内部崩溃被降级成全 0 且路由无条件回 status='ok'，前端据此弹
+   * 「审计完成，发现 0 处冲突」—— 实为谎报，真实结论是审计崩了。
+   */
+  audit_status?: string;
   project_id: number;
   total_sections: number;
   facts_extracted: number;
   conflicts_found: number;
   conflicts: Conflict[];
   audit_time: string;
+  message?: string;
 }
+
+/** 冲突过滤口径：open=仅未解决(默认) / resolved=仅已解决 / all=全部 */
+export type ConflictFilter = "open" | "resolved" | "all";
 
 export async function runConsistencyAudit(projectId: number): Promise<AuditResult> {
   const res = await http.get<AuditResult>(`/consistency/audit/${projectId}`);
   return res.data;
 }
 
-export async function getConflicts(projectId: number): Promise<{
-  status: string; count: number; conflicts: Conflict[];
+export async function getConflicts(
+  projectId: number,
+  opts: { resolved?: ConflictFilter } = {},
+): Promise<{
+  status: string; count: number; filter: string; conflicts: Conflict[];
 }> {
-  const res = await http.get<{ status: string; count: number; conflicts: Conflict[] }>(
+  const res = await http.get<{ status: string; count: number; filter: string; conflicts: Conflict[] }>(
     `/consistency/conflicts/${projectId}`,
+    { params: { resolved: opts.resolved ?? "open" } },
   );
+  return res.data;
+}
+
+// ---------------------------------------------------------------------------
+// 审核规则命名空间（2026-10-08 新增，后端 GET /consistency/rules）
+// ---------------------------------------------------------------------------
+
+/**
+ * 严重度取值/排序/文案配色的单一事实来源（后端 `services/consistency_rules.py`）。
+ *
+ * BUG-FIX 2026-10-08：此前「严重/中等/轻微」的取值、排序与配色在前端 `utils.ts`
+ * 与后端 auditor 各写一套且无任何一致性约束 —— 后端调过阈值或文案时前端不会跟着变。
+ * 页面启动时拉一次对齐，拉取失败则退回 `utils.ts` 的静态兜底（保持离线可用）。
+ */
+export interface ConsistencyRules {
+  status: string;
+  severity: {
+    order: string[];
+    default: string;
+    unknown_rank: number;
+    meta: Record<string, { label: string; color: string }>;
+  };
+  facts: {
+    base_names: string[];
+    critical: string[];
+    high_distinct_threshold: number;
+  };
+  audit_status: {
+    success: string[];
+    failed: string;
+    completed: string;
+    no_conflicts: string;
+  };
+  conflict_state: { open: string; resolved: string };
+  scoring_status: { meta: Record<string, { label: string; color: string }> };
+}
+
+export async function getConsistencyRules(): Promise<ConsistencyRules> {
+  const res = await http.get<ConsistencyRules>(`/consistency/rules`);
   return res.data;
 }
 
@@ -3078,19 +3242,25 @@ export async function repairConsistencyWithAi(
   return res.data;
 }
 
+export interface AuditSummary {
+  latest_audit: Record<string, unknown> | null;
+  /**
+   * 未解决冲突数。与 `conflicts_by_severity` 同一口径（都只算未解决）——
+   * BUG-FIX 2026-10-08：此前 `conflicts_by_severity` 未过滤 `resolved`，把已解决的
+   * 也算进「严重/中等」卡片，同屏两个卡片口径打架。
+   */
+  unresolved_conflicts: number;
+  /** 已解决（历史）冲突数，2026-10-08 新增 */
+  resolved_conflicts?: number;
+  /** 仅统计**未解决**冲突的严重度分布 */
+  conflicts_by_severity: Record<string, number>;
+}
+
 export async function getAuditSummary(projectId: number): Promise<{
-  status: string; summary: {
-    latest_audit: any;
-    unresolved_conflicts: number;
-    conflicts_by_severity: Record<string, number>;
-  };
+  status: string; summary: AuditSummary;
 }> {
   const res = await http.get<{
-    status: string; summary: {
-      latest_audit: any;
-      unresolved_conflicts: number;
-      conflicts_by_severity: Record<string, number>;
-    };
+    status: string; summary: AuditSummary;
   }>(`/consistency/summary/${projectId}`);
   return res.data;
 }
@@ -3500,10 +3670,25 @@ export interface WordCountOverview {
   completed_sections: number;
   on_target_sections: number;
   below_target_sections: number;
+  exceeded_target_sections: number;
   empty_sections: number;
   stats: {
     per_level: Record<string, number>;
     per_status: Record<string, number>;
+    level3_stats: {
+      count: number;
+      on_target: number;
+      below_target: number;
+      exceeded_target: number;
+      rate: number;
+    };
+    per_tier_stats: Record<string, {
+      count: number;
+      on_target: number;
+      below: number;
+      exceeded: number;
+      rate: number;
+    }>;
   };
 }
 
@@ -3518,6 +3703,45 @@ export interface WordCountItem {
   target_words: number | null;
   word_count_text: string;
   progress: number;
+  // 2026-10-08 新增：档位与达标状态
+  word_count_tier: string | null;
+  tier_label: string | null;
+  tier_target: number;
+  on_target: boolean | string; // boolean 或 'unknown'
+}
+
+// ========== 字数档位配置 API（2026-10-08）==========
+
+export interface WordCountTierConfig {
+  key: string;
+  label: string;
+  target_words: number;
+  tolerance_ratio: number;
+  is_default: boolean;
+  sort_order: number;
+  enabled: number;
+}
+
+export async function getWordCountTiers(): Promise<{
+  status: string;
+  tiers: WordCountTierConfig[];
+  default_key: string;
+}> {
+  const res = await http.get<{ status: string; tiers: WordCountTierConfig[]; default_key: string }>(
+    '/word-count/tiers',
+  );
+  return res.data;
+}
+
+export async function updateWordCountTier(
+  tierKey: string,
+  updates: Partial<Pick<WordCountTierConfig, 'target_words' | 'tolerance_ratio' | 'is_default' | 'label' | 'enabled'>>,
+): Promise<{ status: string; tier: WordCountTierConfig }> {
+  const res = await http.put<{ status: string; tier: WordCountTierConfig }>(
+    `/word-count/tiers/${tierKey}`,
+    updates,
+  );
+  return res.data;
 }
 
 export async function getWordCountOverview(projectId: number): Promise<WordCountOverview> {

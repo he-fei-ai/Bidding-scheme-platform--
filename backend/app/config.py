@@ -173,6 +173,15 @@ OUTLINE_DIRECT_MAX_SCORING_ITEMS = int(os.environ.get("OUTLINE_DIRECT_MAX_SCORIN
 # 直出路径期望的目录规模上限（一级章数）
 OUTLINE_DIRECT_MAX_LEVEL1 = int(os.environ.get("OUTLINE_DIRECT_MAX_LEVEL1", "12"))
 
+# ========== 增强 2026-10-08：目录生成各阶段 AI 调用 max_tokens 可调 ==========
+# PRD 描述目录生成 max_tokens=2000，但实际按阶段需要放大（长标书三级 JSON 体积大）。
+# 此处把各阶段上限显式暴露为配置，默认值与历史硬编码值一致（向后兼容），
+# 便于按模型上下文窗口 / 标书规模调优，无需改代码。
+OUTLINE_MAX_TOKENS_DIRECT = int(os.environ.get("OUTLINE_MAX_TOKENS_DIRECT", "6000"))
+OUTLINE_MAX_TOKENS_L1 = int(os.environ.get("OUTLINE_MAX_TOKENS_L1", "8192"))
+OUTLINE_MAX_TOKENS_L2 = int(os.environ.get("OUTLINE_MAX_TOKENS_L2", "4096"))
+OUTLINE_MAX_TOKENS_SELFCHECK = int(os.environ.get("OUTLINE_MAX_TOKENS_SELFCHECK", "5000"))
+
 
 # ========== 增强 2.1: RAG 向量检索配置 ==========
 RAG_ENABLED = os.environ.get("RAG_ENABLED", "true").lower() == "true"
@@ -248,6 +257,19 @@ EXPORT_IMAGE_DPI = int(os.environ.get("EXPORT_IMAGE_DPI", "300"))
 # 向后兼容：默认 false 与历史「始终插入失败说明」不同——历史行为等价于 true。
 # 若需保留旧版可见的失败提示，设置环境变量 CHART_FAIL_PLACEHOLDER=true。
 CHART_FAIL_PLACEHOLDER = os.environ.get("CHART_FAIL_PLACEHOLDER", "false").lower() == "true"
+
+
+# ========== 遗留项 2026-10-08: 正文普通代码块剥离开关 ==========
+# 控制正文清洗（clean_generated_content）对「闭合」普通代码块（```python / ```json /
+# ```text 等，不含 mermaid/chart-json 图表围栏）的处理：
+#   false（默认）：保留块内内容为正文段落，仅剥离围栏标记行 —— 与 2026-10-06 之前
+#     的既有行为完全一致（回归保护见 tests/test_unclosed_fence_boundary_2026_10_08.py::
+#     test_closed_plain_fence_untouched）。
+#   true：闭合普通代码块连同标记行与内容整体剔除 —— 适用于标书正文不允许出现
+#     代码片段的业务场景（与「未闭合坏块一律删除」的口径统一）。
+# 向后兼容：默认 false，不改变任何既有输出；需剥离时设置环境变量
+# STRIP_PLAIN_CODE_BLOCKS=true（运行时读取，改动后重启生效）。
+STRIP_PLAIN_CODE_BLOCKS = os.environ.get("STRIP_PLAIN_CODE_BLOCKS", "false").lower() == "true"
 
 
 # ========== 增强 4.3: DOCX 导出表格样式配置 ==========

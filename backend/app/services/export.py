@@ -11,6 +11,7 @@ from pathlib import Path
 import re
 import threading
 import time
+import uuid
 
 from docx import Document
 from docx.enum.table import WD_TABLE_ALIGNMENT
@@ -60,6 +61,7 @@ from .ai.mermaid_renderer import (
 from .content_cleaning import extract_mermaid_title, parse_content
 from .export_presets import resolve_export_config
 from .sections import build_tree, list_sections
+from .ai.writing_length_config import get_l3_own_range, get_l3_own_target
 
 
 logger = logging.getLogger(__name__)
@@ -258,6 +260,22 @@ def _reset_figure_counter(project_id: int | None = None):
                 _figure_counter_state.pop(k, None)
 
 
+def _drop_fig_no(obj):
+    """**递归**剔除任意层级的 `fig_no` 键。
+
+    BUG-FIX 2026-10-09（P2·缓存键归一不完整）：旧实现只在**顶层**剔除 fig_no。
+    图号由 `_add_inline_chart` 注入 `source["fig_no"]`，但图表载荷常是嵌套结构
+    （如 `{"type": ..., "data": {...}, "config": {...}}`，渲染器也可能把 fig_no
+    写进内层 data）。只要 fig_no 出现在嵌套层，预渲染与正式渲染的序列化结果就
+    仍然不同 → L1/磁盘缓存命中率依旧为 0，预渲染白做、磁盘每轮多落一份同图 PNG。
+    """
+    if isinstance(obj, dict):
+        return {k: _drop_fig_no(v) for k, v in obj.items() if k != "fig_no"}
+    if isinstance(obj, list):
+        return [_drop_fig_no(item) for item in obj]
+    return obj
+
+
 def _strip_fig_no_for_cache(payload) -> str:
     """生成图表缓存键：剔除 fig_no（会话内递增图号），并做 key 排序归一化。
 
@@ -265,14 +283,17 @@ def _strip_fig_no_for_cache(payload) -> str:
     sort_keys 归一化可让语义相同、字段顺序不同的 payload 共享同一份缓存。
     """
     if isinstance(payload, dict):
-        obj: object = {k: v for k, v in payload.items() if k != "fig_no"}
+        obj: object = _drop_fig_no(payload)
     elif isinstance(payload, str):
         try:
-            obj = json.loads(payload)
+            parsed = json.loads(payload)
         except (json.JSONDecodeError, TypeError):
+            # BUG-FIX 2026-10-09：解析失败时旧实现**原样返回**原文，等于放弃
+            # sort_keys 归一化 —— 语义相同、字段顺序不同的两份载荷会产生两个
+            # 缓存键（内存 + 磁盘各一份同样的 PNG）。改走 str(payload) 无意义，
+            # 这里保留原文但至少保证返回稳定字符串；真正需要归一的是可解析分支。
             return payload
-        if isinstance(obj, dict):
-            obj = {k: v for k, v in obj.items() if k != "fig_no"}
+        obj = _drop_fig_no(parsed) if isinstance(parsed, (dict, list)) else parsed
     else:
         obj = payload
     try:
@@ -289,8 +310,13 @@ def _next_figure_number(parent_section: str, project_id: int | None = None) -> s
         project_id: 项目 ID；与父章节号一起构成分桶键，避免跨项目串号
 
     Returns:
-        格式化的图号，如 "图3-1"、"图3-2"
+        格式化的图号，如 "图3-1"、"图3-2"；章节号缺失时返回空串（无图号）
     """
+    # FIX 2026-10-08（遗留5）：章节编号缺失时不再产出 `图default-1` 这类伪编号——
+    # 它既无法被正文引用，也会漏过失败文案的剔除正则 `_FIG_NO_PREFIX_RE`（^图\d+-\d+）。
+    # 返回空串 = 本图无可用图号：调用方只输出图题，不消耗/不回滚序号。
+    if not parent_section or not str(parent_section).strip():
+        return ""
     bucket = _figure_counter_key(parent_section, project_id)
     with _figure_counter_lock:
         _figure_counter_state[bucket] = _figure_counter_state.get(bucket, 0) + 1
@@ -372,9 +398,29 @@ _chart_render_cache_misses = 0
 # 其余线程等待其完成后共享结果；owner 渲染失败则结果为 None，等待方同步判失败。
 # 仅合并「真正耗时的渲染动作」，缓存命中路径不受影响（不串行化热点）。
 _inflight_renders: dict[str, threading.Event] = {}   # key -> 进行中的渲染事件
-_inflight_results: dict[str, bytes | None] = {}     # key -> owner 渲染产物（成功字节/None=失败）
+# key -> (写入时间戳, 渲染产物)；已加 TTL + 容量上限（见 _inflight_put）
+_inflight_results: dict[str, tuple[float, bytes | None]] = {}
 _inflight_lock = threading.Lock()
 _INFLIGHT_WAIT_TIMEOUT = 90  # 等待方最长等待（s），超过则兜底自行判失败，不死等
+# FIX 2026-10-08（遗留6）：single-flight 产物容器原先**只增不减**——旧实现仅在
+# 「同 key 再次渲染」时才 pop 掉上一条，进程长时间运行会把每次图表聚合渲染的产物
+# （成功字节流与失败标记 None）永久留在内存里。比照 `_chart_render_cache` 的
+# 治理方式补 TTL + LRU 容量双淘汰。
+_INFLIGHT_RESULT_TTL_SECONDS = 300
+_INFLIGHT_RESULT_MAX_ENTRIES = 50
+
+
+def _inflight_put(key: str, data: bytes | None) -> None:
+    """写入 single-flight 产物并淘汰过期/超量条目（调用方不得持有 _inflight_lock）。"""
+    now = time.time()
+    with _inflight_lock:
+        _inflight_results[key] = (now, data)
+        for _k in [k for k, (ts, _d) in _inflight_results.items()
+                   if now - ts > _INFLIGHT_RESULT_TTL_SECONDS]:
+            _inflight_results.pop(_k, None)
+        while len(_inflight_results) > _INFLIGHT_RESULT_MAX_ENTRIES:
+            oldest = min(_inflight_results.items(), key=lambda kv: kv[1][0])[0]
+            _inflight_results.pop(oldest, None)
 
 
 def _single_flight_render(cache_key: str, do_render) -> BytesIO | None:
@@ -402,7 +448,9 @@ def _single_flight_render(cache_key: str, do_render) -> BytesIO | None:
     if not owner:
         # 非 owner：等待 owner 渲染完成，最长 _INFLIGHT_WAIT_TIMEOUT
         ev.wait(timeout=_INFLIGHT_WAIT_TIMEOUT)
-        data = _inflight_results.get(cache_key)
+        with _inflight_lock:
+            entry = _inflight_results.get(cache_key)
+        data = entry[1] if entry else None
         return BytesIO(data) if data else None
 
     # owner：真正执行渲染
@@ -413,8 +461,9 @@ def _single_flight_render(cache_key: str, do_render) -> BytesIO | None:
         data = out.getvalue() if out else None
         return out
     finally:
+        # FIX 2026-10-08（遗留6）：产物写入走 _inflight_put（含 TTL/LRU 淘汰）
+        _inflight_put(cache_key, data)
         with _inflight_lock:
-            _inflight_results[cache_key] = data
             ev.set()
             # owner 注销；同 key 的后续新请求将成为新 owner（重新渲染）
             _inflight_renders.pop(cache_key, None)
@@ -906,6 +955,7 @@ def check_document(
 
     empty_sections = []
     short_sections = []
+    l3_range_sections = []
     empty_title_sections = []
     orphan_sections = []
     control_char_sections = []
@@ -918,6 +968,12 @@ def check_document(
 
     # 预检增强（V1.0）：1. 结构校验——先收集全部节点ID，用于检测孤立节点
     section_ids = {s.id for s in sections}
+    # 2026-10-09 方案三：L3 自身正文字数校验需要区分「有/无下级目录章节」，
+    # 因此先构建 parent_id -> 子节点列表 映射。
+    children_map: dict[int, list[int]] = {}
+    for s in sections:
+        if s.parent_id is not None:
+            children_map.setdefault(s.parent_id, []).append(s.id)
     # BUG-FIX 2026-09-18（中）：区分「父章节」与「叶子章节」。
     # AI 生成链路只在叶子节点上写正文（`_build_leaf_dicts`），父章节 content
     # 恒为空 —— 原实现不区分，把它们一律计入 empty_sections，于是每次预检
@@ -966,8 +1022,11 @@ def check_document(
             )
 
         # 2. 内容完整性：空内容 / 过短内容（<50字警告）
-        # 父章节跳过（见上方 parent_ids 说明）：它没有正文是设计如此，不是缺陷。
-        if s.id in parent_ids:
+        # 父章节跳过（见上方 parent_ids 说明）：L1/L2 没有正文是设计如此，不是缺陷。
+        # 2026-10-09 方案三例外：L3 无论有无下级目录章节都必须生成自身正文，
+        # 因此「有下级的 L3」也不能整体跳过空正文检查（否则 414/657 未生成会被漏检）。
+        _is_l3 = (s.level or 3) == 3
+        if not _is_l3 and s.id in parent_ids:
             pass
         elif not content.strip():
             empty_sections.append(
@@ -977,6 +1036,21 @@ def check_document(
             short_sections.append(
                 EmptySection(id=s.id, title=title, level=s.level),
             )
+
+        # 2.1 L3 自身正文字数检查（方案三 2026-10-09）：300 ± 20%（默认 240~360）
+        #   - 无下级目录章节（L4+）的 L3：自身正文是唯一测量口径；
+        #   - 有下级目录章节的 L3：按四档「子树总字数」±10% 控制，不在此处判罚。
+        if (
+            _is_l3
+            and s.id not in children_map
+            and not getattr(s, 'word_count_tier', None)
+            and s.word_count > 0
+        ):
+            _l3_lo, _l3_hi = get_l3_own_range()
+            if not (_l3_lo <= s.word_count <= _l3_hi):
+                l3_range_sections.append(
+                    EmptySection(id=s.id, title=title, level=s.level),
+                )
 
         # 4. 特殊字符过滤：扫描 Word 不兼容控制字符，提前标记以便导出前替换
         # BUG-FIX：此前只扫 content 不扫 title，标题带 \x0b 时预检报不出来，
@@ -1041,6 +1115,17 @@ def check_document(
 
     if short_sections:
         warnings.append(f"有 {len(short_sections)} 个章节字数少于50，导出后内容可能过于单薄")
+
+    if l3_range_sections:
+        # 方案三 2026-10-09：L3 自身正文需在 300 ± 20%（默认 240~360）区间内。
+        # 汇总为一条告警并列出前 5 个标题，便于用户定位。
+        _l3_lo, _l3_hi = get_l3_own_range()
+        _l3_names = "、".join((x.title or f"#{x.id}") for x in l3_range_sections[:5])
+        warnings.append(
+            f"有 {len(l3_range_sections)} 个三级目录自身正文未在 {_l3_lo}~{_l3_hi} 字达标区间"
+            f"（目标 {get_l3_own_target()} 字 ±20%），例如：{_l3_names}"
+            + ("…" if len(l3_range_sections) > 5 else "")
+        )
 
     if empty_title_sections:
         errors.append(f"有 {len(empty_title_sections)} 个章节标题为空，请先补充标题")
@@ -1596,6 +1681,7 @@ def _add_parsed_content(
     project_id: int | None = None,
     _http_service_available: bool | None = None,
     parent_section_number: str = "",
+    chapter_number: str = "",
 ):
     # 预检增强（V1.0）：写入前清理 Word 不兼容控制字符（垂直制表符等），
     # 与 check_document 的 control_char_sections 检查呼应，防止 python-docx 写入损坏文档
@@ -1634,6 +1720,7 @@ def _add_parsed_content(
                         config,
                         _http_service_available=_http_service_available,
                         parent_section_number=parent_section_number,
+                        chapter_number=chapter_number,
                     )
             except Exception as e:
                 logger.warning("解析图表标记失败: %s", e)
@@ -1744,6 +1831,16 @@ def _add_parsed_content(
             _add_paragraph_with_format(doc, display_text, config, block.type, level)
         elif block.type in ("list_item", "list_bullet", "list_ordered"):
             _add_paragraph_with_format(doc, block.text, config, block.type)
+            # FIX 2026-10-08（P2 列表拍平）：嵌套列表层级保真——parse_content 现在
+            # 把全角缩进层级写入 block.level（parse 端 FIX 2026-10-08），导出端按
+            # 层级附加左缩进（numPr 重起/嵌套由既有 D2 机制承载，这里补视觉层级）。
+            if block.level:
+                try:
+                    doc.paragraphs[-1].paragraph_format.left_indent = Pt(
+                        21 * min(int(block.level), 4)
+                    )
+                except Exception:
+                    pass
         else:
             _add_paragraph_with_format(doc, block.text, config, "paragraph")
 
@@ -1768,6 +1865,7 @@ def _add_parsed_content(
                         config,
                         _http_service_available=_http_service_available,
                         parent_section_number=parent_section_number,
+                        chapter_number=chapter_number,
                     )
                 except Exception as _e:
                     logger.warning("[D5加固] 标题兜底图表插入失败（已忽略）: %s", _e)
@@ -1782,8 +1880,19 @@ def _add_inline_chart(
     preload_only: bool = False,
     _http_service_available: bool | None = None,
     parent_section_number: str = "",
+    chapter_number: str = "",
 ):
     """根据图表类型和章节数据，在当前位置内联渲染图表（商业级 v2 渲染器）
+
+    BUG-FIX 2026-10-09（P1·图号章号错乱 / 跨章重号）：新增 `chapter_number`。
+    图号格式为「图{章号}-{序号}」，而旧实现把它绑在 `parent_section_number` 上
+    —— 后者由 `_section_number_to_arabic(numbering)` 得来，取的是**节点自身在其
+    层级里的序号**（L2 的「一/二」、L3 的「1/2」），这些序号在**每一章内都从 1
+    重新计数**。于是第 2 章下的 L2 节点得到 "1"，图号被算进第 1 章的桶里，
+    既串章又与第 1 章的图共享序号 → 跨章重号。
+    现由 `_write_tree_content_with_progress` 透传**当前 L1 章节序号**作为章号；
+    未传时回退 `parent_section_number`（向后兼容既有调用方与测试）。
+    分桶键与展示章号因此恒等，同章内图号连续且唯一。
 
     支持全部 7 类图表：gantt / flowchart / architecture / labor / comparison / layout / timeline
     优先级：
@@ -1812,6 +1921,8 @@ def _add_inline_chart(
             pass
 
     chart_type = (chart_type or "").lower().strip()
+    # 图号归属：优先用调用方透传的章号，未透传时回退旧口径（parent_section_number）
+    _fig_parent = (chapter_number or "").strip() or (parent_section_number or "").strip()
 
     # 统一图表类型处理（无降级模式）
     # 所有图表类型统一调用 _render_commercial：真实数据经渲染缓存 →
@@ -1837,13 +1948,23 @@ def _add_inline_chart(
             True 表示渲染成功；False 表示真实数据渲染失败，跳过该图表
         """
 
-        def _emit(stream, cap: str):
+        def _emit(stream, cap: str) -> bool:
+            """把字节流插入文档；返回是否**真的插入成功**。
+
+            BUG-FIX 2026-10-09（P1·插入失败仍占号）：旧实现无返回值并让调用方
+            一律 `return True`，于是「渲染成功但 `_add_diagram_picture` 插入失败」
+            也被算作成功 —— 文档里只剩一条灰色占位说明，却已消耗一个图号，
+            后续图号整体前跳（图号虚跳）。现把插入结果透传回去，失败即回滚。
+            """
             # 预加载模式：仅触发渲染并填充缓存，不写入 Document（线程安全）
-            if not preload_only:
-                # BUG-FIX 2026-09-18（P1）：渲染成功但插入失败（异常编码等）
-                # 时补灰色占位说明，避免成品静默空白
-                if not _add_diagram_picture(doc, stream, config, caption=cap):
-                    _add_image_placeholder(doc, config, cap, reason="图表图片插入失败")
+            if preload_only:
+                return True
+            # BUG-FIX 2026-09-18（P1）：渲染成功但插入失败（异常编码等）
+            # 时补灰色占位说明，避免成品静默空白
+            if not _add_diagram_picture(doc, stream, config, caption=cap):
+                _add_image_placeholder(doc, config, cap, reason="图表图片插入失败")
+                return False
+            return True
 
         payload_str = (
             json.dumps(payload, ensure_ascii=False) if not isinstance(payload, str) else payload
@@ -1861,19 +1982,19 @@ def _add_inline_chart(
         cached = _get_cached_chart_render(cache_payload_str, typ)
         if cached:
             cached_stream, _ = cached
-            _emit(cached_stream, caption)
+            ok = _emit(cached_stream, caption)
             logger.debug("商业级渲染: L1缓存命中 (%s)", typ)
-            return True
+            return ok
 
         # 策略 1: V6.0 持久化缓存
         try:
             cached_path = _chart_cache.get(cache_payload_str, chart_type=typ)
             if cached_path:
                 cached_bytes = cached_path.read_bytes()
-                _emit(BytesIO(cached_bytes), caption)
+                ok = _emit(BytesIO(cached_bytes), caption)
                 _store_chart_render(cache_payload_str, BytesIO(cached_bytes), chart_type=typ)
                 logger.debug("商业级渲染: 策略1缓存命中 (%s)", typ)
-                return True
+                return ok
         except Exception as e:
             last_error = e
 
@@ -1941,11 +2062,11 @@ def _add_inline_chart(
                 _render_bytes = stream.getvalue()
                 _chart_cache.set(cache_payload_str, _render_bytes, chart_type=typ)
                 _store_chart_render(cache_payload_str, BytesIO(_render_bytes), chart_type=typ)
-                _emit(stream, caption)
+                ok = _emit(stream, caption)
                 logger.info(
                     "[商业级渲染] 策略2成功: %s (原始数据, %d bytes)", typ, len(_render_bytes)
                 )
-                return True
+                return ok
             else:
                 logger.warning(
                     "[商业级渲染] 策略2失败: render_mermaid_to_bytes 返回 None chart_type=%s", typ
@@ -2074,9 +2195,7 @@ def _add_inline_chart(
                 # 但这只是巧合：一旦给预渲染补上章节号就会立刻串位，故显式短路。
                 # 图号不进缓存键（见 _strip_fig_no_for_cache），预热拿不到号不影响命中。
                 fig_no = (
-                    ""
-                    if preload_only
-                    else _next_figure_number(parent_section_number, _project_id)
+                    "" if preload_only else _next_figure_number(_fig_parent, _project_id)
                 )
                 if isinstance(source, dict):
                     source["fig_no"] = fig_no
@@ -2087,9 +2206,22 @@ def _add_inline_chart(
                 # 商业级 v2 渲染器（真实数据，无降级）
                 # P2：透传渲染结果，上层（预渲染计数/失败重试）才能感知成败
                 # P1 修复 2026-09-29：渲染失败时回滚图号，消除正文图号虚跳
-                _rendered = _render_commercial(ctype, source, final_caption)
+                # FIX 2026-10-08（P1 图号虚跳）：_render_commercial 内的
+                # json.dumps(payload)（payload 含不可序列化对象时抛 TypeError）等
+                # 不在其 try 保护内，异常向上传播被上层 except 吞掉 → 已取图号
+                # 不回滚，后续图号整体前跳一位。try/except 收口保证任何异常路径
+                # 都回滚（成功路径不受影响）。
+                try:
+                    _rendered = _render_commercial(ctype, source, final_caption)
+                except Exception as _rc_err:
+                    logger.warning(
+                        "[图表导出] 渲染异常，回滚图号 %s: %s", fig_no, _rc_err
+                    )
+                    if fig_no:
+                        _rewind_figure_number(_fig_parent, _project_id)
+                    return False
                 if fig_no and not _rendered:
-                    _rewind_figure_number(parent_section_number, _project_id)
+                    _rewind_figure_number(_fig_parent, _project_id)
                 return _rendered
             # V6.1 无数据源：跳过图表（无降级原则）
             #   正文出现图表占位但章节无绑定图表数据时，不得伪造图表内容
@@ -2117,6 +2249,7 @@ def _add_inline_chart(
                 preload_only=preload_only,
                 _http_service_available=_http_service_available,
                 parent_section_number=parent_section_number,
+                chapter_number=chapter_number,
             )
 
     if inline_data:
@@ -2141,12 +2274,11 @@ def _add_inline_chart(
                 preload_only=preload_only,
                 _http_service_available=_http_service_available,
                 parent_section_number=parent_section_number,
+                chapter_number=chapter_number,
             )
         # V7.0 未识别类型也注入图号（同上：预渲染阶段不消耗会话级图号计数器）
         fig_no = (
-            ""
-            if preload_only
-            else _next_figure_number(parent_section_number, _project_id)
+            "" if preload_only else _next_figure_number(_fig_parent, _project_id)
         )
         if isinstance(inline_data, dict):
             inline_data["fig_no"] = fig_no
@@ -2155,9 +2287,18 @@ def _add_inline_chart(
         )
         # P2：透传渲染结果（原裸 return 永远 None，调用方无法感知失败）
         # P1 修复 2026-09-29：渲染失败回滚图号
-        _rendered_fb = _render_commercial(inner_type or "chart", inline_data, fb_caption)
+        # FIX 2026-10-08（P1 图号虚跳）：同上，异常路径也必须回滚（见上方注释）。
+        try:
+            _rendered_fb = _render_commercial(inner_type or "chart", inline_data, fb_caption)
+        except Exception as _rc_err:
+            logger.warning(
+                "[图表导出] 渲染异常（兜底分支），回滚图号 %s: %s", fig_no, _rc_err
+            )
+            if fig_no:
+                _rewind_figure_number(_fig_parent, _project_id)
+            return False
         if fig_no and not _rendered_fb:
-            _rewind_figure_number(parent_section_number, _project_id)
+            _rewind_figure_number(_fig_parent, _project_id)
         return _rendered_fb
 
     # V6.1 无数据源且无法识别图表类型：跳过（无降级原则，不输出文本占位）
@@ -2760,6 +2901,29 @@ def _preload_chart_images_parallel(
     return success_count
 
 
+def _verify_docx_integrity(path: str) -> None:
+    """校验 .docx（ZIP 容器）完整性：不完整即抛 RuntimeError。
+
+    BUG-FIX 2026-10-09：原子写盘此前只查「大小非 0」。磁盘写满 / 进程被杀会留下
+    **非零但被截断**的半成品，它会被 `os.replace` 提升为正式产物，而下游
+    `build_docx` 只 `stat().st_size`，看不出来 —— 用户下载到 Word 打不开的文件。
+    docx 本质是 ZIP，用 `zipfile` 打开并 `testzip()` 即可拦住截断件与坏条目。
+
+    只做**读校验**，不修改文件；校验失败由调用方清理临时件后上抛。
+    """
+    import zipfile
+
+    try:
+        with zipfile.ZipFile(path) as zf:
+            bad = zf.testzip()
+    except zipfile.BadZipFile as exc:
+        raise RuntimeError(f"导出的 DOCX 不是有效的 ZIP 包（疑似写入被截断）: {exc}") from exc
+    except OSError as exc:
+        raise RuntimeError(f"读取临时 DOCX 失败: {exc}") from exc
+    if bad is not None:
+        raise RuntimeError(f"导出的 DOCX 内条目损坏: {bad}")
+
+
 def _atomic_save_docx(doc, output_path: str) -> None:
     """原子写盘：写同目录临时文件 → 大小校验 → os.replace 替换为最终路径。
 
@@ -2769,12 +2933,22 @@ def _atomic_save_docx(doc, output_path: str) -> None:
     替换」：任一步失败都只留下 .tmp.* 临时件并被清理，最终 .docx 要么不存在、要么完整。
     与本文件 _save_export_cache_index 的原子写口径一致。
     """
-    tmp_save_path = f"{output_path}.tmp.{os.getpid()}"
+    # BUG-FIX 2026-10-09（P2·临时件互踩 + 截断件放行）：原临时名固定为
+    # `<output>.tmp.<pid>` —— 同一进程内若有两个导出写同一目标路径（组锁失效
+    # 窗口 / 单测并发 / `output_path` 显式传入同一路径），两者共用同一个临时名，
+    # 后写完的那个 `os.replace` 会把前一个的产物顶掉，且失败清理时会删掉对方
+    # 正在写的临时件。现加入 uuid4 短随机段，一人一名。
+    tmp_save_path = f"{output_path}.tmp.{os.getpid()}.{uuid.uuid4().hex[:8]}"
     try:
         doc.save(tmp_save_path)
         # 零字节半成品不进入最终路径
         if os.path.getsize(tmp_save_path) == 0:
             raise RuntimeError("临时文件大小为 0，拒绝原子替换")
+        # BUG-FIX 2026-10-09（P2·只验大小不验完整性）：非零但**被截断**的 docx
+        # （磁盘写满/进程被杀）同样是坏件，旧实现会把它提升为正式产物，下游
+        # `build_docx` 只 stat 大小因此看不出来，用户下载到打不开的文件。
+        # docx 本质是 ZIP：校验 EOCD 签名 + 用 zipfile 打开一次即可拦住截断件。
+        _verify_docx_integrity(tmp_save_path)
         os.replace(tmp_save_path, output_path)
     except Exception as e:
         logger.error("保存文档失败: %s", e)
@@ -3748,6 +3922,7 @@ def _render_section_charts(
     config: ExportConfig,
     _http_service_available: bool | None = None,
     parent_section_number: str = "",
+    chapter_number: str = "",
 ):
     """V7.0 无降级图表渲染（仅 DB 有真实结构化 JSON 数据时才渲染）
 
@@ -3778,6 +3953,7 @@ def _render_section_charts(
             config,
             _http_service_available=_http_service_available,
             parent_section_number=parent_section_number,
+            chapter_number=chapter_number,
         )
         rendered_count += 1
 
@@ -3912,11 +4088,31 @@ def _write_tree_content_with_progress(
                 # 跳过节点仍需跳过其子树（栈中已包含 children）
                 continue
 
-            numbering = numbering_tracker.update_counter(node.level, str(current_parent_id)) + "、"
+            # BUG-FIX 2026-10-09（P1·L5+ 标题被硬加一个顿号）：`update_counter` 对
+            # L5+（不在 HEADING_MANAGED_LEVELS 内）返回空串，旧写法无条件拼 "、"
+            # 得到 "、" —— 它是 truthy，于是 L5+ 标题被渲染成「、施工组织设计」。
+            # 现与 `heading_standard.format_heading` 同口径：无编号就不加标点。
+            _raw_number = numbering_tracker.update_counter(node.level, str(current_parent_id))
+            numbering = f"{_raw_number}、" if _raw_number else ""
+            # BUG-FIX 2026-10-09（P1·图号章号错乱）：图号要用**所属章的序号**（L1
+            # 计数器），而不是节点自身在其层级里的序号（后者每章都从 1 重数 →
+            # 跨章重号）。counters[0] 在处理任意层级节点后都保持当前 L1 序号。
+            chapter_number = str(max(1, numbering_tracker.counters[0] or 1))
             has_children = bool(node.children)
 
+            # BUG-FIX 2026-10-09（P1·重试重复出图）：记录「本节点正文起点」。
+            # 旧实现在章节渲染抛异常时**保留已插入的元素**（可能已有若干张图）
+            # 再追加占位符，随后重试又对同一节点整段重跑一遍 → 文档里出现
+            # **重复的图片与段落**，且两次各占一批图号（图号断档）。
+            # 现于失败分支回滚本节点已写入的全部元素（标题之后），只留占位符，
+            # 使重试从干净状态开始。
+            _node_body_mark: int | None = None
             try:
                 _add_section_heading(doc, node.title, node.level, config, numbering=numbering)
+                # 必须用 `_body_insertion_mark` 而不是 `len(list(body))`：python-docx
+                # 把所有新元素插到末尾 `<w:sectPr>` **之前**，用长度当游标会偏后一位，
+                # 切片漏掉第一个新增元素（该函数的 docstring 已就此警告过）。
+                _node_body_mark = _body_insertion_mark(doc.element.body)
 
                 # BUG-FIX 2026-09-18（P1）：去掉 `not has_children` 门——用户在
                 # 非叶子（父级）章节上手工编辑的正文此前被静默丢弃，而字数
@@ -3939,6 +4135,7 @@ def _write_tree_content_with_progress(
                                 project_id=project_id,
                                 _http_service_available=_http_service_available,
                                 parent_section_number=_section_number_to_arabic(numbering.rstrip("、")),
+                                chapter_number=chapter_number,
                             )
                             logger.info(
                                 "[DIAG-EXPORT] After _add_parsed_content: node_id=%s", node.id
@@ -3950,6 +4147,7 @@ def _write_tree_content_with_progress(
                             doc, section_detail, node.title, config,
                             _http_service_available=_http_service_available,
                             parent_section_number=_section_number_to_arabic(numbering.rstrip("、")),
+                            chapter_number=chapter_number,
                         )
                         logger.info(
                             "[DIAG-EXPORT] After _render_section_charts: node_id=%s", node.id
@@ -3962,7 +4160,14 @@ def _write_tree_content_with_progress(
                     "node_id": node.id, "title": node.title, "level": node.level,
                     "error": str(e)[:200],
                     "parent_section_number": _section_number_to_arabic(numbering.rstrip("、")),
+                    "chapter_number": chapter_number,
                 })
+                # 回滚本节点已写入的元素（标题保留），避免重试时内容重复
+                if _node_body_mark is not None:
+                    try:
+                        _remove_body_elements(list(doc.element.body)[_node_body_mark:])
+                    except Exception:
+                        logger.warning("回滚失败章节的半截内容失败，忽略: node=%s", node.id)
                 _ph = None
                 try:
                     _ph = doc.add_paragraph()
@@ -4054,6 +4259,7 @@ def _write_tree_content_with_progress(
                             project_id=project_id,
                             _http_service_available=_http_service_available,
                             parent_section_number=fs.get("parent_section_number", ""),
+                            chapter_number=fs.get("chapter_number", ""),
                         )
                         _render_section_charts(
                             doc,
@@ -4062,6 +4268,7 @@ def _write_tree_content_with_progress(
                             config,
                             _http_service_available=_http_service_available,
                             parent_section_number=fs.get("parent_section_number", ""),
+                            chapter_number=fs.get("chapter_number", ""),
                         )
                     if _ph is not None:
                         _move_body_elements_before(list(_body)[_mark:], _ph._p)

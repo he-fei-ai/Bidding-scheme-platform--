@@ -116,6 +116,9 @@ class Section(BaseModel):
     illustration_data: str | None = None
     content: str = ""
     target_words: int | None = None
+    # 2026-10-08 新增：字数档位（brief/standard/detailed/long）
+    # 用于三级目录（叶子节点）的字数控制；None 表示跟随全局默认档位
+    word_count_tier: str | None = None
     status: str = "pending"
     created_at: str = ""
     updated_at: str = ""
@@ -144,6 +147,9 @@ class SectionCreate(BaseModel):
     sort_order: int | None = None
     section_type: str = "text"
     scoring_point_id: str | None = None
+    # 2026-10-08 新增：字数档位（brief/standard/detailed/long）；None 表示跟随全局默认
+    word_count_tier: str | None = None
+    target_words: int | None = None
 
 
 class SectionUpdate(BaseModel):
@@ -152,6 +158,8 @@ class SectionUpdate(BaseModel):
     parent_id: int | None = None
     content: str | None = None
     target_words: int | None = None
+    # 2026-10-08 新增：字数档位覆盖；None 表示清除（跟随全局默认）
+    word_count_tier: str | None = None
     status: str | None = None
     section_type: str | None = None
     scoring_point_id: str | None = None
@@ -176,12 +184,20 @@ class SectionTreeNode(BaseModel):
     section_type: str
     scoring_point_id: str | None = None
     target_words: int | None = None
+    # 2026-10-08 新增：字数档位相关字段（仅三级目录叶子有意义）
+    word_count_tier: str | None = None
+    tier_label: str | None = None
+    tier_target: int | None = None
+    # 只读统计字段：L1/L2 显示其子树所有 L3 的字数累计
+    cumulative_word_count: int = 0
     status: str
     created_at: str | None = None
     children: list["SectionTreeNode"] = []
     has_content: bool = False
     word_count: int = 0
     chart_flags: list[str] = []
+    graph_suitable: bool = False
+    suggested_chart: str = ""
 
 
 class ExportConfig(BaseModel):

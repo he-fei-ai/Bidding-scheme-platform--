@@ -61,6 +61,7 @@ from ...utils.scoring_points import (
 )
 from . import outline_gate
 from .outline_common import (
+    FIXED_28_CHAPTERS,
     _ensure_min_children,
     _parse_scope_items,
     check_json,
@@ -76,6 +77,12 @@ from .workflows_base import (
     collect_json_response,
 )
 from .workflows_sections import _format_facts_list
+from app.config import (
+    OUTLINE_MAX_TOKENS_DIRECT,
+    OUTLINE_MAX_TOKENS_L1,
+    OUTLINE_MAX_TOKENS_L2,
+    OUTLINE_MAX_TOKENS_SELFCHECK,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -220,7 +227,7 @@ async def generate_outline_direct(
         provider,
         messages,
         max_retries=2,
-        max_tokens=6000,
+        max_tokens=OUTLINE_MAX_TOKENS_DIRECT,
     )
     if not raw:
         logger.warning("[目录直出] AI 未返回有效内容，回退分步路径")
@@ -351,30 +358,23 @@ def _int_to_chinese_num(n: int) -> str:
 # 本工作流此前**直接忽略**调用方传入的 `reference_outline`，永远用这份 23 章列表，
 # 于是「改参考目录」只改一处、另一处不动，两套骨架长期漂移且无人察觉。
 # 现由 `_resolve_reference_json()` 让调用方传入的参考目录优先生效，本列表仅作兜底。
+# 增强 2026-10-08（反漂移）：23 章精简兜底模板由 FIXED_28_CHAPTERS 过滤派生，
+# 标题与 28 章主源单一来源，新增/重命名章节时自动同步，杜绝第三份手工列表漂移。
+# 剔除：文明施工(11)、检测仪器(16)、紧急情况处理(21)、与发包人配合(23)、其他(28)。
+# 唯一保留的刻意改写：id24 原标题较冗长，兜底模板以「与各参建方的配合协调」措辞呈现
+# （与原硬编码模板完全一致，仅在此显式登记，便于后续溯源）。
+_REFERENCE_KEEP_IDS = {
+    "1", "2", "3", "4", "5", "6", "7", "8", "9", "10",
+    "12", "13", "14", "15", "17", "18", "19", "20", "22", "24", "25", "26", "27",
+}
+_REFERENCE_TITLE_REWRITE = {
+    "对总包管理及专业分包配合方案／与各参建方配合": "与各参建方的配合协调",
+}
 REFERENCE_TEMPLATE_V51 = [
-    {"id": "ref_1", "title": "项目概述"},
-    {"id": "ref_2", "title": "项目重难点分析"},
-    {"id": "ref_3", "title": "工程概况"},
-    {"id": "ref_4", "title": "编制依据"},
-    {"id": "ref_5", "title": "施工方案及技术措施"},
-    {"id": "ref_6", "title": "施工现场总平面布置"},
-    {"id": "ref_7", "title": "主要分部工程施工方法"},
-    {"id": "ref_8", "title": "装配式混凝土结构（PC）工程专项方案"},
-    {"id": "ref_9", "title": "质量保证措施和创优计划"},
-    {"id": "ref_10", "title": "施工安全措施计划"},
-    {"id": "ref_11", "title": "施工环保措施计划"},
-    {"id": "ref_12", "title": "施工总进度计划及保证措施"},
-    {"id": "ref_13", "title": "资源配备计划"},
-    {"id": "ref_14", "title": "拟投入本工程的主要施工设备表"},
-    {"id": "ref_15", "title": "主要材料及劳动力计划表"},
-    {"id": "ref_16", "title": "特殊气候季节性施工方案"},
-    {"id": "ref_17", "title": "成品保护和工程保修工作的管理措施和承诺"},
-    {"id": "ref_18", "title": "危大工程及专项施工方案、紧急情况预案与风险控制措施"},
-    {"id": "ref_19", "title": "对专业分包工程的配合、协调、管理、服务方案"},
-    {"id": "ref_20", "title": "与各参建方的配合协调"},
-    {"id": "ref_21", "title": "工期优化"},
-    {"id": "ref_22", "title": "工程资料及竣工验收管理"},
-    {"id": "ref_23", "title": "附图、附件"},
+    {"id": f"ref_{i}", "title": _REFERENCE_TITLE_REWRITE.get(c["title"], c["title"])}
+    for i, c in enumerate(
+        (ch for ch in FIXED_28_CHAPTERS if ch["id"] in _REFERENCE_KEEP_IDS), start=1
+    )
 ]
 
 
@@ -665,7 +665,7 @@ async def _generate_level1_v51(
                 provider,
                 sys_prompt,
                 base_user_prompt,
-                max_tokens=8192,
+                max_tokens=OUTLINE_MAX_TOKENS_L1,
                 max_retries=1,
                 project_info=project_info,
             )
@@ -1736,7 +1736,7 @@ async def _fill_level2_with_ai(
                 provider,
                 sys_prompt,
                 user_prompt,
-                max_tokens=4096,
+                max_tokens=OUTLINE_MAX_TOKENS_L2,
                 max_retries=1,
                 project_info=project_info,
             )
@@ -3982,7 +3982,7 @@ async def _generate_level3_v51(
     BUG 修复：添加完整的类型检查，防止非 dict 元素导致 AttributeError。
     """
     if phase_callback:
-        await phase_callback("V5.1三级生成", "流水线生成三级目录")
+        await phase_callback("V5.1三级生成", "检查并补全三级目录（串行后处理）")
 
     # 收集所有 L3 节点做最终检查并多样化填充
     l3_total = 0
@@ -4633,7 +4633,7 @@ async def _ai_deep_check(
             provider,
             sys_prompt,
             user_prompt,
-            max_tokens=5000,
+            max_tokens=OUTLINE_MAX_TOKENS_SELFCHECK,
             max_retries=1,
             project_info=project_info,
         )
@@ -4836,7 +4836,7 @@ async def generate_outline_v51(
     2. 人工审核：一级目录（可跳过）
     3. L2：代码预构建 JSON 骨架 → AI 并发填充二三级标题
     4. 人工审核：二级目录（可跳过）
-    5. L3：流水线模式检查三级节点完整性
+    5. L3：全量串行后处理，检查三级节点完整性（非流水线，整树一次性遍历）
     6. AI 自检 + 最终审核
 
     ENHANCE 2026-10-05（P-4）：新增 `outline_mode` 参数，支持「短标书 +
@@ -4901,10 +4901,24 @@ async def generate_outline_v51(
                     logger.info("[V5.1] 直出目录最终审核未通过，中止")
                     return []
                 direct = edited
+
+        if direct:
+            # 编号安全网（修复：直出路径与分步路径产物结构不一致 / 编辑后编号未重算）：
+            # 直出路径不经过门禁 rennumber，且最终审核可能有人工编辑/重排，落库前按当前
+            # 真实树结构重排位置式 id（1 / 1.1 / 1.1.1）。renumber_outline_ids 仅改 id，
+            # 不动 title/children，幂等且安全，确保 id 始终与层级、顺序严格一致。
+            direct, _id_changes = outline_gate.renumber_outline_ids(direct)
+            if _id_changes:
+                logger.info("[V5.1] 直出路径编号重排: 修正 %d 个 id", _id_changes)
             logger.info(
                 "[V5.1] 直出路径完成: %d 章, 耗时 %.1fs",
                 len(direct), time.monotonic() - _t_start,
             )
+            # BUG-FIX 2026-10-08（P1 直出失败不回退）：return 原先位于 if 块外，
+            # 直出异常（direct=[]）时直接返回空目录，"回退分步路径"永远不执行
+            # （下一行回退日志是不可达死代码）。生产表现：短标书直出遇 AI 超时/
+            # JSON 失败时目录生成为空，而不是按设计回退到分步生成。修复后仅
+            # 直出成功才返回，空结果落到下方分步路径。
             return direct
         logger.warning("[V5.1] 直出路径未产出结果，回退分步路径")
 
@@ -5116,6 +5130,13 @@ async def generate_outline_v51(
         level1 = edited
 
     # ===== 返回最终结果 =====
+    # 编号安全网（修复：最终审核的人工编辑/重排发生在门禁 rennumber 之后，此处按最终
+    # 真实结构重排位置式 id，确保 id 与层级、顺序严格一致；同时统一直出/分步两条路径
+    # 的产物契约）。renumber_outline_ids 仅改 id，不动 title/children，幂等且安全。
+    level1, _id_changes = outline_gate.renumber_outline_ids(level1)
+    if _id_changes:
+        logger.info("[V5.1] 终态编号重排: 修正 %d 个 id（含人工编辑后重排）", _id_changes)
+
     _total_nodes = sum(
         1 + sum(1 + sum(1 for _ in l2.get("children", [])) for l2 in l1.get("children", []))
         for l1 in level1

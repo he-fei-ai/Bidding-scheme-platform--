@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 /**
- * 全文一致性审计页 —— 组件级（DOM）交互测试（2026-10-06）。
+ * 全文一致性审计页 —— 组件级（DOM）交互测试。
  *
  * 重点钉住 BUG-1（P1·正文污染）：此前「采纳建议并修复」按钮把后端返回的
  * 整段建议文案（"建议将以下内容统一为：450（已确认的全局事实基准）\n待修正取值：500"）
@@ -9,6 +9,11 @@
  *
  * 本测试在真实 DOM 交互里断言：点「采纳建议并修复」时，applyAutoFix 收到的
  * new_value 必须是结构化纯目标值 "450"，而不是整段文案。
+ *
+ * ENHANCE 2026-10-08：页面已拆为「页面壳 + ConflictListTab / ScoringComplianceTab」。
+ * 本文件聚焦页面壳层（默认 Tab、跨 Tab 挂载、规则对齐）；ConflictListTab 内部的
+ * 交互细节（筛选切换、章节深链、已解决行只读）迁到 `ConsistencyPage.tabs.dom.test.tsx`
+ * 单独挂载 —— 更快，也不必为测一个断言把另一个 Tab 的请求一起拉起来。
  */
 import { describe, it, expect, vi, beforeAll } from "vitest";
 
@@ -22,6 +27,8 @@ const CONFLICTS = [
     sources: ["global_facts (已确认事实基准)", "section_1 (第一章)"],
     severity: "high",
     description: "工期存在2种不同表述：450、500，可能存在不一致",
+    state: "open",
+    resolved: 0,
   },
 ];
 
@@ -30,30 +37,77 @@ const SUGGESTION_TEXT =
   "建议将以下内容统一为：450（已确认的全局事实基准）\n待修正取值：500";
 const TARGET_VALUE = "450";
 
-const applyAutoFixMock = vi.fn(async () => ({ status: "ok", message: "已修改", success: true }));
+const applyAutoFixMock = vi.fn(
+  async (_cid: string, _pid: number, _nv: string) => ({
+    status: "ok", message: "已修改", success: true,
+  }),
+);
 
+// 2026-10-08：页面壳会拉规则快照对齐严重度映射；评分达标 Tab 未激活时不请求。
+// 但 mock 工厂必须提供这两个导出，否则模块一加载就是 undefined 调用。
 vi.mock("../api", () => ({
   runConsistencyAudit: vi.fn(async () => ({
+    status: "ok",
+    audit_status: "completed",
     total_sections: 2,
     facts_extracted: 4,
     conflicts_found: 1,
     conflicts: CONFLICTS,
   })),
-  getConflicts: vi.fn(async () => ({ conflicts: CONFLICTS })),
+  getConflicts: vi.fn(async () => ({
+    conflicts: CONFLICTS, count: CONFLICTS.length, filter: "open",
+  })),
   getFixSuggestion: vi.fn(async () => ({
     suggestion: SUGGESTION_TEXT,
     target_value: TARGET_VALUE,
   })),
-  applyAutoFix: (...args: unknown[]) => applyAutoFixMock(...args),
+  applyAutoFix: applyAutoFixMock,
   getAuditSummary: vi.fn(async () => ({
     summary: {
       latest_audit: { audit_time: "2026-01-01 00:00:00" },
       unresolved_conflicts: 1,
-      conflicts_by_severity: { high: 1, medium: 0 },
+      resolved_conflicts: 0,
+      conflicts_by_severity: { high: 1 },
     },
   })),
   repairConsistencyWithAi: vi.fn(async () => ({
-    status: "no_change", message: "无补丁", patches: [], applied: [], rejected: [], sections: [], unresolved: [], errors: [],
+    status: "no_change", message: "无补丁", patches: [], applied: [], rejected: [],
+    sections: [], unresolved: [], errors: [], conflict_states: null,
+  })),
+  getConsistencyRules: vi.fn(async () => ({
+    status: "ok",
+    severity: {
+      order: ["high", "medium", "low"],
+      default: "medium",
+      unknown_rank: 4,
+      meta: {
+        high: { label: "严重", color: "red" },
+        medium: { label: "中等", color: "orange" },
+        low: { label: "轻微", color: "blue" },
+      },
+    },
+    facts: { base_names: [], critical: [], high_distinct_threshold: 2 },
+    audit_status: {
+      success: ["completed", "completed_no_conflicts"],
+      failed: "failed",
+      completed: "completed",
+      no_conflicts: "completed_no_conflicts",
+    },
+    conflict_state: { open: "open", resolved: "resolved" },
+    scoring_status: { meta: {} },
+  })),
+  getScoringCompliance: vi.fn(async () => ({
+    status: "ok",
+    project_id: 1,
+    audit_time: "2026-01-01 00:00:00",
+    audit_status: "completed",
+    total_points: 0,
+    unmapped: 0,
+    empty: 0,
+    weak: 0,
+    covered: 0,
+    gaps: [],
+    warnings: [],
   })),
 }));
 
@@ -101,7 +155,7 @@ describe.skipIf(!hasDom)("ConsistencyPage 组件级交互（BUG-1 防回归）",
     const Page = (await import("./ConsistencyPage")).default;
     rtl.render(<Page />);
 
-    // ① 冲突表格已渲染（事实项列有"工期"）
+    // ① 默认 Tab 是「一致性冲突」，冲突表格已渲染（事实项列有"工期"）
     expect(await rtl.screen.findByText("工期")).toBeTruthy();
 
     // ② 点第一行的「修复建议」按钮 → 弹窗出现建议文案
@@ -116,15 +170,15 @@ describe.skipIf(!hasDom)("ConsistencyPage 组件级交互（BUG-1 防回归）",
     rtl.fireEvent.click(adoptBtn);
 
     // 等待 autofix 弹窗打开后点「应用修复」（antd Modal 的 ok 按钮）
-    // 直接找"应用修复"按钮
     const okBtn = await rtl.screen.findByText("应用修复");
     rtl.fireEvent.click(okBtn);
 
     // ④ 关键断言：applyAutoFix 被调用，且第三个参数（new_value）是纯值 "450"，
-    //    绝不能是整段建议文案。
-    //    applyAutoFix 签名：(conflictId, projectId, newValue)
+    //    绝不能是整段建议文案。签名：(conflictId, projectId, newValue)
     expect(applyAutoFixMock).toHaveBeenCalled();
-    const [, , newValue] = applyAutoFixMock.mock.calls[0] as [string, number, string];
+    const call = applyAutoFixMock.mock.calls[0] as unknown as [string, number, string];
+    expect(call).toBeDefined();
+    const newValue = call[2];
     expect(newValue).toBe(TARGET_VALUE);
     expect(newValue).not.toContain("建议");
     expect(newValue).not.toContain("统一为");
@@ -138,7 +192,9 @@ describe.skipIf(!hasDom)("ConsistencyPage 组件级交互（BUG-1 防回归）",
     if (!rtl) return;
 
     const { getConflicts } = await import("../api");
-    (getConflicts as unknown as ReturnType<typeof vi.fn>).mockResolvedValueOnce({ conflicts: [] });
+    (getConflicts as unknown as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
+      conflicts: [], count: 0, filter: "open",
+    });
 
     const Page = (await import("./ConsistencyPage")).default;
     rtl.render(<Page />);

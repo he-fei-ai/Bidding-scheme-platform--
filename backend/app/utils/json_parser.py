@@ -136,22 +136,43 @@ def _try_parse_candidate(candidate: str) -> dict | list | None:
     段 JSON 里**同时**出现非法转义（如 `\\.`、裸换行）与尾随逗号/注释，单独做任一种
     修复都无法解析，必须两者组合才能消化（否则仍会退化到昂贵的 AI 修复重试）。
     """
-    # 预计算两种单边修复结果，再组合，避免重复调用且覆盖两种顺序
-    escapes_fixed = repair_invalid_json_escapes(candidate)
-    loose_fixed = _repair_loose_syntax(candidate)
-    combined_a = _repair_loose_syntax(escapes_fixed)  # 先修转义，再清逗号/注释
-    combined_b = repair_invalid_json_escapes(loose_fixed)  # 先清逗号/注释，再修转义
-
-    for text in (candidate, escapes_fixed, loose_fixed, combined_a, combined_b):
+    # BUG-FIX 2026-10-08：修复变体改为惰性计算——先尝试原样解析，
+    # 成功则无需计算任何修复。原实现在首次 json.loads 成功后仍会
+    # 执行全部 4 种修复变换，白耗 CPU。
+    def _try_variant(text: str | None) -> dict | list | None:
         if not text:
-            continue
+            return None
         try:
             parsed = json.loads(text)
         except (json.JSONDecodeError, TypeError, ValueError):
-            continue
-        # 只接受对象/数组，标量（如纯数字）视为无效 JSON 响应
-        if isinstance(parsed, (dict, list)):
-            return parsed
+            return None
+        return parsed if isinstance(parsed, (dict, list)) else None
+
+    # 1. 原样解析
+    result = _try_variant(candidate)
+    if result is not None:
+        return result
+
+    # 2. 仅修复转义
+    result = _try_variant(repair_invalid_json_escapes(candidate))
+    if result is not None:
+        return result
+
+    # 3. 仅修复语法（逗号/注释）
+    result = _try_variant(_repair_loose_syntax(candidate))
+    if result is not None:
+        return result
+
+    # 4. 先修转义再清语法
+    result = _try_variant(_repair_loose_syntax(repair_invalid_json_escapes(candidate)))
+    if result is not None:
+        return result
+
+    # 5. 先清语法再修转义
+    result = _try_variant(repair_invalid_json_escapes(_repair_loose_syntax(candidate)))
+    if result is not None:
+        return result
+
     return None
 
 
@@ -328,15 +349,27 @@ def _extract_balanced_json(content: str) -> str | None:
     else:
         find_start = min(first_open, first_bracket)
 
-    for start in range(find_start, len(content)):
+    # BUG-FIX 2026-10-08：原实现 for start in range(find_start, len) 逐字符
+    # 迭代外层循环，每次失败后从 start+1 重启扫描，最坏 O(n²)。
+    # 现改用 content.find() 跳到下一个开括号位置，内层扫描仍单次通过。
+    start = find_start
+    n = len(content)
+    while start < n:
         ch = content[start]
         if ch not in openers:
+            # 跳到下一个开括号（避免逐字符遍历非开括号字符）
+            next_open = content.find("{", start + 1)
+            next_bracket = content.find("[", start + 1)
+            candidates = [p for p in (next_open, next_bracket) if p != -1]
+            if not candidates:
+                break
+            start = min(candidates)
             continue
+
         stack: list[str] = [ch]
         in_string = False
         escape = False
         i = start + 1
-        n = len(content)
         while i < n:
             c = content[i]
             if in_string:
@@ -357,9 +390,16 @@ def _extract_balanced_json(content: str) -> str | None:
                         if not stack:
                             return content[start : i + 1]
                     else:
-                        # 括号不匹配，从此起点无法构成合法 JSON
                         break
             i += 1
+
+        # 扫描失败 → 跳到下一个开括号位置继续尝试
+        next_open = content.find("{", start + 1)
+        next_bracket = content.find("[", start + 1)
+        candidates = [p for p in (next_open, next_bracket) if p != -1]
+        if not candidates:
+            break
+        start = min(candidates)
     return None
 
 

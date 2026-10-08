@@ -12,6 +12,7 @@ import re
 from typing import ClassVar
 
 from ..db import get_db
+from . import consistency_rules as rules
 from . import text_patch
 from .facts_service import is_placeholder_value, normalize_fact_value, parse_stored_items
 
@@ -69,7 +70,14 @@ class ConsistencyAuditor:
     # 需要检查的关键事实模式（类级只读常量）
     FACT_PATTERNS: ClassVar[dict[str, str]] = {
         "工期": r"(?:工期|周期|天数|天)\s*[:：]?\s*(\d+)\s*天",
-        "金额": r"(?:金额|造价|预算|报价|合同价)\s*[:：]?\s*([\d,\.]+)\s*(?:万元|元|百万|千万)?",
+        # BUG-FIX 2026-10-09（P1·金额单位丢失 → 误报 + 修复建议有害）：原式
+        # `(?:...)\s*[:：]?\s*([\d,\.]+)\s*(?:万元|元|百万|千万)?` 只捕获**数字**、
+        # 把单位留在非捕获组里统统丢弃。于是「合同价 1200 万元」与「造价 12000000 元」
+        # 被抽成 ["1200","12000000"] —— 实为同一金额却判成冲突（误报）；采纳修复
+        # 建议后还会把 12000000 替换成 1200，正文金额被改小一万倍。
+        # 现把单位一并捕获进第 2 组，判等前由 `rules.normalize_amount_to_yuan`
+        # 统一换算到「元」基准（见 `_distinct_values`）。
+        "金额": r"(?:金额|造价|预算|报价|合同价)\s*[:：]?\s*([\d,\.]+)\s*(万元|亿元|百万|千万|万|元)?",
         # BUG-FIX 2026-10-04（正则不分岗位 → 结构性误报）：原式
         # `(?:项目经理|技术人员|管理人员|人员)\s*[:：]?\s*(\d+)\s*人` 把**不同岗位**的
         # 人数统统归到同一个事实名「人员数量」。于是正文里一句「项目经理 1 人、
@@ -116,15 +124,20 @@ class ConsistencyAuditor:
         for fact_type, pattern in self.FACT_PATTERNS.items():
             matches = re.findall(pattern, text, re.IGNORECASE)
             for match in matches:
-                # 双捕获组的模式（当前仅「人员数量」）返回 (岗位, 数值)：按岗位
-                # 拆分事实名，避免不同岗位人数被合并成一条「人员数量」造成误报。
+                # 双捕获组的模式（「人员数量」= (岗位, 数值)、「金额」= (数值, 单位)）
+                # 返回 tuple：
+                #  - 人员按岗位拆分事实名，避免不同岗位人数被合并成一条「人员数量」误报；
+                #  - 金额把单位拼回取值，供后续按「元」基准换算消除单位口径误报。
                 if isinstance(match, tuple):
-                    role, number = str(match[0]), str(match[1])
-                    fact_name = f"{role}数量" if role != fact_type else fact_type
-                    value = number.strip()
+                    if fact_type == rules.FACT_AMOUNT:
+                        fact_name = rules.FACT_AMOUNT
+                        value = f"{str(match[0]).strip()}{str(match[1] or '').strip()}"
+                    else:
+                        fact_name = rules.personnel_fact_name(str(match[0]))
+                        value = str(match[1]).strip()
                 else:
                     fact_name = f"{fact_type}"
-                    value = match.strip()
+                    value = str(match).strip()
                 if value:
                     facts.append(
                         FactVariable(
@@ -148,7 +161,11 @@ class ConsistencyAuditor:
         前端「提取 N 个事实」恒显示 0。抽取逻辑下沉到本方法后，全量重扫只需跑一次，
         审计数直接由本方法的返回值计算。
         """
-        with get_db() as conn:
+# PERF（2026-10-08）：本方法只读不写，改 readonly 连接，不再在事件循环
+        # 所在的 to_thread 里抢全局写锁。此前用无参 `get_db()`（写连接），与
+        # `routers/consistency.py` 里自己写的「纯读必须 readonly」注释自相矛盾，
+        # 在生成高峰期会与正文写库争锁、拉长 SSE 延迟。
+        with get_db(readonly=True) as conn:
             # 获取项目摘要（使用notes字段作为摘要）
             summary_row = conn.execute(
                 "SELECT notes, bidder_name, industry FROM projects WHERE id = ?",
@@ -227,21 +244,18 @@ class ConsistencyAuditor:
                     all_facts[key].append(
                         {
                             "value": fact.value,
-                            "source": f"section_{section['id']} ({section['title']})",
+"source": f"section_{section['id']} ({section['title']})",
                             "section_id": section["id"],
                         }
                     )
 
         return all_facts
 
-    def count_extracted_facts(self, project_id: int) -> int:
-        """本项目本次全量抽取到的事实实例总数（各事实名下的取值出现次数之和）。
-
-        供 `run_full_audit` 写入审计日志的 `facts_extracted`，是**当前这次审计**
-        的真实抽取数，而非历史日志累加。
-        """
-        all_facts = self._collect_fact_instances(project_id)
-        return sum(len(instances) for instances in all_facts.values())
+    # DEAD-CODE REMOVED 2026-10-08：原 `count_extracted_facts(project_id)` 已删除。
+    # 它自述「供 run_full_audit 写入 facts_extracted」，但 `run_full_audit` 实际
+    # 直接用 `_collect_fact_instances` 的返回值求和（ENHANCE 2026-10-04 改的），
+    # 该方法在全仓（含全部测试）无任何调用方。留着等于提供一条「调它就会把全部
+    # 章节正文再扫一遍」的重复路径，是误导性 API，故移除而非保留。
 
     def detect_conflicts(
         self, project_id: int, *, all_facts: dict[str, list[dict]] | None = None
@@ -269,12 +283,20 @@ class ConsistencyAuditor:
             # BUG-FIX 2026-09-29（误报）：原判定用 `len(set(values)) > 1` 比较**原文**，
             # 于是“450”/“450 天”/“450日历天”这类同义写法被判成多个冲突值，
             # 审计报告里挤满假阳性。现按归一化口径去重后仍 ≥ 2 种才判冲突。
-            distinct_values = self._distinct_values(values)
+            distinct_values = self._distinct_values(values, fact_name=fact_name)
             if len(distinct_values) < 2:
                 continue
 
+            # 冲突取值落在多少个**正文章节**里：只有一处 → 正文内部自洽，
+            # 只是与基准/摘要不符（判 low）。基准与摘要的 section_id 为 None，不计入。
+            section_count = len(
+                {inst.get("section_id") for inst in instances if inst.get("section_id") is not None}
+            )
+
             # 发现冲突
-            severity = self._assess_severity(fact_name, values)
+            severity = self._assess_severity(
+                fact_name, values, section_count=section_count
+            )
 
             conflict = Conflict(
                 # BUG-FIX 2026-09-18（高）：原 conflict_id 为
@@ -300,12 +322,17 @@ class ConsistencyAuditor:
 
         return conflicts
 
-    @staticmethod
-    def _distinct_values(values: list[str]) -> list[str]:
+    @classmethod
+    def _distinct_values(cls, values: list[str], *, fact_name: str | None = None) -> list[str]:
         """按归一化口径去重，保留每种写法的首个原文形式（展示/替换仍用原文）。
 
         归一化只用于**判等**，不能用于落文：`apply_autofix` 拿到的仍是原文值，
         才能做带数字边界保护的安全替换。
+
+        金额事实（`fact_name == "金额"`）额外按「元」基准换算判等：
+        「1200万元」与「12000000元」归一后相同，不判冲突（见
+        `rules.normalize_amount_to_yuan` 的 BUG-FIX 说明）。换算不可用时
+        回退通用归一化，保持「宁多报也不漏报」。
         """
         reps: dict[str, str] = {}
         for value in values or []:
@@ -313,29 +340,40 @@ class ConsistencyAuditor:
             if not text:
                 continue
             norm = normalize_fact_value(text)
+            if fact_name == rules.FACT_AMOUNT:
+                yuan = rules.normalize_amount_to_yuan(text)
+                if yuan is not None:
+                    norm = f"yuan:{yuan}"
             if norm and norm not in reps:
                 reps[norm] = text
         return list(reps.values())
 
-    def _assess_severity(self, fact_name: str, values: list[str]) -> str:
+    def _assess_severity(
+        self,
+        fact_name: str,
+        values: list[str],
+        *,
+        section_count: int | None = None,
+    ) -> str:
         """评估冲突严重程度
 
         Args:
             fact_name: 事实名称
             values: 冲突的值列表
+            section_count: 冲突取值落在多少个正文章节里（None = 未知，不判 low）
 
         Returns:
-            严重程度：high/medium/low
+            严重程度：high/medium/low（取值与排序见 `consistency_rules`）
         """
-        critical_facts = ["工期", "金额", "资质等级"]
-
-        if fact_name in critical_facts:
-            return "high"
-
-        if len(self._distinct_values(values)) > 2:
-            return "high"
-
-        return "medium"
+        # ENHANCE 2026-10-09：判定标准整体收敛到 `consistency_rules.assess_severity`。
+        # 此前本方法自带 `critical_facts` 字面量与 `>2` 魔法阈值，且与前端
+        # `CONSISTENCY_SEVERITY_META` 各写一套；更重要的是它**永不产出 low**
+        # —— 命名空间里定义的一档严重度是死档。现在审计器只做委托。
+        return rules.assess_severity(
+            fact_name,
+            self._distinct_values(values, fact_name=fact_name),
+            section_count=section_count,
+        )
 
     def _describe_conflict(self, fact_name: str, values: list[str]) -> str:
         """描述冲突
@@ -347,7 +385,7 @@ class ConsistencyAuditor:
         Returns:
             冲突描述
         """
-        unique_values = self._distinct_values(values)
+        unique_values = self._distinct_values(values, fact_name=fact_name)
         return (
             f"{fact_name}存在{len(unique_values)}种不同表述："
             + "、".join(unique_values)
@@ -378,19 +416,26 @@ class ConsistencyAuditor:
                        (project_id, conflict_id, fact_name, values_json,
                         sources_json, severity, description, created_at)
                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                       ON CONFLICT(conflict_id) DO UPDATE SET
-                        values_json = excluded.values_json,
-                        sources_json = excluded.sources_json,
-                        severity = excluded.severity,
-                        description = excluded.description,
-                        created_at = excluded.created_at""",
+ON CONFLICT(conflict_id) DO UPDATE SET
+                         values_json = excluded.values_json,
+                         sources_json = excluded.sources_json,
+                         severity = excluded.severity,
+                         description = excluded.description,
+                         resolved = 0,
+                         resolved_value = NULL,
+                         resolved_at = NULL,
+                         created_at = excluded.created_at""",
                     (
                         project_id,
                         conflict.conflict_id,
                         conflict.fact_name,
                         self._json_serialize(conflict.values),
                         self._json_serialize(conflict.sources),
-                        conflict.severity,
+                        # BUG-FIX 2026-10-08：写库前归一化严重度，杜绝 `severity=''`
+                        # 这类脏值（`severity` 列 NOT NULL 但**空串合法**，而
+                        # `ORDER BY CASE severity ... END` 若不写 ELSE，未命中 CASE
+                        # 的行在 SQLite 里求值为 NULL 并排到最前 → 冲突列表顺序错乱）。
+                        rules.normalize_severity(conflict.severity),
                         conflict.description,
                         now_str,
                     ),
@@ -408,7 +453,7 @@ class ConsistencyAuditor:
 
     @classmethod
     def _build_suggestion(
-        cls, values: list, sources: list
+        cls, values: list, sources: list, *, fact_name: str | None = None
     ) -> tuple[str | None, str | None]:
         """由 (values, sources) 同时推导出「目标值」与「建议文案」。
 
@@ -429,9 +474,11 @@ class ConsistencyAuditor:
                 break
 
         if baseline_value is not None:
-            baseline_norm = normalize_fact_value(baseline_value)
+            baseline_norm = cls._norm_for_compare(baseline_value, fact_name)
             others = [
-                v for v in cls._distinct_values(values) if normalize_fact_value(v) != baseline_norm
+                v
+                for v in cls._distinct_values(values, fact_name=fact_name)
+                if cls._norm_for_compare(v, fact_name) != baseline_norm
             ]
             if not others:
                 # 归一化后已一致（仅措辞不同），不应给出“统一为”建议误导用户
@@ -455,9 +502,19 @@ class ConsistencyAuditor:
 
         text = (
             f"建议将以下内容统一为：{most_common}\n"
-            f"冲突值：{', '.join(cls._distinct_values(values))}"
+            f"冲突值：{', '.join(cls._distinct_values(values, fact_name=fact_name))}"
         )
         return str(most_common), text
+
+    @staticmethod
+    def _norm_for_compare(value: Any, fact_name: str | None) -> str:
+        """取值判等用的归一化键：金额先按「元」基准换算，其余走通用归一化。"""
+        text = str(value or "").strip()
+        if fact_name == rules.FACT_AMOUNT:
+            yuan = rules.normalize_amount_to_yuan(text)
+            if yuan is not None:
+                return f"yuan:{yuan}"
+        return normalize_fact_value(text)
 
     def suggest_fixes(self, conflict_id: str, project_id: int) -> str | None:
         """生成修复建议（人类可读文案；向后兼容返回 str）。
@@ -499,7 +556,9 @@ class ConsistencyAuditor:
                 sources = json.loads(row["sources_json"] or "[]")
             except (json.JSONDecodeError, TypeError):
                 sources = []
-            return self._build_suggestion(values, sources)
+            return self._build_suggestion(
+                values, sources, fact_name=row["fact_name"] if "fact_name" in row.keys() else None
+            )
         except Exception as e:
             logger.error("生成修复建议失败: %s", e)
             return None, None
@@ -697,8 +756,8 @@ class ConsistencyAuditor:
             facts_count = sum(len(instances) for instances in all_facts.values())
             conflicts = self.detect_conflicts(project_id, all_facts=all_facts)
 
-            # 统计章节数
-            with get_db() as conn:
+# 统计章节数（纯读 → readonly 连接，见 _collect_fact_instances 的 PERF 说明）
+            with get_db(readonly=True) as conn:
                 total_sections = conn.execute(
                     "SELECT COUNT(*) as cnt FROM sections WHERE project_id = ?",
                     (project_id,),
@@ -711,7 +770,11 @@ class ConsistencyAuditor:
                 conflicts_found=len(conflicts),
                 conflicts=conflicts,
                 audit_time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                status="completed" if len(conflicts) > 0 else "completed_no_conflicts",
+                status=(
+                    rules.AUDIT_STATUS_COMPLETED
+                    if conflicts
+                    else rules.AUDIT_STATUS_NO_CONFLICTS
+                ),
             )
 
             # 记录审计日志
@@ -721,13 +784,17 @@ class ConsistencyAuditor:
 
         except Exception as e:
             logger.error("完整审计失败: %s", e, exc_info=True)
+            # BUG-FIX 2026-10-08（P1·谎报成功）：降级结果必须带明确失败态且
+            # **不能带 0 值冒充「审计了 0 章节 0 事实」**。调用方（路由层）此前
+            # 无条件回 `status='ok'`，前端弹「审计完成，发现 0 处冲突」——
+            # 实际是审计在第一步就崩了。现回 failed，路由层据此回 500。
             return AuditResult(
                 project_id=project_id,
                 total_sections=0,
                 facts_extracted=0,
                 conflicts_found=0,
                 audit_time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                status="failed",
+                status=rules.AUDIT_STATUS_FAILED,
             )
 
     def _save_audit_log(self, project_id: int, result: AuditResult):

@@ -78,9 +78,11 @@ class OpenAICompatibleProvider:
         try:
             yield self._client
         except (httpx.ConnectError, httpx.RemoteProtocolError):
-            if self._client is not None:
-                await self._client.aclose()
-                self._client = None
+            # BUG-FIX 2026-10-08（P1 并发竞态）：client 被多任务并发复用，此处
+            # aclose 会关掉其它在飞请求正在使用的连接池，制造级联失败。
+            # 改为仅置空引用（下次调用重建新 client），旧实例由在飞请求
+            # 结束后交由 GC 回收；连接类错误本身无需主动销毁连接池。
+            self._client = None
             raise
 
     @property
@@ -116,6 +118,11 @@ class OpenAICompatibleProvider:
             empty_retries = 0
             # BUG-FIX 2026-10-07：429 独立计数，不再与通用 max_retries 共用预算。
             rate_limit_hits = 0
+            # BUG-FIX 2026-10-08（P1 预算挤压）：429 分支 continue 同样会推进 for
+            # 的 attempt，原先 429 重试会把 5xx/超时/空内容的通用预算吃光——
+            # max_retries=2 时只要先发生 ≥2 次 429，后续第一个通用错误就零重试
+            # 直接抛错。通用错误改用独立计数 generic_retries。
+            generic_retries = 0
             # 循环上限需容纳三类重试：通用 max_retries、空内容截断、429 限流。
             # BUG-FIX 2026-10-07：原先只有 max_retries + _EMPTY_LENGTH_MAX_RETRIES，
             # 429 拿到独立预算后若不同步放宽上限，会在预算用完前被外层 range 截断，
@@ -139,7 +146,15 @@ class OpenAICompatibleProvider:
                             concurrency=self._concurrency or None,
                             cancel_event=cancel_event_check,
                         ):
-                            response = await client.post(f'{self.base_url}/chat/completions', json=payload)
+                            # BUG-FIX 2026-10-08（P2 超时失效）：client 复用后其建连时
+                            # 的固定 timeout 不再跟随本次 effective_timeout（长文
+                            # max_tokens>=16000 → 180s 会被旧读超时误杀）。httpx 支持
+                            # 每请求覆盖超时，这里显式传入本次计算结果。
+                            response = await client.post(
+                                f'{self.base_url}/chat/completions',
+                                json=payload,
+                                timeout=httpx.Timeout(effective_timeout, read=int(effective_timeout * 1.5), write=effective_timeout, connect=30.0),
+                            )
                         cancel_event_after = options.get('cancel_event')
                         if cancel_event_after and cancel_event_after.is_set():
                             raise asyncio.CancelledError('操作已被用户取消')
@@ -173,10 +188,13 @@ class OpenAICompatibleProvider:
                             continue
                         if response.status_code in (500, 502, 503, 504, 520):
                             last_error = f'可重试错误 (HTTP {response.status_code}): {response.text[:200]}'
-                            logger.warning('HTTP %d 错误，准备重试 (%d/%d)', response.status_code, attempt + 1, max_retries)
-                            if attempt >= max_retries - 1:
+                            logger.warning('HTTP %d 错误，准备重试 (%d/%d)', response.status_code, generic_retries + 1, max_retries)
+                            # BUG-FIX 2026-10-08：以 generic_retries（而非被 429 推进的
+                            # attempt）判定通用重试预算是否耗尽。
+                            if generic_retries >= max_retries - 1:
                                 raise RuntimeError(f'可重试错误 (HTTP {response.status_code}): {response.text[:200]}')
-                            wait_time = 2 ** attempt * (0.5 + 0.5 * random.random())
+                            generic_retries += 1
+                            wait_time = 2 ** (generic_retries - 1) * (0.5 + 0.5 * random.random())
                             await _cancellable_sleep(cancel_event, wait_time)
                             continue
                         if response.status_code == 400:
@@ -224,7 +242,8 @@ class OpenAICompatibleProvider:
                                     await _cancellable_sleep(options.get('cancel_event'), 1)
                                     continue
                                 raise ValueError(f'API 返回空内容 (finish_reason: {finish_reason})')
-                            if attempt < max_retries - 1:
+                            if generic_retries < max_retries - 1:
+                                generic_retries += 1
                                 cancel_event_retry = options.get('cancel_event')
                                 if cancel_event_retry and cancel_event_retry.is_set():
                                     raise asyncio.CancelledError('操作已被用户取消')
@@ -243,41 +262,49 @@ class OpenAICompatibleProvider:
                         except Exception as monitor_error:
                             logger.debug('监控记录失败: %s', monitor_error)
                         finish_reason = choice.get('finish_reason', 'stop') if choice else 'stop'
+                        # BUG-FIX 2026-10-08（低）：本次响应缺 usage 时不得返回
+                        # 上一请求的陈旧 token 数（record_prompt_cache 会记错），
+                        # 返回全零占位更真实。
+                        _usage_meta = {'prompt_tokens': 0, 'completion_tokens': 0, 'total_tokens': 0}
                         if data.get('usage'):
                             u = data['usage']
                             self._last_usage = {'prompt_tokens': u.get('prompt_tokens', 0), 'completion_tokens': u.get('completion_tokens', 0), 'total_tokens': u.get('total_tokens', 0)}
+                            _usage_meta = dict(self._last_usage)
                         if return_meta:
-                            return {'content': content, 'finish_reason': finish_reason, 'usage': self._last_usage}
+                            return {'content': content, 'finish_reason': finish_reason, 'usage': _usage_meta}
                         return content
                 except httpx.TimeoutException as e:
                     last_error = f'请求超时（{effective_timeout}秒）: {e}'
-                    logger.warning('请求超时，准备重试 (%d/%d)', attempt + 1, max_retries)
+                    logger.warning('请求超时，准备重试 (%d/%d)', generic_retries + 1, max_retries)
                     if cancel_event and cancel_event.is_set():
                         raise asyncio.CancelledError('操作已被用户取消') from e
-                    if attempt < max_retries - 1:
+                    if generic_retries < max_retries - 1:
                         cancel_event_timeout = options.get('cancel_event')
                         if cancel_event_timeout and cancel_event_timeout.is_set():
                             raise asyncio.CancelledError('操作已被用户取消') from e
-                        await _cancellable_sleep(cancel_event_timeout, 2 ** attempt)
+                        await _cancellable_sleep(cancel_event_timeout, 2 ** generic_retries)
+                        generic_retries += 1
                     else:
                         raise RuntimeError(f'请求超时（{effective_timeout}秒）: {e}') from e
                 except httpx.NetworkError as e:
                     last_error = f'网络错误: {e}'
-                    logger.warning('网络错误，准备重试 (%d/%d)', attempt + 1, max_retries)
+                    logger.warning('网络错误，准备重试 (%d/%d)', generic_retries + 1, max_retries)
                     if cancel_event and cancel_event.is_set():
                         raise asyncio.CancelledError('操作已被用户取消') from e
-                    if attempt < max_retries - 1:
+                    if generic_retries < max_retries - 1:
                         cancel_event_network = options.get('cancel_event')
                         if cancel_event_network and cancel_event_network.is_set():
                             raise asyncio.CancelledError('操作已被用户取消') from e
-                        await _cancellable_sleep(cancel_event_network, 2 ** attempt)
+                        await _cancellable_sleep(cancel_event_network, 2 ** generic_retries)
+                        generic_retries += 1
                     else:
                         raise RuntimeError(f'网络错误: {e}') from e
                 except httpx.HTTPStatusError as e:
                     last_error = f'HTTP 错误: {e}'
-                    logger.warning('HTTP 状态错误，准备重试 (%d/%d)', attempt + 1, max_retries)
-                    if attempt < max_retries - 1:
-                        await _cancellable_sleep(cancel_event, 2 ** attempt)
+                    logger.warning('HTTP 状态错误，准备重试 (%d/%d)', generic_retries + 1, max_retries)
+                    if generic_retries < max_retries - 1:
+                        await _cancellable_sleep(cancel_event, 2 ** generic_retries)
+                        generic_retries += 1
                     else:
                         raise RuntimeError(f'HTTP 错误: {e}') from e
                 except asyncio.CancelledError:
@@ -285,7 +312,8 @@ class OpenAICompatibleProvider:
                     try:
                         from ...ai_monitor import record_ai_call
                         task_type = options.get('task_type', '')
-                        record_ai_call(provider='openai_compatible', model=self.model, success=True, response_time=elapsed, task_type=task_type, error='操作已被用户取消')
+                        # BUG-FIX 2026-10-08（低）：用户取消不应记为成功调用（成功率虚高）
+                        record_ai_call(provider='openai_compatible', model=self.model, success=False, response_time=elapsed, task_type=task_type, error='操作已被用户取消')
                     except Exception as monitor_error:
                         logger.debug('监控记录失败: %s', monitor_error)
                     raise
@@ -310,26 +338,65 @@ class OpenAICompatibleProvider:
             raise RuntimeError(f'超过最大重试次数 ({max_retries}): {last_error}')
 
     async def stream_chat(self, messages: list[AIMessage], **options: Any) -> AsyncIterator[str]:
-        """流式调用 OpenAI 兼容 API"""
+        """流式调用 OpenAI 兼容 API
+
+        FIX 2026-10-08（遗留2）：本方法当前零调用方，但一旦启用就会**绕过** chat()
+        的三层保护（全局信号量 / 限流闸门 / 每请求超时），一个长流式请求即可占满
+        并发额度并打穿 RPM 限制。这里补齐同等保护：入 slots 前后的凭据/超时与 chat()
+        完全同口径（并发许可以整条流为单位持有，直到流结束才释放）。
+        """
         import json as _json
-        async with self._get_client(self.timeout, {'Authorization': f'Bearer {self.api_key}', 'Content-Type': 'application/json'}) as client:
-            payload = {'model': options.get('model', self.model), 'messages': [{'role': m.role, 'content': m.content} for m in messages], 'max_tokens': options.get('max_tokens', self.max_tokens), 'temperature': options.get('temperature', self.temperature), 'stream': True}
-            async with client.stream('POST', f'{self.base_url}/chat/completions', json=payload) as response:
-                response.raise_for_status()
-                async for line in response.aiter_lines():
-                    if not line or not line.startswith('data: '):
-                        continue
-                    data = line[6:]
-                    if data == '[DONE]':
-                        break
-                    try:
-                        chunk = _json.loads(data)
-                    except _json.JSONDecodeError:
-                        continue
-                    delta = chunk.get('choices', [{}])[0].get('delta', {})
-                    content = delta.get('content')
-                    if content:
-                        yield content
+        headers = {'Authorization': f'Bearer {self.api_key}', 'Content-Type': 'application/json'}
+        payload = {'model': options.get('model', self.model), 'messages': [{'role': m.role, 'content': m.content} for m in messages], 'max_tokens': options.get('max_tokens', self.max_tokens), 'temperature': options.get('temperature', self.temperature), 'stream': True}
+        cancel_event = options.get('cancel_event')
+        requested_max_tokens = options.get('max_tokens', self.max_tokens)
+        try:
+            requested_max_tokens = min(max(int(requested_max_tokens or 4096), 256), 65536)
+        except (TypeError, ValueError):
+            requested_max_tokens = 4096
+        effective_timeout = self.timeout
+        if requested_max_tokens >= 16000:
+            effective_timeout = max(effective_timeout, 180)
+        elif requested_max_tokens >= 8000:
+            effective_timeout = max(effective_timeout, 120)
+        _req_timeout = httpx.Timeout(
+            effective_timeout, read=int(effective_timeout * 1.5),
+            write=effective_timeout, connect=30.0,
+        )
+        async with _GLOBAL_REQUEST_SEMAPHORE:
+            async with _rate_gate.slot(
+                self.base_url,
+                rpm=self._rate_limit_per_min or None,
+                concurrency=self._concurrency or None,
+                cancel_event=cancel_event,
+            ):
+                if cancel_event is not None and cancel_event.is_set():
+                    raise asyncio.CancelledError('操作已被用户取消')
+                async with self._get_client(effective_timeout, headers) as client:
+                    async with client.stream(
+                        'POST', f'{self.base_url}/chat/completions', json=payload, timeout=_req_timeout,
+                    ) as response:
+                        response.raise_for_status()
+                        async for line in response.aiter_lines():
+                            if cancel_event is not None and cancel_event.is_set():
+                                raise asyncio.CancelledError('操作已被用户取消')
+                            if not line or not line.startswith('data: '):
+                                continue
+                            data = line[6:]
+                            if data == '[DONE]':
+                                break
+                            try:
+                                chunk = _json.loads(data)
+                            except _json.JSONDecodeError:
+                                continue
+                            # BUG-FIX 2026-10-08（低）：choices 为空数组或 delta 为 null 时
+                            # 原实现直接 IndexError/AttributeError 中断流。加固为空值安全。
+                            _choices = chunk.get('choices') or [{}]
+                            _choice0 = _choices[0] if isinstance(_choices[0], dict) else {}
+                            delta = _choice0.get('delta') or {}
+                            content = delta.get('content')
+                            if content:
+                                yield content
 
     async def close(self):
         """关闭底层 HTTP 客户端"""

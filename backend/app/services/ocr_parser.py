@@ -82,9 +82,12 @@ class MinerUParser:
     def _get_cache_key(self, pdf_path: str) -> str:
         """生成缓存 key（基于文件路径 + 修改时间）"""
         path = Path(pdf_path)
-        if not path.exists():
+        try:
+            mtime = path.stat().st_mtime
+        except (OSError, FileNotFoundError):
+            # BUG-FIX 2026-10-08：TOCTOU race — exists() 检查与 stat() 之间
+            # 文件可能被删除，导致 FileNotFoundError 未捕获
             return pdf_path
-        mtime = path.stat().st_mtime
         content_hash = hashlib.md5(f'{pdf_path}:{mtime:.0f}'.encode()).hexdigest()
         return content_hash
 

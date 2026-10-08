@@ -5,16 +5,77 @@
 import asyncio
 import json
 import logging
+import threading
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from ..security.auth import get_current_user
+from ..services import consistency_rules as rules
 from ..services.consistency_auditor import consistency_auditor
+from ..services.scoring_compliance import COVERAGE_WEAK
 from .project_access import enforce_project_access
 
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix='/consistency', tags=['consistency_audit'], dependencies=[Depends(get_current_user)])
+
+# ENHANCE 2026-10-09（P1·并发竞态）：同一项目的「审计 / 自动修复 / AI 修复」三条
+# **写路径**必须串行。原因（`consistency_auditor._save_conflicts` 的实现决定）：
+#   全量审计 = `DELETE 未解决冲突` + `INSERT 本次结果`；自动修复 = `UPDATE 正文` +
+#   `UPDATE 冲突 SET resolved=1`。这两组操作若交错，会出现
+#     (a) 审计的 DELETE 把刚被 autofix 标记 resolved 之外的在途冲突清掉，
+#         用户刚看到的冲突瞬间消失且无任何提示；
+#     (b) autofix 依据的冲突行在落文前被并发审计删除 → `resolved` 标记写到 0 行，
+#         正文改了、冲突却仍是未解决（或反过来：正文没改、冲突被标已解决）。
+# 组锁（task_lock）在导出模块已用于跨进程互斥；此处是**进程内**排队（不返回 409，
+# 而是等前者跑完），因为一致性审计是秒级操作、排队代价远低于报错重试。
+_CONSISTENCY_OP_LOCKS: dict[int, asyncio.Lock] = {}
+_CONSISTENCY_OP_LOCKS_GUARD = threading.Lock()
+
+
+def _consistency_op_lock(project_id: int) -> asyncio.Lock:
+    """取（必要时创建）该项目的操作锁；字典本身用线程锁保护。"""
+    with _CONSISTENCY_OP_LOCKS_GUARD:
+        lock = _CONSISTENCY_OP_LOCKS.get(project_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            _CONSISTENCY_OP_LOCKS[project_id] = lock
+        return lock
+
+
+class _LockManager:
+    """`async with _LockManager(project_id)` 语法糖（避免每处手写两行）。"""
+
+    def __init__(self, project_id: int):
+        self._lock = _consistency_op_lock(project_id)
+
+    async def __aenter__(self):
+        await self._lock.acquire()
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        self._lock.release()
+        return False
+
+
+#: autofix 的 `new_value` 长度上限。超过即拒：正文里一个事实值不可能这么长，
+#: 超长输入只可能来自误填（把整段说明文案当值）或恶意请求。
+AUTOFIX_VALUE_MAX_CHARS = 200
+
+
+@router.get('/rules')
+async def get_consistency_rules(user=Depends(get_current_user)):
+    """审核规则命名空间快照（严重度取值/排序/文案配色、事实项、审计与冲突状态枚举）。
+
+    ENHANCE 2026-10-08：此前「严重/中等/轻微」的取值、排序与配色在前端
+    `utils.ts` 与后端 `consistency_auditor` 各写一套，没有任何一致性约束
+    —— 后端调过阈值/文案时前端不会跟着变。本端点把 `consistency_rules`
+    这份单一事实来源原样下发，前端启动时对齐一次（失败则退回静态兜底）。
+
+    纯读、无副作用、不触碰任何项目数据，故不做 `enforce_project_access`。
+    """
+    return {'status': 'ok', **rules.rules_payload()}
+
 
 @router.get('/audit/{project_id}')
 async def run_audit(project_id: int, user=Depends(get_current_user)):
@@ -32,18 +93,76 @@ async def run_audit(project_id: int, user=Depends(get_current_user)):
     try:
         # BUG-FIX 2026-09-18（P2）：run_full_audit 是同步重操作（全量读正文 +
         # 事实抽取），直接在事件循环里跑会阻塞整个服务（SSE/其他请求卡死）。
-        result = await asyncio.to_thread(consistency_auditor.run_full_audit, project_id)
-        return {'status': 'ok', 'project_id': project_id, 'total_sections': result.total_sections, 'facts_extracted': result.facts_extracted, 'conflicts_found': result.conflicts_found, 'conflicts': [{'conflict_id': c.conflict_id, 'fact_name': c.fact_name, 'values': c.values, 'sources': c.sources, 'severity': c.severity, 'description': c.description} for c in result.conflicts], 'audit_time': result.audit_time}
+        # ENHANCE 2026-10-09：与 autofix / AI 修复串行（见模块头并发说明）。
+        async with _LockManager(project_id):
+            result = await asyncio.to_thread(consistency_auditor.run_full_audit, project_id)
+        # BUG-FIX 2026-10-08（P1·谎报成功）：`run_full_audit` 内部把异常吞掉并
+        # 降级返回 `status='failed'` + 全 0，而本行此前**无条件**回 `status='ok'`。
+        # 前端收到后弹「审计完成，发现 0 处冲突」——实际审计在第一步就崩了，
+        # 用户据此以为全文一致。现按 `consistency_rules.AUDIT_SUCCESS_STATUSES`
+        # 判定，失败即回 `status='failed'`（HTTP 仍为 200，保持既有响应契约）
+        # 并带出真实 audit_status，不再谎报成功。
+        if not rules.is_audit_success(result.status):
+            logger.error(
+                '一致性审计未成功完成: project=%s status=%s',
+                project_id,
+                result.status,
+            )
+            return {
+                'status': rules.AUDIT_STATUS_FAILED,
+                'audit_status': result.status,
+                'project_id': project_id,
+                'total_sections': result.total_sections,
+                'facts_extracted': result.facts_extracted,
+                'conflicts_found': result.conflicts_found,
+                'conflicts': [],
+                'audit_time': result.audit_time,
+                'message': '审计过程异常终止，结果不可信，请查看后端日志后重试',
+            }
+        return {
+            'status': 'ok',
+            # audit_status 与 HTTP 层 status 分开，避免同名键互相覆盖
+            # （`status` 恒表示「请求是否成功」，`audit_status` 才是审计结论）。
+            'audit_status': result.status,
+            'project_id': project_id,
+            'total_sections': result.total_sections,
+            'facts_extracted': result.facts_extracted,
+            'conflicts_found': result.conflicts_found,
+            'conflicts': [
+                {
+                    'conflict_id': c.conflict_id,
+                    'fact_name': c.fact_name,
+                    'values': c.values,
+                    'sources': c.sources,
+                    'severity': c.severity,
+                    'description': c.description,
+                }
+                for c in result.conflicts
+            ],
+            'audit_time': result.audit_time,
+        }
     except Exception as e:
         logger.error('一致性审计失败: %s', e, exc_info=True)
         raise HTTPException(status_code=500, detail=f'审计失败: {e!s}') from e
 
 @router.get('/conflicts/{project_id}')
-async def get_conflicts(project_id: int, user=Depends(get_current_user)):
+async def get_conflicts(
+    project_id: int,
+    resolved: str = Query(
+        'open',
+        pattern='^(open|resolved|all)$',
+        description='按解决状态过滤：open=仅未解决(默认) / resolved=仅已解决 / all=全部',
+    ),
+    user=Depends(get_current_user),
+):
     """获取项目的冲突列表
 
     Args:
         project_id: 项目ID
+        resolved: 状态过滤。**默认只返回未解决冲突** —— 已解决的会作为历史
+            保留在库里（`_save_conflicts` 只清理 `resolved=0`），此前本接口
+            无条件全量返回，前端表格把「早已修好」的历史冲突和待处理冲突
+            混排在一起，用户无法分辨哪些还要动手。
 
     Returns:
         冲突列表
@@ -51,12 +170,25 @@ async def get_conflicts(project_id: int, user=Depends(get_current_user)):
     await enforce_project_access(project_id, user)
     from ..db import get_db
 
+    # `severity` 归一化 + ORDER BY 补 ELSE：见 consistency_rules.severity_sort_sql
+    order_by = rules.severity_sort_sql()
+    where = 'WHERE project_id = ?'
+    params: list = [project_id]
+    if resolved == rules.CONFLICT_STATE_OPEN:
+        where += ' AND COALESCE(resolved, 0) = 0'
+    elif resolved == rules.CONFLICT_STATE_RESOLVED:
+        where += ' AND COALESCE(resolved, 0) = 1'
+
     def _read_conflicts():
         # PERF（2026-10-05）：纯读查询改为 readonly + to_thread，
         # 不再在事件循环内抢全局写锁（旧实现 get_db() 无 readonly，
         # 生成高峰期锁争用会冻结整个 loop，前端 3s 轮询直接卡死）
         with get_db(readonly=True) as conn:
-            rows = conn.execute("SELECT * FROM consistency_conflicts \n               WHERE project_id = ?\n               ORDER BY \n                   CASE severity \n                       WHEN 'high' THEN 1 \n                       WHEN 'medium' THEN 2 \n                       WHEN 'low' THEN 3 \n                   END,\n                   created_at DESC", (project_id,)).fetchall()
+            rows = conn.execute(
+                f"SELECT * FROM consistency_conflicts {where} "
+                f"ORDER BY {order_by}, created_at DESC",
+                tuple(params),
+            ).fetchall()
             conflicts = []
             for row in rows:
                 conflict = dict(row)
@@ -71,11 +203,26 @@ async def get_conflicts(project_id: int, user=Depends(get_current_user)):
                     logger.warning(f"解析冲突数据失败: {conflict.get('id', 'unknown')}")
                     conflict['values'] = []
                     conflict['sources'] = []
+                if not isinstance(conflict['values'], list):
+                    conflict['values'] = []
+                if not isinstance(conflict['sources'], list):
+                    conflict['sources'] = []
+                # BUG-FIX 2026-10-08：把库里的 0/1 翻译成前端可读状态名，
+                # 并回传归一化后的 severity（脏值 `''` 在响应层就变回 `medium`，
+                # 不再把排序错乱的成因外泄给调用方）。
+                conflict['state'] = rules.conflict_state(conflict.get('resolved'))
+                conflict['resolved'] = int(conflict.pop('resolved') or 0)
+                conflict['severity'] = rules.normalize_severity(conflict.get('severity'))
                 conflicts.append(conflict)
         return conflicts
 
     conflicts = await asyncio.to_thread(_read_conflicts)
-    return {'status': 'ok', 'count': len(conflicts), 'conflicts': conflicts}
+    return {
+        'status': 'ok',
+        'count': len(conflicts),
+        'filter': resolved,
+        'conflicts': conflicts,
+    }
 
 @router.get('/conflicts/{conflict_id}/fix-suggestion')
 async def get_fix_suggestion(conflict_id: str, project_id: int, user=Depends(get_current_user)):
@@ -135,13 +282,40 @@ async def apply_autofix(
         修复报告（changed_sections / total_replacements / sections / skipped / message）
     """
     await enforce_project_access(project_id, user)
+    # BUG-FIX 2026-10-09（P1·空值/超长值把正文改坏）：`new_value` 是**替换目标值**，
+    # 后端此前完全不校验。前端虽然做了 `newValue.trim()` 的提示，但开放 API / 脚本
+    # 调用不受此约束：
+    #   - `new_value=""` → `apply_autofix` 会把所有旧值判为「待替换」并替换成空串，
+    #     正文里的事实值被**删掉**（「工期 30 天」→「工期 天」），且冲突被标已解决；
+    #   - 超长值（误把整段建议文案当值，历史上前端确实这么做过）会把说明文字写进正文。
+    # 现显式拦截，返回 400 而不是静默落文。
+    if not new_value or not new_value.strip():
+        raise HTTPException(status_code=400, detail='new_value 不能为空')
+    if len(new_value) > AUTOFIX_VALUE_MAX_CHARS:
+        raise HTTPException(
+            status_code=400,
+            detail=f'new_value 过长（>{AUTOFIX_VALUE_MAX_CHARS} 字符），请只填统一后的取值',
+        )
     try:
         # BUG-FIX 2026-09-18（P2）：apply_autofix 逐章节正则替换+写库+失效缓存，
         # 同步直调会阻塞事件循环（大项目正文可达数十 MB）。
-        report = await asyncio.to_thread(
-            consistency_auditor.apply_autofix,
-            conflict_id, project_id, new_value, dry_run,
-        )
+        # BUG-FIX 2026-10-08（**P0·接口 100% 失败**）：`ConsistencyAuditor.apply_autofix`
+        # 的第 4 参 `dry_run` 是**keyword-only**（`*, dry_run=False`），而这里把
+        # `dry_run` 当第 4 个**位置参数**传了进去 —— 于是每一次调用都抛
+        #     TypeError: apply_autofix() takes 4 positional arguments but 5 were given
+        # 被下面的 except 吞成 HTTP 500。即 **POST /consistency/conflicts/{id}/autofix
+        # 这个「把冲突真正改写进正文」的主修复接口从来就没成功执行过一次**。
+        # 该缺陷此前无任何测试覆盖：既有 autofix 用例（test_enhancement_2026_09_14）
+        # 都是**直接调服务方法**，绕过了路由层，故一直没暴露。
+        # 修复：按签名以关键字传入。
+        async with _LockManager(project_id):
+            report = await asyncio.to_thread(
+                consistency_auditor.apply_autofix,
+                conflict_id,
+                project_id,
+                new_value.strip(),
+                dry_run=dry_run,
+            )
         if not report.get('success'):
             # 未做任何修改（未定位到待替换值 / 有章节无法安全替换）→ 明确告知，不谎报成功
             return {'status': 'no_change', **report}
@@ -185,7 +359,10 @@ async def repair_with_ai(
             raise HTTPException(status_code=400, detail='section_ids 必须是逗号分隔的整数') from e
 
     try:
-        report = await _repair(project_id, dry_run=dry_run, section_ids=parsed_ids)
+        # ENHANCE 2026-10-09：AI 修复同样会改写正文并收敛冲突状态，与审计/自动修复
+        # 串行，避免与并发审计的 DELETE 交错导致冲突状态被误判。
+        async with _LockManager(project_id):
+            report = await _repair(project_id, dry_run=dry_run, section_ids=parsed_ids)
     except Exception as e:
         logger.error('AI 一致性修复失败: %s', e, exc_info=True)
         raise HTTPException(status_code=500, detail=f'修复失败: {e!s}') from e
@@ -201,7 +378,7 @@ async def get_audit_summary(project_id: int, user=Depends(get_current_user)):
         project_id: 项目ID
 
     Returns:
-        审计摘要信息
+审计摘要信息
     """
     await enforce_project_access(project_id, user)
     from ..db import get_db
@@ -209,13 +386,30 @@ async def get_audit_summary(project_id: int, user=Depends(get_current_user)):
     def _read_summary():
         # PERF（2026-10-05）：纯读改 readonly + to_thread，不在 loop 内抢写锁
         with get_db(readonly=True) as conn:
-            latest = conn.execute('SELECT * FROM consistency_audit_log \n               WHERE project_id = ?\n               ORDER BY audit_time DESC LIMIT 1', (project_id,)).fetchone()
-            unresolved = conn.execute('SELECT COUNT(*) as cnt FROM consistency_conflicts \n               WHERE project_id = ? AND resolved = 0', (project_id,)).fetchone()['cnt']
-            by_severity = conn.execute('SELECT severity, COUNT(*) as cnt FROM consistency_conflicts \n               WHERE project_id = ?\n               GROUP BY severity', (project_id,)).fetchall()
+            latest = conn.execute('SELECT * FROM consistency_audit_log \
+              WHERE project_id = ?\
+              ORDER BY audit_time DESC LIMIT 1', (project_id,)).fetchone()
+            unresolved = conn.execute('SELECT COUNT(*) as cnt FROM consistency_conflicts \
+               WHERE project_id = ? AND COALESCE(resolved, 0) = 0', (project_id,)).fetchone()['cnt']
+            resolved = conn.execute('SELECT COUNT(*) as cnt FROM consistency_conflicts \
+               WHERE project_id = ? AND COALESCE(resolved, 0) = 1', (project_id,)).fetchone()['cnt']
+            # BUG-FIX 2026-10-08（统计口径不一致）：原 by_severity **未过滤
+            # resolved**，把已解决的冲突也计入「严重冲突/中等冲突」卡片，而同一屏的
+            # 「未解决冲突」卡片却只算未解决的 —— 两者口径不同，用户看到
+            # 「未解决 3 / 严重 1 / 中等 1」却发现表格里那条中等早已修好。
+            # 现按未解决口径统计，与 conflicts 表默认过滤（open）保持一致。
+            by_severity = conn.execute('SELECT severity, COUNT(*) as cnt FROM consistency_conflicts \
+               WHERE project_id = ? AND COALESCE(resolved, 0) = 0\
+               GROUP BY severity', (project_id,)).fetchall()
             severity_counts = {}
             for row in by_severity:
-                severity_counts[row['severity']] = row['cnt']
-        return {'latest_audit': dict(latest) if latest else None, 'unresolved_conflicts': unresolved, 'conflicts_by_severity': severity_counts}
+                severity_counts[rules.normalize_severity(row['severity'])] = row['cnt']
+        return {
+            'latest_audit': dict(latest) if latest else None,
+            'unresolved_conflicts': unresolved,
+            'resolved_conflicts': resolved,
+            'conflicts_by_severity': severity_counts,
+        }
 
     summary = await asyncio.to_thread(_read_summary)
     return {'status': 'ok', 'summary': summary}
@@ -225,7 +419,18 @@ async def get_audit_summary(project_id: int, user=Depends(get_current_user)):
 async def scoring_compliance(
     project_id: int,
     persist: bool = Query(True, description='是否把本次结果写入审计历史'),
-    coverage_weak: float = Query(0.10, ge=0.0, le=1.0, description='低于该覆盖率判 weak'),
+    # BUG-FIX 2026-10-08（P1·阈值前后端/配置不一致）：此处此前硬编码
+    # `Query(0.10, ...)`，而服务层 `scoring_compliance.COVERAGE_WEAK` 早已按实测
+    # 标定上调到 0.25 —— 且该常量的注释里明确写着「初版取 0.10 过于宽松，实测被
+    # 0.21 的反例直接逃过告警，故上调」。也就是说：生产上唯一被触达的路径用的
+    # 恰恰是作者自己判定为**过松、有已知漏报**的那个值，而服务层常量因被默认值
+    # 遮蔽从未生效。现改为引用常量，保持单一事实来源。
+    coverage_weak: float = Query(
+        COVERAGE_WEAK,
+        ge=0.0,
+        le=1.0,
+        description='低于该覆盖率判 weak（默认取服务层标定值 COVERAGE_WEAK）',
+    ),
     user=Depends(get_current_user),
 ):
     """评分标准达标对齐审计（ENHANCE 2026-10-06 新增）
@@ -250,7 +455,7 @@ async def scoring_compliance(
     Returns:
         {status, project_id, audit_time, total_points, unmapped, empty, weak,
          covered, gaps:[{scoring_point_id,name,weight,standard,status,coverage,
-         section_ids,section_titles,content_chars,detail}], warnings}
+section_ids,section_titles,content_chars,detail}], warnings}
     """
     await enforce_project_access(project_id, user)
     from ..services.scoring_compliance import (

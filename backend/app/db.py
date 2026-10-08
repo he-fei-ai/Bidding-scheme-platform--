@@ -912,6 +912,8 @@ def _migrate(conn: sqlite3.Connection):
             content TEXT NOT NULL DEFAULT '',
             target_words INTEGER DEFAULT NULL,
             status TEXT NOT NULL DEFAULT 'pending',
+            graph_suitable INTEGER NOT NULL DEFAULT 0,
+            suggested_chart TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
             updated_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
             FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
@@ -934,6 +936,8 @@ def _migrate(conn: sqlite3.Connection):
             "content": "TEXT NOT NULL DEFAULT ''",
             "target_words": "INTEGER DEFAULT NULL",
             "status": "TEXT NOT NULL DEFAULT 'pending'",
+            "graph_suitable": "INTEGER NOT NULL DEFAULT 0",
+            "suggested_chart": "TEXT NOT NULL DEFAULT ''",
         },
     )
 
@@ -1433,6 +1437,7 @@ def _migrate(conn: sqlite3.Connection):
     _ensure_column(conn, "usage_limits", "used_count", "INTEGER NOT NULL DEFAULT 0")
     _ensure_column(conn, "project_usage", "consumed_at", "TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP")
     _ensure_column(conn, "sections", "target_words", "INTEGER DEFAULT NULL")
+    _ensure_column(conn, "sections", "word_count_tier", "TEXT DEFAULT NULL")
     _ensure_column(conn, "sections", "architecture_json", "TEXT DEFAULT NULL")
     _ensure_column(conn, "sections", "labor_json", "TEXT DEFAULT NULL")
     _ensure_column(conn, "sections", "inlined_chart_json", "TEXT DEFAULT NULL")
@@ -1933,6 +1938,38 @@ def _migrate(conn: sqlite3.Connection):
         "CREATE INDEX IF NOT EXISTS idx_scoring_compliance_project "
         "ON scoring_compliance_audit(project_id)"
     )
+
+    # ========== 字数档位配置（ENHANCE 2026-10-08）==========
+    # 字数控制策略：由原来的二级目录下沉到三级目录（叶子节点）。
+    # 四档标准：简短 800 / 标准 1200 / 详细 2000 / 超长 2500，每档允许 ±10% 浮动。
+    # 该表允许管理员在运行时调整档位目标字数与浮动范围，无需修改代码。
+    # sections.word_count_tier 字段记录单节点覆盖档位（NULL 表示跟随全局默认）。
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS word_count_tiers (
+            key TEXT PRIMARY KEY,
+            label TEXT NOT NULL,
+            target_words INTEGER NOT NULL,
+            tolerance_ratio REAL NOT NULL DEFAULT 0.10,
+            is_default INTEGER NOT NULL DEFAULT 0,
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+        )
+    """)
+    # 插入四档默认配置（幂等：仅当 key 不存在时插入）
+    for _tier_key, _label, _target, _ratio, _default, _order in (
+        ("brief", "简短", 800, 0.10, 0, 1),
+        ("standard", "标准", 1200, 0.10, 1, 2),
+        ("detailed", "详细", 2000, 0.10, 0, 3),
+        ("long", "超长", 2500, 0.10, 0, 4),
+    ):
+        conn.execute(
+            "INSERT OR IGNORE INTO word_count_tiers "
+            "(key, label, target_words, tolerance_ratio, is_default, sort_order, enabled) "
+            "VALUES (?, ?, ?, ?, ?, ?, 1)",
+            (_tier_key, _label, _target, _ratio, _default, _order),
+        )
 
     # ========== 任务组互斥锁（ENHANCE 2026-09-15）==========
     # 多进程（FastAPI + Celery worker）下内存锁无效，锁必须下沉到 sqlite 行级唯一约束。

@@ -1,4 +1,4 @@
-﻿from dataclasses import dataclass
+from dataclasses import dataclass
 import html
 import json
 import logging
@@ -62,20 +62,41 @@ class DocumentBlock:
     raw_line: str = ""
 
 
+# BUG-FIX 2026-10-08（P0 正文数字被吞）：L3/L4 的「数字 + 空格 + 中文」分支是为
+# 兼容 AI 偶发输出的「1 施工准备」（无顿号/句点）而加的，但它同时命中普通正文里的
+# 数量/金额短语：「3 天内完成移交」「5 万元投资额」「10 平方米场地」「1.8 米净高满足要求」。
+# _match_heading 只取 m.group(lastindex)=group(2) 作为标题文本 → **数字被丢弃**，
+# 导出端再补一个编号，于是投标文档里出现「1、元投资额」这类金额被改写的内容（P0 数据损坏）。
+#
+# 修复：空格分支加「单位/量词」负向前瞻 —— 空格后紧跟量词时判定为正文数量短语而非标题。
+# 正向形态（"1 施工准备"）与顿号/句点分支完全不受影响（2026-10-06 的 BUG-2 修复不回退）。
+_UNIT_LEAD_CHARS = (
+    "元万亿千元百米公分厘毫吨千克公斤克"
+    "天日周月年小时分秒毫秒"
+    "米立方平立方平方米立方米"
+    "个处项组次件根块张本台套样批只"
+    "层栋座棵株间道步轮期"
+    "百千万亿兆京垓"
+    "度温度测量份比率"
+    "%％℃°"
+)
+
 HEADING_PATTERNS = [
     # 七级标题标准（与 heading_standard.HEADING_STYLE_CONFIG 对齐）
     # 注意：具体模式优先于通用模式，避免误匹配
     # 五级: 1.1.1 → L5（3层小数点）
-    (re.compile(r"^(\d+(?:\.\d+){2,})\s*[、．.]?\s*(.+)$"), 5),
+    (re.compile(r"^(\d{1,4}(?:\.\d+){2,})\s*[、．.]?\s*(.+)$"), 5),
     # 四级: 1.1 → L4（2层小数点）
-    (re.compile(r"^(\d+\.\d+)(?!\.\d)\s*[、．.]?\s*(.+)$"), 4),
+    # 空格分支同样加量词负向前瞻（见 _UNIT_LEAD_CHARS 说明）
+    (re.compile(r"^(\d{1,4}\.\d+)(?!\.\d)(?:\s*[、．.]\s*|\s+(?![" + _UNIT_LEAD_CHARS + r"])(?=[一-鿿]))(.+)$"), 4),
     # 三级: 阿拉伯数字（1、2、） → L3（纯数字，无小数点）
     # BUG-FIX 2026-10-06（P1）：原模式 `[、．.]` 为**必需**分隔符，AI 偶尔输出的
     # "1 施工准备"（数字+空格、无顿号/句点）不匹配 → 整行被拍平为普通段落，
     # 标题层级/编号样式在导出文档中全部丢失。
     # 修复：分隔符改为「顿号/句点」或「空格+中文标题」二选一；空格分支用
     # lookahead 锚定中文字符开头，排除 "1 000 元"（空格后是数字）这类正文误匹配。
-    (re.compile(r"^(\d+)(?!\.\d)(?:\s*[、．.]\s*|\s+(?=[一-鿿]))(.+)$"), 3),
+    # 空格分支同样加量词负向前瞻（见 _UNIT_LEAD_CHARS 说明）
+    (re.compile(r"^(\d{1,4})(?!\.\d)(?:\s*[、．.]\s*|\s+(?![" + _UNIT_LEAD_CHARS + r"])(?=[一-鿿]))(.+)$"), 3),
     # 二级: 中文数字（一、二、） → L2
     (re.compile(r"^([一二三四五六七八九十百千]+)[、．.]\s*(.+)$"), 2),
     # 一级: 第X节/第X章 → L1
@@ -121,14 +142,55 @@ CHART_MARKER_OPEN_PATTERN = re.compile(
 # 导出时按需渲染（Mermaid 语法走渲染引擎，chart-json 为结构化数据载荷）。
 # 与 <<CHART:...>> 标记体系并存（向后兼容），解析后统一产出 chart_marker 块。
 # =====================================================================
+# BUG-FIX 2026-10-08（P0 围栏变体泄漏）：原模式只认 ```mermaid / ```chart-json 两种形态，
+# AI 实际还会输出 ~~~mermaid（波浪线围栏）、```chart_json / ```chartjson（下划线/无连字符）、
+# ```mermaid {json}（带属性串）。这些形态原先走「普通围栏」路径 → 闭合时被剥掉标记行、
+# **把 mermaid 源码 / JSON 载荷整段写进投标正文**（导出文档里出现 graph TD / {"type":...）。
+# 现统一按 `(?:`{3,}|~{3,})` + `chart[-_]?json` 收敛，并保留可选属性串。
+_FENCE_MARK = r"(?:`{3,}|~{3,})"
+_FENCE_ATTR = r"(?:\{[^}]*\})?"
 CHART_FENCE_OPEN_PATTERN = re.compile(
-    r"^```[ \t]*(mermaid|chart-json)[ \t]*$",
+    r"^" + _FENCE_MARK + r"[ \t]*(mermaid|chart[-_]?json)[ \t]*" + _FENCE_ATTR + r"[ \t]*$",
     re.IGNORECASE,
 )
+# 闭合行 / 任意围栏标记行（供状态机判定闭合性与坏块右边界）
+#
+# BUG-FIX 2026-10-09（P1·带 info-string 的闭合行被判未闭合 → 整块图表静默丢失）：
+# AI 复现率很高的一种写法是把闭合行也写上语言标记，例如
+#     ```mermaid
+#     graph TD ...
+#     ```mermaid        ← 闭合行带 info-string
+# 旧 `FENCE_CLOSE_LINE_PATTERN`（`^```[ \t]*$`）不认它，而 `FENCE_ANY_LINE_PATTERN`
+# 会命中 → 状态机走「遇到另一个围栏起始行 = 原块未闭合」分支，**整块被当作坏块删除**
+# （`_protect_chart_fences` 只打一条 info 日志），图表在导出文档里消失且用户无感。
+# 现允许闭合行带可选 info-string（语言字眼或属性串），与围栏开启行的口径对齐；
+# 开启/扫描/状态机三处共用 `_FENCE_CLOSE_TAIL`，避免口径再次分叉。
+_FENCE_CLOSE_TAIL = rf"[ \t]*[A-Za-z0-9_\-+.#]*[ \t]*{_FENCE_ATTR}[ \t]*$"
+FENCE_CLOSE_LINE_PATTERN = re.compile(rf"^{_FENCE_MARK}{_FENCE_CLOSE_TAIL}")
+FENCE_ANY_LINE_PATTERN = re.compile(rf"^{_FENCE_MARK}")
+
 CHART_FENCE_SCAN_PATTERN = re.compile(
-    r"^```[ \t]*(mermaid|chart-json)[ \t]*\n(.*?)^```[ \t]*$",
+    r"^" + _FENCE_MARK + r"[ \t]*(mermaid|chart[-_]?json)[ \t]*" + _FENCE_ATTR + r"[ \t]*\n"
+    r"(.*?)^" + _FENCE_MARK + _FENCE_CLOSE_TAIL,
     re.DOTALL | re.IGNORECASE | re.MULTILINE,
 )
+
+#: 图表围栏载荷行数硬上限（防御）。**只用于判定「 pathological 坏块整块删除」**，
+#: 不再像旧实现那样在收集到 200 行时「半途停止收集并把剩余代码当正文输出」。
+_HARD_CHART_FENCE_LINE_LIMIT = 5000
+
+
+def _normalize_fence_lang(lang: str | None) -> str:
+    """把围栏语言标记归一为内部口径（'mermaid' / 'chart-json'）。
+
+    BUG-FIX 2026-10-08：`````chart_json`` / `````chartjson`` 会被 ``chart[-_]?json`` 捕获，
+    但下游 ``_fence_payload_to_marker_text`` 按 ``lang == "chart-json"`` 判定载荷格式，
+    未归一时 chart_json 载荷会走 mermaid 分支被当源码处理。
+    """
+    s = (lang or "").strip().lower()
+    if re.fullmatch(r"chart[-_]?json", s):
+        return "chart-json"
+    return "mermaid"
 
 # Mermaid 内部 title 行（图题提取优先级第二级：载荷 title > Mermaid title > 引导语 > 类型通用名）
 _MERMAID_TITLE_PATTERN = re.compile(r"^[ \t]*title[ \t]+(.+?)[ \t]*$", re.MULTILINE | re.IGNORECASE)
@@ -153,7 +215,7 @@ def iter_chart_fences(content: str):
     if not content:
         return
     for m in CHART_FENCE_SCAN_PATTERN.finditer(content):
-        lang = m.group(1).lower()
+        lang = _normalize_fence_lang(m.group(1))
         body = m.group(2).strip()
         yield lang, body, _fence_payload_to_marker_text(lang, body)
 
@@ -230,6 +292,17 @@ CHART_MARKER_SCAN_PATTERN = re.compile(
     re.DOTALL | re.IGNORECASE,
 )
 
+# FIX 2026-10-08（遗留4）：「终止符在行尾」形态——优先用它，再回落到上面的宽松形态。
+# 原扫描正则的终止符是**非贪婪且不锚定行尾**的 `(.*?)\s*(?:\]\]|>>)`：
+# 描述串里只要出现 `>>` 就会被判为终止（mermaid sequenceDiagram 的 `->>`、
+# JSON 里的 `}}>>`），导致载荷被截断或整条标记解析失败 → 静默丢图。
+# 加上行尾锚定后，非贪婪会一直扩展到**本行最后一个**终止符，
+# 中间的 `->>` 不再被误认。多行/非行尾形态仍由上方的宽松正则兜底。
+CHART_MARKER_SCAN_PATTERN_LINE_TERMINAL = re.compile(
+    r"(?:\[\[|<<)\s*(CHART|FLOWCHART|GANTT|ARCHITECTURE|LABOR|COMPARISON|LAYOUT|TIMELINE)\s*:\s*(.*?)\s*(?:\]\]|>>)[ \t]*$",
+    re.DOTALL | re.IGNORECASE | re.MULTILINE,
+)
+
 # 图表类型关键词表（唯一权威来源）
 # 历史上 export._CHART_KEYWORDS_FOR_DETECT 与 workflows_sections._CHART_TYPE_KEYWORDS
 # 各维护一份且互有差异，导致「正文里写的图」与「导出的图」判定不一致。
@@ -274,7 +347,12 @@ def iter_chart_markers(content: str):
     """
     if not content:
         return
-    for m in CHART_MARKER_SCAN_PATTERN.finditer(content):
+    # FIX 2026-10-08（遗留4）：优先用行尾锚定形态（抗 `->>` 截断），
+    # 仅在它能匹配到的条目数**少于**宽松形态时才整体回退（说明存在多行/非行尾
+    # 标记，宽松形态才能覆盖）——保证不比修复前更少。
+    _terminal = list(CHART_MARKER_SCAN_PATTERN_LINE_TERMINAL.finditer(content))
+    _loose = list(CHART_MARKER_SCAN_PATTERN.finditer(content))
+    for m in (_terminal if len(_terminal) >= len(_loose) else _loose):
         yield m.group(0), m.group(1).lower(), m.group(2).strip()
 
 
@@ -345,6 +423,51 @@ class _RepairBudgetExceeded(Exception):
     """JSON 修复总尝试预算耗尽的内部信号（不被各策略循环的 except 吞掉）"""
 
 
+def _normalize_single_quoted(raw: str) -> str | None:
+    """把 AI 偶发的 ASCII 单引号 JSON 归一为双引号 JSON。
+
+    FIX 2026-10-08（遗留4）：`<<CHART:{'type':'gantt','title':'进度'}>>` 这类输出在
+    三条解析管线上全部解析失败（既不是合法 JSON，补引号/补括号策略也救不回来），
+    最终整条标记被跳过 → 静默丢图。
+
+    实现要点：逐字符状态机——双引号段整体原样搬运（其内部的撇号不受影响），
+    只对**结构性**单引号改写；遇到未闭合的单引号返回 None（不是可归一的形态）。
+    """
+    s = (raw or "").strip()
+    if not s.startswith("{") or "'" not in s:
+        return None
+    out: list[str] = []
+    i, n = 0, len(s)
+    while i < n:
+        c = s[i]
+        if c == '"':
+            j = i + 1
+            while j < n:
+                if s[j] == '"' and s[j - 1] != "\\":
+                    break
+                j += 1
+            if j >= n:
+                return None  # 双引号未闭合：交给既有策略处理
+            out.append(s[i:j + 1])
+            i = j + 1
+            continue
+        if c == "'":
+            j = i + 1
+            while j < n and s[j] != "'":
+                if s[j] == "\\":
+                    j += 1
+                j += 1
+            if j >= n:
+                return None  # 单引号未闭合
+            inner = s[i + 1:j]
+            out.append('"' + inner.replace('"', '\\"') + '"')
+            i = j + 1
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
 def _try_repair_json(raw: str) -> dict | None:
     """尝试修复 AI 截断的 JSON，返回解析后的 dict 或 None"""
     import json as _json
@@ -355,6 +478,17 @@ def _try_repair_json(raw: str) -> dict | None:
             return obj
     except (_json.JSONDecodeError, TypeError):
         pass
+
+    # FIX 2026-10-08（遗留4）：单引号归一——仅在直接解析失败后触发，
+    # 一次尝试、失败即继续走既有修复策略，不影响原有预算与成功率。
+    _sq = _normalize_single_quoted(raw)
+    if _sq is not None:
+        try:
+            obj = _json.loads(_sq)
+            if isinstance(obj, dict):
+                return obj
+        except (_json.JSONDecodeError, TypeError):
+            pass
 
     # BUG-FIX 2026-09-18（P1）：修复总尝试硬预算。策略 1/3 的 120 次裁剪 × 4 后缀
     # 叠加括号枚举，单个严重畸变标记最坏可触发约十万次 json.loads，
@@ -518,7 +652,7 @@ def _protect_chart_fences(text: str) -> str:
       剥离不会破坏其内容），由 _restore_chart_fences 还原后交给 parse_content。
     - 未闭合（悬挂起始行）：删除起始行及其后直到下一个围栏闭合行/文末的内容
       （坏块删除，不吞正文：下一个普通 ``` 作为右边界；无则删到文末）。
-    """
+"""
     lines = text.split("\n")
     out: list[str] = []
     blocks: list[str] = []
@@ -529,21 +663,29 @@ def _protect_chart_fences(text: str) -> str:
             out.append(lines[i])
             i += 1
             continue
-        # 收集到闭合行（上限 200 行防御）
+# 收集到闭合行。
+        # BUG-FIX 2026-10-08（P1 部分删除泄漏）：旧实现在 `len(body) < 201` 处**停止收集**
+        # 并按「未闭合」处理 → 200 行以上的合法 mermaid 块被截断丢弃，而 `i = _j` 让扫描
+        # 从围栏内部继续，剩余源码（graph TD / 节点定义）被当作**正常正文**写进投标文档。
+        # 现在只在超过 _HARD_CHART_FENCE_LINE_LIMIT（病态输入）时整块判坏，
+        # 闭合行判定用 FENCE_CLOSE_LINE_PATTERN（同时支持 ``` 与 ~~~）。
         body: list[str] = [lines[i]]
         _j = i + 1
         closed = False
-        while _j < len(lines) and len(body) < 201:
-            if lines[_j].strip() == "```":
+        while _j < len(lines):
+            _s = lines[_j].strip()
+            if FENCE_CLOSE_LINE_PATTERN.match(_s):
                 body.append(lines[_j])
                 closed = True
                 _j += 1
                 break
-            # 遇到另一个围栏起始行：视为原块未闭合（AI 漏写 ```）
-            if CHART_FENCE_OPEN_PATTERN.match(lines[_j].strip()) or lines[_j].lstrip().startswith("```"):
+            # 遇到另一个围栏起始行：视为原块未闭合（AI 漏写闭合标记）
+            if FENCE_ANY_LINE_PATTERN.match(_s):
                 break
             body.append(lines[_j])
             _j += 1
+            if _j - i > _HARD_CHART_FENCE_LINE_LIMIT:
+                break  # 病态超长围栏：按坏块删除（区域有界）
         if closed:
             blocks.append("\n".join(body))
             out.append(f"{_FENCE_PLACEHOLDER_PREFIX}{len(blocks) - 1}\x00")
@@ -553,7 +695,7 @@ def _protect_chart_fences(text: str) -> str:
             logger.info(
                 "[图表跳过] 未闭合的图表围栏代码块（坏块 %d 行已删除）: lang=%s",
                 len(body),
-                m.group(1).lower(),
+                _normalize_fence_lang(m.group(1)),
             )
             i = _j
     _fence_cache.blocks.extend(blocks)
@@ -565,7 +707,63 @@ def _restore_chart_fences(text: str) -> str:
     blocks = _fence_cache.blocks
     for _i, _blk in enumerate(blocks):
         text = text.replace(f"{_FENCE_PLACEHOLDER_PREFIX}{_i}\x00", _blk)
+    # BUG-FIX 2026-10-08（P1 哨兵泄漏）：若上游异常把占位符本身改坏（截断/拼接），
+    # 未还原的 `\x00CHARTFENCE…` 会作为字面量进入正文与导出文档。这里显式兜底。
+    if _FENCE_PLACEHOLDER_PREFIX in text:
+        logger.warning(
+            "[围栏还原] 仍有未还原占位符，已剔除: %r", text[:80]
+        )
+        text = re.sub(r"\x00CHARTFENCE[^\x00]*\x00?", "", text)
     return text
+
+
+def _apply_outside_chart_fences(text: str, fn) -> str:
+    """只对「图表围栏占位符以外」的文本片段应用 fn（载荷零污染）。
+
+    BUG-FIX 2026-10-08（P0）：clean_generated_content 里的 Markdown 改写（去粗体、
+    剥标题标记、\\n 字面量还原）原先在 _restore_chart_fences 之后执行，会直接作用到
+    mermaid / chart-json 的载荷上。本函数把占位符当作分隔符，只改写普通文本片段。
+
+    实现：用 re.split 的**捕获组**切分——捕获组内容（占位符）会保留在结果列表中，
+    奇数索引恒为占位符本身、偶数索引恒为普通文本，与占位符数量和位置无关。
+
+    BUG-FIX 2026-10-08b（P1 隔段漏洗）：旧实现给每个占位符**追加**哨兵再按
+    `idx % 2 == 1 跳过` 二分——哨兵在占位符之后，split 后奇数片段实为
+    「上一占位符之后的普通文本 + 本占位符」。两个图表之间的 `**加粗**`、字面量
+    `\\n` 因此整段漏洗（多图章节一半的普通文本未被清洗）。捕获组切分根治。
+    """
+    if _FENCE_PLACEHOLDER_PREFIX not in text:
+        return fn(text)
+    _pieces = re.split(
+        r"(" + re.escape(_FENCE_PLACEHOLDER_PREFIX) + r"\d+\x00)",
+        text,
+    )
+    return "".join(p if idx % 2 == 1 else fn(p) for idx, p in enumerate(_pieces))
+
+
+def _strip_markdown_markup(segment: str) -> str:
+    """去 Markdown 粗体 + 剥行首标题标记（仅作用于非图表围栏片段）。"""
+    segment = re.sub(r"\*\*(.*?)\*\*", r"\1", segment)
+    return re.sub(r"^(#{1,6})\s+", r"", segment, flags=re.MULTILINE)
+
+
+def _strip_literal_newline_escapes(segment: str) -> str:
+    """把字面量 `\\n` 还原为真换行（仅作用于非图表围栏片段）。"""
+    return segment.replace("\\n", "\n")
+
+
+def _strip_plain_code_blocks_enabled() -> bool:
+    """是否整体剔除闭合普通代码块（遗留项 2026-10-08，config.STRIP_PLAIN_CODE_BLOCKS）。
+
+    惰性读取 config 模块属性：① 避免顶层 import 造成循环依赖；② 每次调用取
+    最新值，便于测试 monkeypatch；③ 环境变量改动重启后自然生效。
+    """
+    try:
+        import app.config as _cfg
+
+        return bool(getattr(_cfg, "STRIP_PLAIN_CODE_BLOCKS", False))
+    except Exception:
+        return False
 
 
 def _strip_unclosed_plain_fences(text: str) -> str:
@@ -581,29 +779,64 @@ def _strip_unclosed_plain_fences(text: str) -> str:
 
     修复：行级状态机逐块判定闭合性——
       - 闭合块：保留全部行（后续正则剥围栏行、保留内容，既有行为向后兼容）；
+        ENHANCE 2026-10-08（遗留项1）：config.STRIP_PLAIN_CODE_BLOCKS=true 时
+        改为整体剔除（标记行+内容），供「标书正文不含代码」的业务口径选用；
       - 未闭合坏块：删除从起始行到文末的所有坏行，绝不把代码原文写进正文。
+
+    BUG-FIX 2026-10-08（P1 图表连带丢失）：坏块删除的右边界增加「图表占位符」。
+    _protect_chart_fences 先行执行，其后的闭合图表块已变成 \x00CHARTFENCE{i}\x00
+    占位符——占位符行不可能属于普通代码块（它是受保护的完整块），却命中
+    「未闭合 → 删到文末」分支被一并删除，连占位符之后的正常正文也全部丢失
+    （实测：未闭合 ```python + 其后合法 mermaid 块 → 图表与后续段落全消失）。
+    修复：扫描闭合行时遇到占位符行即停——把「围栏起始行 → 占位符前一行」
+    视为坏块删除，保留占位符本身及其后内容，并从占位符后继续状态机扫描。
+    （AI 漏写闭合 ``` 时，其后的 ```mermaid 起始行语义上正是坏块的真实右边界，
+    该行已被 _protect_chart_fences 消费成占位符，此处以占位符还原边界最可靠。）
     """
     lines = text.split("\n")
     out: list[str] = []
     i = 0
     while i < len(lines):
-        stripped = lines[i].strip()
-        if stripped.startswith("```"):
-            # 找闭合行（代码块不嵌套：第一个 ``` 行即闭合）
+        _s = lines[i].strip()
+        # BUG-FIX 2026-10-08：原实现用 `stripped.startswith("```")` 判定围栏，
+        # 波浪线围栏（~~~python）不在其列 → 未闭合的 ~~~ 块内容会整段泄漏为正文。
+        if FENCE_ANY_LINE_PATTERN.match(_s):
+            # 找闭合行（代码块不嵌套：第一个围栏标记行即闭合）
             _j = i + 1
             closed = False
+            boundary = None  # 图表占位符行号（坏块右边界，独占该行）
             while _j < len(lines):
-                if lines[_j].strip().startswith("```"):
+                if FENCE_ANY_LINE_PATTERN.match(lines[_j].strip()):
                     closed = True
+                    break
+                # 图表占位符行：坏块的硬边界（占位符是受保护的完整图表块）
+                if _FENCE_PLACEHOLDER_PREFIX in lines[_j]:
+                    boundary = _j
                     break
                 _j += 1
             if closed:
+                # ENHANCE 2026-10-08（遗留项1）：开关开启时闭合普通代码块整体剔除
+                if _strip_plain_code_blocks_enabled():
+                    logger.info(
+                        "[围栏清理] STRIP_PLAIN_CODE_BLOCKS 开启，闭合普通代码块已整体剔除（%d 行）: %s",
+                        _j - i + 1, _s[:40],
+                    )
+                    i = _j + 1
+                    continue
                 out.extend(lines[i : _j + 1])
                 i = _j + 1
+            elif boundary is not None:
+                # 未闭合但其后存在受保护图表块：只删「起始行 → 占位符前」，
+                # 保留占位符及其后正文/图表，继续扫描后续行
+                logger.info(
+                    "[围栏清理] 未闭合普通代码块（%d 行已删除，%d 行图表/正文保留）: %s",
+                    boundary - i, len(lines) - boundary, _s[:40],
+                )
+                i = boundary
             else:
                 logger.info(
                     "[围栏清理] 未闭合普通代码块（%d 行已删除）: %s",
-                    len(lines) - i, stripped[:40],
+                    len(lines) - i, _s[:40],
                 )
                 break
         else:
@@ -615,6 +848,11 @@ def _strip_unclosed_plain_fences(text: str) -> str:
 def clean_generated_content(raw: str) -> str:
     if not raw:
         return ""
+
+    # BUG-FIX 2026-10-08（P3 编码）：剥离 UTF-8 BOM（\ufeff）。BOM 粘在首行会挡住
+    # HEADING_PATTERNS 的 ^(\d{1,4}) 锚点，首标题被降级为普通段落，
+    # 导出文档首个标题丢失编号样式。
+    raw = raw.lstrip("\ufeff")
 
     # BUG-FIX 2026-09-16（低）：去掉 DOTALL。原非贪婪跨行匹配会从任意
     # 「行首为 分析/推理」的行一路吞到全文第一个「输出/结果」——中文正文
@@ -639,11 +877,27 @@ def clean_generated_content(raw: str) -> str:
     # 若未闭合，原全局正则只删围栏行、块内代码残留为正文段落。
     raw = _strip_unclosed_plain_fences(raw)
 
-    raw = re.sub(r"```[\w]*\n?", "", raw)
-    raw = re.sub(r"\n?```", "", raw)
+    # ↓↓↓ 以下三步必须发生在 _restore_chart_fences **之前** ↓↓↓
+    # BUG-FIX 2026-10-08（P0 图表载荷被污染）：Markdown 改写与围栏标记剥离原先都在
+    # 还原之后执行，等于直接作用到 mermaid / chart-json 载荷上：
+    #   - `\n` 字面量还原会把 JSON 字符串里的 \\n 变成真换行 → 载荷非法 JSON，
+    #     _try_repair_json 抢救出一个被截断的残缺对象，甘特图丢数据后被静默丢弃；
+    #   - `**` 去粗体会改写 mermaid 节点标签（A[**关键路径**]）；
+    #   - `#` 剥标题会吃掉 mermaid 注释行。
+    # 改为用 _apply_outside_chart_fences 只处理「占位符以外」的文本片段；
+    # 由于此刻图表围栏仍是 `\x00CHARTFENCE{i}\x00` 占位符，载荷天然不可见。
+    raw = _apply_outside_chart_fences(raw, _strip_markdown_markup)
+    raw = _apply_outside_chart_fences(raw, _strip_literal_newline_escapes)
+
+    # BUG-FIX 2026-10-08（P1 围栏标记残留）：原正则 `r"```[\w]*\n?"` 的 \w 不含 "-",
+    # ```chart-json 这类带连字符的围栏标记行**删不干净**，闭合标记 `` ``` `` 会残留
+    # 成正文行。改为匹配整个 info-string（同时支持 ``` 与 ~~~）。
+    raw = re.sub(r"(?:`{3,}|~{3,})[^\n`~]*\n?", "", raw)
+    raw = re.sub(r"\n?(?:`{3,}|~{3,})", "", raw)
 
     raw = _restore_chart_fences(raw)
     _fence_cache.blocks.clear()
+    # ↑↑↑ 载荷在此刻才被放回 ↑↑↑
 
     trimmed = raw.strip()
     if trimmed.startswith("{") and trimmed.endswith("}"):
@@ -653,13 +907,6 @@ def clean_generated_content(raw: str) -> str:
                 raw = str(parsed["content"])
         except (json.JSONDecodeError, AttributeError, TypeError):
             pass
-
-    raw = re.sub(r"\*\*(.*?)\*\*", r"\1", raw)
-
-    # 清理 Markdown 标题标记（如 ### 标题 -> 标题）
-    raw = re.sub(r"^(#{1,6})\s+", r"", raw, flags=re.MULTILINE)
-
-    raw = raw.replace("\\n", "\n")
 
     raw = re.sub(r"\n{3,}", "\n\n", raw)
 
@@ -816,14 +1063,22 @@ def parse_content(raw: str, base_level: int = 0) -> list[DocumentBlock]:
             _fence_body: list[str] = []
             _j = i + 1
             _closed = False
-            while _j < len(lines) and len(_fence_body) < 200:
-                _nxt = lines[_j]
-                if _nxt.strip() == "```":
+            # BUG-FIX 2026-10-08（P1 部分删除泄漏 + 围栏变体）：旧实现的 200 行上限会在
+            # 半途停止收集并按「未闭合」处理，`i = _j` 让扫描从围栏内部继续 →
+            # 超长 mermaid 块的剩余源码被当作**正文段落**输出到投标文档。
+            # 现在统一到 _HARD_CHART_FENCE_LINE_LIMIT 病态上限，闭合判定支持 ~~~。
+            while _j < len(lines):
+                _s = lines[_j].strip()
+                if FENCE_CLOSE_LINE_PATTERN.match(_s):
                     _closed = True
                     break
-                _fence_body.append(_nxt)
+                if FENCE_ANY_LINE_PATTERN.match(_s):
+                    break
+                _fence_body.append(lines[_j])
                 _j += 1
-            _lang = CHART_FENCE_OPEN_PATTERN.match(stripped).group(1).lower()
+                if _j - i > _HARD_CHART_FENCE_LINE_LIMIT:
+                    break
+            _lang = _normalize_fence_lang(CHART_FENCE_OPEN_PATTERN.match(stripped).group(1))
             if _closed:
                 _marker_text = _fence_payload_to_marker_text(_lang, "\n".join(_fence_body))
                 if _marker_text is not None:
@@ -844,9 +1099,13 @@ def parse_content(raw: str, base_level: int = 0) -> list[DocumentBlock]:
             # 这里先把「未闭合的图表标记」聚合到闭合符（≤40 行），再统一解析。
             _marker_line_i = i
             if not stripped.endswith((">>", "]]")):
+            # FIX 2026-10-08（P2）：聚合上限 40 → 200。折行 JSON 标记超过 40 行时
+            # 旧实现按「未闭合」回退为仅消费标记行，剩余 JSON 体被当普通正文
+            # 写进文档（乱码段落），且导出端 DOTALL 扫描仍把该类型判为「已内联」
+            # → 章末也不补图，图彻底丢失。200 行已覆盖合法折行标记的实际上限。
                 _buf = [stripped]
                 _j = i + 1
-                while _j < len(lines) and len(_buf) < 40:
+                while _j < len(lines) and len(_buf) < 200:
                     _nxt = lines[_j].strip()
                     _buf.append(_nxt)
                     _j += 1
@@ -983,7 +1242,16 @@ def parse_content(raw: str, base_level: int = 0) -> list[DocumentBlock]:
             i += 1
             continue
 
-        cleaned, _indent = _strip_leading_spaces(stripped)
+        # FIX 2026-10-08（P2 列表拍平）：缩进层级必须从**原始行**计算——上方
+        # stripped = line.strip() 已把前导全角空格剥掉，_strip_leading_spaces
+        # 恒得 0，嵌套列表层级会整体丢失。口径：每个全角空格 1 级，半角空格
+        # 每 2 个折 1 级，封顶 4 级。
+        _m_lead = re.match(r"^([\u3000 ]+)", line)
+        _indent = 0
+        if _m_lead:
+            _lead = _m_lead.group(1)
+            _indent = min(4, _lead.count("\u3000") + len(_lead.replace("\u3000", "")) // 2)
+        cleaned, _ = _strip_leading_spaces(stripped)
 
         heading_match = _match_heading(cleaned, base_level)
         if heading_match:
@@ -1000,10 +1268,16 @@ def parse_content(raw: str, base_level: int = 0) -> list[DocumentBlock]:
             continue
 
         is_list, list_text, list_kind = _is_list_item(cleaned)
+        # FIX 2026-10-08（P3）：纯 "-" / "---" 水平装饰线命中 LIST_BULLET_PATTERN
+        # 会变成列表项文本 "---"。剔除符号后仅剩连字符/破折号的行不是列表。
+        if is_list and list_text and set(list_text.strip()) <= set("-—–‐‑‒"):
+            is_list = False
         if is_list:
             # D2 修复：区分有序/无序列表，导出端据此写入真正的 Word 编号（numPr）
+            # FIX 2026-10-08（P2 列表拍平）：缩进层级（全角空格数）写入 level 字段，
+            # 导出端按 level 附加左缩进，嵌套列表层级不再被拍平为同级。
             list_type = "list_ordered" if list_kind == "ordered" else "list_bullet"
-            blocks.append(DocumentBlock(type=list_type, text=list_text))
+            blocks.append(DocumentBlock(type=list_type, text=list_text, level=min(_indent, 4)))
             i += 1
             continue
 
@@ -1044,3 +1318,142 @@ def _split_heading_body_concat(
             result.append(block)
 
     return result
+
+
+# ===========================================================================
+# BUG-2026-1008-02 修复（P1）：正文标题去重清洗器
+# ===========================================================================
+
+
+# 编号前缀正则：匹配 "1、" / "1." / "1." / "（1）" / "(1)" / "一、" / "（一）" 等
+_NUMBERING_PREFIX = re.compile(
+    r"^\s*(?:\d+[.、．,]|（?\d+）?|[\(（]\d+[\)）]|[一二三四五六七八九十]+[、．.])\s*"
+)
+
+# Markdown 标题标记正则：匹配行首 # 到 ######
+_MARKDOWN_HEADING = re.compile(r"^\s*#{1,6}\s*")
+
+
+class ContentCleaner:
+    """正文清洗器：移除 AI 生成内容中的重复标题与格式残留。
+
+    BUG-2026-1008-02 修复（P1）：AI 生成章节内容时，经常在 content 字段
+    开头重复输出章节标题（如 content = "主体结构施工节奏管控\\n\\n本项目..."），
+    导致导出文档中出现「2、主体结构施工节奏管控」+「主体结构施工节奏管控」
+    的双重标题。
+
+    清洗策略（保守、幂等）：
+      1. _remove_duplicate_title：检查前 3 行是否重复标题，命中则移除
+      2. _remove_markdown_headings：移除行首 # 标记
+      3. _remove_leading_numbering：移除首行编号前缀
+
+    使用方式::
+
+        cleaner = ContentCleaner()
+        cleaned = cleaner.clean(title="主体结构施工节奏管控", content="主体结构施工节奏管控\\n\\n本项目...")
+    """
+
+    def clean(self, title: str, content: str) -> str:
+        """执行完整清洗流程，返回去重后的正文。
+
+        Args:
+            title: 章节标题（用于检测正文开头的重复标题）
+            content: AI 生成的原始正文
+
+        Returns:
+            清洗后的正文。空/None 输入原样返回。
+        """
+        if not content or not isinstance(content, str):
+            return content
+
+        original = content
+        content = self._remove_duplicate_title(title, content)
+        content = self._remove_markdown_headings(content)
+        content = self._remove_leading_numbering(content)
+        cleaned = content.strip()
+
+        if cleaned != original.strip():
+            logger.info(
+                "[ContentCleaner] 正文清洗生效: title=%r 原长=%d 新长=%d",
+                (title or "")[:30],
+                len(original),
+                len(cleaned),
+            )
+        return cleaned
+
+    def _remove_duplicate_title(self, title: str, content: str) -> str:
+        """移除正文开头的重复标题行。
+
+        检查前 3 行（跳过空行），若某行（去掉编号前缀后）与标题一致，
+        则移除该行及其后的连续空行。
+
+        示例：
+          title = "主体结构施工节奏管控"
+          content = "主体结构施工节奏管控\\n\\n本项目主体..."
+          → "本项目主体..."
+
+          title = "主体结构施工节奏管控"
+          content = "2、主体结构施工节奏管控\\n本项目主体..."
+          → "本项目主体..."
+        """
+        if not title or not title.strip():
+            return content
+
+        title_stripped = title.strip()
+        lines = content.split("\n")
+
+        for i in range(min(3, len(lines))):
+            line = lines[i].strip()
+            if not line:
+                continue
+
+            # 移除编号前缀后比较
+            line_clean = _NUMBERING_PREFIX.sub("", line).strip()
+            # 也移除 Markdown 标题标记
+            line_clean = _MARKDOWN_HEADING.sub("", line_clean).strip()
+
+            if line_clean == title_stripped:
+                # 找到重复标题行，移除该行及其后连续空行
+                lines = lines[i + 1 :]
+                while lines and not lines[0].strip():
+                    lines = lines[1:]
+                return "\n".join(lines)
+
+        return content
+
+    def _remove_markdown_headings(self, content: str) -> str:
+        """移除所有行首的 Markdown 标题标记（# 到 ######）。
+
+        示例：
+          "### 标题\\n正文" → "标题\\n正文"
+          "# 一级标题" → "一级标题"
+
+        注意：仅移除行首的 #，不影响正文中的 # 字符。
+        """
+        lines = content.split("\n")
+        result = []
+        for line in lines:
+            cleaned = _MARKDOWN_HEADING.sub("", line)
+            result.append(cleaned)
+        return "\n".join(result)
+
+    def _remove_leading_numbering(self, content: str) -> str:
+        """移除首行的编号前缀（仅首行，保留列表编号）。
+
+        示例：
+          "1、本项目主体..." → "本项目主体..."
+          "（1）本项目主体..." → "本项目主体..."
+          "本项目主体..." → "本项目主体..."（无编号，不变）
+
+        注意：仅处理首行，列表中的编号（如 "1. 第一步" 在段落中）不受影响。
+        """
+        lines = content.split("\n")
+        if not lines:
+            return content
+
+        first_line = lines[0]
+        cleaned_first = _NUMBERING_PREFIX.sub("", first_line).strip()
+        lines[0] = cleaned_first
+
+        return "\n".join(lines)
+

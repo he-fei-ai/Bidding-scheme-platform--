@@ -1003,3 +1003,64 @@ async def with_timeout(coro, timeout: int = 30, error_msg: str = "AI调用超时
         return await asyncio.wait_for(coro, timeout=timeout)
     except TimeoutError:
         raise TimeoutError(f"{error_msg}（{timeout}秒）")
+
+
+# ===========================================================================
+# BUG-2026-1008-02 修复（P1）：正文重复标题预检
+# ===========================================================================
+
+
+# 编号前缀正则（与 content_cleaning.py 保持一致）
+_TITLE_NUMBERING_PREFIX = re.compile(
+    r"^\s*(?:\d+[.、．,]|（?\d+）?|[\(（]\d+[\)）]|[一二三四五六七八九十]+[、．.])\s*"
+)
+
+
+def check_duplicate_title_in_content(title: str, content: str) -> list[dict]:
+    """检查正文是否重复标题（导出预检 CMP-07）。
+
+    BUG-2026-1008-02 修复（P1）：在导出前检查章节正文前 5 行是否包含
+    与章节标题重复的行（去编号前缀后比较），避免双重标题出现在导出文档中。
+
+    Args:
+        title: 章节标题
+        content: 章节正文
+
+    Returns:
+        Issue 列表，每项含 rule_id / severity / title / message / suggestion / section_id。
+        空列表表示无重复标题。
+    """
+    issues: list[dict] = []
+
+    if not content or not isinstance(content, str):
+        return issues
+
+    title_stripped = (title or "").strip()
+    if not title_stripped:
+        return issues
+
+    lines = content.split("\n")[:5]  # 仅检查前 5 行
+
+    for i, line in enumerate(lines):
+        line_clean = line.strip()
+        if not line_clean:
+            continue
+
+        # 移除编号前缀和 Markdown 标题标记
+        line_clean = _TITLE_NUMBERING_PREFIX.sub("", line_clean)
+        line_clean = re.sub(r"^\s*#{1,6}\s*", "", line_clean).strip()
+
+        if line_clean == title_stripped:
+            issues.append(
+                {
+                    "rule_id": "CMP-07",
+                    "severity": "medium",
+                    "title": "正文重复标题",
+                    "message": f"章节「{title_stripped}」正文第 {i + 1} 行重复标题",
+                    "suggestion": "移除正文开头的重复标题",
+                    "section_id": None,
+                }
+            )
+            break  # 只报告第一个重复
+
+    return issues
