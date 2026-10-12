@@ -131,6 +131,9 @@ describe.skipIf(!hasDom)("FactBackflowTab", () => {
     expect((btn as HTMLButtonElement).disabled).toBe(true);
   });
 
+  // FACT-2026-10-12：antd Table 在 jsdom 下渲染较慢 + 串行多次 waitFor，
+  // 整体偶发超过 vitest 默认 5s testTimeout（其他用例已通过，属环境偶发）。
+  // 放宽本用例超时至 15s，消除 flaky，不改测试语义。
   it("选中后点击采纳调 acceptFactProposals", async () => {
     render(<FactBackflowTab projectId={1} />);
     await waitFor(() => {
@@ -159,5 +162,5 @@ describe.skipIf(!hasDom)("FactBackflowTab", () => {
         ]),
       );
     });
-  });
+  }, 15000);
 });
