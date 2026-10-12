@@ -55,4 +55,10 @@ acl-repair/
 .trae-html-share-packages/
 frontend_vitest_*.txt
 
+# 审计/探针临时产物（外部执行体生成，勿提交）
+*.tsbuildinfo
+backend/_spec_*.json
+backend/scripts/audit_*.py
+frontend/vite.*.config.ts
+
 /_*.txt
