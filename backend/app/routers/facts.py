@@ -565,8 +565,16 @@ async def generate_facts(project_id: int, body: FactsGenerateRequest | None = No
     work_interface = row["work_interface_json"] if row else ""
     construction_method = row["construction_method_json"] if row else ""
 
-    from ..services.ai.provider_factory import create_provider, get_ai_config
-    from ..services.ai.providers.base import AIMessage
+    # R-2 2026-10-12：统一「取 provider → 调 collect_json_response」链路，
+    # 消除本文件与 routers/templates.py 各自内联该组合的重复。
+    # provider **仍在下方 try 之外构造**：原语义是「AI 配置故障直接 500」，
+    # 若把构造挪进 try，配置异常会被启发式兜底静默吞掉、向用户谎报成功。
+    from ..services.ai.extraction_runner import (
+        create_provider,
+        get_ai_config,
+        run_json_extraction,
+        AIMessage,
+    )
 
     ai_config = get_ai_config()
     provider = create_provider(ai_config)
@@ -617,8 +625,6 @@ async def generate_facts(project_id: int, body: FactsGenerateRequest | None = No
 
 请提取所有可确定的事实变量，输出 JSON 对象（dict）。"""
 
-    from ..services.ai.workflows import collect_json_response
-
     # BUG-FIX 2026-09-14（中·可信度）：原先无论 AI 成功还是异常降级为正则启发式，
     # 接口都返回同一形态的结果，前端一律提示"事实变量已提取"——用户以为这些
     # 数值来自 AI 精准抽取，实际只是几条正则匹配，极易把错误事实带进正文。
@@ -626,12 +632,13 @@ async def generate_facts(project_id: int, body: FactsGenerateRequest | None = No
     extraction_mode = "ai"
     extraction_note = ""
     try:
-        result = await collect_json_response(
-            provider,
+        # R-2 2026-10-12：改走统一 runner（provider 由调用方预构造传入）。
+        result, _ = await run_json_extraction(
             [
                 AIMessage(role="system", content=extract_sys),
                 AIMessage(role="user", content=extract_user),
             ],
+            provider=provider,
             temperature=0.3,
             max_retries=2,
         )
@@ -823,8 +830,13 @@ async def audit_facts_consistency(project_id: int, current_user: Annotated[Any, 
         [f"- {f.get('label') or f.get('key', '')}：{f.get('value', '')}" for f in facts]
     )
 
-    from ..services.ai.provider_factory import create_provider, get_ai_config
-    from ..services.ai.providers.base import AIMessage
+    # R-2 2026-10-12：同上一处，统一 provider + collect_json_response 链路。
+    from ..services.ai.extraction_runner import (
+        create_provider,
+        get_ai_config,
+        run_json_extraction,
+        AIMessage,
+    )
 
     ai_config = get_ai_config()
     provider = create_provider(ai_config)
@@ -847,8 +859,6 @@ async def audit_facts_consistency(project_id: int, current_user: Annotated[Any, 
 
 直接输出 JSON 数组。"""
 
-    from ..services.ai.workflows import collect_json_response
-
     _sem = asyncio.Semaphore(max(1, AUDIT_GROUP_CONCURRENCY))
 
     async def _audit_group(group_index: int, group: list) -> tuple[list, bool]:
@@ -869,12 +879,13 @@ async def audit_facts_consistency(project_id: int, current_user: Annotated[Any, 
 请逐条检查以上事实变量在送审正文中的一致性。"""
         async with _sem:
             try:
-                result = await collect_json_response(
-                    provider,
+                # R-2 2026-10-12：改走统一 runner（provider 由调用方预构造传入）。
+                result, _ = await run_json_extraction(
                     [
                         AIMessage(role="system", content=audit_sys),
                         AIMessage(role="user", content=audit_user),
                     ],
+                    provider=provider,
                     temperature=0.3,
                     max_retries=2,
                 )

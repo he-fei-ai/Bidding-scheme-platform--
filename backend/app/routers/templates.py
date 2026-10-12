@@ -14,9 +14,12 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from ..config import PROJECTS_DATA_DIR
 from ..db import get_db
-from ..services.ai.provider_factory import create_provider, get_ai_config
-from ..services.ai.providers.base import AIMessage
-from ..services.ai.workflows import collect_json_response
+from ..services.ai.extraction_runner import (
+    create_provider,
+    get_ai_config,
+    run_json_extraction,
+    AIMessage,
+)
 from ..services.files import extract_text_from_path
 from ..security.auth import get_current_user
 logger = logging.getLogger(__name__)
@@ -80,7 +83,9 @@ async def extract_template_outline(project_id: int, template_id: int):
     truncated = text[:30000]
     extract_user = f'请从以下标书文本中提取目录结构：\n\n{truncated}'
     try:
-        result = await collect_json_response(provider, [AIMessage(role='system', content=extract_sys), AIMessage(role='user', content=extract_user)], temperature=0.3, max_retries=2)
+        # R-2 2026-10-12：改走统一 runner（provider 由上方 try 预构造后传入，
+        # 保留「AI 配置异常 → 500」的原始语义，与 facts.py 口径一致）。
+        result, _ = await run_json_extraction([AIMessage(role='system', content=extract_sys), AIMessage(role='user', content=extract_user)], provider=provider, temperature=0.3, max_retries=2)
         outline = result if isinstance(result, list) else []
     except Exception as e:
         logger.warning('模板目录提取失败: %s', e)
