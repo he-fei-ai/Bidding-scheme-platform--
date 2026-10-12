@@ -99,6 +99,16 @@ def _tolerance_for_section(s) -> float:
     return 0.10
 
 
+def _tolerance_for_section_via_resolver(s) -> float:
+    """CONVERGE 2026-10-12：容差的权威读取路径（转发唯一权威口径）。
+
+    ``_tolerance_for_section`` 保留为兼容入口（仍有测试与外部调用引用其符号），
+    新代码请直接用本函数或 ``_resolve_word_target_for_section``。
+    """
+    resolved = _resolve_word_target_for_section(s)
+    return float(resolved.tolerance) if resolved else 0.10
+
+
 @router.get('/overview/{project_id}')
 async def overview(project_id: int, user=Depends(get_current_user)):
     """项目总体字数概览（2026-10-08：含三级目录达标率与各档位统计）"""
@@ -169,22 +179,19 @@ async def section_stats(project_id: int, user=Depends(get_current_user)):
 
 
 def _target_bounds(s) -> tuple[int, int]:
-    """解析章节达标区间 [lo, hi]（与 sse_utils / check_document 同口径）。
+    """解析章节达标区间 [lo, hi]（CONVERGE 2026-10-12：转发唯一权威口径）。
 
     - L3 自身正文（无档位覆盖）：300 ± 20%（默认 240~360），随
       L3_OWN_TARGET_WORDS / L3_OWN_TOLERANCE_RATIO 配置变化。
     - 其他（L3 非叶子四档子树总字数、L4+ 叶子）：target × [1-tol, 1+tol]，
-      其中 tol 取该章节档位的 tolerance_ratio（BUG-FIX 2026-10-09：
+      其中 tol 取**目标来源**的 tolerance_ratio（BUG-FIX 2026-10-09：
       此前硬编码 0.10，与管理员可编辑的 word_count_tiers.tolerance_ratio
       以及生成侧口径分叉）。
     """
-    target = _resolve_target_for_section(s)
-    if not target:
+    resolved = _resolve_word_target_for_section(s)
+    if not resolved:
         return (0, 0)
-    if target == get_l3_own_target() and _is_l3_own_section(s):
-        return get_l3_own_range()
-    tol = _tolerance_for_section(s)
-    return (int(target * (1 - tol)), int(target * (1 + tol)))
+    return (int(resolved.lo), int(resolved.hi))
 
 
 def _is_below_target(s) -> bool:
@@ -209,38 +216,37 @@ def _is_l3_own_section(s) -> bool:
 
 
 def _resolve_target_for_section(s, writing_length: str | None = None):
-    """解析章节有效目标字数（与 sse_utils._get_effective_target_words 同口径）。
+    """解析章节有效目标字数（CONVERGE 2026-10-12：转发唯一权威口径）。
 
-    优先级（与 SSE 侧 `_get_effective_target_words` 逐条对齐）：
-      单节点 target_words > 单节点 word_count_tier
-      > 全局 writing_length（本项目最近一次生成任务所用档位）
+    权威实现见 ``services/word_target_resolver.py``（本函数曾是 5 份同构实现
+    之一）。本函数保留原签名与返回语义（``int | None``，L1/L2 → None），
+    口径改为转发，避免「生成侧 / 校验侧 target 与 tolerance 各算一套」的分叉。
+
+    优先级：单节点 target_words > 单节点 word_count_tier
+      > L3 自身正文 300±20% > 全局 writing_length（本项目最近一次生成任务所用档位）
       > 默认档位（standard）。
-    BUG-FIX 2026-10-09：新增 `writing_length` 形参。此前本函数对 L4+ 章节
-    一律回落到默认档位，导致「生成按 detailed 写、校验按 standard 判」的
-    系统性误报；`writing_length` 形参默认 None 时行为与修复前完全一致，
-    保证既有单测与旧调用方不受影响。
     """
-    level = s.level or 3
-    if level < 3:
-        return None
-    tw = s.target_words
-    if isinstance(tw, int) and tw > 0:
-        return tw
-    tier_key = getattr(s, 'word_count_tier', None)
-    if tier_key:
-        cfg = get_tier_config(tier_key)
-        if cfg:
-            return int(cfg['target_words'])
-    if level == 3:
-        # L3 自身正文：300 ± 20%（240~360）为唯一口径；仅在存在 L4+ 下级时
-        # 四档「子树总字数」口径才生效（SSE 侧已由 word_count_tier 兜住）。
-        return get_l3_own_target()
-    if writing_length:
-        cfg = get_tier_config(writing_length)
-        if cfg and cfg.get('target_words'):
-            return int(cfg['target_words'])
-    default_cfg = get_default_tier_config()
-    return int(default_cfg.get('target_words', 1200))
+    from ..services.word_target_resolver import (
+        resolve_section_word_target_from_mapping,
+    )
+
+    resolved = resolve_section_word_target_from_mapping(s, writing_length=writing_length)
+    return resolved.target if resolved else None
+
+
+def _resolve_word_target_for_section(s, writing_length: str | None = None):
+    """返回完整口径对象（target / lo / hi / tolerance / source）。
+
+    CONVERGE 2026-10-12：``_target_bounds`` 与 ``_tolerance_for_section`` 原本
+    各自再解析一遍（且边界条件不同：前者对「target == L3 自身目标」用
+    ``get_l3_own_range()``，后者对「L3 无档位覆盖」用 L3 容差），存在同一事实
+    两个判定标准的隐患。现统一取权威对象的 lo/hi/tolerance。
+    """
+    from ..services.word_target_resolver import (
+        resolve_section_word_target_from_mapping,
+    )
+
+    return resolve_section_word_target_from_mapping(s, writing_length=writing_length)
 
 
 def _is_within_tolerance(s) -> bool:
@@ -580,7 +586,9 @@ def _options_payload(inp: WordControlSettingsInput) -> dict:
     min_leaf, max_leaf = wc.leaf_count_range(opts)
     target_total = inp.maximum_words or inp.minimum_words
     target_leaf = wc.derive_target_leaf_count(opts)
-    review_lo, review_hi = wc.outline_review_bounds(target_leaf)
+    # R7：未设置总字数目标时 outline_review_bounds 返回 None（回归 2026-10-12：
+    # 未配置项目 GET 该接口曾因直接解包 None 而 500）
+    review_bounds = wc.outline_review_bounds(target_leaf)
     return {
         "valid": True,
         "errors": [],
@@ -588,7 +596,7 @@ def _options_payload(inp: WordControlSettingsInput) -> dict:
         "leaf_count_range": [min_leaf, max_leaf],
         "target_leaf_count": target_leaf,
         "outline_review_bounds": (
-            [review_lo, review_hi] if review_lo is not None else None
+            [review_bounds[0], review_bounds[1]] if review_bounds is not None else None
         ),
         "generation_word_target": (
             wc.compute_generation_word_target(
@@ -657,21 +665,17 @@ async def put_word_control_settings(
         raise HTTPException(status_code=422, detail={"valid": False, "errors": errors})
 
     # 写入配置后，快照视为失效（需用户重新点「固化」才生效）
-    now = _now_local()
-    with get_db() as conn:
-        if _wc_table_ready(conn):
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO word_control_settings (
-                    project_id, minimum_words, maximum_words, section_words,
-                    strict_section_words, outline_word_control_snapshot_json,
-                    snapshot_at, word_control_warning, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?)
-                """,
-                (project_id, body.minimum_words, body.maximum_words,
-                 body.section_words, 1 if body.strict_section_words else 0,
-                 now, now),
-            )
+    # GUARD 2026-10-12：写事务走线程池——async def 内裸调 get_db() 会阻塞
+    # 事件循环（SSE 流被 fsync 卡住），与 update_tier 的既有处理保持一致。
+    await asyncio.to_thread(
+        _persist_word_control_settings,
+        project_id,
+        body.minimum_words,
+        body.maximum_words,
+        body.section_words,
+        1 if body.strict_section_words else 0,
+        None,
+    )
 
     return {
         "status": "ok",
@@ -680,6 +684,41 @@ async def put_word_control_settings(
         "snapshot_invalidated": True,
         "derived": _options_payload(body),
     }
+
+
+def _persist_word_control_settings(
+    project_id: int,
+    minimum_words: int,
+    maximum_words: int,
+    section_words: int,
+    strict_flag: int,
+    snapshot_json: str | None,
+) -> None:
+    """把「配置 + 快照」写进同一行（同步函数，必须在 to_thread 中调用）。
+
+    快照与配置同表同行：``INSERT OR REPLACE`` 保证二者要么同时更新、要么都不变，
+    不会出现「新配置 + 旧快照」的脱节。``snapshot_json=None`` 时连带清空快照
+    （改配置即让快照失效，需用户重新固化）。
+    """
+    now = _now_local()
+    with get_db() as conn:
+        if not _wc_table_ready(conn):
+            return
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO word_control_settings (
+                project_id, minimum_words, maximum_words, section_words,
+                strict_section_words, outline_word_control_snapshot_json,
+                snapshot_at, word_control_warning, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
+            """,
+            (
+                project_id, minimum_words, maximum_words, section_words,
+                strict_flag, snapshot_json,
+                now if snapshot_json else None,
+                now, now,
+            ),
+        )
 
 
 def _build_warning_for_project(project_id: int, total_readable: int) -> dict | None:
@@ -787,24 +826,16 @@ async def create_word_control_snapshot(project_id: int, user=Depends(get_current
         "snapshot_at": _now_local(),
         "section_count": len(sections),
     }
-    now = _now_local()
-    with get_db() as conn:
-        if _wc_table_ready(conn):
-            # 快照与配置同表同行：INSERT OR REPLACE 保证「配置 + 快照」
-            # 要么同时更新、要么都不变，不会出现「新配置 + 旧快照」的脱节。
-            conn.execute(
-                """
-                INSERT OR REPLACE INTO word_control_settings (
-                    project_id, minimum_words, maximum_words, section_words,
-                    strict_section_words, outline_word_control_snapshot_json,
-                    snapshot_at, word_control_warning, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
-                """,
-                (project_id, inp.minimum_words, inp.maximum_words, inp.section_words,
-                 1 if inp.strict_section_words else 0,
-                 json.dumps(snapshot, ensure_ascii=False),
-                 now, now, now),
-            )
+    # GUARD 2026-10-12：同 put_word_control_settings，写事务走线程池。
+    await asyncio.to_thread(
+        _persist_word_control_settings,
+        project_id,
+        inp.minimum_words,
+        inp.maximum_words,
+        inp.section_words,
+        1 if inp.strict_section_words else 0,
+        json.dumps(snapshot, ensure_ascii=False),
+    )
 
     return {
         "status": "ok",

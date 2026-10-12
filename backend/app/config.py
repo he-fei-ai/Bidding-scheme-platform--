@@ -155,6 +155,34 @@ CONTENT_WORD_COUNT_CONDENSE_MAX_ROUNDS = max(
 )
 
 
+# ========== 2026-10-12：易标 R9/R10/R11 字数双向多轮调整 ==========
+# 生产接线（services/ai/workflows_word_adjust.py），在 condense / 兜底扩写之后运行：
+#   R9  小节强控拉回（仅强控项目；每节 ≤3 轮；额度 |当前−S|）
+#   R10 全文扩写 / 缩写（按比例分配额度；缩写 ≤3 轮；扩写连续 3 轮无进展即停）
+#   R11 每次结果六道硬校验（不通过即保留原文）
+#   CONTENT_USE_WORD_ADJUSTMENT_DEFAULT  是否启用该阶段。
+#     默认 false —— 该阶段会额外产生 AI 调用（扩写方向不限轮），只有配置了
+#     绝对字数目标的用户才需要；关闭时行为与修复前完全一致（零额外调用）。
+#     请求参数 use_word_adjust=true 可单次强制开启。
+#   CONTENT_WORD_ADJUST_AUTO_ON_STRICT  强控（R5 ±20% 硬区间）项目是否自动启用。
+#     默认 true —— 强控承诺的是「区间是硬约束」，而 condense 只有 1 轮且不带
+#     额度/校验，达不到硬约束语义，必须由 R9/R11 收敛。
+#   CONTENT_WORD_ADJUST_MAX_ROUNDS      单节 / 单轮最大调整轮数（默认 3）。
+#   CONTENT_WORD_ADJUST_CONCURRENCY     调整阶段并发上限（默认 4）。
+CONTENT_USE_WORD_ADJUSTMENT_DEFAULT = _env_bool(
+    "CONTENT_USE_WORD_ADJUSTMENT_DEFAULT", "false"
+)
+CONTENT_WORD_ADJUST_AUTO_ON_STRICT = _env_bool(
+    "CONTENT_WORD_ADJUST_AUTO_ON_STRICT", "true"
+)
+CONTENT_WORD_ADJUST_MAX_ROUNDS = max(
+    1, int(os.environ.get("CONTENT_WORD_ADJUST_MAX_ROUNDS", "3"))
+)
+CONTENT_WORD_ADJUST_CONCURRENCY = max(
+    1, int(os.environ.get("CONTENT_WORD_ADJUST_CONCURRENCY", "4"))
+)
+
+
 # ========== 增强 1.1: OCR 配置 ==========
 OCR_ENABLED = os.environ.get("OCR_ENABLED", "true").lower() == "true"
 OCR_ENGINE = os.environ.get("OCR_ENGINE", "mineru")  # mineru | paddleocr | none

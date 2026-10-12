@@ -280,6 +280,13 @@ def ensure_enhancement_tables():
                 logger.info("添加 %s.%s 列", table, column)
             except Exception as e:
                 err_msg = str(e).lower()
+                if "no such table" in err_msg:
+                    # BUG-FIX 2026-10-12：目标表尚未建出（增量迁移场景：只跑了
+                    # 子集 DDL 的老库 / 测试夹具）。此时 ALTER 无从谈起，但也不该
+                    # 让整条迁移链崩掉——该表由 db.py::init_db 在启动时建出，
+                    # 建表语句里已含这些列。跳过即可。
+                    logger.warning("表 %s 尚未建出，跳过添加 %s 列", table, column)
+                    return
                 if "already exists" not in err_msg and "duplicate column" not in err_msg:
                     raise  # 如果不是已存在错误，抛出
                 logger.debug("%s.%s 列已存在", table, column)

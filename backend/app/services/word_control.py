@@ -899,12 +899,29 @@ def validate_word_adjustment_result(
             return False, f"调整后字数 {after} 超出强控区间 [{lo}, {hi}]"
 
     # 6. 全文边界（扩写不超上限、缩写不低于下限）
+    # 6. 全文边界（扩写不超上限、缩写不低于下限）
+    #    BUG-FIX 2026-10-12（生产接线暴露）：此前两个边界**不看方向**，导致
+    #    「全文低于下限时执行扩写」永远被下限判负（new_total 仍 < minimum_words）
+    #    → 扩写被 100% 打回，R10 扩写方向彻底失效。该缺陷此前不可见，只因为
+    #    本函数零生产调用点（纯函数 + 单测）。现按方向分别约束，与易标
+    #    R11 第 6 道语义逐字一致。
     if enforce_total_bounds and total_words is not None:
         new_total = max(0, int(total_words)) + delta
-        if maximum_words is not None and maximum_words > 0 and new_total > maximum_words:
+        if (
+            mode == MODE_EXPAND
+            and maximum_words is not None
+            and maximum_words > 0
+            and new_total > maximum_words
+        ):
             return False, f"扩写后全文 {new_total} 字将超出上限 {maximum_words} 字"
-        if minimum_words is not None and minimum_words > 0 and new_total < minimum_words:
+        if (
+            mode == MODE_SHRINK
+            and minimum_words is not None
+            and minimum_words > 0
+            and new_total < minimum_words
+        ):
             return False, f"缩写后全文 {new_total} 字将低于下限 {minimum_words} 字"
+
 
     return True, "ok"
 

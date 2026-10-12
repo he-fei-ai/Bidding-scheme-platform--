@@ -1069,20 +1069,50 @@ def build_chapter_content_messages(chapter_info: dict, facts: Any = None,
     #   - L1/L2 是父节点，不生成正文，不注入字数指令。
     _chapter_level = int(chapter_info.get("level", 3) or 3)
     _mode = normalize_writing_length(kw_writing_length)
+    # CONVERGE 2026-10-12：本处曾是 5 份「有效目标字数」同构实现中的第 3 份
+    # （另 4 份：sse_utils._get_effective_target_words、word_count._resolve_target_for_section、
+    #  workflows_expand.section_expand_threshold、condense_overlong_results 内联解析）。
+    # 历史上多次出现「生成按 detailed 写、校验按 standard 判」的分叉故障，现把
+    # target / tolerance 统一取自 services/word_target_resolver.py。提示词话术与
+    # 数字格式逐字不变，仅数值来源收敛；is_l3_own 是本函数独有信息（有下级章节的
+    # L3 走四档「子树总字数」口径），显式传入避免被误判为 L3 自身正文。
+    _wc_resolved = None
+    if _chapter_level >= 3:
+        from ..word_target_resolver import (
+            resolve_section_word_target_from_mapping as _resolve_wt,
+        )
+
+        _wc_resolved = _resolve_wt(
+            {
+                "level": _chapter_level,
+                # # 提示词侧契约 P-22：显式 target_words 不参与生成目标（与权威解析器的唯一差异，见下）。
+                # 权威优先级首项是单节点 target_words（校验 / 压缩 / R12 按它判达标），
+                # 但生成侧刻意不采用：2026-10-05 契约 P-22 规定「L2+ 目标字数由写作
+                # 长度模式统一决定，显式 target_words 仅对 L1 / 异常层级生效」，避免
+                # 历史遗留的 target_words 值把整批正文拉偏。此处显式传 None，
+                # 其余优先级与 word_target_resolver 完全一致。
+                "target_words": None,
+                "word_count_tier": chapter_info.get("word_count_tier"),
+            },
+            writing_length=_mode,
+            is_l3_own=(
+                bool(chapter_info.get("is_l3_own")) if _chapter_level == 3 else None
+            ),
+        )
     if _chapter_level == 3 and chapter_info.get("is_l3_own"):
-        # L3 叶子：自身正文 300 \u00b1 20%
+        # L3 叶子：自身正文 300 ± 20%
         _tier_key = None
         _tier_label = "L3 自身正文"
         _tier_target = get_l3_own_target()
         _tolerance = float(get_l3_own_tolerance())
-    elif _chapter_level >= 3:
+    elif _chapter_level >= 3 and _wc_resolved is not None:
         # L3 非叶子：四档子树总字数（含下级目录章节）；
         # L4+ 深层叶子跟随同一档位，测量口径为自身正文。
         _tier_key = chapter_info.get("word_count_tier") or _mode
         _tier_cfg = get_tier_config(_tier_key) or get_default_tier_config()
         _tier_label = _tier_cfg.get("label", _mode)
-        _tier_target = int(_tier_cfg.get("target_words", 1200))
-        _tolerance = float(_tier_cfg.get("tolerance_ratio", 0.10))
+        _tier_target = int(_wc_resolved.target)
+        _tolerance = float(_wc_resolved.tolerance)
     elif _chapter_level == 2:
         # L2 是父节点，不生成正文；实际生成路径不会进入 L2
         # 保留原提示词格式以兼容旧流程
@@ -1406,6 +1436,9 @@ async def condense_overlong_results(
         DEFAULT_WORD_COUNT_TIER,
     )
     from ...services.sections import _count_words as _cw
+    from ...utils import count_readable_words as _crw
+    from ..word_control import STRICT_SECTION_TOLERANCE
+    from ..word_control_runtime import resolve_override as _resolve_ov
     from ...config import (
         CONTENT_USE_WORD_COUNT_ENFORCEMENT_DEFAULT,
         CONTENT_WORD_COUNT_CONDENSE_THRESHOLD,
@@ -1450,34 +1483,48 @@ async def condense_overlong_results(
         sec_level = sec.get("level", 3)
         if sec_level < 3:
             continue
+
+        # 易标 R5（2026-10-12）：强控覆盖优先于档位/单节目标——命中章节以
+        # R1 可读字数计量（与校验侧/R12 警告同口径），目标 S、容差 ±20%，
+        # 超过硬性上限（hi=1.2S）即触发压缩。
+        _ov = None
+        try:
+            _ov = _resolve_ov(word_control, sec)
+        except Exception:
+            _ov = None
         r_content = r.get("content") or ""
-        r_wc = _cw(r_content) if r_content else 0
+        if _ov:
+            r_wc = _crw(r_content) if r_content else 0
+        else:
+            r_wc = _cw(r_content) if r_content else 0
         if r_wc == 0:
             continue
 
         # 解析目标字数与容差（与 sse_utils._get_effective_target_words 同口径）
-        tw = sec.get("target_words")
-        tier_key = sec.get("word_count_tier")
-        tolerance = 0.10
         target = None
-        if isinstance(tw, int) and tw > 0:
-            target = tw
-            tolerance = 0.10
-        elif sec_level == 3 and not tier_key and not tw:
-            # L3 自身正文：300 ±20%
-            target = get_l3_own_target()
-            tolerance = float(get_l3_own_tolerance())
+        tolerance = 0.10
+        if _ov:
+            target = int(_ov["section_words"])
+            tolerance = float(STRICT_SECTION_TOLERANCE)
+            thr = float(_ov["hi"])
         else:
-            key = tier_key or writing_length or DEFAULT_WORD_COUNT_TIER
-            cfg = get_tier_config(key) or get_default_tier_config()
-            if cfg:
-                target = int(cfg.get("target_words", 1200))
-                tolerance = float(cfg.get("tolerance_ratio", 0.10))
+            # CONVERGE 2026-10-12：转发唯一权威口径 services/word_target_resolver.py；
+            # 本处曾是第 5 份同构实现（顺序与生成/校验/扩写三侧曾不一致）。
+            from ..word_target_resolver import (
+                resolve_section_word_target_from_mapping as _resolve_wt,
+            )
+
+            _resolved = _resolve_wt(
+                sec, writing_length=writing_length or DEFAULT_WORD_COUNT_TIER
+            )
+            if _resolved:
+                target = int(_resolved.target)
+                tolerance = float(_resolved.tolerance)
+            thr = target * threshold if target else 0
         if not target or target <= 0:
             continue
 
         summary["total_before"] += r_wc
-        thr = target * threshold
         if r_wc > thr:
             try:
                 condensed, meta = await condense_overlong_content(
@@ -2478,4 +2525,16 @@ async def generate_sections(
 
             _reports = run_content_self_checks(
                 [r for r in results if r is not None],
-                merged_context["field_contract"].get("global_
+                merged_context["field_contract"].get("global_dictionary"),
+            )
+            _bad = [rep for rep in _reports if not rep.get("ok")]
+            if _bad:
+                logger.info(
+                    "[正文生成] 生成后自检: %d/%d 章存在待处理问题（详情见 result.self_check）",
+                    len(_bad), len(_reports),
+                )
+        except Exception as _sc_e:
+            logger.warning("[正文生成] 生成后自检执行失败（忽略）: %s", _sc_e)
+
+    # 最终返回干净的 list[dict]（过滤掉 None 异常占位）
+    return [r for r in results if r is not None]

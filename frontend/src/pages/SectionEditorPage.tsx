@@ -1,7 +1,7 @@
 import React, { useEffect, useState, useCallback, useRef, useMemo } from "react";
 import { useParams, useNavigate, useSearchParams } from "react-router-dom";
 import {
-  Button, Card, Skeleton, message, Space, Typography, Tag, Empty,
+  Button, Card, Skeleton, message, notification, Space, Typography, Tag, Empty,
   Spin, Select, Tabs, Divider, Alert, InputNumber, Tooltip, Badge, Row, Col, Checkbox,
 } from "antd";
 import {
@@ -76,6 +76,48 @@ function getWordCountStatus(
   // 达标区间与工具栏/后端同口径（L3 自身正文 ±20%，四档 ±10%）
   const [lo, hi] = getWordCountRange(targetWords, toleranceRatio);
   return wordCount >= lo && wordCount <= hi ? "ok" : "warning";
+}
+
+/** R12 收尾警告（易标字数控制 2026-10-12）→ 弹窗明细：期望区间 vs 实际 + 逐节越界。 */
+function describeWordControlWarning(w: {
+  message?: string;
+  total?: { expected?: [number, number] | null; actual?: number; status?: string | null } | null;
+  sections?: {
+    target?: number | null;
+    range?: [number, number] | null;
+    out_of_range_count?: number;
+    items?: Array<{ id: number; title?: string; words: number; status?: string }>;
+  } | null;
+}): string {
+  const lines: string[] = [];
+  const total = w?.total;
+  if (total?.expected) {
+    const tag =
+      total.status === "below" ? "（偏低）" : total.status === "above" ? "（偏高）" : "";
+    lines.push(
+      `全文期望 ${total.expected[0].toLocaleString()}~${total.expected[1].toLocaleString()} 字，` +
+        `实际 ${(total.actual ?? 0).toLocaleString()} 字${tag}`,
+    );
+  }
+  const sec = w?.sections;
+  if (sec?.range && sec.range[1] > 0) {
+    lines.push(
+      `强控每节 ${(sec.target ?? 0).toLocaleString()} 字` +
+        `（达标区间 ${sec.range[0].toLocaleString()}~${sec.range[1].toLocaleString()} 字），` +
+        `越界 ${sec.out_of_range_count ?? 0} 节`,
+    );
+    const items = sec.items || [];
+    items.slice(0, 5).forEach((it) => {
+      lines.push(
+        `· ${it.title || `#${it.id}`}：${it.words.toLocaleString()} 字` +
+          `${it.status === "above" ? "（超出上限）" : "（低于下限）"}`,
+      );
+    });
+    if (items.length > 5) {
+      lines.push(`……等共 ${items.length} 节越界，详见「字数统计」页`);
+    }
+  }
+  return lines.join("\n");
 }
 
 interface WordBudgetInfo {
@@ -816,9 +858,47 @@ if (d.status === "failed") {
         } else if (d.status === "word_sampling") {
           message.info(d.message || "正在进行字数采样预估...", 3);
         } else if (d.status === "fallback_expand") {
-          message.info(d.message || "正在对字数不足的章节进行兜底扩写...", 3);
+          // SSE payload 对称化（2026-10-12）：后端补了 expanded_count / saved_to_db，
+          // 此处优先展示真实统计，只有老版本后端（无字段）才回落到固定文案。
+          if (typeof d.expanded_count === "number") {
+            message.info(
+              d.message ||
+                `兜底扩写完成：${d.expanded_count} 节扩写，落库 ${d.saved_to_db ?? 0} 节`,
+              4,
+            );
+          } else {
+            message.info(d.message || "正在对字数不足的章节进行兜底扩写...", 3);
+          }
         } else if (d.status === "consistency_audit") {
-          message.info(d.message || "正在进行全文一致性审计...", 3);
+          if (typeof d.audited_count === "number") {
+            message.info(d.message || `一致性审计完成：修订 ${d.audited_count} 节`, 4);
+          } else {
+            message.info(d.message || "正在进行全文一致性审计...", 3);
+          }
+        } else if (d.status === "word_adjust_progress") {
+          // 易标 R9/R10（2026-10-12）：多轮字数调整的**阶段进度**实时反馈。
+          // 该阶段可能持续数十秒（每轮并发调 AI），无反馈会被误判为「卡住」。
+          message.loading({ content: d.message || "正在按字数目标调整正文...", key: "wordAdjust", duration: 0 });
+        } else if (d.status === "word_adjust") {
+          // 易标 R9/R10/R11 生产接线完成事件：带调整节数 / 落库数 / 全文方向 / 未达标数。
+          message.destroy("wordAdjust");
+          const unresolved = typeof d.section_unresolved === "number" ? d.section_unresolved : 0;
+          if ((d.adjusted_count ?? 0) > 0 || unresolved > 0) {
+            const parts: string[] = [];
+            if ((d.section_adjusted ?? 0) > 0) parts.push(`强控拉回 ${d.section_adjusted} 节`);
+            if ((d.total_adjusted ?? 0) > 0) {
+              parts.push(`全文${d.total_direction === "expand" ? "扩写" : "缩写"} ${d.total_adjusted} 节`);
+            }
+            if (unresolved > 0) parts.push(`${unresolved} 节仍未达标`);
+            notification.info({
+              message: d.message || "字数多轮调整完成",
+              description: parts.join(" · "),
+              duration: 6,
+              key: "wordAdjustDone",
+            });
+          } else {
+            message.info(d.message || "字数多轮调整完成：无需调整", 3);
+          }
         } else if (d.status === "quality_summary") {
           if (d.avg_score !== undefined) {
             message.success(`质量评估完成：平均 ${d.avg_score} 分（${d.evaluated_count} 个章节）`, 5);
@@ -857,6 +937,18 @@ if (d.status === "failed") {
               4,
             );
           }
+        } else if (d.status === "word_control_warning") {
+          // R12（易标字数控制 2026-10-12）：收尾结构化警告 —— 不硬裁正文，
+          // 弹窗展示「期望区间 vs 实际 + 逐节越界明细」，由人工裁决是否重生成。
+          const w = d.warning as
+            | Parameters<typeof describeWordControlWarning>[0]
+            | undefined;
+          notification.warning({
+            message: `字数控制提醒：${w?.message || "经多轮修复，字数仍未达预期，请您人工核对"}`,
+            description: w ? describeWordControlWarning(w) : undefined,
+            duration: 10,
+            key: "wordControlWarning",
+          });
         } else if (d.status === "retry_round") {
           // ENHANCE 2026-09-16：后端失败章节的指数退避重试此前**完全没有前端反馈**
           // （事件已下发但无分支处理），大项目重试期间界面体感为"卡住"。
@@ -879,6 +971,9 @@ if (d.status === "failed") {
           message.warning(d.message || "AI 响应较慢，生成仍在继续", 4);
         } else if (d.status === "completed") {
           finishedNormally = true;
+          // CONVERGE 2026-10-12：清理字数调整阶段的常驻 loading
+          // （R9/R10 在取消或异常路径下可能不发 word_adjust 终事件）
+          message.destroy("wordAdjust");
           clearAllTimeouts();
           flushTreeUpdates();
           setIsGenerating(false);
@@ -900,6 +995,7 @@ if (d.status === "failed") {
           eventSourceRef.current = null;
         } else if (d.status === "stopped") {
           finishedNormally = true;
+          message.destroy("wordAdjust");
           clearAllTimeouts();
           flushTreeUpdates();
           setIsGenerating(false);
@@ -921,6 +1017,7 @@ globalCompletedReceivedRef.current = true;
           eventSourceRef.current = null;
         } else if (d.status === "error") {
           finishedNormally = true;
+          message.destroy("wordAdjust");
           clearAllTimeouts();
           flushTreeUpdates();
           setIsGenerating(false);

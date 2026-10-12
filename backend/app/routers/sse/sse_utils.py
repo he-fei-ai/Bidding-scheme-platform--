@@ -203,18 +203,18 @@ def _get_effective_target_words(
     level2_default: int = 3500,
     writing_length: str | None = None,
 ) -> int | None:
-    """计算章节的有效目标字数（2026-10-08 版：字数控制下沉到三级目录 L3）。
+    """计算章节的有效目标字数（权威口径收敛至 ``word_target_resolver``）。
 
-    策略：
-      - **只对三级目录（L3）作为字数控制单位**：L3 是叶子生成中最常见的层级，
-        其目标字数由档位（brief/standard/detailed/long）决定，四档标准
-        800/1200/2000/2500，允许 ±10% 浮动。
-      - **L1 / L2 不参与字数控制**：它们是不生成正文的父节点，`target_words`
-        字段仅作为统计/展示用途（其累计字数由子树所有 L3 累加得出）。
-      - **优先级**：单节点 `target_words` 精确覆盖 > 单节点 `word_count_tier`
-        > 全局 `writing_length` 档位 > 默认档位（standard=1200）。
-      - **L4+ 叶子**：若目录深度 >3，其目标字数按父 L3 档位同步（避免深层
-        叶子脱离档位控制）。当前系统默认 L3 即为最深叶子，此兜底较少触发。
+    CONVERGE 2026-10-12：本函数曾是 4 份同构实现之一（另 3 份在
+    ``routers/word_count.py``、``workflows_sections`` 提示词侧、
+    ``workflows_expand.section_expand_threshold``，压缩侧还有第 5 份内联解析），
+    历史上多次出现「生成按 detailed 写、校验按 standard 判」的分叉故障。
+    现全部改为调用唯一权威实现 ``services/word_target_resolver.py``，
+    本函数退化为**薄转发**（保留原签名与返回值语义，含 L1/L2 → None）。
+
+    口径（唯一公式，详见该模块 docstring）：
+      L1/L2 不参与控制 → 单节点 target_words > 单节点 word_count_tier
+      > L3 自身正文 300±20% > 全局 writing_length 档位 > 默认档位。
 
     Args:
         section: 章节字典（含 level / target_words / word_count_tier 等）
@@ -224,48 +224,12 @@ def _get_effective_target_words(
     Returns:
         int | None: 目标字数；对 L1/L2 返回 None（不参与控制）
     """
-    level = section.get("level", 3) or 3
+    from ...services.word_target_resolver import (
+        resolve_section_word_target_from_mapping,
+    )
 
-    # L1 / L2 是父节点，不生成正文 -> 不参与字数控制
-    if level < 3:
-        return None
-
-    # 三级目录（L3）：字数控制核心
-    if level == 3:
-        # 1) 单节点精确覆盖（用户显式设置的 target_words）> 最高优先级
-        tw = section.get("target_words")
-        if isinstance(tw, int) and tw > 0:
-            return tw
-        # 2) 单节点档位覆盖（混合口径 2026-10-12）：显式设置 word_count_tier 时
-        #    按该档位目标生成，与校验侧 routers/word_count.py、压缩侧
-        #    workflows_sections 保持一致（否则用户给叶子 L3 选档位无效）。
-        tier_key = section.get("word_count_tier")
-        if tier_key:
-            cfg = get_tier_config(tier_key)
-            if cfg:
-                return int(cfg["target_words"])
-        # 3) L3 自身正文（方案三 2026-10-09）：无档位覆盖时固定 300 字左右 ±20%
-        #    （240~360 字）。四档 800/1200/2000/2500 作为「L3 子树总字数」口径，
-        #    仅在 L3 存在下级目录章节（L4+）时参与校验；无下级的 L3 以自身正文
-        #    300 ± 20% 为唯一测量口径，生成层与校验层必须一致。
-        return get_l3_own_target()
-
-    # L4+ 深层叶子：跟随其父 L3 的档位（简化实现：直接用当前全局档位）
-    # 实际系统中 L4+ 极少出现；此处保持与 L3 相同分档策略
-    tw = section.get("target_words")
-    if isinstance(tw, int) and tw > 0:
-        return tw
-    tier_key = section.get("word_count_tier")
-    if tier_key:
-        cfg = get_tier_config(tier_key)
-        if cfg:
-            return int(cfg["target_words"])
-    if writing_length:
-        cfg = get_tier_config(writing_length)
-        if cfg:
-            return int(cfg["target_words"])
-    default_cfg = get_default_tier_config()
-    return int(default_cfg.get("target_words", 1200))
+    resolved = resolve_section_word_target_from_mapping(section, writing_length=writing_length)
+    return resolved.target if resolved else None
 
 
 def _resolve_chart_field(chart_type: str) -> str | None:

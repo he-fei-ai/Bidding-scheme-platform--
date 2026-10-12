@@ -12,6 +12,13 @@ export interface ProgressItem {
   message: string;
   word_count?: number;
   saved?: boolean;
+  /** 有效目标字数（后端唯一权威口径 word_target_resolver 解析，CONVERGE 2026-10-12） */
+  word_count_target?: number | null;
+  /** 达标区间下界 / 上界（强控为快照派生的 ±20% 硬区间） */
+  word_count_target_lo?: number | null;
+  word_count_target_hi?: number | null;
+  /** 目标来源：strict（强控快照）/ l3_own / section_tier / writing_length_tier / default_tier / section_target_words */
+  word_count_target_source?: string | null;
 }
 
 interface ProgressPanelProps {
@@ -34,6 +41,39 @@ const PHASE_CONFIG: Record<string, { icon: React.ReactNode; color: string; text:
   failed: { icon: <CloseCircleFilled style={{ color: "#ff4d4f" }} />, color: "red", text: "失败" },
   cancelled: { icon: <StopOutlined style={{ color: "#999" }} />, color: "default", text: "已取消" },
 };
+
+/** 偏差百分比文案（如 +4% / -12%）；缺目标或实际字数为空时返回空串。 */
+function deviationText(item: ProgressItem): string {
+  const target = item.word_count_target;
+  const actual = item.word_count;
+  if (!target || target <= 0 || actual == null || actual <= 0) return "";
+  const rate = Math.round(((actual - target) / target) * 100);
+  if (rate === 0) return "";
+  return `${rate > 0 ? "+" : ""}${rate}%`;
+}
+
+/** 是否越界（强控区间优先；缺区间时按 ±20% 兜底判定）。 */
+function isWordTargetOutOfRange(item: ProgressItem): boolean {
+  const actual = item.word_count;
+  const lo = item.word_count_target_lo;
+  const hi = item.word_count_target_hi;
+  if (actual == null || actual <= 0) return false;
+  if (lo != null && hi != null && hi > 0) return actual < lo || actual > hi;
+  const target = item.word_count_target;
+  if (!target || target <= 0) return false;
+  return actual < target * 0.8 || actual > target * 1.2;
+}
+
+/** 「目标 300（240~360）· +4%」；无目标时返回空串（不渲染）。 */
+function describeWordTarget(item: ProgressItem): string {
+  const target = item.word_count_target;
+  if (!target || target <= 0) return "";
+  const lo = item.word_count_target_lo;
+  const hi = item.word_count_target_hi;
+  const range = lo != null && hi != null && hi > 0 ? `（${lo}~${hi}）` : "";
+  const dev = deviationText(item);
+  return `目标${target}字${range}${dev ? ` · ${dev}` : ""}`;
+}
 
 export default React.memo(function ProgressPanel({ items, total, success, failed, isRunning, cancelled = 0 }: ProgressPanelProps) {
   const done = success + failed + cancelled;
@@ -117,6 +157,19 @@ export default React.memo(function ProgressPanel({ items, total, success, failed
                   )}
                   {item.word_count != null && item.word_count > 0 && (
                     <Text type="secondary" style={{ fontSize: 11 }}>{item.word_count}字</Text>
+                  )}
+                  {/* CONVERGE 2026-10-12：字数目标可视化。
+                      此前本面板只显示「实际 N 字」，用户无法判断是否达标，
+                      必须切到「字数统计」页比对；现在单章节 SSE 事件自带
+                      目标/区间，生成过程中即可看到「目标 300（240~360）· 实测 312 (+4%)」，
+                      越界一目了然（与 R12 警告同源事实）。 */}
+                  {describeWordTarget(item) && (
+                    <Text
+                      type={isWordTargetOutOfRange(item) ? "danger" : "secondary"}
+                      style={{ fontSize: 11 }}
+                    >
+                      {describeWordTarget(item)}
+                    </Text>
                   )}
                 </Space>
               </Space>

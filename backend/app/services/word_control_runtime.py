@@ -65,7 +65,14 @@ class ProjectWordControl:
 
     @property
     def strict_active(self) -> bool:
-        """强控是否生效：快照里 section_words > 0 且开关为真。"""
+        """强控是否生效：持有生效快照，且快照内 section_words > 0 且开关为真。
+
+        R14 语义——正文链只认快照：快照缺失/无效时即便当前配置开了强控也
+        不生效（此时 :meth:`gate_error` 已拒绝生成；本属性再加一道保险，
+        防止任何绕过门槛的调用方按未固化配置跑控制链）。
+        """
+        if not wc.has_valid_snapshot(self.snapshot):
+            return False
         opts = self.effective_options
         return bool(opts.section_words and opts.strict_section_words)
 
@@ -146,10 +153,19 @@ def build_section_override(
         len(pool),
         True,
     )
+    # GUARD 2026-10-12（配置失配防矛盾提示词）：目录叶子数远低于配置区间
+    # （如 max=12 万但只有 5 个章节）时，R8 倒推值 floor(0.8×max/叶子数) 会
+    # 超过 R5 硬性上限 hi，提示词将自相矛盾（「目标 19200，硬性上限 3600」），
+    # 模型按大目标写完后必被压缩链重创。合理解释：全文字数上限此时不是绑定
+    # 约束，每节按标称目标 S 写作即可 —— 回落 S（S ∈ [lo, hi]）。纯函数公式
+    # 本身保持原样（仍是唯一公式源），此处只做装配侧钳制。
+    hi_words = int(snap["section_maximum_words"])
+    if gen_target > hi_words > 0:
+        gen_target = section_words
     base = {
         "section_words": section_words,
         "lo": int(snap["section_minimum_words"]),
-        "hi": int(snap["section_maximum_words"]),
+        "hi": hi_words,
         "generation_target": gen_target,
         "strict": True,
     }

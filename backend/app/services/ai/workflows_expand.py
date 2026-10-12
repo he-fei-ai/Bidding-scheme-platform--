@@ -232,17 +232,19 @@ def section_expand_threshold(
     level2_default: int = 3500,
     writing_length: str | None = None,
 ) -> int:
-    """单章节的扩写阈值（2026-10-09 版：按三级目录 L3 自身正文口径）。
+    """单章节的扩写阈值（CONVERGE 2026-10-12：目标解析转发唯一权威口径）。
 
-    策略：
-      - **L1/L2**：父节点，不生成正文，不参与扩写，返回 0。
-      - **L3 自身正文**：目标 300 ± 20%（240~360 字）为唯一测量口径；
-        扩写达标线 = 300 × 80% = **240 字**。无下级目录章节的 L3
-        按此口径控制，生成层与校验层必须一致。
-      - **L3 非叶子（存在 L4+）**：四档 800/1200/2000/2500 作为
-        「L3 子树总字数」口径参与校验；扩写阈值按该子树目标 × 80% 计算。
-      - 优先级：单节点 target_words 精确覆盖 > 单节点 word_count_tier
-        > 全局 writing_length 档位 > 默认档位（L3 默认 300）。
+    达标线 = 有效目标字数 × 80%，不超过 ``flat_minimum``，保底 200 字。
+
+    口径（唯一公式，见 ``services/word_target_resolver.py``）：
+      - **L1/L2**：父节点，不生成正文，不参与扩写，返回 0；
+      - **优先级**：单节点 ``target_words`` > 单节点 ``word_count_tier``
+        > **L3 自身正文 300±20%** > 全局 ``writing_length`` 档位 > 默认档位。
+
+    CONVERGE 行为修正（唯一一处）：此前本函数对「L3 无档位覆盖但有全局
+    ``writing_length``」按档位优先（detailed → 1600），与生成提示词侧 /
+    校验页 / 压缩侧 / R12 警告的「L3 自身正文 300 字优先」相反，属真实口径
+    分叉（兜底扩写会把本已达标的小节误判为不足并烧 token）。现已统一。
 
     Args:
         section: 章节字典（含 level / target_words / word_count_tier）
@@ -253,47 +255,14 @@ def section_expand_threshold(
     Returns:
         int: 扩写达标线（字数不足此值则触发扩写）；L1/L2 返回 0
     """
-    from .writing_length_config import (
-        get_l3_own_tolerance,
-        get_l3_own_target,
-        get_tier_config,
-        get_default_tier_config,
-    )
+    from ..word_target_resolver import resolve_section_word_target_from_mapping
 
-    level = int((section or {}).get("level") or 3)
-
-    # L1/L2 是父节点，不生成正文，不参与扩写
-    if level < 3:
+    resolved = resolve_section_word_target_from_mapping(section, writing_length=writing_length)
+    if not resolved:
         return 0
-
-    # L3+：解析有效目标字数
-    # 1) 单节点 target_words（精确覆盖，用户显式设置）> 最高优先级
-    target = int((section or {}).get("target_words") or 0)
+    target = int(resolved.target)
     if target <= 0:
-        # 2) 单节点 word_count_tier
-        tier_key = (section or {}).get("word_count_tier")
-        if tier_key:
-            cfg = get_tier_config(tier_key)
-            if cfg:
-                target = int(cfg["target_words"])
-        # 3) 全局 writing_length 档位
-        if target <= 0 and writing_length:
-            cfg = get_tier_config(writing_length)
-            if cfg:
-                target = int(cfg["target_words"])
-        # 4) 默认口径（前 3 步都未命中时才回落）：
-        #    - L3 自身正文 300 ± 20%（240~360）为唯一口径；
-        #    - 四档 800/1200/2000/2500 是「L3 子树总字数」口径，仅在 L3
-        #      存在下级目录章节（L4+）时参与校验；
-        #    - L4+ 深层叶子回落默认档位（standard 1200），与 sse_utils /
-        #      word_count._resolve_target_for_section 同口径。
-        if target <= 0:
-            if level == 3:
-                target = get_l3_own_target()
-            else:
-                default_cfg = get_default_tier_config()
-                target = int(default_cfg.get("target_words", 1200))
-
+        return 0
 
     # 扩写达标线 = 目标字数 × 80%，不超过平铺阈值，保底 200 字
     return max(200, min(int(flat_minimum), int(target * 0.8)))

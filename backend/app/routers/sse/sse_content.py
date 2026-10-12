@@ -143,6 +143,11 @@ async def generate_content_impl(
 
     orch_section_per_segment: int = Query(10, ge=3, le=40),
 
+    # 易标 R9/R10/R11（2026-10-12）：字数双向多轮调整（额度分配 + 六道硬校验）。
+    #   None = 服务端判定（config 默认 + 强控自动启用）；true/false = 单次强制。
+    # BUG-FIX 2026-10-05 同款约束：必须追加在**签名末尾**，否则
+    # routers/sections.py::generate_content 的位置参数调用会整体错位。
+    use_word_adjust: bool | None = Query(None),
 ):
 
     """SSE 并发生成正文（EventSource 只支持 GET）
@@ -1043,6 +1048,34 @@ async def generate_content_impl(
 
             wc = _count_words(content) if content else 0
 
+            # CONVERGE 2026-10-12：单章节事件补字数目标/区间，让前端
+            # ProgressPanel 直接显示「目标 N 字（lo~hi）· 实际 M 字 · 偏差 ±X」，
+            # 无需二次请求字数统计页。口径全部来自唯一权威解析器 +
+            # 强控覆盖表（_wc_override），与校验页 / R12 警告同源。
+            _target = _target_lo = _target_hi = _target_source = None
+            try:
+                _ov = _wc_override.get(sid) if _wc_override else None
+                if _ov:
+                    _target = int(_ov.get("section_words") or 0)
+                    _target_lo = int(_ov.get("lo") or 0)
+                    _target_hi = int(_ov.get("hi") or 0)
+                    _target_source = "strict"
+                else:
+                    from ...services.word_target_resolver import (
+                        resolve_section_word_target_from_mapping as _resolve_wt,
+                    )
+
+                    _sec_for_target = sections_by_id.get(sid) or {}
+                    _resolved = _resolve_wt(_sec_for_target, writing_length=writing_length)
+                    if _resolved:
+                        _target = int(_resolved.target)
+                        _target_lo = int(_resolved.lo)
+                        _target_hi = int(_resolved.hi)
+                        _target_source = _resolved.source
+            except Exception as _tgt_e:
+                logger.debug("[字数目标] 章节 %s 目标解析失败（忽略）: %s", sid, _tgt_e)
+
+
             await queue.put(
 
                 {
@@ -1060,6 +1093,11 @@ async def generate_content_impl(
                     "word_count": wc,
 
                     "saved": status == "completed",
+
+                    "word_count_target": _target,
+                    "word_count_target_lo": _target_lo,
+                    "word_count_target_hi": _target_hi,
+                    "word_count_target_source": _target_source,
 
                 }
 
@@ -1899,12 +1937,198 @@ async def generate_content_impl(
 
                         failed_count = sum(1 for r in results if r.get("status") == "failed")
 
-                        await queue.put({"status": "fallback_expand", "message": "兜底扩写完成"})
+                        # SSE payload 对称化（2026-10-12）：此前本事件只有
+                        # status/message，而 word_count_condense 带 5 个统计字段，
+                        # 前端只能用固定文案 toast，用户看不到「扩了几节、落库几节」。
+                        await queue.put({
+                            "status": "fallback_expand",
+                            "message": "兜底扩写完成：{} 节扩写，落库 {} 节".format(
+                                expanded_count, len(batch_updates)
+                            ),
+                            "expanded_count": expanded_count,
+                            "deficient_total": len(expanded),
+                            "saved_to_db": len(batch_updates),
+                        })
 
                     except Exception as e:
 
                         logger.warning("兜底扩写失败: %s", e)
 
+
+
+# WIRING-2026-10-12：易标 R9/R10/R11 字数双向多轮调整
+                # 易标 R9/R10/R11 生产接线（2026-10-12）：
+                #   R9  强控小节双向拉回（每节 ≤3 轮，额度 |当前−S|）
+                #   R10 全文扩写 / 缩写（按比例分配额度；缩写 ≤3 轮；
+                #        扩写连续 3 轮无进展即停）
+                #   R11 每次结果六道硬校验（不通过即保留原文）
+                # 排在 condense / 兜底扩写之后：先做「一次性压缩」与「兜底补齐」，
+                # 再按额度做精调，最后由 R12 统一出警告，语义与易标正文阶段一致。
+                # 启用判定：显式参数 > （强控自动启用 且 项目已配置绝对字数目标）
+                #         > config 默认值；任一环节异常都只记日志，不影响主生成。
+                _wc_adjust_enabled = False
+                try:
+                    from ...config import (
+                        CONTENT_USE_WORD_ADJUSTMENT_DEFAULT,
+                        CONTENT_WORD_ADJUST_AUTO_ON_STRICT,
+                        CONTENT_WORD_ADJUST_CONCURRENCY,
+                        CONTENT_WORD_ADJUST_MAX_ROUNDS,
+                    )
+
+                    if use_word_adjust is None:
+                        _wc_adjust_enabled = bool(
+                            CONTENT_USE_WORD_ADJUSTMENT_DEFAULT
+                            or (
+                                CONTENT_WORD_ADJUST_AUTO_ON_STRICT
+                                and _wc_override
+                                and _wc_state.effective_options
+                            )
+                        )
+                    else:
+                        _wc_adjust_enabled = bool(use_word_adjust)
+                except Exception as _adj_cfg_e:
+                    logger.warning("[字数调整] 配置读取失败（跳过该阶段）: %s", _adj_cfg_e)
+                    _wc_adjust_enabled = False
+
+                if (
+                    _wc_adjust_enabled
+                    and saved_count > 0
+                    and not cancel_event.is_set()
+                ):
+                    try:
+                        from ...services.ai.workflows_word_adjust import (
+                            run_word_adjustment_pipeline,
+                        )
+
+                        async def _on_adjust_summary(_stage: str, _summary: dict):
+                            await queue.put({
+                                "status": "word_adjust_progress",
+                                "stage": _stage,
+                                "message": (
+                                    "字数强控拉回：调整 {}/{} 节，未达标 {} 节".format(
+                                        _summary.get("adjusted_count", 0),
+                                        _summary.get("checked", 0),
+                                        len(_summary.get("unresolved_ids") or []),
+                                    )
+                                    if _stage == "section"
+                                    else "全文{}：轮数 {}，调整 {} 节，总字数 {} → {}".format(
+                                        "扩写"
+                                        if _summary.get("direction") == "expand"
+                                        else "缩写",
+                                        _summary.get("rounds", 0),
+                                        _summary.get("adjusted_count", 0),
+                                        _summary.get("total_before", 0),
+                                        _summary.get("total_after", 0),
+                                    )
+                                ),
+                                "direction": _summary.get("direction"),
+                                "adjusted_count": _summary.get("adjusted_count", 0),
+                                "fail_count": _summary.get("fail_count", 0),
+                                "rounds": _summary.get("rounds", 0),
+                                "checked": _summary.get("checked", 0),
+                                "unresolved_count": len(
+                                    _summary.get("unresolved_ids") or []
+                                ),
+                                "total_before": _summary.get("total_before"),
+                                "total_after": _summary.get("total_after"),
+                            })
+
+                        _wc_adjust_summary = await run_word_adjustment_pipeline(
+                            provider,
+                            results,
+                            sections_by_id,
+                            options=_wc_state.effective_options,
+                            word_control=_wc_override,
+                            max_rounds=CONTENT_WORD_ADJUST_MAX_ROUNDS,
+                            concurrency=min(
+                                CONTENT_WORD_ADJUST_CONCURRENCY,
+                                max(1, actual_concurrency),
+                            ),
+                            cancel_event=cancel_event,
+                            on_summary=_on_adjust_summary,
+                        )
+                        # 落库：与 condense / 兜底扩写同构（批量 UPDATE + 三层失效）。
+                        # BUG-FIX 2026-10-12 同源教训：调整只改内存 results 而不落库 /
+                        # 不失效缓存，会让用户刷新看到调整前正文、AI 压缩成本白花。
+                        _adjust_ids = set(_wc_adjust_summary.get("adjusted_ids") or [])
+                        _adjust_updates = [
+                            (_r.get("content"), _r.get("id"))
+                            for _r in results
+                            if _r.get("id") in _adjust_ids
+                            and _r.get("status") == "completed"
+                            and _r.get("content")
+                            and _r.get("word_count_adjusted")
+                        ]
+                        if _adjust_updates:
+
+                            def _batch_update_adjusted(updates):
+                                from ...db import get_db
+                                from ...services.sections import (
+                                    _count_readable_words,
+                                    _count_words,
+                                )
+
+                                with get_db() as conn:
+                                    conn.executemany(
+                                        "UPDATE sections SET content = ?, word_count = ?, readable_word_count = ?, updated_at = datetime('now', 'localtime') WHERE id = ?",
+                                        [
+                                            (
+                                                _c,
+                                                _count_words(_c),
+                                                _count_readable_words(_c),
+                                                _sid,
+                                            )
+                                            for _c, _sid in updates
+                                        ],
+                                    )
+
+                            await asyncio.to_thread(
+                                _batch_update_adjusted, _adjust_updates
+                            )
+                            try:
+                                from ...services.sections import invalidate_content_caches
+
+                                invalidate_content_caches(
+                                    project_id, [_sid for _c, _sid in _adjust_updates]
+                                )
+                            except Exception as _adj_inv_e:
+                                logger.warning(
+                                    "[字数调整] 三层缓存失效失败（忽略）: %s", _adj_inv_e
+                                )
+                        _sec_sum = _wc_adjust_summary.get("section") or {}
+                        _tot_sum = _wc_adjust_summary.get("total") or {}
+                        await queue.put({
+                            "status": "word_adjust",
+                            "message": "字数多轮调整完成：调整 {} 节（强控拉回 {}，全文{} {} 节）".format(
+                                len(_wc_adjust_summary.get("adjusted_ids") or []),
+                                _sec_sum.get("adjusted_count", 0),
+                                "扩写" if _tot_sum.get("direction") == "expand" else "缩写",
+                                _tot_sum.get("adjusted_count", 0),
+                            ),
+                            "adjusted_count": len(
+                                _wc_adjust_summary.get("adjusted_ids") or []
+                            ),
+                            "saved_to_db": len(_adjust_updates),
+                            "section_adjusted": _sec_sum.get("adjusted_count", 0),
+                            "section_failed": _sec_sum.get("fail_count", 0),
+                            "section_unresolved": len(
+                                _sec_sum.get("unresolved_ids") or []
+                            ),
+                            "total_direction": _tot_sum.get("direction", "none"),
+                            "total_rounds": _tot_sum.get("rounds", 0),
+                            "total_adjusted": _tot_sum.get("adjusted_count", 0),
+                            "total_before": _tot_sum.get("total_before"),
+                            "total_after": _tot_sum.get("total_after"),
+                        })
+                        logger.info(
+                            "[字数调整] 完成：调整 %d 节，落库 %d 节",
+                            len(_wc_adjust_summary.get("adjusted_ids") or []),
+                            len(_adjust_updates),
+                        )
+                    except Exception as _adj_e:
+                        logger.warning(
+                            "[字数调整] 整体流程异常（忽略，不影响主生成）: %s", _adj_e
+                        )
 
 
                 # 易标 R12（字数控制 2026-10-12）：生成/压缩/扩写链全部结束后，
@@ -2164,9 +2388,28 @@ async def generate_content_impl(
 
                         results = audited
 
+                        # SSE payload 对称化（2026-10-12）：补「审计了几节」统计，
+                        # 前端可据此提示覆盖率，而不是黑盒 toast。基准取审计前的
+                        # 原文快照 _audit_original_by_id（此处 results 已被整体
+                        # 替换为 audited，拿它自比恒为 0）。
+                        _audited_count = sum(
+                            1
+                            for _r in audited
+                            if _r.get("id") is not None
+                            and _r.get("content")
+                            and _r.get("content")
+                            != _audit_original_by_id.get(_r.get("id"))
+                        )
+
                         await queue.put(
 
-                            {"status": "consistency_audit", "message": "一致性审计完成"}
+                            {
+                                "status": "consistency_audit",
+                                "message": "一致性审计完成：修订 {} 节".format(
+                                    _audited_count
+                                ),
+                                "audited_count": _audited_count,
+                            }
 
                         )
 

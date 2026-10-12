@@ -3972,12 +3972,18 @@ export interface WordControlWarning {
   [key: string]: unknown;
 }
 
+/** 生效快照（R14：与目录版本配对；固化时附带章节数）。 */
+export type WordControlSnapshot = WordControlSettings & {
+  snapshot_at?: string;
+  section_count?: number;
+};
+
 /** 字数控制配置 + 快照 + 派生指标（GET 返回）。 */
 export interface WordControlSettingsResponse {
   status: string;
   project_id: number;
   settings: WordControlSettings;
-  snapshot: WordControlSettings | null;
+  snapshot: WordControlSnapshot | null;
   snapshot_at: string | null;
   last_warning: string | null;
   derived: WordControlDerived;

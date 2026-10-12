@@ -183,12 +183,34 @@ class TestWordCountTargetConsistency:
         assert callable(wc._load_project_writing_length)
 
     def test_target_bounds_uses_configured_tolerance(self):
-        """容差来自档位配置而非硬编码 0.10。"""
+        """容差来自权威口径（CONVERGE 2026-10-12）而非硬编码 0.10。
+
+        CONVERGE：`_target_bounds` 不再自己解析，而是转发唯一权威实现
+        `services/word_target_resolver.py`（其容差随「目标来源」走：档位 →
+        该档位 tolerance_ratio；L3 自身正文 → L3 容差）。本断言的**意图**
+        （容差不得硬编码、必须来自配置）保持不变，只是断言点从
+        「函数体内出现 `_tolerance_for_section`」改为「函数转发权威口径」。
+        """
         from app.routers import word_count as wc
 
         src = inspect.getsource(wc._target_bounds)
-        assert "_tolerance_for_section" in src
+        assert "_resolve_word_target_for_section" in src
         assert "(1 - 0.10)" not in src, "容差仍被硬编码为 0.10"
+
+    def test_target_bounds_tolerance_follows_tier_config(self):
+        """档位容差配置变更后，达标区间随之变化（权威口径的实义断言）。"""
+        from app.routers import word_count as wc
+
+        class _Sec:
+            level = 3
+            target_words = None
+            word_count_tier = "detailed"
+
+        resolved = wc._resolve_word_target_for_section(_Sec())
+        assert resolved is not None
+        lo, hi = wc._target_bounds(_Sec())
+        assert (lo, hi) == (resolved.lo, resolved.hi)
+        assert (lo, hi) == (1800, 2200)  # detailed 2000 字 ±10%
 
     def test_tolerance_helper_prefers_tier_then_l3_own(self):
         from app.routers import word_count as wc

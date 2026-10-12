@@ -37,10 +37,34 @@ const SECTIONS = {
   ],
 };
 
+// FIX 2026-10-12：页面在易标字数控制移植后新增了 4 个 API 依赖
+// （getWordControlSettings / computeWordControlDerived /
+//  updateWordControlSettings / snapshotWordControlSettings）。mock 未覆盖时
+// 页面 load() 抛错 → 概览卡片整块不渲染，测试报「找不到 总字数」。
+// 这里补齐 mock（未配置态），保持对「概览 / 明细 / 空态」三条断言的覆盖不变。
+const WORD_CONTROL_SETTINGS = {
+  status: "ok",
+  project_id: 1,
+  settings: {
+    minimum_words: 0,
+    maximum_words: 0,
+    section_words: 0,
+    strict_section_words: false,
+  },
+  has_snapshot: false,
+  snapshot_at: null,
+  derived: null,
+  warning: null,
+};
+
 vi.mock("../api", () => ({
   getWordCountOverview: vi.fn(async () => OVERVIEW),
   getWordCountSections: vi.fn(async () => SECTIONS),
   setSectionTargetWords: vi.fn(async () => ({ ok: true })),
+  getWordControlSettings: vi.fn(async () => WORD_CONTROL_SETTINGS),
+  computeWordControlDerived: vi.fn(async () => ({ status: "ok", derived: null })),
+  updateWordControlSettings: vi.fn(async () => ({ status: "ok" })),
+  snapshotWordControlSettings: vi.fn(async () => ({ status: "ok" })),
 }));
 
 vi.mock("react-router-dom", async () => {
@@ -112,7 +136,10 @@ describe.skipIf(!hasDom)("WordCountPage 组件级交互", () => {
     const Page = (await import("./WordCountPage")).default;
     rtl.render(<Page />);
 
-    expect(await rtl.screen.findByText("暂无章节数据")).toBeTruthy();
+    // FIX 2026-10-12：页面新增「字数控制」卡片后，空态文案在页面中出现两次
+    // （章节明细表 + 字数控制的派生区），findByText 会抛「Found multiple」。
+    // 语义未变：断言「至少渲染了一处空态」。
+    expect((await rtl.screen.findAllByText("暂无章节数据")).length).toBeGreaterThan(0);
 
     rtl.cleanup();
   });
