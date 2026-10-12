@@ -55,13 +55,19 @@ from ..task_control import _cancel_events, _cancel_events_lock, _cancel_tasks
 
 from .sse_charts import _auto_generate_charts_for_section
 from .sse_db_ops import _mark_sections_generating, _rollback_dirty_sections, _save_section_to_db
-from .sse_shared import _background_tasks, logger
+from .sse_shared import SSE_TERMINAL_STATUSES, _background_tasks, logger
 from .sse_utils import _build_leaf_dicts, _fetch_project_data_async, _try_get_provider
 
 # ENHANCE 2026-09-15：并发硬上限提为模块级常量，供正文生成与兜底扩写共用。
 # PERF-P1-B4 注释声称「从 3 提升到 8」，但常量一直是 4 —— 注释与代码不一致；
 # 前端并发选择器提供 6，会被这里静默钳制，用户无从得知。现统一为 8。
 MAX_CONTENT_CONCURRENCY = 8
+
+# Risk-P3b FIX 2026-10-11：模块级命名常量，避免硬编码散落在函数体内部。
+# 整体进度事件推送节流：同 percent 值 2s 内只发一次，避免日志噪声。
+_OVERALL_PROGRESS_THROTTLE_SECS = 2.0
+# chart_queue 入队有界等待（1s）：QueueFull 后不阻塞 section_complete_callback。
+_CHART_QUEUE_PUT_WAIT_TIMEOUT = 1.0
 
 # ENHANCE 2026-10-05（P-11）：正文编排的可配置面。
 # 此前这些值全部硬编码在 _adjudicate_illustrations 的签名默认值里
@@ -458,7 +464,25 @@ async def generate_content_impl(
             # 字段调用追溯：记录每个章节实际注入了哪些字段（供审计/自检）
             field_trace: list = []
 
+            # R14 硬门槛（易标字数控制 2026-10-12）：项目一旦配置了绝对字数
+            # 目标（最少/最多/每节任一 > 0），生成正文前必须持有「与目录版本
+            # 配对」的生效快照；未配置（全 0）时保持既有档位体系，不设门槛。
+            # 快照由「字数统计」页的固化动作产出，改配置会置空快照（PUT 端点），
+            # 从根上杜绝「改了目录/配置但控制链按旧口径跑」的静默脱节。
+            from ...services.word_control_runtime import (
+                build_section_override,
+                load_project_word_control,
+            )
 
+            _wc_state = await asyncio.to_thread(load_project_word_control, project_id)
+
+            _wc_gate_error = _wc_state.gate_error()
+
+            if _wc_gate_error:
+
+                yield f"data: {json.dumps({'status': 'error', 'message': _wc_gate_error}, ensure_ascii=False)}\n\n"
+
+                return
 
             cancel_event = asyncio.Event()
 
@@ -470,7 +494,28 @@ async def generate_content_impl(
 
             leaf_ids_for_generation = [ld["id"] for ld in leaf_dicts]
 
+            # R5/R8（易标字数控制 2026-10-12）：强控生效时为每个参与生成的
+            # L3+ 章节装配「目标 S / 硬区间 [0.8S,1.2S] / 初稿倒推目标 G」覆盖表；
+            # 未配置或未强控时为空表，下游提示词与压缩链回落既有档位逻辑。
+            _wc_override = await asyncio.to_thread(
+                build_section_override, _wc_state, leaf_dicts
+            )
 
+            if _wc_override:
+
+                logger.info(
+
+                    "[字数控制] 强控生效：%d 个章节按快照装配（S=%d, 区间=[%d,%d]）",
+
+                    len(_wc_override),
+
+                    _wc_state.effective_options.section_words,
+
+                    next(iter(_wc_override.values()))["lo"],
+
+                    next(iter(_wc_override.values()))["hi"],
+
+                )
 
         except Exception as e:
 
@@ -509,6 +554,23 @@ async def generate_content_impl(
         failed_count = 0
 
         cancelled_count = 0
+
+        # BUG-P3-A FIX 2026-10-11：chart_processed 估算错误。
+        # 原实现用 saved_count（所有落库成功章节数） - chart_queue.qsize()，
+        # 但 chart_queue.put_nowait 在队列满时会 QueueFull 被 skip，
+        # 而 failed/cancelled 章节根本不会入队 → chart_processed 永远偏低。
+        # 现新增 chart_enqueued_count，只有真正入队成功的章节才 +1。
+        #
+        # Risk-P3c NOTE 2026-10-11：chart_enqueued_count 是本 SSE 事件生成器
+        # 内的 nonlocal 局部变量，生命周期 = 单次 SSE 连接。
+        # 多 worker 部署时各 worker 独立计数，无跨 worker 一致性问题——
+        # 每个 SSE 连接固定落在一个 worker 上，计数只服务于当前连接的
+        # overall_progress 事件推送，无需共享状态。
+        chart_enqueued_count = 0
+
+        # BUG-P2b FIX 2026-10-11：整体进度推送节流。
+        # 防止每完成一个章节就推一次相同 percent 值 → 日志噪声。
+        _last_overall_progress_event_at = 0
 
         results_lock = asyncio.Lock()
 
@@ -828,7 +890,7 @@ async def generate_content_impl(
 
         async def section_complete_callback(result: dict):
 
-            nonlocal saved_count, failed_count, cancelled_count
+            nonlocal saved_count, failed_count, cancelled_count, chart_enqueued_count, _last_overall_progress_event_at
 
             sid = result.get("id")
 
@@ -898,12 +960,14 @@ async def generate_content_impl(
                 try:
 
                     chart_queue.put_nowait(result)
+                    chart_enqueued_count += 1  # BUG-P3-A FIX：真正入队才计数
 
                 except asyncio.QueueFull:
 
                     try:
 
-                        await asyncio.wait_for(chart_queue.put(result), timeout=1.0)
+                        await asyncio.wait_for(chart_queue.put(result), timeout=_CHART_QUEUE_PUT_WAIT_TIMEOUT)
+                        chart_enqueued_count += 1  # BUG-P3-A FIX：1s 等待入队也计数
 
                     except (TimeoutError, asyncio.TimeoutError):
 
@@ -1001,6 +1065,38 @@ async def generate_content_impl(
 
             )
 
+            # BUG-P2b FIX 2026-10-11：整体进度事件推送。
+            # 此前前端只能靠单章节事件硬算整体进度，感知延迟 ≈ 下一个章节完成
+            # 才能跳一次 → "日志延迟错位"感。
+            # 现每有章节终态（success/fail/cancel），推送一条 overall_progress：
+            #   {"status":"overall_progress","saved":N,"failed":F,"total":T,"percent":P}
+            # 节流：同 percent 值 2s 内不重复推送，避免噪声。
+            import time as _time
+            # leaf_dicts 是外层 generate_content_impl 的闭包变量，正常情况下恒存在；
+            # 但 section_complete_callback 也可能在极端边界（如初始阶段回调）被调用，
+            # 加 try/except NameError 兜底，防止死代码被移除后暴露隐患。
+            try:
+                _total = len(leaf_dicts)
+            except NameError:
+                _total = 0
+            _done = saved_count + failed_count + cancelled_count
+            _percent = round(_done / max(_total, 1) * 100)
+            _now = _time.time()
+            if _now - _last_overall_progress_event_at >= _OVERALL_PROGRESS_THROTTLE_SECS or _last_overall_progress_event_at == 0:
+                _last_overall_progress_event_at = _now
+                await queue.put({
+                    "status": "overall_progress",
+                    "saved": saved_count,
+                    "failed": failed_count,
+                    "cancelled": cancelled_count,
+                    "chart_enqueued": chart_enqueued_count,
+                    "chart_processed": chart_enqueued_count - chart_queue.qsize(),  # BUG-P3-A FIX
+                    "chart_queue_size": chart_queue.qsize(),
+                    "total": _total,
+                    "done": _done,
+                    "percent": _percent,
+                })
+
 
 
         finished = False
@@ -1057,7 +1153,30 @@ async def generate_content_impl(
                 try:
 
                     from ...services.ai.workflows import orchestrate_content as _orchestrate
-                    from ...services.ai.workflows_orchestration import apply_orchestration_to_leaves
+                    from ...services.ai.workflows_orchestration import (
+                        apply_orchestration_to_leaves,
+                        generate_full_skeleton,
+                    )
+
+                    # ENHANCE 2026-10-09（E-2）：知识素材通道 —— 加载项目可用素材的
+                    # 轻量目录（id/标题/摘要），交给编排 AI 按章节挑选（非 RAG：
+                    # 不给全文，只给清单，正文阶段按选中 id 再取全文）。
+                    _knowledge_catalog = []
+                    try:
+                        from ...services import knowledge as _kb_svc
+                        _kb_items = _kb_svc.get_relevant_items(limit=30)
+                        for _it in _kb_items or []:
+                            try:
+                                _kid = int(_it.get("id"))
+                            except (TypeError, ValueError):
+                                continue
+                            _knowledge_catalog.append({
+                                "id": _kid,
+                                "title": str(_it.get("title") or "").strip()[:60],
+                                "summary": str(_it.get("summary") or "").strip()[:120],
+                            })
+                    except Exception as _kb_e:
+                        logger.warning("知识素材目录加载失败（跳过 knowledge 编排）: %s", _kb_e)
 
 
 
@@ -1073,6 +1192,20 @@ async def generate_content_impl(
 
                     # 标书智能体（六）完整编排调用：直接传 leaf_dicts（已转为 list[dict]），
                     # 不再序列化为 JSON 字符串——编排实现需要 list 迭代，而非 str。
+                    # E-7.4：AI 生图成本拦截 —— 编排入口先做全局配置钳制
+                    # （is_image_enabled=False → 0；max_images_per_project 配额 → min）
+                    try:
+                        from ...services.ai.image_engine import resolve_image_budget
+
+                        _max_ai_images_eff = resolve_image_budget(orch_max_ai_images, project_id)
+                        if _max_ai_images_eff != orch_max_ai_images:
+                            logger.info(
+                                "[正文生成] AI 生图上限被全局配置钳制: %s → %s",
+                                orch_max_ai_images, _max_ai_images_eff,
+                            )
+                    except Exception:
+                        _max_ai_images_eff = orch_max_ai_images
+
                     orchestration_result = await _orchestrate(
 
                         provider, leaf_dicts,
@@ -1091,7 +1224,7 @@ async def generate_content_impl(
 
                         cancel_event=cancel_event,
 
-                        max_ai_images=orch_max_ai_images,
+                        max_ai_images=_max_ai_images_eff,
 
                         table_ratio=(orch_table_ratio if orch_table_ratio in TABLE_RATIO_VALID
                                      else "moderate"),
@@ -1099,6 +1232,8 @@ async def generate_content_impl(
                         prefer_mermaid=orch_prefer_mermaid,
 
                         section_per_segment=orch_section_per_segment,
+
+                        knowledge_catalog=_knowledge_catalog,
 
                     )
 
@@ -1112,6 +1247,51 @@ async def generate_content_impl(
                     # 同时写入 plan(table/mermaid/image 决策) + illustration_type + section_type
                     if isinstance(orchestration_result, list):
                         apply_orchestration_to_leaves(leaf_dicts, orchestration_result)
+
+                        # E-2：按编排选定的 knowledge.item_ids 解析素材正文写回叶子，
+                        # 供正文生成注入（build_chapter_content_messages 读 chapter_info）。
+                        if _knowledge_catalog:
+                            _cat_ids = {it["id"] for it in _knowledge_catalog}
+                            for _leaf in leaf_dicts:
+                                _kn_ids = ((_leaf.get("plan") or {}).get("knowledge") or {}).get("item_ids") or []
+                                _sel = []
+                                for _kid in _kn_ids:
+                                    try:
+                                        _kid_i = int(_kid)
+                                    except (TypeError, ValueError):
+                                        continue
+                                    if _kid_i not in _cat_ids:
+                                        continue
+                                    _meta = next((it for it in _knowledge_catalog if it["id"] == _kid_i), None)
+                                    if _meta is None:
+                                        continue
+                                    _content_txt = _meta["summary"]
+                                    try:
+                                        _full = _kb_svc.get_item(_kid_i)
+                                        if isinstance(_full, dict) and _full.get("content"):
+                                            _content_txt = str(_full["content"])[:800]
+                                    except Exception:
+                                        pass
+                                    _sel.append({"id": _kid_i, "title": _meta["title"], "content": _content_txt})
+                                    try:
+                                        _kb_svc.record_usage(_kid_i, project_id, _leaf.get("id"), "content_orchestration")
+                                    except Exception:
+                                        pass
+                                if _sel:
+                                    _leaf["knowledge_items"] = _sel
+
+                        # E-4：全篇叙事骨架 —— 一次生成、随叶子下发（best-effort，
+                        # 失败不阻塞主流程）。骨架内容同项目内稳定，不影响缓存前缀。
+                        try:
+                            _skeleton = await generate_full_skeleton(
+                                provider, leaf_dicts, project_overview=summary,
+                                cancel_event=cancel_event,
+                            )
+                            if _skeleton:
+                                for _leaf in leaf_dicts:
+                                    _leaf["full_skeleton"] = _skeleton
+                        except Exception as _sk_e:
+                            logger.warning("全篇骨架生成失败（跳过）: %s", _sk_e)
 
                 except asyncio.CancelledError:
 
@@ -1295,6 +1475,9 @@ async def generate_content_impl(
 
                     industry=industry,
 
+                    # 易标 R5/R8：强控覆盖表（空表 = 未强控，下游回落档位逻辑）
+                    word_control=_wc_override,
+
                 )
 
                 # === BUG-C-04 修复：失败章节指数退避重试 ===
@@ -1370,6 +1553,7 @@ async def generate_content_impl(
                                     field_contract=field_contract,
                                     field_trace=field_trace,
                                     industry=industry,
+                                    word_control=_wc_override,
                                 )
                                 # 更新 results 中对应条目的状态（重试成功的替换掉 failed 条目）
                                 _retry_success_ids = {
@@ -1431,6 +1615,104 @@ async def generate_content_impl(
 
                     await asyncio.to_thread(update_step, project_id, 5)
 
+                # 字数偏差控制（2026-10-11 新增）：对超长章节自动压缩
+                # 缺口：DB 实测 10 个 L3 章节平均偏差 +34.2%、100% 系统性偏高。
+                # 修复：主生成完成后、兜底扩写之前，对超出 target × threshold
+                # 的章节调用 condense_overlong_results 压缩到目标区间。
+                # 失败安全：压缩失败/超时/取消均保留原文；异常向上被捕获，不影响主生成。
+                try:
+                    from ...services.ai.workflows_sections import condense_overlong_results
+                    _condense_summary = await condense_overlong_results(
+                        results, sections_by_id, provider, writing_length,
+                        # 易标 R5：强控生效时按快照 S ±20% 压缩（空表回落档位逻辑）
+                        word_control=_wc_override,
+                        cancel_event=cancel_event,
+                    )
+                    if _condense_summary.get("condensed_count", 0) > 0:
+                        logger.info(
+                            "[字数偏差控制] 压缩完成: %d/%d 章节, 失败=%d",
+                            _condense_summary.get("condensed_count", 0),
+                            saved_count,
+                            _condense_summary.get("fail_count", 0),
+                        )
+                        # BUG-FIX 2026-10-12（P1 缓存未失效 / 压缩不落库）：
+                        # condense_overlong_results 只在内存 results 列表上就地
+                        # 改写 content 字段，此前既不写 sections 表也不失效任何
+                        # 一层缓存（内存 1h / Redis 30min / build_tree 60s）。
+                        # 用户刷新页面后从 DB 读回的仍是压缩前长版正文，前端
+                        # word_count_condense 事件里"压缩 N 章节"的提示与页面
+                        # 显示矛盾；同一项目其他 60 分钟窗口内的读接口全部命中
+                        # 旧缓存。修复：与兜底扩写同构，批量 executemany UPDATE
+                        # 后调用统一三层失效入口。condense_overlong_results 仅
+                        # 在压缩成功分支写入 `original_content` 字段（见
+                        # workflows_sections.py 1385 行），据此筛选压缩章节。
+                        # HARDEN 2026-10-12：优先使用 condense_overlong_results
+                        # 显式返回的 condensed_ids 契约（精确、无歧义）；若上游
+                        # 版本尚未提供该字段，回退到旧的隐式判别（original_content
+                        # != content）以维持向后兼容。
+                        _condensed_ids = set(
+                            _condense_summary.get("condensed_ids") or []
+                        )
+                        _condense_updates: list[tuple[str, int]] = []
+                        _r_indexed = False
+                        if _condensed_ids:
+                            # 显式契约路径：O(1) 查找、精确落库
+                            _by_id = {r.get("id"): r for r in results}
+                            for _sid in _condensed_ids:
+                                _r = _by_id.get(_sid)
+                                if not _r or _r.get("status") != "completed":
+                                    continue
+                                _new = _r.get("content")
+                                if _new is None:
+                                    continue
+                                _condense_updates.append((_new, _sid))
+                            _r_indexed = True
+                        if not _r_indexed:
+                            # 兼容回退：隐式判别（旧路径）
+                            for _r in results:
+                                if _r.get("status") != "completed":
+                                    continue
+                                _orig = _r.get("original_content")
+                                _new = _r.get("content")
+                                if not _orig or _new is None or _orig == _new:
+                                    continue
+                                _condense_updates.append((_new, _r["id"]))
+                        if _condense_updates:
+
+                            def _batch_update_condensed(updates):
+                                from ...db import get_db
+                                from ...services.sections import _count_readable_words, _count_words
+
+                                with get_db() as conn:
+                                    conn.executemany(
+                                        "UPDATE sections SET content = ?, word_count = ?, readable_word_count = ?, updated_at = datetime('now', 'localtime') WHERE id = ?",
+                                        [
+                                            (_c, _count_words(_c), _count_readable_words(_c), _sid)
+                                            for _c, _sid in updates
+                                        ],
+                                    )
+
+                            await asyncio.to_thread(_batch_update_condensed, _condense_updates)
+                            try:
+                                from ...services.sections import invalidate_content_caches
+
+                                invalidate_content_caches(
+                                    project_id, [_sid for _c, _sid in _condense_updates]
+                                )
+                            except Exception as _inv_e:
+                                logger.warning(
+                                    "[字数偏差控制] 三层缓存失效失败（忽略）: %s", _inv_e
+                                )
+                        await queue.put({
+                            "status": "word_count_condense",
+                            "message": f"字数偏差控制完成：{_condense_summary.get('condensed_count', 0)} 章节压缩",
+                            "condensed_count": _condense_summary.get("condensed_count", 0),
+                            "fail_count": _condense_summary.get("fail_count", 0),
+                            "saved_to_db": len(_condense_updates),
+                        })
+                except Exception as _we:
+                    logger.warning("[字数偏差控制] 整体流程异常（忽略，不影响主生成）: %s", _we)
+
 
 
                 # 兜底扩写：对字数最少的章节进行扩写
@@ -1456,6 +1738,12 @@ async def generate_content_impl(
                         _section_effective_targets = []
                         for _r in results:
                             _sid = _r.get("id")
+                            # 易标 R5：强控生效时以快照 S 为基准（S×80% 恰为区间下限），
+                            # 保证扩写不会停在强控区间之外。
+                            _ov = _wc_override.get(_sid) if _wc_override else None
+                            if _ov:
+                                _section_effective_targets.append(int(_ov["section_words"]))
+                                continue
                             if _sid and _sid in sections_by_id:
                                 _sec = sections_by_id[_sid]
                                 _lvl = _sec.get("level", 3)
@@ -1563,7 +1851,7 @@ async def generate_content_impl(
 
                                 from ...db import get_db
 
-                                from ...services.sections import _count_words
+                                from ...services.sections import _count_readable_words, _count_words
 
 
 
@@ -1571,9 +1859,12 @@ async def generate_content_impl(
 
                                     conn.executemany(
 
-                                        "UPDATE sections SET content = ?, word_count = ?, updated_at = datetime('now', 'localtime') WHERE id = ?",
+                                        "UPDATE sections SET content = ?, word_count = ?, readable_word_count = ?, updated_at = datetime('now', 'localtime') WHERE id = ?",
 
-                                        [(_c, _count_words(_c), _sid) for _c, _sid in updates],
+                                        [
+                                            (_c, _count_words(_c), _count_readable_words(_c), _sid)
+                                            for _c, _sid in updates
+                                        ],
 
                                     )
 
@@ -1613,6 +1904,40 @@ async def generate_content_impl(
                     except Exception as e:
 
                         logger.warning("兜底扩写失败: %s", e)
+
+
+
+                # 易标 R12（字数控制 2026-10-12）：生成/压缩/扩写链全部结束后，
+                # 逐节按 R1 可读口径重算实际字数，判定强控小节越界与全文偏离，
+                # 结构化警告回写 word_control_settings.word_control_warning
+                # 并推送 SSE「word_control_warning」事件；不硬裁正文，
+                # 由前端弹窗展示「期望区间 vs 实际 + 逐节明细」交人工裁决。
+                if saved_count > 0 and not cancel_event.is_set():
+
+                    try:
+
+                        from ...services.word_control_runtime import (
+                            finalize_word_control_warning,
+                        )
+
+                        _word_control_warning = await asyncio.to_thread(
+                            finalize_word_control_warning,
+                            _wc_state,
+                            results,
+                            single_section=len(leaf_ids_for_generation) == 1,
+                        )
+
+                        if _word_control_warning:
+
+                            await queue.put({
+                                "status": "word_control_warning",
+                                "warning": _word_control_warning,
+                                "message": _word_control_warning.get("message", ""),
+                            })
+
+                    except Exception as _wc_warn_e:
+
+                        logger.warning("[字数控制] 收尾警告计算失败（忽略）: %s", _wc_warn_e)
 
 
 
@@ -2422,7 +2747,7 @@ async def generate_content_impl(
 
                     if (
 
-                        event.get("status") in ("completed", "error", "stopped")
+                        event.get("status") in SSE_TERMINAL_STATUSES
 
                         and event.get("section_id") is None
 
@@ -2617,7 +2942,7 @@ async def generate_content_impl(
 
                                     # 丢弃事件，仅用于防止队列堆积
 
-                                    if event.get("status") in ("completed", "error", "stopped"):
+                                    if event.get("status") in SSE_TERMINAL_STATUSES:
 
                                         break
 
@@ -3315,7 +3640,7 @@ async def expand_content_impl(
 
                     if (
 
-                        event.get("status") in ("completed", "error", "stopped")
+                        event.get("status") in SSE_TERMINAL_STATUSES
 
                         and event.get("section_id") is None
 

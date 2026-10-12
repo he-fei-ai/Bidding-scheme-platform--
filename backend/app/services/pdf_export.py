@@ -19,6 +19,7 @@ import shutil
 import subprocess
 import tempfile
 import threading
+import time
 import uuid
 
 logger = logging.getLogger(__name__)
@@ -27,6 +28,13 @@ logger = logging.getLogger(__name__)
 _pdf_probe_lock = threading.Lock()
 _cached_soffice: str | None = None
 _probe_done = False
+_probe_last_ts = 0.0  # 最近一次探测时间戳（秒）
+# MODULARIZATION 2026-10-12（遗留加固）：此前 `_probe_done=True` 后**永不重探测**——
+# 进程启动时 LibreOffice 没装好（返回 None），运行中用户装好了也不会再探测，
+# 每次 /pdf 都走 501。现加 PROBE_RETRY_INTERVAL_SECONDS 间隔重试（生产建议 ≥ 3600s
+# 即每小时重探一次，开发可设更短）。卸载后路径失效的场景已由 10-11 修复的
+# Path(_cached_soffice).exists() 守卫拦住，这里不再重复。
+_PROBE_RETRY_INTERVAL_SECONDS = float(os.getenv("PDF_PROBE_RETRY_INTERVAL", "3600"))
 
 #: Windows/Linux/macOS 常见安装位置（which 探测失败后的兜底候选）
 _SOFFICE_CANDIDATES: tuple[str, ...] = (
@@ -48,12 +56,25 @@ def find_soffice(*, force_refresh: bool = False) -> str | None:
     """定位 LibreOffice 可执行文件；找不到返回 None（结果进程内缓存）。
 
     优先级：环境变量 PDF_SOFFICE_PATH > shutil.which > 常见安装路径。
+
+    MODULARIZATION 2026-10-12（遗留加固）：新增周期性重试。
+    `_PROBE_RETRY_INTERVAL_SECONDS`（默认 3600s）内同一结果复用；超时后自动
+    force_refresh=True 重新探测。覆盖「进程启动时 LO 未装好、运行中装完」场景。
+    仍允许 force_refresh 手动触发立即重探。
     """
-    global _cached_soffice, _probe_done
-    if _probe_done and not force_refresh:
+    global _cached_soffice, _probe_done, _probe_last_ts
+    # TTL 自动刷新：上次探测结果是 None 或已超时则强制重探
+    now_ts = time.time()
+    if _probe_done and not force_refresh and (
+        _cached_soffice is None
+        or now_ts - _probe_last_ts >= _PROBE_RETRY_INTERVAL_SECONDS
+    ):
+        force_refresh = True
+    # BUG-FIX 2026-10-11（P3·卸载后仍返回失效缓存路径）：缓存值补一次存在性校验。
+    if _probe_done and not force_refresh and (_cached_soffice is None or Path(_cached_soffice).exists()):
         return _cached_soffice
     with _pdf_probe_lock:
-        if _probe_done and not force_refresh:
+        if _probe_done and not force_refresh and (_cached_soffice is None or Path(_cached_soffice).exists()):
             return _cached_soffice
         result: str | None = None
         env_path = os.getenv("PDF_SOFFICE_PATH", "").strip()
@@ -71,10 +92,14 @@ def find_soffice(*, force_refresh: bool = False) -> str | None:
                     break
         _cached_soffice = result
         _probe_done = True
+        _probe_last_ts = now_ts
         if result:
             logger.info("PDF 转换引擎已就绪: %s", result)
         else:
-            logger.info("未检测到 LibreOffice，PDF 导出将以 501 提示（DOCX 导出不受影响）")
+            logger.info(
+                "未检测到 LibreOffice，PDF 导出将以 501 提示（DOCX 导出不受影响；"
+                "%ds 后自动重试）", int(_PROBE_RETRY_INTERVAL_SECONDS)
+            )
         return result
 
 
@@ -97,8 +122,15 @@ def convert_docx_to_pdf(docx_path: Path, *, timeout_seconds: int = 180) -> Path:
     if not docx_path.exists():
         raise FileNotFoundError(f"待转换的 DOCX 不存在: {docx_path}")
     target = docx_path.with_suffix(".pdf")
-    if target.exists() and target.stat().st_mtime >= docx_path.stat().st_mtime:
-        logger.info("PDF 缓存命中（不早于源文件），直接复用: %s", target.name)
+    # BUG-FIX 2026-10-11（P1·PDF 复用陈旧产物）：原判据
+    # `target.st_mtime >= docx_path.st_mtime` 直接浮点比大小、无安全余量。
+    # build_docx 产物命名是 `{项目名}_{年月日_时分秒}.docx`（秒级时间戳）且 PDF 与
+    # DOCX 同名同目录；一旦「重新导出 DOCX」与「上次生成的 PDF」落在同一文件系统
+    # 时间戳粒度秒内（或 FS mtime 粒度较粗），新旧产物 st_mtime 会相等，`>=` 恒真 →
+    # 把过期 PDF 当新文档返回，用户改完正文再导 PDF 拿到的仍是旧内容且无提示。
+    # 现改为严格 `>`：仅当 PDF 明确新于 DOCX 才复用，相等即视作“无法证明新”→重新转换。
+    if target.exists() and target.stat().st_mtime > docx_path.stat().st_mtime:
+        logger.info("PDF 缓存命中（明确新于源文件），直接复用: %s", target.name)
         return target
 
     profile_dir = Path(tempfile.gettempdir()) / f"lo_profile_{uuid.uuid4().hex[:8]}"

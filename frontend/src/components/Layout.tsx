@@ -24,6 +24,7 @@ import {
 } from "@ant-design/icons";
 import { Outlet, useNavigate, useParams, useLocation } from "react-router-dom";
 import HealthStatusIndicator from "./HealthStatusIndicator";
+import TaskStatusBar from "./TaskStatusBar";
 import { clearAuthToken, isAuthenticated } from "../api";
 
 const { Sider, Content, Header } = Layout;
@@ -209,6 +210,10 @@ export default function AppLayout() {
             </Tooltip>
             <span className="app-header__divider" />
             <HealthStatusIndicator />
+          </div>
+
+          <div className="app-header__tasks">
+            <TaskStatusBar />
           </div>
 
           <div className="app-header__right">

@@ -129,8 +129,18 @@ def _current_row(conn, key: str):
 
 
 @router.get("")
-async def list_prompts():
-    """获取所有提示词（含分类、标签、DB 内容、实际变量列表）"""
+async def list_prompts(include_orphans: bool = Query(False, description="是否返回DB中存在但未在代码注册的孤儿提示词")):
+    """获取所有提示词（含分类、标签、DB 内容、实际变量列表）
+
+    BUG-FIX-PROMPT-R5（孤儿记录不可见）：本接口只遍历 ``_ALL_PROMPTS``，
+    DB 中存在但未注册的 key（例如历史遗留 key、或早期 PUT 未校验 key 时
+    写入的垃圾行）完全不出现在响应里。运维因此无法发现/清理它们，
+    实测生产库 data/bid_assistant.sqlite3 中 prompt_templates 有 84 行而
+    注册表仅 60 个，其中含 ``_TEST_*`` 4 条测试污染行。
+
+    修复：``include_orphans=true`` 时追加返回孤儿记录，并打上
+    ``orphan: true`` 标记，前端可据此提示清理；默认关闭以保持既有响应形状。
+    """
     # PERF（2026-10-05）：同步 sqlite 读取派发至工作线程（连接重试 sleep
     # 不再发生在事件循环内，与本文件其余端点同口径）
     def _read_all():
@@ -150,7 +160,7 @@ async def list_prompts():
             # 修正：此前 variables 恒取硬编码模板，用户 DB 编辑增删变量后前端展示的
             # 变量列表与实际内容不符。改为按实际内容解析（内容为空时回退注册表）。
             effective = row.get("content") or meta["content"]
-            result.append({**row, "variables": sorted(set(extract_variables(effective)))})
+            result.append({**row, "variables": sorted(set(extract_variables(effective))), "orphan": False})
         else:
             result.append(
                 {
@@ -160,212 +170,110 @@ async def list_prompts():
                     "content": meta["content"],
                     "default_content": meta["content"],
                     "variables": meta.get("variables", []),
+                    "orphan": False,
                 },
             )
+
+    if include_orphans:
+        for key in sorted(set(db_map) - set(_ALL_PROMPTS)):
+            row = db_map[key]
+            effective = row.get("content") or ""
+            result.append({**row, "variables": sorted(set(extract_variables(effective))), "orphan": True})
+
     return result
 
 
-@router.get("/{key}")
-async def get_prompt_detail(key: str):
-    # PERF（2026-10-05）：纯读派发至工作线程，不在事件循环内做同步 I/O
-    def _read_row():
-        with get_db(readonly=True) as conn:
-            row = _current_row(conn, key)
-            return dict(row) if row else None
+# ──────────────────────────────────────────────────────────────────────────
+# 顺序约束（重要，勿调整）
+#
+# BUG-FIX-PROMPT-R1（路由遮蔽）：本文件原先把 `GET /prompts/{key}` 与
+# `PUT /prompts/{key}` 声明在所有静态子路由（/metrics、/alerts、/budget…）之前。
+# Starlette/FastAPI 按**声明顺序**匹配路由，`/prompts/{key}` 会先命中并把
+# key 绑定成 "metrics" / "alerts" / "budget"，导致这些接口全部 404（实测复现）：
+#   GET  /prompts/metrics   -> 404 提示词不存在
+#   GET  /prompts/alerts    -> 挂起（叠加 _cache.check_prompt_alerts 死锁）
+#   GET  /prompts/budget    -> 404
+#   PUT  /prompts/budget    -> 422（错命中 update_prompt，要求 content 字段）
+# 修复：把带路径参数的 `/{key}` 路由整体下沉到文件末尾（见 "带路径参数的路由" 一节），
+# 保证静态路由优先匹配。tests/test_prompts_route_shadowing_2026_10_09.py 做回归守卫。
+# ──────────────────────────────────────────────────────────────────────────
 
-    row = await asyncio.to_thread(_read_row)
-    meta = _ALL_PROMPTS.get(key)
-    if row:
-        effective = row["content"] or (meta["content"] if meta else "")
-        return {**dict(row), "variables": sorted(set(extract_variables(effective)))}
-    if meta:
-        return {
+
+# ──────────────────────────────────────────────────────────────────────
+# R7 2026-10-12：模板生命周期管理仪表盘
+# ──────────────────────────────────────────────────────────────────────
+@router.get("/overview")
+async def get_prompts_overview():
+    """提示词生命周期管理仪表盘 —— 聚合 DB / 注册表 / 漂移 / 调用指标。
+
+    返回每个已注册 key 的：
+      - key, category, label, variables 声明
+      - source: db / fallback / missing（运行时内容来源）
+      - drifted: DB 内容与注册表是否一致
+      - calls, errors, not_found: 调用指标
+      - updated_at: DB 最后更新时间
+
+    冷启动时 metrics 为空字典，所有 calls=0。
+    """
+    from ..services.ai.prompts import get_prompt_metrics
+
+    # 从注册表拿全部 key
+    reg = _ALL_PROMPTS
+
+    # R7-SECURITY: get_db() 是同步阻塞调用，async 端点必须用 to_thread 包起来；
+    # 且 overview 是纯读查询，用 readonly=True 跳过全局写锁，避免阻塞其它写操作。
+    def _fetch_db_rows():
+        with get_db(readonly=True) as conn:
+            return conn.execute(
+                "SELECT key, content, category, label, updated_at FROM prompt_templates"
+            ).fetchall()
+    db_rows = await asyncio.to_thread(_fetch_db_rows)
+    db_keys = {r["key"]: r for r in db_rows}
+
+    # 从内存 metrics 拿调用数据（get_prompt_metrics 内部已做锁保护 + 深拷贝）
+    metrics_snapshot = get_prompt_metrics()
+
+    items = []
+    for key, meta in reg.items():
+        db_row = db_keys.get(key)
+        content_reg = meta["content"]
+
+        # 漂移检测（DB 存在且与注册表不一致 → drifted=True）
+        drifted = False
+        updated_at = None
+        if db_row is not None:
+            updated_at = db_row["updated_at"]
+            drifted = (db_row["content"] or "") != (content_reg or "")
+
+        # 运行时调用指标
+        m = metrics_snapshot.get(key, {})
+        items.append({
             "key": key,
-            "category": meta["category"],
-            "label": meta["label"],
-            "content": meta["content"],
-            "default_content": meta["content"],
+            "category": meta.get("category", ""),
+            "label": meta.get("label", ""),
             "variables": meta.get("variables", []),
-        }
-    raise HTTPException(status_code=404, detail="提示词不存在")
+            "db_present": db_row is not None,
+            "drifted": drifted,
+            "updated_at": updated_at,
+            "calls": m.get("calls", 0),
+            "db_hits": m.get("db_hits", 0),
+            "fallback_hits": m.get("fallback_hits", 0),
+            "total_tokens": m.get("total_tokens", 0),
+        })
 
+    # 汇总统计
+    total = len(items)
+    drifted_count = sum(1 for it in items if it["drifted"])
+    db_present = sum(1 for it in items if it["db_present"])
+    total_calls = sum(it["calls"] for it in items)
 
-@router.put("/{key}")
-async def update_prompt(
-    key: str,
-    data: PromptUpdate,
-    force: bool = Query(False, description="跳过变量校验强制保存"),
-    current: User = Depends(get_current_user),
-):
-    # 修复：default_content 在 key 不存在时应回退到硬编码默认值，
-    # 原 SQL 用 COALESCE(...,'') 会导致新 key 的 default_content 为空字符串，
-    # 前端执行"重置为默认"时得到空内容
-    meta = _ALL_PROMPTS.get(key)
-    fallback_default = meta["content"] if meta else ""
-
-    if not force:
-        _validate_prompt_content(key, data.content)
-
-    changed_by = getattr(current, "username", "") or ""
-
-    # PERF（2026-10-05）：归档+写入整段同步 I/O（含全局写锁）派发至工作线程，
-    # 锁争用在 worker 阻塞，不冻结事件循环
-    def _write():
-        with get_db() as conn:
-            old = _current_row(conn, key)
-            if old:
-                _archive_version(
-                    conn,
-                    key,
-                    content=old["content"],
-                    default_content=old["default_content"],
-                    label=old["label"],
-                    category=old["category"],
-                    source="edit",
-                    changed_by=changed_by,
-                )
-            conn.execute(
-                """INSERT INTO prompt_templates (key, content, default_content, updated_at)
-               VALUES (?, ?, COALESCE((SELECT default_content FROM prompt_templates WHERE key = ?), ?), datetime('now', 'localtime'))
-               ON CONFLICT(key) DO UPDATE SET
-                content=excluded.content,
-                updated_at=datetime('now', 'localtime')""",
-                (key, data.content, key, fallback_default),
-            )
-
-    await asyncio.to_thread(_write)
-    reload_prompt_cache()
-    return {"status": "ok"}
-
-
-@router.post("/{key}/reset")
-async def reset_prompt(key: str, current: User = Depends(get_current_user)):
-    """重置为默认提示词（重置前归档当前自定义内容，可回滚）"""
-    meta = _ALL_PROMPTS.get(key)
-    if not meta:
-        raise HTTPException(status_code=404, detail="提示词不存在")
-
-    default_content = meta["content"]
-    changed_by = getattr(current, "username", "") or ""
-
-    # PERF（2026-10-05）：归档+重置写操作派发至工作线程
-    def _write():
-        with get_db() as conn:
-            old = _current_row(conn, key)
-            if old:
-                _archive_version(
-                    conn,
-                    key,
-                    content=old["content"],
-                    default_content=old["default_content"],
-                    label=old["label"],
-                    category=old["category"],
-                    source="reset",
-                    changed_by=changed_by,
-                )
-            conn.execute(
-                """INSERT INTO prompt_templates (key, content, default_content, updated_at)
-               VALUES (?, ?, ?, datetime('now', 'localtime'))
-               ON CONFLICT(key) DO UPDATE SET
-                content=excluded.default_content,
-                updated_at=datetime('now', 'localtime')""",
-                (key, default_content, default_content),
-            )
-
-    await asyncio.to_thread(_write)
-    reload_prompt_cache()
-    return {"status": "ok"}
-
-
-@router.get("/{key}/versions")
-async def list_prompt_versions(key: str, limit: int = Query(50, ge=1, le=200)):
-    """列出某提示词的历史版本（按时间倒序，不含 content 正文以减小体积）。"""
-    # PERF（2026-10-05）：纯读派发至工作线程
-    def _read_versions():
-        with get_db(readonly=True) as conn:
-            return [dict(r) for r in conn.execute(
-                """SELECT id, key, label, category, source, changed_by, created_at,
-                      length(content) AS content_length
-               FROM prompt_versions WHERE key = ?
-               ORDER BY id DESC LIMIT ?""",
-                (key, limit),
-            ).fetchall()]
-
-    return await asyncio.to_thread(_read_versions)
-
-
-@router.get("/{key}/versions/{version_id}")
-async def get_prompt_version(key: str, version_id: int):
-    """查看某个历史版本的完整内容。"""
-    # PERF（2026-10-05）：纯读派发至工作线程
-    def _read_version():
-        with get_db(readonly=True) as conn:
-            row = conn.execute(
-                "SELECT * FROM prompt_versions WHERE id = ? AND key = ?",
-                (version_id, key),
-            ).fetchone()
-            return dict(row) if row else None
-
-    row = await asyncio.to_thread(_read_version)
-    if not row:
-        raise HTTPException(status_code=404, detail="版本不存在")
-    return row
-
-
-@router.post("/{key}/versions/{version_id}/rollback")
-async def rollback_prompt(
-    key: str,
-    version_id: int,
-    current: User = Depends(get_current_user),
-):
-    """回滚到指定历史版本：先把当前内容归档（source=rollback），再用历史版本覆盖。"""
-    changed_by = getattr(current, "username", "") or ""
-
-    # PERF（2026-10-05）：读版本+归档+覆盖的整段同步 I/O 派发至工作线程；
-    # 版本不存在用哨兵返回值回主协程抛 404（语义不变）
-    def _rollback():
-        with get_db() as conn:
-            target = conn.execute(
-                "SELECT * FROM prompt_versions WHERE id = ? AND key = ?",
-                (version_id, key),
-            ).fetchone()
-            if not target:
-                return None
-            target = dict(target)
-            old = _current_row(conn, key)
-            if old:
-                _archive_version(
-                    conn,
-                    key,
-                    content=old["content"],
-                    default_content=old["default_content"],
-                    label=old["label"],
-                    category=old["category"],
-                    source="rollback",
-                    changed_by=changed_by,
-                )
-            conn.execute(
-                """INSERT INTO prompt_templates (key, category, label, content, default_content, updated_at)
-               VALUES (?, ?, ?, ?, ?, datetime('now', 'localtime'))
-               ON CONFLICT(key) DO UPDATE SET
-                content=excluded.content,
-                category=excluded.category,
-                label=excluded.label,
-                updated_at=datetime('now', 'localtime')""",
-                (
-                    key,
-                    target["category"] or "",
-                    target["label"] or "",
-                    target["content"],
-                    target["default_content"] or "",
-                ),
-            )
-            return target
-
-    if await asyncio.to_thread(_rollback) is None:
-        raise HTTPException(status_code=404, detail="版本不存在")
-    reload_prompt_cache()
-    return {"status": "ok", "restored_from": version_id}
+    return {
+        "total": total,
+        "db_present": db_present,
+        "drifted": drifted_count,
+        "total_calls": total_calls,
+        "items": items,
+    }
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -374,7 +282,11 @@ async def rollback_prompt(
 
 @router.post("/sync-hardcode")
 async def sync_hardcode_to_db(
-    overwrite: bool = Query(False, description="是否覆盖DB中已修改的内容；默认仅同步DB中不存在的新提示词"),
+    overwrite: bool = Query(False, description="是否把未被用户改过的 content 一并刷新为硬编码新版本"),
+    reset_modified: bool = Query(
+        False,
+        description="是否强制用硬编码覆盖用户已修改的 content（危险：会丢弃自定义，清理前请先归档版本）",
+    ),
     current: User = Depends(get_current_user),
 ):
     """一键同步硬编码提示词到数据库。
@@ -382,51 +294,107 @@ async def sync_hardcode_to_db(
     用途：开发者修改了硬编码提示词后，无需手动执行 init 脚本，
     直接通过此接口将新版本同步到 DB。
 
-    Args:
-        overwrite: False（默认）仅同步 DB 中不存在的新提示词；
-                   True 覆盖所有提示词的 default_content（保留用户已修改的 content）。
+    BUG-FIX-PROMPT-R4（同步后仍不生效）：原 ``overwrite=True`` 只更新
+    ``default_content`` 而**从不刷新 content**。而 ``_cache.get_prompt`` 读的是
+    ``content``，于是开发者同步后线上仍跑旧文案——正是 _cache._check_hardcode_drift
+    一直在告警的那类漂移，且该接口「看起来成功了」却毫无效果。
+
+    修复：区分「用户改过」与「未被改过」两种 content——
+      - content == 旧 default_content（未被用户改过）→ 直接跟随硬编码刷新
+      - content != 旧 default_content（用户改过）→ 默认保留，
+        需显式 reset_modified=true 才覆盖（覆盖前按 source='sync' 归档版本）。
     """
     changed_by = getattr(current, "username", "") or ""
 
     def _sync():
         synced = []
+        refreshed = []      # 跟随硬编码刷新的 content
+        kept_modified = []  # 保留了用户自定义
         skipped = []
         with get_db() as conn:
             for key, meta in _ALL_PROMPTS.items():
                 default_content = meta["content"]
-                # 检查 DB 中是否存在
                 existing = conn.execute(
                     "SELECT content, default_content FROM prompt_templates WHERE key = ?",
                     (key,),
                 ).fetchone()
 
                 if existing is None:
-                    # DB 中不存在，插入新记录
                     conn.execute(
                         """INSERT INTO prompt_templates (key, category, label, content, default_content, updated_at)
-                       VALUES (?, ?, ?, ?, ?, datetime('now', 'localtime'))""",
+                           VALUES (?, ?, ?, ?, ?, datetime('now', 'localtime'))""",
                         (key, meta["category"], meta["label"], default_content, default_content),
                     )
                     synced.append(key)
-                elif overwrite:
-                    # 覆盖 default_content（保留用户修改的 content）
+                    continue
+
+                if not overwrite:
+                    skipped.append(key)
+                    continue
+
+                old_content = existing["content"] or ""
+                old_default = existing["default_content"] or ""
+                user_modified = old_content != old_default
+
+                if user_modified and not reset_modified:
+                    # 只刷新 default_content（供「重置」使用），content 保留用户版本
                     conn.execute(
                         """UPDATE prompt_templates
-                       SET default_content = ?, updated_at = datetime('now', 'localtime')
-                       WHERE key = ?""",
+                           SET default_content = ?, updated_at = datetime('now', 'localtime')
+                           WHERE key = ?""",
                         (default_content, key),
                     )
-                    synced.append(f"{key} (default_content)")
+                    kept_modified.append(key)
+                elif user_modified and reset_modified:
+                    # 危险路径：归档用户版本后再覆盖，保证可回滚
+                    _archive_version(
+                        conn,
+                        key,
+                        content=old_content,
+                        default_content=old_default,
+                        label=meta["label"],
+                        category=meta["category"],
+                        source="sync",
+                        changed_by=changed_by,
+                    )
+                    conn.execute(
+                        """UPDATE prompt_templates
+                           SET content = ?, default_content = ?, category = ?, label = ?,
+                               updated_at = datetime('now', 'localtime')
+                           WHERE key = ?""",
+                        (default_content, default_content, meta["category"], meta["label"], key),
+                    )
+                    refreshed.append(key)
                 else:
-                    skipped.append(key)
+                    # 未被用户改过：content 跟随硬编码，漂移彻底消除
+                    conn.execute(
+                        """UPDATE prompt_templates
+                           SET content = ?, default_content = ?, category = ?, label = ?,
+                               updated_at = datetime('now', 'localtime')
+                           WHERE key = ?""",
+                        (default_content, default_content, meta["category"], meta["label"], key),
+                    )
+                    refreshed.append(key)
 
-        return {"synced": synced, "skipped": skipped, "total": len(_ALL_PROMPTS)}
+                synced.append(key)
+
+        return {
+            "synced": synced,
+            "refreshed": refreshed,
+            "kept_modified": kept_modified,
+            "skipped": skipped,
+            "total": len(_ALL_PROMPTS),
+        }
 
     result = await asyncio.to_thread(_sync)
     reload_prompt_cache()
     return {
         "status": "ok",
-        "message": f"同步完成：{len(result['synced'])} 个提示词已更新",
+        "message": (
+            f"同步完成：{len(result['synced'])} 个已处理，"
+            f"其中 {len(result['refreshed'])} 个 content 刷新为硬编码新版本，"
+            f"{len(result['kept_modified'])} 个保留了用户自定义"
+        ),
         **result,
     }
 
@@ -681,12 +649,17 @@ async def get_budget_config(
 @router.put("/budget")
 async def update_budget_config(
     body: BudgetUpdate,
-    current: User = Depends(get_current_user),
+current: User = Depends(get_current_user),
 ):
     """更新月度预算配置。"""
     from ..services.ai.prompts import set_monthly_budget
 
-    set_monthly_budget(body.amount)
+    # BUG-FIX-PROMPT-B2：set_monthly_budget 现对非正数抛 ValueError；不拦截会变成
+    # 500，而这是纯粹的用户输入错误，应返回 400。
+    try:
+        set_monthly_budget(body.amount)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     return {
         "status": "ok",
         "message": f"月度预算已更新为 ¥{body.amount:.2f}",
@@ -763,16 +736,20 @@ class ThresholdUpdate(BaseModel):
 @router.put("/alerts/thresholds")
 async def update_alert_thresholds_api(
     body: ThresholdUpdate,
-    current: User = Depends(get_current_user),
+current: User = Depends(get_current_user),
 ):
     """更新告警阈值配置。"""
     from ..services.ai.prompts import set_alert_thresholds
 
-    set_alert_thresholds(
-        db_hit_threshold=body.db_hit_threshold,
-        spike_multiplier=body.spike_multiplier,
-        spike_min_baseline=body.spike_min_baseline,
-    )
+    # BUG-FIX-PROMPT-B2：越界阈值会被静默持久化，使告警规则永久失效。转 400。
+    try:
+        set_alert_thresholds(
+            db_hit_threshold=body.db_hit_threshold,
+            spike_multiplier=body.spike_multiplier,
+            spike_min_baseline=body.spike_min_baseline,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
     return {
         "status": "ok",
@@ -822,3 +799,240 @@ async def suggest_budget(
         "status": "ok",
         "suggestion": suggestion,
     }
+
+# ══════════════════════════════════════════════════════════════════════════
+# 带路径参数的路由（必须声明在全部静态子路由之后）
+#
+# 原因：Starlette 按声明顺序匹配。`/prompts/{key}` 若早于 `/prompts/metrics`
+# 声明，会把 "metrics"/"alerts"/"budget" 当作 key 绑定并返回 404。
+# 因此本节统一置于文件末尾。详见文件头「顺序约束」注释。
+# ══════════════════════════════════════════════════════════════════════════
+@router.get("/{key}")
+async def get_prompt_detail(key: str):
+    # PERF（2026-10-05）：纯读派发至工作线程，不在事件循环内做同步 I/O
+    def _read_row():
+        with get_db(readonly=True) as conn:
+            row = _current_row(conn, key)
+            return dict(row) if row else None
+
+    row = await asyncio.to_thread(_read_row)
+    meta = _ALL_PROMPTS.get(key)
+    if row:
+        effective = row["content"] or (meta["content"] if meta else "")
+        return {**dict(row), "variables": sorted(set(extract_variables(effective)))}
+    if meta:
+        return {
+            "key": key,
+            "category": meta["category"],
+            "label": meta["label"],
+            "content": meta["content"],
+            "default_content": meta["content"],
+            "variables": meta.get("variables", []),
+        }
+    raise HTTPException(status_code=404, detail="提示词不存在")
+
+
+@router.put("/{key}")
+async def update_prompt(
+    key: str,
+    data: PromptUpdate,
+    force: bool = Query(False, description="跳过变量校验强制保存"),
+    current: User = Depends(get_current_user),
+):
+    # 修复：default_content 在 key 不存在时应回退到硬编码默认值，
+    # 原 SQL 用 COALESCE(...,'') 会导致新 key 的 default_content 为空字符串，
+    # 前端执行"重置为默认"时得到空内容
+    meta = _ALL_PROMPTS.get(key)
+
+    # BUG-FIX-PROMPT-R2（脏 key 写入）：原实现对未知 key 也照写不误。INSERT 只写
+    # (key, content, default_content, updated_at)，category/label 落库为 NULL，
+    # 于是 DB 里多出一条既不在注册表、又没有分类/标签的孤儿记录；
+    # 同时 _validate_prompt_content 因 default_vars 为空集而形同虚设。
+    # 另外路由遮蔽修复前，`PUT /prompts/budget` 会误命中本处理器并写入
+    # key='budget' 的垃圾行。改为：仅允许更新注册表中的 key。
+    if meta is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"提示词不存在: {key}（不可新增未注册提示词，请先在代码中 _reg 注册）",
+        )
+    fallback_default = meta["content"]
+
+    if not force:
+        _validate_prompt_content(key, data.content)
+
+    changed_by = getattr(current, "username", "") or ""
+
+    # PERF（2026-10-05）：归档+写入整段同步 I/O（含全局写锁）派发至工作线程，
+    # 锁争用在 worker 阻塞，不冻结事件循环
+    def _write():
+        with get_db() as conn:
+            old = _current_row(conn, key)
+            if old:
+                _archive_version(
+                    conn,
+                    key,
+                    content=old["content"],
+                    default_content=old["default_content"],
+                    label=old["label"],
+                    category=old["category"],
+                    source="edit",
+                    changed_by=changed_by,
+                )
+            # BUG-FIX-PROMPT-R3：补写 category/label。原先仅在 key 不存在时插入，
+            # 而插入的 category/label 为 NULL（见 R2）。现统一带上 meta 值，
+            # 保证 list_prompts / sync-hardcode / 监控按分类聚合都有可靠字段。
+            conn.execute(
+                """INSERT INTO prompt_templates
+                   (key, category, label, content, default_content, updated_at)
+                   VALUES (?, ?, ?, ?, ?, datetime('now', 'localtime'))
+                   ON CONFLICT(key) DO UPDATE SET
+                    content=excluded.content,
+                    category=excluded.category,
+                    label=excluded.label,
+                    updated_at=datetime('now', 'localtime')""",
+                (key, meta["category"], meta["label"], data.content, fallback_default),
+            )
+
+    await asyncio.to_thread(_write)
+    reload_prompt_cache()
+    return {"status": "ok"}
+
+
+@router.post("/{key}/reset")
+async def reset_prompt(key: str, current: User = Depends(get_current_user)):
+    """重置为默认提示词（重置前归档当前自定义内容，可回滚）"""
+    meta = _ALL_PROMPTS.get(key)
+    if not meta:
+        raise HTTPException(status_code=404, detail="提示词不存在")
+
+    default_content = meta["content"]
+    changed_by = getattr(current, "username", "") or ""
+
+    # PERF（2026-10-05）：归档+重置写操作派发至工作线程
+    def _write():
+        with get_db() as conn:
+            old = _current_row(conn, key)
+            if old:
+                _archive_version(
+                    conn,
+                    key,
+                    content=old["content"],
+                    default_content=old["default_content"],
+                    label=old["label"],
+                    category=old["category"],
+                    source="reset",
+                    changed_by=changed_by,
+                )
+            conn.execute(
+                """INSERT INTO prompt_templates (key, content, default_content, updated_at)
+               VALUES (?, ?, ?, datetime('now', 'localtime'))
+               ON CONFLICT(key) DO UPDATE SET
+                content=excluded.default_content,
+                updated_at=datetime('now', 'localtime')""",
+                (key, default_content, default_content),
+            )
+
+    await asyncio.to_thread(_write)
+    reload_prompt_cache()
+    return {"status": "ok"}
+
+
+@router.get("/{key}/versions")
+async def list_prompt_versions(key: str, limit: int = Query(50, ge=1, le=200)):
+    """列出某提示词的历史版本（按时间倒序，不含 content 正文以减小体积）。"""
+    # PERF（2026-10-05）：纯读派发至工作线程
+    def _read_versions():
+        with get_db(readonly=True) as conn:
+            return [dict(r) for r in conn.execute(
+                """SELECT id, key, label, category, source, changed_by, created_at,
+                      length(content) AS content_length
+               FROM prompt_versions WHERE key = ?
+               ORDER BY id DESC LIMIT ?""",
+                (key, limit),
+            ).fetchall()]
+
+    return await asyncio.to_thread(_read_versions)
+
+
+@router.get("/{key}/versions/{version_id}")
+async def get_prompt_version(key: str, version_id: int):
+    """查看某个历史版本的完整内容。"""
+    # PERF（2026-10-05）：纯读派发至工作线程
+    def _read_version():
+        with get_db(readonly=True) as conn:
+            row = conn.execute(
+                "SELECT * FROM prompt_versions WHERE id = ? AND key = ?",
+                (version_id, key),
+            ).fetchone()
+            return dict(row) if row else None
+
+    row = await asyncio.to_thread(_read_version)
+    if not row:
+        raise HTTPException(status_code=404, detail="版本不存在")
+    return row
+
+
+@router.post("/{key}/versions/{version_id}/rollback")
+async def rollback_prompt(
+    key: str,
+    version_id: int,
+    current: User = Depends(get_current_user),
+):
+    """回滚到指定历史版本：先把当前内容归档（source=rollback），再用历史版本覆盖。"""
+    changed_by = getattr(current, "username", "") or ""
+
+    # PERF（2026-10-05）：读版本+归档+覆盖的整段同步 I/O 派发至工作线程；
+    # 版本不存在用哨兵返回值回主协程抛 404（语义不变）
+    def _rollback():
+        with get_db() as conn:
+            target = conn.execute(
+                "SELECT * FROM prompt_versions WHERE id = ? AND key = ?",
+                (version_id, key),
+            ).fetchone()
+            if not target:
+                return None
+            target = dict(target)
+            old = _current_row(conn, key)
+            if old:
+                _archive_version(
+                    conn,
+                    key,
+                    content=old["content"],
+                    default_content=old["default_content"],
+                    label=old["label"],
+                    category=old["category"],
+                    source="rollback",
+                    changed_by=changed_by,
+                )
+            # BUG-FIX-PROMPT-R6（回滚清空 default_content）：ON CONFLICT 分支
+            # 不更新 default_content（正确），但**首次插入**分支会写入
+            # `target["default_content"] or ""`。历史版本若归档时 default_content
+            # 本就为空（早期 PUT 未回退硬编码默认值所致，见 db.seed 说明），
+            # 回滚后 prompt_templates.default_content 就变成空串，前端
+            # 「重置为默认」将把提示词清空 —— 回滚反而制造了数据损坏。
+            # 修复：空值回退到注册表硬编码默认值，绝不写入空 default_content。
+            meta = _ALL_PROMPTS.get(key)
+            fallback_default = meta["content"] if meta else ""
+            restored_default = target.get("default_content") or fallback_default
+            conn.execute(
+                """INSERT INTO prompt_templates (key, category, label, content, default_content, updated_at)
+               VALUES (?, ?, ?, ?, ?, datetime('now', 'localtime'))
+               ON CONFLICT(key) DO UPDATE SET
+                content=excluded.content,
+                category=excluded.category,
+                label=excluded.label,
+                updated_at=datetime('now', 'localtime')""",
+                (
+                    key,
+                    target["category"] or (meta["category"] if meta else ""),
+                    target["label"] or (meta["label"] if meta else ""),
+                    target["content"],
+                    restored_default,
+                ),
+            )
+            return target
+
+    if await asyncio.to_thread(_rollback) is None:
+        raise HTTPException(status_code=404, detail="版本不存在")
+    reload_prompt_cache()
+    return {"status": "ok", "restored_from": version_id}

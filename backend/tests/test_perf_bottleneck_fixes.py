@@ -481,8 +481,15 @@ class TestTitleDedupVerificationLoop:
         assert "_next_unique_title" in source, (
             "_auto_fix_issues 应调用 _next_unique_title 生成递增后缀"
         )
-        assert "_CN_NUMS" in source, (
-            "_auto_fix_issues 应有中文数字列表 _CN_NUMS"
+        # 2026-10-11：代码已改为统一走 outline_common._disambiguate_title
+        # （专业维度词 → 父级差异词 → 中文序数「之N」），不再使用
+        # _CN_NUMS 常量（原中文数字列表已删除）。此处改为检查当前实现使用的
+        # 事实来源，确保消歧链不回退到「（其N）/（二）」式冗余后缀。
+        assert "_disambiguate_title" in source, (
+            "_auto_fix_issues 应调用 _disambiguate_title（统一消歧入口）"
+        )
+        assert "_cn_ordinal" in source or "之" in source, (
+            "_auto_fix_issues 的兜底应为「之N」式中文序数，而非「（二）」式冗余后缀"
         )
 
     def test_auto_fix_handles_three_duplicates(self):

@@ -336,15 +336,21 @@ class TestSaveOutlineNormalization:
 
 
 class TestOutlineSaveCrossParentDedupe:
-    """BUG-FIX 目录生成：normalize 只做同父去重，落库前需再跑一次全树去重，
-    否则两个不同章节下各一份完全同名的子标题会被同时入库，导出出现重复条目。"""
+    """BUG-FIX 目录生成：落库前去重的作用域。
+
+    2026-10-11 修正：作用域由「全树」收窄为「同级」。
+    旧实现为消除**不同章节下合法的同名子标题**而把它们整段删掉，导致落库后
+    正文章节直接缺失；同时生成阶段又为这类「重复」追加「（其N）」式后缀，
+    形成目录污染。现在：跨父同名全部保留，只有同一父节点下的真·重复才被剔除。
+    """
 
     @staticmethod
     def _save(pid: int, outline: list) -> list:
         from app.routers.sse.sse_db_ops import _clear_and_save_outline
+
         return _clear_and_save_outline(pid, outline)
 
-    def test_cross_parent_duplicate_titles_deduped(self):
+    def test_cross_parent_duplicate_titles_preserved(self):
         pid = _seed_project("跨父去重")
         outline = [
             {
@@ -361,28 +367,44 @@ class TestOutlineSaveCrossParentDedupe:
         ]
         saved = self._save(pid, outline)
         assert [n["title"] for n in saved] == ["施工部署", "安全管理"]
-        # 第二个「质量控制」（不同父节点）应被全树去重剔除
+        # 第二个「质量控制」（不同父节点）是标书合法形态，必须保留
         assert [n["title"] for n in saved[0]["children"]] == ["质量控制"]
-        assert [n["title"] for n in saved[1]["children"]] == ["进度管理"]
+        assert [n["title"] for n in saved[1]["children"]] == ["质量控制", "进度管理"]
+
+    def test_same_parent_duplicate_titles_still_deduped(self):
+        pid = _seed_project("同级去重")
+        outline = [
+            {
+                "title": "第一章 施工部署",
+                "children": [
+                    {"title": "质量控制", "children": []},
+                    {"title": "质量控制", "children": []},
+                ],
+            },
+        ]
+        saved = self._save(pid, outline)
+        assert [n["title"] for n in saved[0]["children"]] == ["质量控制"]
 
 
 class TestDedupeOutlineTitles:
-    """直接验证 _dedupe_outline_titles 的跨父去重语义（不依赖落库）。"""
+    """直接验证 _dedupe_outline_titles 的同级去重语义（不依赖落库）。"""
 
-    def test_cross_parent_dedupe(self):
+    def test_cross_parent_duplicates_preserved(self):
         from app.services.ai.workflows_outline_utils import _dedupe_outline_titles
+
         tree = [
             {"title": "A", "children": [{"title": "X", "children": []}]},
             {"title": "B", "children": [{"title": "X", "children": []}]},
         ]
         result = _dedupe_outline_titles(tree)
         assert [n["title"] for n in result] == ["A", "B"]
-        # 第二个 X（不同父）被剔除
+        # 跨父同名的 X 全部保留（不同章节下的合法重复，不能删内容）
         assert [c["title"] for c in result[0]["children"]] == ["X"]
-        assert result[1]["children"] == []
+        assert [c["title"] for c in result[1]["children"]] == ["X"]
 
-    def test_within_parent_dedupe_keeps_first(self):
+    def test_same_parent_duplicate_removed(self):
         from app.services.ai.workflows_outline_utils import _dedupe_outline_titles
+
         tree = [
             {
                 "title": "A",
@@ -394,6 +416,22 @@ class TestDedupeOutlineTitles:
         ]
         result = _dedupe_outline_titles(tree)
         assert [c["title"] for c in result[0]["children"]] == ["X"]
+
+    def test_same_parent_duplicate_with_legacy_suffix_removed(self):
+        """「X」与「X（其2）」归一化后同名 —— 同级下应视为重复。"""
+        from app.services.ai.workflows_outline_utils import _dedupe_outline_titles
+
+        tree = [
+            {
+                "title": "A",
+                "children": [
+                    {"title": "砌体成品保护", "children": []},
+                    {"title": "砌体成品保护（其2）", "children": []},
+                ],
+            },
+        ]
+        result = _dedupe_outline_titles(tree)
+        assert [c["title"] for c in result[0]["children"]] == ["砌体成品保护"]
 
 
 class TestV51ResumePersistence:

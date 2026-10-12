@@ -312,6 +312,127 @@ def _render_timeline_image_v2(data: dict, scale: float = 2.5) -> BytesIO | None:
     )
     return result_stream
 
+@_render_hq
+def _render_milestone_flowchart_image_v2(data: dict, scale: float = 2.5) -> BytesIO | None:
+    """垂直里程碑流程图渲染器（样式参考：浅紫色圆角矩形 + 黑色向下箭头）。
+
+    适用于把含日期节点的里程碑序列渲染为与参考图一致的流程图样式：
+      - 节点为等宽圆角矩形，填充浅紫/薰衣草色；
+      - 节点内分两行居中显示「名称」「日期」；
+      - 节点间用带三角箭头的竖直连线连接；
+      - 画布白色、无水平时间轴、无菱形标记。
+
+    Args:
+        data: TimelinePlan JSON（type/title/milestones）
+        scale: 超采样缩放比例（默认 2.5）
+    """
+    if not isinstance(data, dict):
+        return None
+    milestones = data.get("milestones") or data.get("events") or data.get("points") or []
+    if not isinstance(milestones, list) or not milestones:
+        return None
+
+    norm: list[dict] = []
+    for i, m in enumerate(milestones):
+        if not isinstance(m, dict):
+            continue
+        name = str(m.get("name") or m.get("title") or m.get("label") or f"里程碑{i+1}").strip()
+        if not name:
+            continue
+        date = str(m.get("date") or m.get("time") or m.get("day") or "").strip()
+        norm.append({"name": name, "date": date})
+    if not norm:
+        return None
+    n = len(norm)
+
+    logger.info(
+        "[PIL v2渲染] 垂直里程碑流程图渲染启动: 里程碑=%d scale=%.1f",
+        n,
+        scale,
+    )
+
+    # 样式常量：参考图「浅紫圆角矩形 + 黑色文字 + 黑色向下箭头」
+    node_w = int(220 * scale)
+    node_h = int(80 * scale)
+    h_margin = int(80 * scale)
+    title_h = int(60 * scale)
+    v_padding = int(40 * scale)
+    v_gap = int(50 * scale)  # 节点间留白，含箭头
+
+    total_w = h_margin * 2 + node_w
+    total_h = title_h + v_padding + n * node_h + (n - 1) * v_gap + v_padding
+
+    img = Image.new("RGB", (total_w, total_h), "white")
+    draw = ImageDraw.Draw(img)
+    font_title = _image_font(int(18 * scale), bold=True)
+    font_name = _image_font(int(15 * scale), bold=True)
+    font_date = _image_font(int(12 * scale))
+
+    title = str(data.get("title") or "项目关键里程碑节点")
+    if title:
+        tw = _text_width(draw, title, font_title)
+        draw.text(((total_w - tw) / 2, int(20 * scale)), title, fill="#1F2937", font=font_title)
+
+    cx = total_w / 2
+    fill_c = "#EDEBFA"      # 浅紫填充
+    border_c = "#C3C1E6"    # 浅紫边框
+    text_c = "#1F2937"      # 接近黑色的深灰文字
+    arrow_c = "#4B5563"     # 箭头
+    radius = int(8 * scale)
+    arrowhead = int(6 * scale)
+
+    for i, m in enumerate(norm):
+        y = title_h + v_padding + i * (node_h + v_gap)
+        x0 = cx - node_w / 2
+        x1 = cx + node_w / 2
+        y1 = y + node_h
+
+        # 圆角矩形节点
+        draw.rounded_rectangle(
+            [x0, y, x1, y1],
+            radius=radius,
+            fill=fill_c,
+            outline=border_c,
+            width=int(2 * scale),
+        )
+
+        # 名称（上半区居中）
+        _draw_text_center(
+            draw,
+            (x0, y, x1, y + node_h / 2 + int(2 * scale)),
+            m["name"],
+            font_name,
+            text_c,
+            max_lines=1,
+        )
+        # 日期（下半区居中）
+        if m["date"]:
+            _draw_text_center(
+                draw,
+                (x0, y + node_h / 2 - int(2 * scale), x1, y1),
+                m["date"],
+                font_date,
+                text_c,
+                max_lines=1,
+            )
+
+        # 向下箭头（到下一个节点）
+        if i < n - 1:
+            y_top = y1
+            y_bottom = y1 + v_gap
+            draw.line([(cx, y_top), (cx, y_bottom)], fill=arrow_c, width=int(2 * scale))
+            draw.polygon(
+                [
+                    (cx, y_bottom),
+                    (cx - arrowhead, y_bottom - arrowhead * 1.5),
+                    (cx + arrowhead, y_bottom - arrowhead * 1.5),
+                ],
+                fill=arrow_c,
+            )
+
+    return _image_to_stream(img)
+
+
 def _repair_timeline_data(data: dict) -> dict | None:
     """修复时间轴数据：补齐缺失字段，确保渲染器能处理
 

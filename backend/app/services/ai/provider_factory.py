@@ -176,6 +176,25 @@ def mask_key_for_audit(key: str) -> str:
     return f"(tail:{plain[-4:]})"
 
 
+# HARDENING 2026-10-11（遗留·审计日志无 retention）：配置审计表 ai_config_audit
+# 会长期累积。新增按天清理函数：删除 retention_days 天之前的记录（默认 90）。
+# 返回删除的行数；任何异常都不阻断主流程（与 record_config_audit 同容错口径）。
+def cleanup_old_config_audit(retention_days: int = 90) -> int:
+    try:
+        retention_days = max(1, int(retention_days))
+        with get_db() as conn:
+            cur = conn.execute(
+                "DELETE FROM ai_config_audit"
+                " WHERE created_at < datetime('now', 'localtime', ?)",
+                (f"-{retention_days} days",),
+            )
+            conn.commit()
+            return cur.rowcount or 0
+    except Exception as e:
+        logger.warning("清理 ai_config_audit 失败（不阻断主流程）: %s", e)
+        return 0
+
+
 # ──────────────────────────────────────────────────────────────────────
 # 内置兜底提供商（永不消失的最后防线）
 # D-1（2026-10-06）：清单收敛到 provider_catalog 单一正本，此处保留同名别名

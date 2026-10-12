@@ -7,6 +7,10 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
+# 阈值统一从 test_diversity.THRESHOLDS 引用，避免与本文件出现口径漂移。
+# 参见 test_diversity.py 顶部 THRESHOLDS 的注释说明。
+from test_diversity import THRESHOLDS
+
 
 def _make_chapters():
     """构造 28 章的真实 Mock 数据，模拟技术评分大类。"""
@@ -140,8 +144,11 @@ def test_end_to_end_diversity():
     for t, c in list(l3_dup.items())[:5]:
         print(f"    '{t}' 出现 {c} 次")
 
-    assert l2_rate >= 60, f"L2 唯一率 {l2_rate:.1f}% 低于 60% 阈值"
-    assert l3_rate >= 25, f"L3 唯一率 {l3_rate:.1f}% 低于 25% 阈值"
+    # 阈值统一从 THRESHOLDS 引用，避免与本文件出现口径漂移
+    l2_threshold = THRESHOLDS["L2_UNIQUENESS_E2E"] * 100
+    l3_threshold = THRESHOLDS["L3_UNIQUENESS_E2E"] * 100
+    assert l2_rate >= l2_threshold, f"L2 唯一率 {l2_rate:.1f}% 低于 {l2_threshold:.0f}% 阈值"
+    assert l3_rate >= l3_threshold, f"L3 唯一率 {l3_rate:.1f}% 低于 {l3_threshold:.0f}% 阈值"
     print(f"\n  ✓ 多样性达标！")
 
 

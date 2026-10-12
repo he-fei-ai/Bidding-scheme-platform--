@@ -269,5 +269,5 @@ class TestModuleLevelAPI:
         code = "A[开工] --> B[竣工]"
         result = sanitize_mermaid_code(code)
         expected = SANITIZER.sanitize(code)
-        assert result == expected
-
+        assert result == expected
+

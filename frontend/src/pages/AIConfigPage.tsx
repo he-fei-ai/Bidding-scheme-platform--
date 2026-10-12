@@ -18,9 +18,9 @@ import {
   SaveOutlined, ApiOutlined, ReloadOutlined, CheckCircleOutlined,
   CloseCircleOutlined, ThunderboltOutlined, InfoCircleOutlined,
   PictureOutlined, SettingOutlined, BulbOutlined, FileImageOutlined,
-  DashboardOutlined, BarChartOutlined,
+  DashboardOutlined, BarChartOutlined, FileSearchOutlined,
   ImportOutlined, ExportOutlined, PlusOutlined, DeleteOutlined,
-  EditOutlined, RocketOutlined,
+  EditOutlined, RocketOutlined, KeyOutlined,
 } from "@ant-design/icons";
 import {
   getImageModelConfig, saveImageModelConfig, testImageConnection, getImageModelProviders, fetchKnownProviders,
@@ -28,6 +28,8 @@ import {
   fetchAIProfiles, getAIDefaultProfile, createAIPProfile, updateAIPProfile,
   deleteAIPProfile, setAIDefaultProfile, applyAIPProfile,
   exportAIPProfiles, importAIPProfiles,
+  // HARDENING 2026-10-11（G-5/G-6 前端集成）
+  clearAiConfigApiKey, getConfigAudit,
   // Usage & Health
   getUsageDashboard, getHealthDashboard, getUsageTrend, truncateUsageStats,
 } from "../api";
@@ -669,6 +671,55 @@ export default function AIConfigPage() {
     });
   };
 
+  // ── HARDENING 2026-10-11（G-5/G-6 前端集成）──────────────
+  // G-6：显式清空主 AI 配置的已保存 API Key（后端 2026-10-11 新增端点）
+  const [clearingKey, setClearingKey] = useState(false);
+  const handleClearApiKey = () => {
+    Modal.confirm({
+      title: "清空已保存的 API Key？",
+      content: "将删除主 AI 配置中已保存的密钥，之后 AI 调用需重新填写。",
+      okButtonProps: { danger: true },
+      okText: "清空",
+      onOk: async () => {
+        try {
+          setClearingKey(true);
+          await clearAiConfigApiKey();
+          message.success("已清空主配置 API Key");
+          loadProfiles();
+        } catch (err: any) {
+          message.error(extractApiError(err));
+        } finally {
+          setClearingKey(false);
+        }
+      },
+    });
+  };
+
+  // G-5：配置变更审计日志（支持 action/target 过滤）
+  const [auditData, setAuditData] = useState<Array<{
+    actor: string; action: string; target: string; detail: string; created_at: string;
+  }>>([]);
+  const [auditAction, setAuditAction] = useState<string | undefined>(undefined);
+  const [auditLoading, setAuditLoading] = useState(false);
+  const loadAudit = useCallback(async () => {
+    try {
+      setAuditLoading(true);
+      const rows = await getConfigAudit({ limit: 50, action: auditAction });
+      setAuditData(rows || []);
+    } catch (err: any) {
+      message.error(extractApiError(err));
+    } finally {
+      setAuditLoading(false);
+    }
+  }, [auditAction]);
+
+  // HARDENING 2026-10-11（G-5）：切到「配置审计」Tab 时自动加载最新审计记录
+  useEffect(() => {
+    if (activeTab === "audit") {
+      loadAudit();
+    }
+  }, [activeTab, loadAudit]);
+
   const tabs = [
     {
       key: "profiles",
@@ -730,16 +781,77 @@ export default function AIConfigPage() {
         </div>
       ),
     },
+    {
+      key: "audit",
+      label: <span><FileSearchOutlined /> 配置审计</span>,
+      children: (
+        <div>
+          <div style={{ display: "flex", gap: 8, marginBottom: 16 }}>
+            <Select
+              allowClear
+              placeholder="按动作过滤（如 clear_api_key）"
+              style={{ minWidth: 220 }}
+              value={auditAction}
+              onChange={(v) => setAuditAction(v || undefined)}
+              options={[
+                { value: "clear_api_key", label: "clear_api_key" },
+                { value: "save_config", label: "save_config" },
+                { value: "apply_profile", label: "apply_profile" },
+                { value: "create_profile", label: "create_profile" },
+                { value: "update_profile", label: "update_profile" },
+                { value: "delete_profile", label: "delete_profile" },
+              ]}
+            />
+            <Button icon={<ReloadOutlined />} onClick={loadAudit}>查询</Button>
+          </div>
+          <Spin spinning={auditLoading}>
+            <List
+              bordered
+              dataSource={auditData}
+              locale={{ emptyText: "暂无配置审计记录" }}
+              renderItem={(item) => (
+                <List.Item>
+                  <List.Item.Meta
+                    title={
+                      <Space>
+                        <Tag color="blue">{item.action}</Tag>
+                        <Tag>{item.target || "-"}</Tag>
+                        <span style={{ fontSize: 12, color: "#999" }}>{item.created_at}</span>
+                      </Space>
+                    }
+                    description={`操作人: ${item.actor} — ${item.detail || "-"}`}
+                  />
+                </List.Item>
+              )}
+            />
+          </Spin>
+        </div>
+      ),
+    },
   ];
 
   return (
     <div style={{ maxWidth: 1100, margin: "0 auto" }}>
-      <Typography.Title level={4} style={{ marginBottom: 8 }}>
-        <SettingOutlined /> AI 模型配置中心
-      </Typography.Title>
-      <Typography.Paragraph type="secondary" style={{ marginBottom: 24 }}>
-        管理 AI 模型配置、Profile 预设、用量统计和 Provider 健康度
-      </Typography.Paragraph>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+        <div>
+          <Typography.Title level={4} style={{ marginBottom: 8 }}>
+            <SettingOutlined /> AI 模型配置中心
+          </Typography.Title>
+          <Typography.Paragraph type="secondary" style={{ marginBottom: 24 }}>
+            管理 AI 模型配置、Profile 预设、用量统计和 Provider 健康度
+          </Typography.Paragraph>
+        </div>
+        <Space style={{ marginTop: 4 }}>
+          <Button
+            danger
+            icon={<KeyOutlined />}
+            loading={clearingKey}
+            onClick={handleClearApiKey}
+          >
+            清空主密钥
+          </Button>
+        </Space>
+      </div>
 
       <Tabs activeKey={activeTab} onChange={setActiveTab} destroyOnHidden items={tabs} />
     </div>

@@ -6,6 +6,7 @@ import json
 import time
 from fastapi import HTTPException
 from starlette.responses import StreamingResponse
+from ...config import OUTLINE_AUTO_CONFIRM
 from ...services.ai.workflows import generate_outline as _run_outline_workflow
 from ...services import task_lock as _task_lock
 from ...services import task_snapshot
@@ -28,7 +29,7 @@ from ...services.v51_state import (
 from ..task_control import _cancel_events_lock, _cancel_tasks
 
 from .sse_db_ops import _extract_project_context_with_retry, _save_and_finalize_outline
-from .sse_shared import SSE_TOTAL_TIMEOUT_DEFAULT, _NotifyQueue, logger
+from .sse_shared import SSE_TERMINAL_STATUSES, SSE_TOTAL_TIMEOUT_DEFAULT, _NotifyQueue, logger
 from .sse_utils import _try_get_provider, _try_get_provider_with_retry
 
 # ---------------------------------------------------------------------------
@@ -1017,7 +1018,7 @@ async def generate_outline_sse_impl(
 
                     outline_queue=outline_queue,
 
-                    auto_confirm=True,
+                    auto_confirm=OUTLINE_AUTO_CONFIRM,
 
                     outline_mode=outline_mode,
 
@@ -1036,6 +1037,41 @@ async def generate_outline_sse_impl(
                     return
 
 
+
+                # ENHANCE 2026-10-11（引入项 #16）：目录成稿后的知识库「两轮补漏」预览。
+                # 门禁 KNOWLEDGE_REFILL_TWO_ROUND 默认 false → 整段跳过，主流程零变更。
+                # 按产品决策**仅下发预览、不写 knowledge_items 表**，由用户在前端决定是否采纳，
+                # 避免自动污染长期知识库；任何异常都不得影响目录生成收尾。
+                try:
+                    from ...config import KNOWLEDGE_REFILL_TWO_ROUND
+                except Exception:  # pragma: no cover - 配置读取兜底
+                    KNOWLEDGE_REFILL_TWO_ROUND = False
+                if KNOWLEDGE_REFILL_TWO_ROUND and tender_context:
+                    try:
+                        from ...services import knowledge as _knowledge_svc
+                        from ...services.ai.knowledge_refill import build_refill_preview
+
+                        _existing_rows = await asyncio.to_thread(
+                            functools.partial(_knowledge_svc.search_items, limit=200)
+                        )
+                        _refill_preview = await build_refill_preview(
+                            provider, outline, _existing_rows.get("items", []), tender_context
+                        )
+                        await _qput(
+                            {
+                                "status": "knowledge_refill",
+                                "success": bool(_refill_preview.get("success")),
+                                "count": int(_refill_preview.get("count", 0)),
+                                "items": _refill_preview.get("items", []),
+                                "message": (
+                                    f"知识库两轮补漏：新发现 {_refill_preview.get('count', 0)} 条可补充要点（仅预览，未入库）"
+                                    if _refill_preview.get("success")
+                                    else f"知识库补漏未完成：{_refill_preview.get('error') or '未知原因'}"
+                                ),
+                            }
+                        )
+                    except Exception as _refill_e:
+                        logger.warning("[目录生成] 知识库两轮补漏预览失败（忽略）: %s", _refill_e)
 
                 if not await _save_and_finalize_outline(project_id, outline, outline_queue, emit=_qput):
 
@@ -1127,7 +1163,7 @@ async def generate_outline_sse_impl(
 
                                 outline_queue=outline_queue,
 
-                                auto_confirm=True,
+                                auto_confirm=OUTLINE_AUTO_CONFIRM,
 
                                 # BUG-FIX 2026-10-04：兜底重跑与此前主流程保持同一
                                 # outline_mode（直出/分步判别口径一致），否则降级
@@ -1421,7 +1457,21 @@ async def generate_outline_sse_impl(
 
                                 break
 
-                            if event.get("status") in ("completed", "error", "stopped"):
+                            if event.get("status") in SSE_TERMINAL_STATUSES:
+
+                                # BUG-FIX 2026-10-09（前后端协议不一致）：原终态集合为
+                                # ("completed", "error", "stopped")，**不含 "cancelled"**。
+                                # 但前端 OutlineEditorPage.tsx:299 明确处理了
+                                # `data.status === "cancelled"`（置 finishedNormally、
+                                # completeTask("cancelled")、收起进度条）。
+                                # 于是双向失配：
+                                #   · 若上游真的推来 cancelled，事件循环不会 break，
+                                #     前端已经自认为结束，而服务端继续 while 等待，
+                                #     连接一直挂着到 1800s 总超时才释放；
+                                #   · 服务端从不主动发 cancelled，「取消」只能靠 error/stopped
+                                #     近似表达，前端的 cancelled 分支是纯死代码。
+                                # 现把 cancelled 纳入终态集合，并统一定义在模块顶部，
+                                # 与正文流（sse_content.py）的终态保持同一份语义。
 
                                 break
 

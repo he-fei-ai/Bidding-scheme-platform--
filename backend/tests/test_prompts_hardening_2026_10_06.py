@@ -27,7 +27,8 @@ def test_truncate_to_tokens_noop_under_cap():
 
 def test_truncate_to_tokens_truncates_over_cap():
     text = "甲乙丙丁戊己庚辛壬癸" * 50  # 500 字
-    out = truncate_to_tokens(text, 10)
+    # C10 修复：预算须大于截断标记自身开销（~11 token），否则标记被降级省略
+    out = truncate_to_tokens(text, 50)
     assert len(out) < len(text)
     assert "Token 预算已截断" in out
 

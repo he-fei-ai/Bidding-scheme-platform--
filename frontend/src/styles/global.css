@@ -372,6 +372,14 @@ body {
   gap: 14px;
   font-size: 12.5px;
 }
+.app-header__tasks {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 0;
+  overflow: hidden;
+}
 
 /* 健康指示 */
 .health-indicator {

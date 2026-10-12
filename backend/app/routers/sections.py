@@ -37,7 +37,7 @@ from ..security.auth import get_current_user
 from ..services.generation_manager import generation_manager
 from ..services.task_lock import TASK_LABELS, get_active_lock, is_lock_live
 from ..services.sections import build_tree, clear_project_sections, create_section, delete_section_tree, get_section, get_section_word_budget, list_sections, move_section, reorder_sections, update_section
-from ..services.v51_state import cancel_v51_task, clear_v51_state_from_db, get_v51_confirm_version, get_v51_state, load_v51_state_from_db, resume_v51_task
+from ..services.v51_state import cancel_v51_task, clear_v51_state_from_db, get_v51_confirm_version, get_v51_last_reject_reason, get_v51_state, load_v51_state_from_db, resume_v51_task
 from .rate_limiter import limit_per_endpoint
 from .sse_handlers import expand_content_impl, generate_content_impl, generate_outline_sse_impl
 from .task_control import pause_generation, stop_generation
@@ -634,6 +634,32 @@ async def v51_confirm_route(project_id: int, data: dict, current_user: Annotated
     expected_version = get_v51_confirm_version(project_id)
     success = resume_v51_task(project_id, edited_outline, expected_version=expected_version)
     if not success:
+        # BUG-FIX 2026-10-11（O-7）：按拒绝原因区分 HTTP 状态码，
+        # 让用户/前端能给出可操作提示，而不是笼统返回"冲突"。
+        #   · version_conflict → 409 Conflict（乐观锁冲突，刷新重试）
+        #   · depth_mismatch   → 400 Bad Request（当前 phase 不匹配 outline 深度）
+        #   · invalid_outline  → 400 Bad Request（outline 格式非法）
+        #   · 其他 / 无原因     → 409（兜底，保持旧行为兼容）
+        reason = get_v51_last_reject_reason(project_id)
+        current_phase = state.current_phase if state else 'unknown'
+        if reason == 'depth_mismatch':
+            # 计算 outline 实际深度以在 detail 里给出可操作提示
+            from ..services.v51_state import _outline_max_depth as _od, _V51_PHASE_ALLOWED_DEPTH as _rngs
+            _rng = _rngs.get(current_phase)
+            rng_text = f"[{_rng[0]},{_rng[1]}]" if _rng else "未定义"
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f'提交的目录深度（{_od(edited_outline)}）不符合当前审核阶段 {current_phase} '
+                    f'允许的范围 {rng_text}。请在当前阶段只提交该层级目录，'
+                    f'后续层级将由系统自动生成。'
+                ),
+            )
+        if reason == 'invalid_outline':
+            raise HTTPException(
+                status_code=400,
+                detail='edited_outline 必须是列表（[{...}, ...]），而非其他类型',
+            )
         raise HTTPException(status_code=409, detail='V5.1 确认冲突：其他标签页或操作已提交了修改，请刷新页面后重试')
     if state.current_phase == 'level1':
         next_phase = 'level2'

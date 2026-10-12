@@ -18,6 +18,63 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
+# BUG-FIX 2026-10-11（O-7）：V5.1 分阶段审核窗口的 max_depth 白名单。
+# `resume_v51_task` 此前无条件接受 `edited_outline`，一旦用户在 L1 审核窗口
+# 提交了 L3 完整树（例如从浏览器工具改 payload，或前端刷新后缓存了旧 outline），
+# 工作流后续 `_generate_level2_v51` → `_build_level2_skeleton`
+# （`workflows_outline_v51.py:2107`）会**按 L1 标题完全重建 L2+L3 骨架**，
+# 用户精心编辑的 children 被静默丢弃，且没有任何错误提示。
+#
+# 该表定义每个 phase 下允许的 outline 最大深度区间 `[min, max]`：
+#   - level1：等用户在"章"级别审核，允许空 tree（仅返回 outline 原样）或
+#     depth<=1 的一级目录。depth>=2 视为「跳审核」——拒绝，用户如需跳过
+#     应显式调 auto_confirm 或直接提交 L3 完整树并切到对应 phase。
+#   - level2：等用户在"章+节"级别审核，允许 depth<=2。
+#   - level3：等用户在"章+节+条"级别审核，允许 depth<=3。
+#   - final：最终审核（L3 已生成完毕），允许完整树（无上限，走 >= max 兜底）。
+# 未知 phase 走宽松兜底（>= 任意深度都放行），避免误伤历史持久化状态。
+_V51_PHASE_ALLOWED_DEPTH: dict[str, tuple[int, int]] = {
+    "level1": (1, 1),
+    "level2": (1, 2),
+    "level3": (1, 3),
+    "final": (0, 10**9),  # 无上限（含空 tree）
+}
+_V51_DEPTH_UNLIMITED = 10**9
+
+
+def _outline_max_depth(outline: Any) -> int:
+    """计算 outline 树的最大深度（空/非 list → 0）。
+
+    - `[{"title": "x"}]` → 1
+    - `[{"title": "x", "children": [{"title": "y"}]}]` → 2
+    - `[{"title": "x", "children": [{"title": "y", "children": []}]}]` → 2
+      （空 children 不计入深度）
+    """
+    if not isinstance(outline, list):
+        return 0
+    max_d = 0
+    for node in outline:
+        if not isinstance(node, dict):
+            continue
+        sub = node.get("children")
+        # 空 children / None 视为叶子；只有子节点列表非空时才递归
+        if isinstance(sub, list) and sub:
+            child_depth = _outline_max_depth(sub)
+        else:
+            child_depth = 0
+        max_d = max(max_d, 1 + child_depth)
+    return max_d
+
+
+def _phase_allows_depth(phase: str, depth: int) -> bool:
+    """判断 phase 下 depth 是否被允许。未知 phase 兜底放行。"""
+    rng = _V51_PHASE_ALLOWED_DEPTH.get(phase)
+    if rng is None:
+        return True
+    lo, hi = rng
+    return lo <= depth <= hi
+
+
 class V51TaskState:
     """单个项目的 V5.1 生成任务状态
 
@@ -55,6 +112,11 @@ class V51TaskState:
         self.active_run: bool = False
         # BUG-O-02 修复：乐观锁版本号，每次 resume_v51_task 时递增
         self._confirm_version: int = 0
+        # BUG-FIX 2026-10-11（O-7）：最近一次 resume_v51_task 被拒的原因，
+        # 供路由层区分「乐观锁冲突（409）」和「层级不匹配（400）」。
+        # 值域：None（未拒或最新一次成功）| "version_conflict" | "depth_mismatch"
+        #      | "invalid_outline" | "no_state"
+        self._last_reject_reason: str | None = None
 
 
 # 全局 V5.1 任务状态字典（project_id -> V51TaskState）
@@ -89,6 +151,42 @@ def get_v51_confirm_version(project_id: int) -> int | None:
     return state._confirm_version
 
 
+def get_v51_last_reject_reason(project_id: int) -> str | None:
+    """获取最近一次 resume_v51_task 被拒的原因。
+
+    BUG-FIX 2026-10-11（O-7）：供 v51_confirm_route 区分不同拒绝原因，
+    以返回精准的 HTTP 状态码：
+      - "version_conflict" → 409 Conflict（并发冲突）
+      - "depth_mismatch"   → 400 Bad Request（提交的 outline 深度不符合当前 phase）
+      - "invalid_outline"  → 400 Bad Request（outline 格式非法）
+      - "no_state"         → 404 Not Found
+      - None               → 未拒，或最新一次 resume 成功
+
+    Returns:
+        str | None: 拒绝原因码，状态不存在时返回 "no_state"，未拒/成功时返回 None
+    """
+    with _v51_states_lock:
+        state = _v51_states.get(project_id)
+    if state is None:
+        return "no_state"
+    return state._last_reject_reason
+
+
+def get_v51_phase(project_id: int) -> str | None:
+    """获取项目 V5.1 当前 phase（level1/level2/level3/final）。
+
+    BUG-FIX 2026-10-11（O-7）：供路由层向客户端透出「实际允许的 outline 深度」，
+    便于用户端在返回 400 时展示"当前处于 L1 审核窗口，请只提交章级目录"之类的
+    可操作提示。
+
+    Returns:
+        str | None: 当前 phase；状态不存在时返回 None
+    """
+    with _v51_states_lock:
+        state = _v51_states.get(project_id)
+    return state.current_phase if state else None
+
+
 def create_v51_state(project_id: int) -> V51TaskState:
     """创建项目 V5.1 状态"""
     state = V51TaskState(project_id)
@@ -114,13 +212,22 @@ def resume_v51_task(
     - 传入 expected_version 时，检查当前 version 是否匹配
     - 不匹配说明有其他并发操作已修改了状态，返回 False
 
+    BUG-FIX 2026-10-11（O-7）：新增层级深度校验
+    - `state.current_phase` 决定本阶段允许收到的 outline 最大深度（见
+      `_V51_PHASE_ALLOWED_DEPTH`）。若提交 outline 的深度超出允许区间，
+      拒绝写入 `state.edited_outline`（避免下游 `_build_level2_skeleton`
+      静默丢弃用户目录），返回 False 并设置 `_last_reject_reason`。
+    - 校验通过/跳过时清空 `_last_reject_reason`，让下一次 resume 的
+      返回值不受上次残留影响。
+
     Args:
         project_id: 项目 ID
         edited_outline: 用户审核编辑后的目录树（可选）
         expected_version: 期望的版本号（乐观锁检查），为 None 时不检查
 
     Returns:
-        bool: 是否成功恢复；若版本冲突则返回 False
+        bool: 是否成功恢复；版本冲突、层级不匹配、outline 格式非法或状态不存在
+              均返回 False，调用方通过 get_v51_last_reject_reason 区分原因。
     """
     with _v51_states_lock:
         state = _v51_states.get(project_id)
@@ -137,13 +244,41 @@ def resume_v51_task(
                 expected_version,
                 state._confirm_version,
             )
+            state._last_reject_reason = "version_conflict"
             return False
 
+        # BUG-FIX 2026-10-11（O-7）：层级深度校验
         if edited_outline is not None:
+            if not isinstance(edited_outline, list):
+                logger.warning(
+                    "V5.1 恢复拒绝：edited_outline 不是 list（type=%s），"
+                    "phase=%s, project=%d",
+                    type(edited_outline).__name__,
+                    state.current_phase,
+                    project_id,
+                )
+                state._last_reject_reason = "invalid_outline"
+                return False
+            actual_depth = _outline_max_depth(edited_outline)
+            if not _phase_allows_depth(state.current_phase, actual_depth):
+                rng = _V51_PHASE_ALLOWED_DEPTH[state.current_phase]
+                logger.warning(
+                    "V5.1 恢复拒绝：outline 深度=%d 超出 phase=%s 允许范围 [%d,%d] - "
+                    "项目 %d。为避免下游重建骨架静默丢弃用户目录，已拒绝写入。",
+                    actual_depth,
+                    state.current_phase,
+                    rng[0],
+                    rng[1],
+                    project_id,
+                )
+                state._last_reject_reason = "depth_mismatch"
+                return False
+
             state.edited_outline = edited_outline
 
         # 每次确认递增版本号
         state._confirm_version += 1
+        state._last_reject_reason = None  # 本次成功，清空残留
 
         logger.info(
             "V5.1 任务恢复: project=%d, phase=%s, version=%d",

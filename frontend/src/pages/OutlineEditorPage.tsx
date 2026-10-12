@@ -5,7 +5,7 @@ import {
   Spin, Alert, Modal, Popconfirm, Dropdown, Progress, Segmented, Tooltip,
 } from "antd";
 import {
-  ArrowLeftOutlined, ThunderboltOutlined, EditOutlined, DeleteOutlined,
+  ArrowLeftOutlined, ArrowRightOutlined, ThunderboltOutlined, EditOutlined, DeleteOutlined,
   PlusOutlined, ReloadOutlined, CloseCircleOutlined, CheckCircleOutlined, LoadingOutlined, MenuOutlined, UpOutlined,
   DownOutlined, DragOutlined, AuditOutlined, RobotOutlined, FolderOutlined,
   RightOutlined,
@@ -19,7 +19,7 @@ import {
   type OutlineMode, getStoredOutlineMode, storeOutlineMode,
 } from "../api";
 import type { SectionTreeNode } from "../types";
-import { extractApiError, annotateOutlineWithNumbers, getLevelColor, getLevelLabel, findNodeInTree, updateNodeInTree, OUTLINE_STEPS_V51, reduceOutlineGeneratingEvent, outlineDictToTreeNodes, nextFreeSortOrder, allocTempNodeId } from "../utils";
+import { extractApiError, annotateOutlineWithNumbers, getLevelColor, getLevelLabel, findNodeInTree, updateNodeInTree, OUTLINE_STEPS_V51, reduceOutlineGeneratingEvent, outlineDictToTreeNodes, nextFreeSortOrder, allocTempNodeId, normalizeNodeTitle } from "../utils";
 import RecoveryBanner from "../components/RecoveryBanner";
 import VersionHistory from "../components/VersionHistory";
 
@@ -879,14 +879,41 @@ const applyTitles = (nodes: SectionTreeNode[]): SectionTreeNode[] =>
     <div style={{ display: "flex", flexDirection: "column", gap: 0, flex: 1, overflow: "hidden" }}>
       {/* 后台任务恢复提示 */}
       <RecoveryBanner projectId={projectId} />
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "8px 16px 0" }}>
-        <Space>
-          <Button icon={<ArrowLeftOutlined />} onClick={() => navigate(`/projects/${projectId}/files`)} size="small">
-            返回
-          </Button>
-          <Title level={4} style={{ margin: 0 }}>
-            {project?.name ? `${project.name} - 目录编辑` : "目录编辑"}
-          </Title>
+      {/* LAYOUT-FIX 2026-10-12：顶栏拆成「标题行 + 操作行」两条独立 flex 行。
+          旧实现是单行 space-between 塞两个 Space：项目名（自带创建时间戳）一长，
+          左侧 Space 就被右侧按钮挤到极窄，标题按字符逐字折行成竖排，按钮组也被
+          压得贴脸。现在标题行只保证「返回 + 目录编辑 + 状态标签」单行完整显示，
+          项目名降级为副标题并省略号截断（悬停看全称）；操作按钮独占一行，窄屏自行换行。 */}
+      <div style={{ display: "flex", alignItems: "center", gap: 12, padding: "8px 16px 0", minWidth: 0 }}>
+        <Button
+          icon={<ArrowLeftOutlined />}
+          onClick={() => navigate(`/projects/${projectId}/files`)}
+          size="small"
+          style={{ flexShrink: 0 }}
+        >
+          返回
+        </Button>
+        <Title level={4} style={{ margin: 0, flexShrink: 0, whiteSpace: "nowrap" }}>
+          目录编辑
+        </Title>
+        {project?.name && (
+          <Tooltip title={project.name}>
+            <Text
+              type="secondary"
+              style={{
+                fontSize: 13,
+                minWidth: 0,
+                flex: "0 1 auto",
+                whiteSpace: "nowrap",
+                overflow: "hidden",
+                textOverflow: "ellipsis",
+              }}
+            >
+              {project.name}
+            </Text>
+          </Tooltip>
+        )}
+        <Space size={4} style={{ flexShrink: 0, marginLeft: "auto" }}>
           {tree.length > 0 && (
           <Tag color="blue">{totalNodes} 个目录节点</Tag>
           )}
@@ -894,7 +921,9 @@ const applyTitles = (nodes: SectionTreeNode[]): SectionTreeNode[] =>
             <Tag color="green" icon={<CheckCircleOutlined />}>审核已通过</Tag>
           )}
         </Space>
-        <Space>
+      </div>
+      <div style={{ display: "flex", justifyContent: "flex-end", padding: "8px 16px 0", minWidth: 0 }}>
+        <Space wrap>
           {/* CROSS-FIX 2026-10-04：生成模式选择器，透传后端 outline_mode */}
           {!isGenerating && (
           <Tooltip title="自动：按评分规模智能判别直出/分步；直出：短标书一次性生成；分步：逐层渐进生成">
@@ -991,7 +1020,7 @@ const applyTitles = (nodes: SectionTreeNode[]): SectionTreeNode[] =>
               </Button>
             </>
           )}
-          <Button icon={<ArrowLeftOutlined />} onClick={() => navigate(`/projects/${projectId}/sections`)} size="small" disabled={!tree.length}>
+          <Button icon={<ArrowRightOutlined />} onClick={() => navigate(`/projects/${projectId}/sections`)} size="small" disabled={!tree.length}>
             进入正文编辑
           </Button>
         </Space>

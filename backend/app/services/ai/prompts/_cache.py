@@ -15,6 +15,7 @@ import logging
 import os
 import threading
 import time
+from pathlib import Path
 
 from ._registry import (
     _ALL_PROMPTS,
@@ -24,7 +25,7 @@ from ._registry import (
     render_prompt,
     validate_prompt_variables,
 )
-from ._context import assemble_prompt_context, truncate_to_tokens
+from ._context import assemble_prompt_context, estimate_tokens, truncate_to_tokens
 
 
 logger = logging.getLogger(__name__)
@@ -37,8 +38,15 @@ _cache_lock = threading.Lock()
 # 监控指标（2026-10-06 增强）
 # ──────────────────────────────────────────────────────────────────────
 # 记录每个提示词的调用次数、DB命中次数、总Token消耗
+#
+# BUG-FIX-PROMPT-L1（死锁）：原为 threading.Lock（非重入）。check_prompt_alerts()
+# 在持有 _metrics_lock 期间调用 predict_month_end_cost() -> get_prompt_metrics()
+# （再次 acquire 同一把锁）-> 永久死锁。表现：GET /prompts/alerts 与
+# GET /prompts/metrics/export 请求线程永久挂起（已实测复现），且
+# generate_monthly_report() 同样卡死。修复：改为 RLock（可重入），
+# 使「持锁 → 调用其它持锁函数」这一既有调用链合法。
 _prompt_metrics: dict[str, dict] = {}
-_metrics_lock = threading.Lock()
+_metrics_lock = threading.RLock()
 
 # 历史数据快照（用于趋势图）
 _metrics_history: list[dict] = []
@@ -58,18 +66,29 @@ def set_alert_thresholds(
     """动态更新告警阈值配置。
 
     Args:
-        db_hit_threshold: DB命中率告警阈值
-        spike_multiplier: 调用量飙升倍数
-        spike_min_baseline: 飙升告警最小基线
+        db_hit_threshold: DB命中率告警阈值（0~1 之间的比例）
+        spike_multiplier: 调用量飙升倍数（> 1）
+        spike_min_baseline: 飙升告警最小基线（>= 0 整数）
+
+    BUG-FIX-PROMPT-B2：原实现不做任何取值校验。越界值（db_hit_threshold=5.0、
+    spike_multiplier=0、spike_min_baseline=-1）会被静默写入并持久化到配置文件，
+    导致告警规则永久失效（阈值恒不满足）或恒触发，且只能靠手改 JSON 恢复。
+    改为入口处校验，非法值抛 ValueError，由路由层转 400。
     """
     global DB_HIT_RATIO_WARN_THRESHOLD, CALL_COUNT_SPIKE_MULTIPLIER, CALL_COUNT_SPIKE_MIN_BASELINE
 
     if db_hit_threshold is not None:
-        DB_HIT_RATIO_WARN_THRESHOLD = db_hit_threshold
+        if not (0.0 <= db_hit_threshold <= 1.0):
+            raise ValueError(f"db_hit_threshold 必须在 0~1 之间，收到 {db_hit_threshold}")
+        DB_HIT_RATIO_WARN_THRESHOLD = float(db_hit_threshold)
     if spike_multiplier is not None:
-        CALL_COUNT_SPIKE_MULTIPLIER = spike_multiplier
+        if spike_multiplier <= 1.0:
+            raise ValueError(f"spike_multiplier 必须 > 1，收到 {spike_multiplier}")
+        CALL_COUNT_SPIKE_MULTIPLIER = float(spike_multiplier)
     if spike_min_baseline is not None:
-        CALL_COUNT_SPIKE_MIN_BASELINE = spike_min_baseline
+        if spike_min_baseline < 0:
+            raise ValueError(f"spike_min_baseline 必须 >= 0，收到 {spike_min_baseline}")
+        CALL_COUNT_SPIKE_MIN_BASELINE = int(spike_min_baseline)
 
     _save_config_to_file()  # 自动保存到文件
     logger.info("告警阈值已更新: DB命中率=%.2f, 飙升倍数=%.1f, 最小基线=%d",
@@ -96,19 +115,54 @@ ALERT_SUPPRESSION_WINDOW = int(os.getenv("PROMPT_ALERT_SUPPRESSION_WINDOW", "360
 MONTHLY_BUDGET_CNY = float(os.getenv("PROMPT_MONTHLY_BUDGET", "100.0"))  # 默认月度预算100元
 
 # 配置持久化文件路径
-_CONFIG_FILE = os.path.join("logs", "prompt_monitoring_config.json")
+#
+# BUG-FIX-PROMPT-B4（路径随 CWD 漂移）：原为 ``os.path.join("logs", ...)``，
+# 是**相对当前工作目录**的相对路径。项目里服务既可能从 `backend/` 启动，也
+# 可能从仓库根启动（start_all.bat / docker / 手工 pytest 各不相同），于是
+# 「月度预算 + 告警阈值」会被读写到**不同目录**，表现为：
+#   - 改了预算，重启后又变回默认值（读不到自己刚写的文件）；
+#   - 仓库里同时出现 `<repo>/logs/` 与 `<repo>/backend/logs/` 两份配置，
+#     运维改错一份不生效；
+#   - _save_config_to_file() 还会 makedirs 在任意 CWD 下凭空造出 logs/ 目录。
+# 改为锚定到后端包目录（与既有规范配置文件 backend/logs/ 一致），
+# 并保留 PROMPT_CONFIG_FILE 环境变量覆盖；启动时若新路径不存在而旧的
+# CWD 相对路径存在，则做一次兼容迁移，保证升级后既有配置不丢。
+_BACKEND_ROOT = Path(__file__).resolve().parents[4]  # .../backend
+_CONFIG_FILE = os.getenv(
+    "PROMPT_CONFIG_FILE",
+) or str(_BACKEND_ROOT / "logs" / "prompt_monitoring_config.json")
+# 升级前的旧位置（相对 CWD），仅用于一次性迁移读取
+_LEGACY_CONFIG_FILE = os.path.join("logs", "prompt_monitoring_config.json")
+
+
+def _resolve_config_path() -> str:
+    """返回要读取的配置文件路径，必要时做一次旧路径兼容迁移。
+
+    BUG-FIX-PROMPT-B4：新路径（锚定后端目录）不存在、而升级前的 CWD 相对
+    路径存在时，沿用旧文件，保证升级不丢已保存的预算/阈值。
+    """
+    if os.path.exists(_CONFIG_FILE):
+        return _CONFIG_FILE
+    if _LEGACY_CONFIG_FILE != _CONFIG_FILE and os.path.exists(_LEGACY_CONFIG_FILE):
+        logger.info(
+            "监控配置仍在旧位置 %s，按兼容模式读取（目标路径 %s）",
+            _LEGACY_CONFIG_FILE, _CONFIG_FILE,
+        )
+        return _LEGACY_CONFIG_FILE
+    return _CONFIG_FILE
 
 
 def _load_saved_config():
     """从文件加载已保存的配置（启动时调用）。"""
     global MONTHLY_BUDGET_CNY, DB_HIT_RATIO_WARN_THRESHOLD, CALL_COUNT_SPIKE_MULTIPLIER, CALL_COUNT_SPIKE_MIN_BASELINE
 
-    if not os.path.exists(_CONFIG_FILE):
+    path = _resolve_config_path()
+    if not os.path.exists(path):
         return
 
     try:
         import json
-        with open(_CONFIG_FILE, "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8") as f:
             config = json.load(f)
 
         if "monthly_budget" in config:
@@ -120,7 +174,16 @@ def _load_saved_config():
         if "spike_min_baseline" in config:
             CALL_COUNT_SPIKE_MIN_BASELINE = config["spike_min_baseline"]
 
-        logger.info("已从文件加载监控配置: %s", _CONFIG_FILE)
+        # BUG-FIX-PROMPT-B2：配置文件是纯文本，历史上可能已被写成 0/负数
+        # （修复前无校验）。载入时同样兜底，避免把非法值带进内存后各处除零。
+        if not (MONTHLY_BUDGET_CNY > 0):
+            logger.warning(
+                "监控配置中的 monthly_budget=%r 非法（须为正数），已回退到默认值 %.2f",
+                MONTHLY_BUDGET_CNY, float(os.getenv("PROMPT_MONTHLY_BUDGET", "100.0")),
+            )
+            MONTHLY_BUDGET_CNY = float(os.getenv("PROMPT_MONTHLY_BUDGET", "100.0"))
+
+        logger.info("已从文件加载监控配置: %s", path)
     except Exception as e:
         logger.warning("加载监控配置失败: %s", e)
 
@@ -152,9 +215,24 @@ def set_monthly_budget(amount: float):
     """动态设置月度预算（覆盖环境变量）。
 
     Args:
-        amount: 月度预算金额（元）
+        amount: 月度预算金额（元），必须为正数。
+
+    BUG-FIX-PROMPT-B2：原实现不做任何校验。``PUT /prompts/budget {"amount": 0}``
+    可把预算写成 0，随后：
+      - ``check_prompt_alerts()`` 计算 ``monthly_cost / MONTHLY_BUDGET_CNY`` 时
+        抛 ZeroDivisionError —— 监控看板 500（实测复现）；
+      - ``suggest_next_month_budget()`` 的 ``suggested / monthly_budget`` 同样抛
+        ZeroDivisionError（实测复现）；
+      - 负数预算会生成「超预算 -150%」这类自相矛盾的告警文案。
+    改为入口校验，非法值抛 ValueError，由路由层转 400。
     """
     global MONTHLY_BUDGET_CNY
+    try:
+        amount = float(amount)
+    except (TypeError, ValueError) as e:
+        raise ValueError(f"月度预算必须是数字，收到 {amount!r}") from e
+    if not (amount > 0) or amount != amount or amount == float("inf"):
+        raise ValueError(f"月度预算必须为正数，收到 {amount}")
     MONTHLY_BUDGET_CNY = amount
     _save_config_to_file()  # 自动保存到文件
     logger.info("月度预算已更新为 ¥%.2f", amount)
@@ -186,10 +264,13 @@ def predict_month_end_cost() -> dict:
     current_cost = get_cost_summary(metrics)["total_cost"]
 
     # 按比例推算月底总成本
+    # BUG-FIX-PROMPT-L2：原 else 分支只赋 predicted_month_end，未赋 daily_avg，
+    # 随后返回体无条件读取 daily_avg → day_of_month 为 0 时 UnboundLocalError。
     if day_of_month > 0:
         daily_avg = current_cost / day_of_month
         predicted_month_end = daily_avg * days_in_month
     else:
+        daily_avg = current_cost
         predicted_month_end = current_cost
 
     budget = get_monthly_budget()
@@ -223,22 +304,30 @@ def suggest_next_month_budget() -> dict:
     prediction = predict_month_end_cost()
     predicted_end = prediction["predicted_month_end_cost"]
 
-    # 建议预算 = 预测月底成本 × 1.2（留20%缓冲）
+# 建议预算 = 预测月底成本 × 1.2（留20%缓冲）
     suggested = predicted_end * 1.2
 
     # 如果历史数据不足，建议保守值
     if prediction["confidence"] == "low":
         suggested = max(suggested, prediction["monthly_budget"])
 
-    return {
+    # BUG-FIX-PROMPT-B2：预算为 0 时原实现直接做 suggested / monthly_budget，
+    # 抛 ZeroDivisionError（实测复现）。除零时省略涨跌幅字段。
+    current_budget = prediction["monthly_budget"]
+    result = {
         "current_month_predicted_cost": predicted_end,
-        "current_budget": prediction["monthly_budget"],
+        "current_budget": current_budget,
         "suggested_next_month_budget": round(suggested, 2),
-        "increase_ratio": round((suggested / prediction["monthly_budget"] - 1) * 100, 1),
         "buffer_ratio": 20,
         "confidence": prediction["confidence"],
         "reason": f"基于本月已消耗¥{prediction['current_cost']:.2f}（{prediction['month_progress_ratio']}%进度）推算，留20%缓冲",
     }
+    if current_budget > 0:
+        result["increase_ratio"] = round((suggested / current_budget - 1) * 100, 1)
+    else:
+        result["increase_ratio"] = None
+        result["reason"] += "（当前预算为 0，无法计算涨跌幅）"
+    return result
 
 
 def get_prompt_metrics() -> dict[str, dict]:
@@ -259,17 +348,22 @@ def snapshot_metrics_history() -> dict:
         本次快照数据
     """
     import time
-    snapshot = {
-        "timestamp": time.time(),
-        "total_calls": sum(m.get("calls", 0) for m in _prompt_metrics.values()),
-        "total_tokens": sum(m.get("total_tokens", 0) for m in _prompt_metrics.values()),
-        "total_db_hits": sum(m.get("db_hits", 0) for m in _prompt_metrics.values()),
-    }
+    # BUG-FIX-PROMPT-L3：原实现先在锁外 sum() 遍历 _prompt_metrics、再进入锁内
+    # append。并发 get_prompt 写入时，聚合值可能与 append 的快照不自洽（读到
+    # 写入一半的计数），且 dict 在遍历中被并发修改可能抛 RuntimeError。
+    # 改为整段在锁内完成，保证「快照值」与「入列快照」来自同一时刻。
     with _metrics_lock:
+        metrics_snapshot = {k: dict(v) for k, v in _prompt_metrics.items()}
+        snapshot = {
+            "timestamp": time.time(),
+            "total_calls": sum(m.get("calls", 0) for m in metrics_snapshot.values()),
+            "total_tokens": sum(m.get("total_tokens", 0) for m in metrics_snapshot.values()),
+            "total_db_hits": sum(m.get("db_hits", 0) for m in metrics_snapshot.values()),
+        }
         _metrics_history.append(snapshot)
         # 只保留最近 N 个点
         if len(_metrics_history) > MAX_HISTORY_POINTS:
-            _metrics_history.pop(0)
+            del _metrics_history[: len(_metrics_history) - MAX_HISTORY_POINTS]
     return snapshot
 
 
@@ -341,16 +435,20 @@ def check_prompt_alerts() -> list[dict]:
                             "message": f"提示词 {key} 调用量飙升：{baseline} → {calls}（{spike_ratio:.1f}倍）",
                         })
 
-        # 检查3：月度成本预算超支
+# 检查3：月度成本预算超支
         from ._cost import get_cost_summary
         cost = get_cost_summary(_prompt_metrics)
         monthly_cost = cost.get("total_cost", 0)
         if monthly_cost > MONTHLY_BUDGET_CNY:
+            # BUG-FIX-PROMPT-B2：预算为 0（或被外部改成 0）时直接做百分号换算会
+            # ZeroDivisionError。此处做除零保护，保证告警检查永远不抛异常。
+            pct = (monthly_cost / MONTHLY_BUDGET_CNY * 100) if MONTHLY_BUDGET_CNY > 0 else float("inf")
+            pct_text = "∞" if pct == float("inf") else f"{pct:.1f}%"
             alerts.append({
                 "level": "critical",
                 "type": "budget_exceeded",
                 "key": "_system",
-                "message": f"月度成本已达 ¥{monthly_cost:.2f}，超过预算 ¥{MONTHLY_BUDGET_CNY:.2f}（{monthly_cost/MONTHLY_BUDGET_CNY*100:.1f}%）",
+                "message": f"月度成本已达 ¥{monthly_cost:.2f}，超过预算 ¥{MONTHLY_BUDGET_CNY:.2f}（{pct_text}）",
             })
 
         # 检查4：预测月底将超预算（提前预警）
@@ -367,20 +465,24 @@ def check_prompt_alerts() -> list[dict]:
         # 更新快照
         _last_metrics_snapshot = current_calls.copy()
 
+        # BUG-FIX-PROMPT-L4：告警抑制表 _sent_alerts 原在锁外读写。并发调用
+        # check_prompt_alerts()（监控看板轮询 / 报表生成可同时触发）时，两个
+        # 线程可能都读到 last_sent=0 而同时放行，造成同一条告警重复推送。
+        # 移入锁内做「检查 + 写入 + 清理」的原子操作（RLock 可重入，安全）。
+        # 通知钩子本身仍在锁外调用，避免持锁期间做网络 I/O。
+        now = time.time()
+        new_alerts = []
+        for alert in alerts:
+            alert_key = f"{alert.get('type')}:{alert.get('key')}"
+            last_sent = _sent_alerts.get(alert_key, 0)
+            if now - last_sent > ALERT_SUPPRESSION_WINDOW:
+                new_alerts.append(alert)
+                _sent_alerts[alert_key] = now
+
+        # 清理过期的告警记录
+        _sent_alerts = {k: v for k, v in _sent_alerts.items() if now - v < ALERT_SUPPRESSION_WINDOW * 2}
+
     # 触发通知钩子（如果已注册）
-    # 告警抑制：相同告警在时间窗口内不重复推送
-    now = time.time()
-    new_alerts = []
-    for alert in alerts:
-        alert_key = f"{alert.get('type')}:{alert.get('key')}"
-        last_sent = _sent_alerts.get(alert_key, 0)
-        if now - last_sent > ALERT_SUPPRESSION_WINDOW:
-            new_alerts.append(alert)
-            _sent_alerts[alert_key] = now
-
-    # 清理过期的告警记录
-    _sent_alerts = {k: v for k, v in _sent_alerts.items() if now - v < ALERT_SUPPRESSION_WINDOW * 2}
-
     if new_alerts and _alert_notification_hook:
         try:
             _alert_notification_hook(new_alerts)
@@ -544,11 +646,13 @@ def predict_token_usage(hours_ahead: int = 24) -> dict:
     }
 
 
-def generate_monthly_report(output_dir: str = "logs/prompt_reports", period: str = "monthly") -> str:
+def generate_monthly_report(output_dir: str | None = None, period: str = "monthly") -> str:
     """生成监控报表并保存到文件。
 
     Args:
-        output_dir: 报表输出目录
+        output_dir: 报表输出目录。默认锚定后端目录下的 logs/prompt_reports
+            （BUG-FIX-PROMPT-B4：原默认 "logs/prompt_reports" 为 CWD 相对路径，
+            从仓库根启动时报表会散落到 <repo>/logs/，与从 backend/ 启动的行为不一致）。
         period: 报表周期 - monthly/quarterly/yearly
 
     Returns:
@@ -557,6 +661,9 @@ def generate_monthly_report(output_dir: str = "logs/prompt_reports", period: str
     import json
     import os
     from datetime import datetime
+
+    if not output_dir:
+        output_dir = str(_BACKEND_ROOT / "logs" / "prompt_reports")
 
     # 确保目录存在
     os.makedirs(output_dir, exist_ok=True)
@@ -700,11 +807,16 @@ def _new_metrics_entry() -> dict:
 def _check_hardcode_drift() -> None:
     """比对硬编码默认值与DB内容的差异，检测漂移。
 
-    场景：开发者修改了硬编码提示词，但没有同步执行 init_prompt_templates.py
-    初始化到 DB。此时 DB 中仍是旧版本，get_prompt 优先返回旧内容，
-    导致修改不生效。
+    场景：开发者修改了硬编码提示词，但没有同步到 DB。此时 DB 中仍是旧版本，
+    get_prompt 优先返回旧内容，导致修改不生效。
 
     本函数在缓存加载完成后自动执行，输出漂移告警日志，提示管理员同步。
+
+    BUG-FIX 2026-10-10（文档漂移）：原日志与文档指引运维去执行
+    ``init_prompt_templates.py``——该脚本早已被 ``app/db.py::seed_prompt_templates``
+    取代且文件不存在，照做只会让运维白跑一趟。改为指引真实可用的两条路径：
+    启动期 seed_prompt_templates()，或提示词管理页的「同步硬编码」
+    （POST /prompts/sync-hardcode）/ 对应提示词的「重置为默认」。
     """
     if not _prompt_cache:
         return
@@ -723,7 +835,8 @@ def _check_hardcode_drift() -> None:
     if drifted_keys:
         logger.warning(
             "提示词硬编码与DB内容存在差异（共 %d 个）：%s\n"
-            "如需同步硬编码新版本到DB，请执行 init_prompt_templates.py 或在管理页重置对应提示词。",
+            "如需同步硬编码新版本到DB，请在提示词管理页点击「同步硬编码」"
+            "（POST /prompts/sync-hardcode），或对对应提示词执行「重置为默认」。",
             len(drifted_keys),
             ", ".join(drifted_keys[:10]) + ("..." if len(drifted_keys) > 10 else ""),
         )
@@ -836,9 +949,14 @@ def get_prompt(key: str, **kwargs) -> str:
         m[f"{source}_hits"] = m.get(f"{source}_hits", 0) + 1
         m["total_chars"] = m.get("total_chars", 0) + len(prompt)
         # 粗略 token 估算：中文按字符计，其余按4字符≈1token
-        cjk_count = sum(1 for c in prompt if '\u4e00' <= c <= '\u9fff')
-        other_count = len(prompt) - cjk_count
-        est_tokens = cjk_count + (other_count + 3) // 4
+        #
+        # BUG-FIX-PROMPT-C4（热路径性能）：原为
+        #   sum(1 for c in prompt if '\u4e00' <= c <= '\u9fff')
+        # 逐字符 Python 循环。get_prompt 位于 AI 热路径（每个章节、每次 JSON
+        # 修复、每次图表编排都会调用），对 20k 字符模板会产生数毫秒的纯 Python
+        # 开销 × 每次调用。改复用 _context.estimate_tokens（translate 实现，
+        # 2.4x 更快且口径与上下文预算完全一致，避免两处估算漂移）。
+        est_tokens = estimate_tokens(prompt)
         m["total_tokens"] = m.get("total_tokens", 0) + est_tokens
 
     # BUG-FIX-PROMPT-D3 2026-10-04：原用 validate_prompt_variables(key, **kwargs)

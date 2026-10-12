@@ -527,18 +527,22 @@ def test_orchestration_uses_registered_prompts():
 
 
 def test_outline_review_prompt_has_no_leftover_placeholders():
-    """BUG: 目录审核模板的 __SUMMARY__/__INDUSTRY_PROFILE__ 从不填充。"""
-    import re
-    from app.services.ai.prompts import get_prompt
+    """BUG: 目录审核模板的 SUMMARY/INDUSTRY_PROFILE 从不填充。
 
-    sys_t = get_prompt("OUTLINE_REVIEW_SYSTEM")
-    # 模板本身声明占位符是设计；这里验证调用方已提供 labels（源码级）
-    assert "__SUMMARY__" in sys_t  # 模板确实声明了该变量
+    R2 2026-10-12：模板变量风格统一为 {VAR}（不再用 __VAR__）。
+    本测试改从 _ALL_PROMPTS 注册表的 variables 列表验证模板确实声明了变量，
+    同时验证调用方源码签名包含 industry_profile 参数。
+    """
+    from app.services.ai.prompts._registry import _ALL_PROMPTS
     from pathlib import Path
     import app.services.ai.workflows_quality as wq
 
+    meta = _ALL_PROMPTS.get("OUTLINE_REVIEW_SYSTEM", {})
+    assert "SUMMARY" in meta.get("variables", []), "OUTLINE_REVIEW_SYSTEM 应声明 SUMMARY 变量"
+    assert "INDUSTRY_PROFILE" in meta.get("variables", []), "OUTLINE_REVIEW_SYSTEM 应声明 INDUSTRY_PROFILE 变量"
+
     src = Path(wq.__file__).read_text(encoding="utf-8")
-    assert "__SUMMARY__" in src and "__INDUSTRY_PROFILE__" in src
+    # 调用方源码签名应包含 industry_profile 参数
     assert 'industry_profile: str = ""' in src or "industry_profile: str = ''" in src
 
 

@@ -29,10 +29,32 @@ TENDER_SUMMARY_SYSTEM = _reg(
     "TENDER_SUMMARY_SYSTEM", "文件解析", "招标摘要（系统提示词）", TENDER_SUMMARY_SYSTEM
 )
 
-TENDER_SUMMARY_USER = """请分析以下招标文件上下文，提取并总结项目概述信息。
+# ===== 缓存优化（标书智能体（四））：所有解析任务共用同一稳定前缀 =====
+# 通用 system：只放稳定角色与通用规则；真正的任务差异放到最后的 user 消息。
+# 大且稳定的招标原文独占一条 user 消息并前置，使「概述/评分/清单/工界/工法」
+# 等不同解析任务共享同一前缀，命中 Prompt Cache，输入成本可降一个数量级。
+ANALYSIS_SYSTEM = """你是一名专业的招标文件分析助手。请严格基于用户提供的招标文件原文完成分析任务。
 
-**招标文件上下文**：
-__CONTEXT__
+通用要求：
+1. 保持提取信息的全面性和准确性，尽量使用原文内容，不要自行编造
+2. 只输出最终分析结果，不要输出额外说明、过程、提示语或客套话
+3. 如果文档内容不足以支持某项结论，应明确说明原文未提及，不要凭空补充"""
+
+ANALYSIS_SYSTEM = _reg(
+    "ANALYSIS_SYSTEM", "文件解析", "解析类通用系统提示词（缓存共享前缀）", ANALYSIS_SYSTEM
+)
+
+# 上下文消息：占 token 最大的招标原文单独成一条 user 消息并前置（稳定前缀）。
+ANALYSIS_CONTEXT_BLOCK = """以下是完整招标文件全文，请先完整阅读，并仅基于原文完成后续任务：
+
+{CONTEXT}"""
+
+ANALYSIS_CONTEXT_BLOCK = _reg(
+    "ANALYSIS_CONTEXT_BLOCK", "文件解析", "解析类共享上下文块（缓存前缀）", ANALYSIS_CONTEXT_BLOCK
+)
+
+
+TENDER_SUMMARY_USER = """请分析上方提供的招标文件全文，提取并总结项目概述信息。
 
 请按照上述要求，直接返回整理好的项目概述。"""
 
@@ -61,10 +83,7 @@ BOQ_ANALYSIS_SYSTEM = _reg(
     "BOQ_ANALYSIS_SYSTEM", "文件解析", "清单工程量分析（系统提示词）", BOQ_ANALYSIS_SYSTEM
 )
 
-BOQ_ANALYSIS_USER = """请分析以下招标文件上下文，提取并整理清单工程量相关信息。
-
-**招标文件上下文**：
-__CONTEXT__
+BOQ_ANALYSIS_USER = """请分析上方提供的招标文件全文，提取并整理清单工程量相关信息。
 
 请按照上述要求，以 JSON 数组格式返回分析结果。"""
 
@@ -96,10 +115,7 @@ WORK_INTERFACE_ANALYSIS_SYSTEM = _reg(
     WORK_INTERFACE_ANALYSIS_SYSTEM,
 )
 
-WORK_INTERFACE_ANALYSIS_USER = """请分析以下招标文件上下文，提取并分析工作界面相关信息。
-
-**招标文件上下文**：
-__CONTEXT__
+WORK_INTERFACE_ANALYSIS_USER = """请分析上方提供的招标文件全文，提取并分析工作界面相关信息。
 
 请按照上述要求，以 JSON 数组格式返回分析结果。"""
 
@@ -135,10 +151,7 @@ CONSTRUCTION_METHOD_ANALYSIS_SYSTEM = _reg(
     CONSTRUCTION_METHOD_ANALYSIS_SYSTEM,
 )
 
-CONSTRUCTION_METHOD_ANALYSIS_USER = """请分析以下招标文件上下文，提取并分析工程作法相关信息。
-
-**招标文件上下文**：
-__CONTEXT__
+CONSTRUCTION_METHOD_ANALYSIS_USER = """请分析上方提供的招标文件全文，提取并分析工程作法相关信息。
 
 请按照上述要求，以 JSON 数组格式返回分析结果。"""
 
@@ -204,10 +217,9 @@ SCORING_FIRST_ROUND_SYSTEM = _reg(
     SCORING_FIRST_ROUND_SYSTEM,
 )
 
-SCORING_FIRST_ROUND_USER = """请综合以下两部分输入，按系统提示词规范识别技术条目：
+SCORING_FIRST_ROUND_USER = """请综合以下输入，按系统提示词规范识别技术条目：
 
-- **招标文件上下文**：`__CONTEXT__`
-- **项目概述**：`__SUMMARY__`
+- **项目概述**：`{SUMMARY}`
 
 ### 必须扫描的技术条目
 施工组织设计/施工方案/施工部署、设计方案/深化设计/优化设计、质量保证措施/质量控制计划/质量管理体系、安全文明施工/安全生产管理、施工进度计划/工期保障措施/里程碑计划、项目管理机构/人员配置/岗位职责、重难点分析/关键节点控制、合理化建议/增值服务、绿色施工/环保措施/节能减排、信息化管理/BIM/智慧工地、特殊工艺/核心技术方案、材料设备选型/采购管理、施工总平面布置/临时设施、季节性施工措施、成品保护/保修服务承诺、应急预案/风险管理。
@@ -237,9 +249,9 @@ SCORING_FIRST_ROUND_USER = """请综合以下两部分输入，按系统提示�
 ### 输出规范
 1. **纯净输出**：直接返回 JSON 数组，**严禁**附加解释或代码围栏。
 2. **严禁**返回空数组 `[]`。
-3. 结合 `__SUMMARY__` 工程特征合理判断 `graph_suitable`。
+3. 结合 `{SUMMARY}` 工程特征合理判断 `graph_suitable`。
 
-**提示词结束** — 请综合 `__CONTEXT__` 和 `__SUMMARY__` 直接输出 JSON 数组。"""
+**提示词结束** — 请综合上方招标文件全文和 `{SUMMARY}` 直接输出 JSON 数组。"""
 
 SCORING_FIRST_ROUND_USER = _reg(
     "SCORING_FIRST_ROUND_USER", "文件解析", "评分点初次识别（用户提示词）", SCORING_FIRST_ROUND_USER
@@ -249,12 +261,12 @@ SCORING_REVIEW_SYSTEM = """### 角色
 你是细心的招标文件审查专家，核心任务是**查漏补缺** — 对照初次识别结果和原文，找出未被覆盖的技术条目。
 
 ### 输入数据
-- **招标文件上下文**：`__CONTEXT__`（已锚定技术标区域，≤24000字符）
-- **项目概述**：`__SUMMARY__`
-- **已识别的评分项列表**：`__EXISTING_POINTS__`（由用户消息提供，JSON 数组）
+- **招标文件上下文**：`{CONTEXT}`（已锚定技术标区域，≤24000字符）
+- **项目概述**：`{SUMMARY}`
+- **已识别的评分项列表**：`{EXISTING_POINTS}`（由用户消息提供，JSON 数组）
 
 ### 任务目标
-对照原文检查 `__EXISTING_POINTS__` 是否有遗漏的技术评分项或技术章节。有遗漏则补充输出；无遗漏返回 `[]`。
+对照原文检查 `{EXISTING_POINTS}` 是否有遗漏的技术评分项或技术章节。有遗漏则补充输出；无遗漏返回 `[]`。
 
 ### 一、重点检查清单
 1. **施工组织设计**：施工方案、部署、顺序、流水划分、施工方法、技术措施
@@ -299,7 +311,7 @@ SCORING_REVIEW_SYSTEM = """### 角色
 
 ### 五、输出规范
 1. **纯净输出**：直接返回 JSON 数组，**严禁**附加解释或代码围栏。
-2. **严禁**返回与 `__EXISTING_POINTS__` 语义重复的项目。
+2. **严禁**返回与 `{EXISTING_POINTS}` 语义重复的项目。
 3. 如确无遗漏，返回 `[]`。
 
 **提示词结束** — 请直接输出 JSON 数组。"""
@@ -309,12 +321,11 @@ SCORING_REVIEW_SYSTEM = _reg(
 )
 
 SCORING_REVIEW_USER = """### 输入数据
-- **招标文件上下文**：`__CONTEXT__`
-- **项目概述**：`__SUMMARY__`
-- **已识别的评分项**：`__EXISTING_POINTS__`
+- **项目概述**：`{SUMMARY}`
+- **已识别的评分项**：`{EXISTING_POINTS}`
 
 ### 任务
-对照原文，检查 `__EXISTING_POINTS__` 是否有遗漏的技术评分项或技术章节。
+对照原文，检查 `{EXISTING_POINTS}` 是否有遗漏的技术评分项或技术章节。
 
 ### 复查重点（逐一核对是否已覆盖）
 1. 施工组织设计（方案、部署、顺序、流水划分、方法、措施）
@@ -344,7 +355,7 @@ SCORING_REVIEW_USER = """### 输入数据
 ### 输出规范
 1. **纯净输出**：直接返回 JSON 数组，**严禁**附加解释或代码围栏。
 2. **如无遗漏**返回 `[]`。
-3. **严禁**返回与 `__EXISTING_POINTS__` 语义重复项（按语义比对）。
+3. **严禁**返回与 `{EXISTING_POINTS}` 语义重复项（按语义比对）。
 
 **提示词结束** — 请直接输出 JSON 数组。"""
 

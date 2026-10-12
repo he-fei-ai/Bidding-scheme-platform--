@@ -254,6 +254,10 @@ export default function ExportConfigPage() {
           // 下载按钮永远回退 /export/latest；现在透传，并在导出记录写库失败
           // （record_failed）时明确告知用户本次文件不在导出历史中。
           export_id: result.export_id,
+          // ENHANCE 2026-10-11（P3）：透传 SSE completed 的下载 URL / 磁盘相对路径，
+          // 与同步 /export/docx 路径的 ExportResult 字段保持一致。
+          download_url: result.download_url,
+          relative_path: result.relative_path,
           check: result.check as DocumentCheckResult,
         });
         if (result.record_failed || result.export_id == null) {
@@ -641,6 +645,53 @@ export default function ExportConfigPage() {
                   {checkResult.errors.map((e, i) => (
                     <Alert key={i} message={e} type="error" showIcon style={{ marginBottom: 4 }} />
                   ))}
+                </div>
+              )}
+              {/* 内容质量规则（《文档质量分析报告》修复 15~24）：
+                  结构化问题清单，按 severity 着色，标题旁显示所在章节便于定位 */}
+              {checkResult.quality_issues && checkResult.quality_issues.length > 0 && (
+                <div style={{ marginTop: 12 }}>
+                  <div style={{ marginBottom: 8, fontWeight: 600 }}>
+                    内容质量规则问题（{checkResult.quality_issues.length}）
+                  </div>
+                  {checkResult.quality_issues.map((q, i) => {
+                    const alertType =
+                      q.severity === "high"
+                        ? "error"
+                        : q.severity === "medium"
+                          ? "warning"
+                          : "info";
+                    return (
+                      <Alert
+                        key={i}
+                        type={alertType}
+                        showIcon
+                        style={{ marginBottom: 4 }}
+                        message={
+                          <span>
+                            <span style={{ fontWeight: 600 }}>
+                              [{q.rule_id}] {q.title}
+                            </span>
+                            {q.section_title && (
+                              <Text type="secondary" style={{ marginLeft: 8, fontSize: 12 }}>
+                                定位：{q.section_title}
+                              </Text>
+                            )}
+                          </span>
+                        }
+                        description={
+                          <div>
+                            <div>{q.message}</div>
+                            {q.suggestion && (
+                              <Text type="secondary" style={{ fontSize: 12 }}>
+                                建议：{q.suggestion}
+                              </Text>
+                            )}
+                          </div>
+                        }
+                      />
+                    );
+                  })}
                 </div>
               )}
             </Card>

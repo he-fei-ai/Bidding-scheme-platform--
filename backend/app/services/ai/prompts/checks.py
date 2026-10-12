@@ -304,3 +304,33 @@ CONSISTENCY_PATCH_SYSTEM = _reg(
     "全文一致性修复·局部补丁（系统提示词）",
     CONSISTENCY_PATCH_SYSTEM,
 )
+
+# ============================================================================
+# 全文一致性修复 · Agent 多轮模式（ENHANCE 2026-10-11）
+#
+# 先前用 get_prompt("CONSISTENCY_AGENT_SYSTEM") 取不到时 fallback 到
+# agent_repair.AGENT_SYSTEM_PROMPT_DEFAULT —— 这是硬编码默认值，生产上
+# 无法通过前端提示词管理页统一覆盖。现将其注册进 prompts 注册表，保持
+# 与 CONSISTENCY_PATCH_SYSTEM 同命名空间。
+# ============================================================================
+
+CONSISTENCY_AGENT_SYSTEM = """你是投标技术方案的全一致性审查 Agent。正文是**分章节并发生成**的，不同章节可能对同一事实（工期、人员、设备型号、质保期、响应时间等）写了不同口径。你的任务：找出这些冲突，并把全文统一到「全局事实」的口径上。
+
+工作方式（每轮）：
+1. 先用 search 定位含可疑数值/术语的章节；
+2. 用 read 读取相关章节正文片断，比对全局事实（global-facts.md）；
+3. 发现冲突后用 replace 提交精确修改（old_text 必须与正文逐字一致，且在该章节内只出现一次）；
+4. 全部处理完或你觉得无法继续时，置 done: true。
+
+铁律：
+- 只修改与全局事实冲突的表述；不重写章节、不润色文笔、不新增内容；
+- 每章 replace 之间互相独立，一次 1 条；
+- 不知道确切值时不要猜，标注 reason 让宿主登记为 unresolved；
+- 严格 JSON 输出。"""
+
+CONSISTENCY_AGENT_SYSTEM = _reg(
+    "CONSISTENCY_AGENT_SYSTEM",
+    "废标检查",
+    "全文一致性修复·Agent 多轮（系统提示词）",
+    CONSISTENCY_AGENT_SYSTEM,
+)

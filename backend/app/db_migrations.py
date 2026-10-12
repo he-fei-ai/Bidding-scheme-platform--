@@ -12,8 +12,10 @@
 8. ai_profiles 表（多配置 Profile 系统）
 """
 
+import json
 import logging
 import os
+import sqlite3
 from pathlib import Path
 
 from .db import get_db
@@ -61,6 +63,189 @@ def unify_api_key_encryption(conn, columns: tuple[tuple[str, str], ...] | None =
     conn.commit()
     if any(stats.values()):
         logger.info("[OK] 存量明文 API Key 已统一加密为 ENC: 存储: %s", stats)
+    return stats
+
+
+# ========== 2026-10-11 / 2026-10-12：遗留目录标题清理 ==========
+#
+# 1) 冗余后缀清理：旧版目录去重为消除「不同章节下合法的同名子标题」而追加
+#    「（其2）（其3）…」式后缀，既污染了目录（Word 自动目录会把这些后缀渲染成
+#    二级条目），又把正文章节整段删掉。生成侧已改为同级去重，这里把存量数据里
+#    已经写死进库的后缀清掉。只剥离后缀字符串本身，不改动任何真实内容。
+#
+# 2) 占位/泛化标题清理（2026-10-12 追加）：加固前（2026-10-10 之前）生成的目录
+#    会出现「专项6」「总体实施策划（2）」这类占位/泛化脏标题（见 outline_common
+#    里的 _is_dirty_l3_title / _semantic_fallback_title）。这里复用生成侧的同
+#    一套清洗逻辑，把存量 JSON 树里的 L3+ 脏标题改写为语义化标题。
+#    只作用于 JSON 树（sections.title 单行存储只存 L1/L2，不含 L3 占位）。
+
+#: JSON 目录树形态的表与列：(表名, 需要清洗的列)
+_LEGACY_TITLE_JSON_COLUMNS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (
+        "v51_tasks",
+        ("level1_outline_json", "level2_outline_json", "final_outline_json", "edited_outline_json"),
+    ),
+    ("project_templates", ("outline_json",)),
+)
+
+#: 单行标题形态的表与列：(表名, 主键列, 标题列)
+_LEGACY_TITLE_TEXT_COLUMNS: tuple[tuple[str, str, str], ...] = (
+    ("sections", "id", "title"),
+    ("feasibility_outline_nodes", "node_id", "title"),
+)
+
+
+def _db_table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    """取表的全部列名；表不存在或查询失败时返回空集合。"""
+    try:
+        return {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    except sqlite3.Error:
+        return set()
+
+
+def _strip_suffix_tree(obj, strip_fn) -> bool:
+    """递归剥离目录树（list/dict 混合）中的冗余后缀，返回内容是否发生变化。"""
+    changed = False
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            if key in ("title", "name") and isinstance(value, str):
+                new = strip_fn(value)
+                if new != value:
+                    obj[key] = new
+                    changed = True
+            elif isinstance(value, (dict, list)):
+                if _strip_suffix_tree(value, strip_fn):
+                    changed = True
+    elif isinstance(obj, list):
+        for item in obj:
+            if isinstance(item, (dict, list)) and _strip_suffix_tree(item, strip_fn):
+                changed = True
+    return changed
+
+
+def clean_legacy_outline_title_suffixes(conn: sqlite3.Connection, *, commit: bool = True) -> dict[str, int]:
+    """清理存量目录标题上的冗余后缀与占位标题（幂等，可重复执行）。
+
+    两个清理阶段（先后缀后占位，确保顺序正确）：
+      阶段 1：剥离「（其2）」「（其 2）」式冗余序数后缀（所有标题层级）
+      阶段 2：改写 L3+ 的「专项N」「总体实施策划」等占位/泛化脏标题
+
+    覆盖：
+      - sections.title / feasibility_outline_nodes.title（单行字符串，仅阶段 1 生效）
+      - v51_tasks 的 level1/level2/final/edited outline JSON（两阶段都生效）
+      - project_templates.outline_json（两阶段都生效）
+
+    全部按「表/列是否存在」守卫，坏 JSON 静默跳过 —— 清理失败绝不阻塞启动。
+    返回 {目标: 受影响的行数}，供启动日志与测试观测。
+    """
+    try:
+        from .services.ai.outline_common import (
+            _strip_legacy_redundant_suffix as strip_fn,
+            _cleanup_placeholder_titles,
+        )
+    except Exception as exc:  # 清理失败不能阻塞启动
+        logger.warning("[silent-except] 无法加载标题清洗函数，跳过遗留后缀清理: %s", exc)
+        return {}
+
+    stats: dict[str, int] = {}
+
+    for table, pk_col, title_col in _LEGACY_TITLE_TEXT_COLUMNS:
+        columns = _db_table_columns(conn, table)
+        if not columns or pk_col not in columns or title_col not in columns:
+            continue
+        try:
+            rows = conn.execute(
+                f"SELECT rowid AS _rid, {title_col} AS t FROM {table}"
+            ).fetchall()
+        except sqlite3.Error as exc:
+            logger.warning("[silent-except] 读取 %s 失败，跳过: %s", table, exc)
+            continue
+        changed = 0
+        for row in rows:
+            old = row["t"] or ""
+            new = strip_fn(old)
+            if new != old:
+                conn.execute(
+                    f"UPDATE {table} SET {title_col} = ? WHERE rowid = ?",
+                    (new, row["_rid"]),
+                )
+                changed += 1
+        stats[table] = changed
+
+    for table, json_cols in _LEGACY_TITLE_JSON_COLUMNS:
+        columns = _db_table_columns(conn, table)
+        if not columns:
+            continue
+        targets = [c for c in json_cols if c in columns]
+        if not targets:
+            continue
+        try:
+            rows = conn.execute(
+                f"SELECT rowid AS _rid, {', '.join(targets)} FROM {table}"
+            ).fetchall()
+        except sqlite3.Error as exc:
+            logger.warning("[silent-except] 读取 %s 失败，跳过: %s", table, exc)
+            continue
+        changed = 0
+        for row in rows:
+            payload = []
+            dirty = False
+            for col in targets:
+                raw = row[col] or ""
+                if not raw.strip():
+                    payload.append(raw)
+                    continue
+                try:
+                    tree = json.loads(raw)
+                except (ValueError, TypeError):
+                    payload.append(raw)
+                    continue
+                row_dirty = False
+                # 阶段 1：剥离「（其N）」式冗余后缀
+                if _strip_suffix_tree(tree, strip_fn):
+                    row_dirty = True
+                # 阶段 2：清洗「专项N」/「总体实施策划」等 L3+ 占位标题
+                # _cleanup_placeholder_titles 要求输入是 list[dict]（一级目录数组），
+                # 否则直接跳过；内部已做完整的脏标题判定 + 父级语义派生兜底。
+                try:
+                    if isinstance(tree, list) and tree and all(
+                        isinstance(n, dict) for n in tree
+                    ):
+                        _ph_fixed = _cleanup_placeholder_titles(tree)
+                        if _ph_fixed > 0:
+                            row_dirty = True
+                except Exception as _ph_exc:
+                    # 占位清洗失败不阻塞后缀清洗
+                    logger.debug(
+                        "[silent-except] 占位标题清洗跳过（继续后缀清理）: %s", _ph_exc
+                    )
+                if row_dirty:
+                    payload.append(json.dumps(tree, ensure_ascii=False))
+                    dirty = True
+                else:
+                    payload.append(raw)
+            if dirty:
+                conn.execute(
+                    f"UPDATE {table} SET {', '.join(c + ' = ?' for c in targets)} WHERE rowid = ?",
+                    (*payload, row["_rid"]),
+                )
+                changed += 1
+        stats[table] = changed
+
+    if commit:
+        conn.commit()
+    if any(stats.values()):
+        logger.info(
+            "[OK] 已清理存量目录标题：「（其N）」冗余后缀 + L3+ 占位/泛化标题（专项N/总体实施策划）: %s",
+            stats,
+        )
+    else:
+        # 2026-10-12 加固：stats 全 0 时也打印 debug 级别日志，
+        # 运维能看到清理逻辑确实被执行了（幂等，已清洗过的数据正常返回全 0）
+        logger.debug(
+            "[OK] clean_legacy_outline_title_suffixes 执行完成，存量数据已清洁：stats=%s",
+            stats,
+        )
     return stats
 
 
@@ -163,6 +348,25 @@ def ensure_enhancement_tables():
         ):
             _add_column_if_not_exists("image_generation_tasks", _img_col, _img_def)
 
+        # ──────────────────────────────────────────────────────────────────
+        # repair_mermaid 统计持久化（ENHANCE 2026-10-11 图表增强）
+        # 设计：JSON blob 表，每次 flush 时 INSERT 一行完整快照
+        # （per_chart_type + type_mismatches + cases + timestamp），
+        # 无复杂 schema → 零迁移风险，跨重启保留历史统计趋势。
+        # ──────────────────────────────────────────────────────────────────
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS repair_stats_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                total_validations INTEGER NOT NULL DEFAULT 0,
+                stats_json TEXT NOT NULL DEFAULT '{}',          -- per_chart_type: {type: {step: count}}
+                mismatches_json TEXT NOT NULL DEFAULT '{}',    -- {outer: {orig: count}}
+                cases_json TEXT NOT NULL DEFAULT '[]',          -- 环形 buffer 快照
+                high_freq_json TEXT NOT NULL DEFAULT '[]',      -- _get_high_freq_mismatches 输出
+                created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+            )
+        """)
+        logger.info("创建 repair_stats_snapshots 表")
+
         # ===== 原有增强功能相关（保持）=====
 
         # 4. 生成任务表（暂停/恢复机制）
@@ -258,6 +462,26 @@ def ensure_enhancement_tables():
             logger.info("添加 sections.generation_id 字段（已存在则忽略）")
         except Exception as _e:
             logger.debug("[silent-except] db_migrations.py: line 217 - %s", _e)
+
+        # 9b. 章节状态自愈：'active' → 'pending'
+        # BUG-FIX 2026-10-09（跨模块数据链 / 章节状态机）：目录生成此前向
+        # sections.status 硬编码写入 'active'，但真实状态机是
+        # pending → generating → completed | failed | cancelled，全仓库无任何
+        # 写入方会产生 'active'。后果：
+        #   · 前端 collectLeafIds(filterPendingFailed=true)（utils.ts:421）
+        #     只认 pending/failed → 大纲生成后尚未写正文的章节在「补全生成」
+        #     里永远选不中；
+        #   · word_count 路由按 status 分组统计时这些章节落入未知分组。
+        # 写入侧已改为 'pending'；此处负责把历史脏数据一次性归位。
+        # 向后兼容：仅改写精确等于 'active' 的行，不触碰其他任何取值。
+        try:
+            _cur = conn.execute(
+                "UPDATE sections SET status = 'pending' WHERE status = 'active'"
+            )
+            if _cur.rowcount and _cur.rowcount > 0:
+                logger.info("章节状态自愈：%s 条 'active' 已归位为 'pending'", _cur.rowcount)
+        except Exception as _e:
+            logger.debug("[silent-except] db_migrations.py: active->pending - %s", _e)
 
         try:
             conn.execute("ALTER TABLE sections ADD COLUMN progress INTEGER NOT NULL DEFAULT 0")
@@ -1000,6 +1224,38 @@ def ensure_enhancement_tables():
             CREATE INDEX IF NOT EXISTS idx_ai_config_audit_created
             ON ai_config_audit(created_at DESC)
         """)
+        conn.commit()
+
+        # 37. 易标字数控制（2026-10-12）：word_control_settings 表 + sections 三列。
+        #     DDL 与 db.py::init_db 内的建表语句保持一致（多环境部署时 init_db 与
+        #     迁移序列两处都必须建出，见《报告_易标字数控制移植实施与差距审计_
+        #     2026-10-12》第 6.5 条）。老库执行本步即可补齐，零破坏：
+        #     CREATE TABLE IF NOT EXISTS + 列存在时静默跳过。
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS word_control_settings (
+                project_id INTEGER PRIMARY KEY,
+                minimum_words INTEGER NOT NULL DEFAULT 0,
+                maximum_words INTEGER NOT NULL DEFAULT 0,
+                section_words INTEGER NOT NULL DEFAULT 0,
+                strict_section_words INTEGER NOT NULL DEFAULT 0,
+                outline_word_control_snapshot_json TEXT DEFAULT NULL,
+                snapshot_at TEXT DEFAULT NULL,
+                word_control_warning TEXT DEFAULT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+                FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+            )
+        """)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_word_control_settings_project "
+            "ON word_control_settings(project_id)"
+        )
+        for _wc_col, _wc_def in [
+            ("readable_word_count", "INTEGER NOT NULL DEFAULT 0"),
+            ("word_count_target", "INTEGER NOT NULL DEFAULT 0"),
+            ("word_count_deviation", "INTEGER NOT NULL DEFAULT 0"),
+        ]:
+            _add_column_if_not_exists("sections", _wc_col, _wc_def)
         conn.commit()
 
 

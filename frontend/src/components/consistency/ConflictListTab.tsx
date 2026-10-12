@@ -111,8 +111,18 @@ export default function ConflictListTab({ projectId }: ConflictListTabProps) {
         await load(filter);
         return;
       }
-      setAudit(result);
-      setConflicts(result.conflicts || []);
+setAudit(result);
+      // BUG-FIX 2026-10-09（筛选态被覆盖）：审计接口 `runConsistencyAudit`
+      // 返回的是**本次新检出**的冲突（后端 `_save_conflicts` 只处理
+      // resolved=0 的行），语义上恒等于「未解决」列表。此前这里直接
+      // `setConflicts(result.conflicts || [])` 覆盖当前表格，于是当用户停留在
+      // 「已解决」页签时点一次「开始审计」，表格会被换成**未解决**的冲突，
+      // 而上方 Segmented 仍显示「已解决」—— 视图与数据自相矛盾，
+      // 用户会以为系统把已修复的冲突又翻了出来。
+      // 修复：审计后按当前筛选态重新拉取，而非用审计返回值直接覆盖。
+      // 同时 `setAudit(result)` 保留（它承载 audit_time/conflicts_found 等
+      // 本次审计的元信息，与页签无关）。
+      await load(filter);
       message.success(`审计完成，发现 ${result.conflicts_found} 处冲突`);
       try {
         const summaryRes = await getAuditSummary(projectId);

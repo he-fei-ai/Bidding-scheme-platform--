@@ -1,0 +1,386 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>架构图 L3 竖排优化 - 验证页面</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    font-family: "Microsoft YaHei", "PingFang SC", Arial, sans-serif;
+    background: #f5f7fa;
+    margin: 0;
+    padding: 40px;
+  }
+  .page-title {
+    font-size: 22px;
+    font-weight: bold;
+    color: #1f3a63;
+    text-align: center;
+    margin-bottom: 8px;
+  }
+  .page-desc {
+    text-align: center;
+    color: #666;
+    font-size: 14px;
+    margin-bottom: 30px;
+  }
+  .comparison {
+    display: flex;
+    gap: 40px;
+    justify-content: center;
+    flex-wrap: wrap;
+  }
+  .panel {
+    background: #fff;
+    border-radius: 12px;
+    padding: 24px;
+    box-shadow: 0 2px 12px rgba(0,0,0,0.08);
+  }
+  .panel-title {
+    font-size: 16px;
+    font-weight: bold;
+    color: #333;
+    margin-bottom: 4px;
+    text-align: center;
+  }
+  .panel-subtitle {
+    font-size: 12px;
+    color: #999;
+    text-align: center;
+    margin-bottom: 16px;
+  }
+  .chart-title {
+    font-size: 16px;
+    font-weight: bold;
+    color: #1f3a63;
+    margin-bottom: 16px;
+    text-align: center;
+  }
+  .chart-container {
+    position: relative;
+  }
+  .chart-container svg.edge-layer {
+    position: absolute;
+    top: 0;
+    left: 0;
+    pointer-events: none;
+    z-index: 1;
+  }
+  .node {
+    position: absolute;
+    box-sizing: border-box;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #fff;
+    border-radius: 4px;
+    z-index: 2;
+    text-align: center;
+    transition: transform .2s, box-shadow .2s;
+    cursor: default;
+    user-select: none;
+  }
+  .node:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 6px 18px rgba(30, 80, 160, .28);
+  }
+  .node.root { background: #1f3a63; font-size: 14px; font-weight: 600; padding: 0 12px; line-height: 1.3; }
+  .node.level2 { background: #4a7cc7; font-size: 13px; font-weight: 500; padding: 0 12px; line-height: 1.3; }
+  .node.level3 { background: #4a7cc7; font-size: 12px; font-weight: 500; padding: 0 8px; line-height: 1.3; }
+  .node.level3.highlight { background: #f5b800; color: #1f3a63; font-weight: 600; }
+  
+  /* L3 竖排文字 */
+  .node.level3.vertical {
+    writing-mode: vertical-rl;
+    text-orientation: upright;
+    letter-spacing: 2px;
+    font-size: 13px;
+    padding: 15px 6px;
+    white-space: normal;
+    word-break: break-all;
+    line-height: 1.4;
+  }
+
+  .stats {
+    display: flex;
+    gap: 20px;
+    justify-content: center;
+    margin-top: 20px;
+    flex-wrap: wrap;
+  }
+  .stat-card {
+    background: #fff;
+    border-radius: 8px;
+    padding: 16px 24px;
+    text-align: center;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+    min-width: 140px;
+  }
+  .stat-value {
+    font-size: 24px;
+    font-weight: bold;
+    color: #1f3a63;
+  }
+  .stat-label {
+    font-size: 12px;
+    color: #999;
+    margin-top: 4px;
+  }
+  .stat-improvement {
+    font-size: 13px;
+    color: #52c41a;
+    font-weight: 600;
+    margin-top: 2px;
+  }
+</style>
+</head>
+<body>
+
+<div class="page-title">架构图 L3 叶子层竖排优化 — 效果对比</div>
+<div class="page-desc">青浦住宅项目质量管控体系（11 个 L3 节点）</div>
+
+<div class="stats">
+  <div class="stat-card">
+    <div class="stat-value">1620px</div>
+    <div class="stat-label">优化前画布宽度</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-value" style="color: #52c41a;">750px</div>
+    <div class="stat-label">优化后画布宽度</div>
+    <div class="stat-improvement">↓ 54%</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-value" style="color: #52c41a;">≤ 800px</div>
+    <div class="stat-label">适配 A4 纸宽</div>
+    <div class="stat-improvement">✓ 达标</div>
+  </div>
+</div>
+
+<div class="comparison">
+
+  <!-- 优化后（竖排） -->
+  <div class="panel">
+    <div class="panel-title">优化后：竖排布局</div>
+    <div class="panel-subtitle">L3 节点竖向排列，宽度 750px</div>
+    <div class="chart-title">青浦住宅项目质量管控体系</div>
+    <div class="chart-container" id="chart-vertical">
+      <svg class="edge-layer" id="edges-vertical" xmlns="http://www.w3.org/2000/svg"></svg>
+    </div>
+  </div>
+
+</div>
+
+<script>
+/* ============================================================
+ *  配置
+ * ============================================================ */
+const CONFIG = {
+  rootWidth: 260, rootHeight: 50,
+  level2Width: 210, level2Height: 50,
+  level3Horizontal: { width: 140, height: 50, gap: 10 },
+  level3Vertical:   { width: 60,  height: 200, gap: 8  },
+  level1Y: 0,
+  level2Y: 120,
+  level3Y: 240,
+  padding: 40,
+  busOffset: 30,
+  arrowSize: 5,
+};
+
+const _VERTICAL_THRESHOLD = 6;
+
+/* ============================================================
+ *  数据
+ * ============================================================ */
+const chartData = {
+  id: 'root',
+  label: '青浦住宅项目质量管控体系',
+  variant: 'root',
+  children: [
+    {
+      id: 'g1', label: '公司级质量管控', variant: 'level2',
+      children: [
+        { id: 'g1_1', label: '公司质量总监', variant: 'level3 highlight' },
+        { id: 'g1_2', label: '质量管理部', variant: 'level3' },
+      ]
+    },
+    {
+      id: 'g2', label: '项目部质量执行', variant: 'level2',
+      children: [
+        { id: 'g2_1', label: '项目经理（第一责任人）', variant: 'level3' },
+        { id: 'g2_2', label: '技术负责人', variant: 'level3' },
+        { id: 'g2_3', label: '质量主管', variant: 'level3' },
+        { id: 'g2_4', label: '专职质检员', variant: 'level3' },
+      ]
+    },
+    {
+      id: 'g3', label: '现场质量落实', variant: 'level2',
+      children: [
+        { id: 'g3_1', label: 'PC灌浆过程控制', variant: 'level3' },
+        { id: 'g3_2', label: '防水蓄水试验组', variant: 'level3' },
+        { id: 'g3_3', label: '进场材料复试组', variant: 'level3' },
+      ]
+    },
+    {
+      id: 'g4', label: '质量保障支撑', variant: 'level2',
+      children: [
+        { id: 'g4_1', label: 'BIM管线综合平衡', variant: 'level3' },
+        { id: 'g4_2', label: '精密检测设备组', variant: 'level3' },
+      ]
+    }
+  ]
+};
+
+/* ============================================================
+ *  布局算法
+ * ============================================================ */
+function countLeaves(node) {
+  if (!node.children || node.children.length === 0) return 1;
+  return node.children.reduce((sum, c) => sum + countLeaves(c), 0);
+}
+
+function getSize(variant, mode) {
+  if (variant === 'root') return { w: CONFIG.rootWidth, h: CONFIG.rootHeight };
+  if (variant === 'level2') return { w: CONFIG.level2Width, h: CONFIG.level2Height };
+  if (mode === 'vertical') return { w: CONFIG.level3Vertical.width, h: CONFIG.level3Vertical.height };
+  return { w: CONFIG.level3Horizontal.width, h: CONFIG.level3Horizontal.height };
+}
+
+function layout(root, mode) {
+  const nodeMap = {};
+  let leafIndex = 0;
+
+  function layoutNode(node, depth, parentId) {
+    const { w: width, h: height } = getSize(node.variant, mode);
+    let x;
+    if (!node.children || node.children.length === 0) {
+      const gap = mode === 'vertical' ? CONFIG.level3Vertical.gap : CONFIG.level3Horizontal.gap;
+      const stride = width + gap;
+      x = CONFIG.padding + width / 2 + leafIndex * stride;
+      leafIndex++;
+    } else {
+      const childXs = node.children.map(c => layoutNode(c, depth + 1, node.id));
+      x = (Math.min(...childXs) + Math.max(...childXs)) / 2;
+    }
+    const y = CONFIG.padding + height / 2 +
+      (depth === 0 ? CONFIG.level1Y : depth === 1 ? CONFIG.level2Y : CONFIG.level3Y);
+    nodeMap[node.id] = { ...node, x, y, width, height, depth, parentId };
+    return x;
+  }
+
+  layoutNode(root, 0, null);
+  return nodeMap;
+}
+
+function buildEdges(nodeMap) {
+  const childrenByParent = {};
+  Object.values(nodeMap).forEach(n => {
+    if (n.parentId) (childrenByParent[n.parentId] ||= []).push(n);
+  });
+  let pathD = '';
+  const arrowPositions = [];
+  Object.entries(childrenByParent).forEach(([parentId, children]) => {
+    const parent = nodeMap[parentId];
+    if (!parent) return;
+    const startX = parent.x;
+    const startY = parent.y + parent.height / 2;
+    const busY = startY + CONFIG.busOffset;
+    const leftX = Math.min(...children.map(c => c.x));
+    const rightX = Math.max(...children.map(c => c.x));
+    pathD += `M ${startX} ${startY} L ${startX} ${busY} `;
+    if (children.length > 1) pathD += `M ${leftX} ${busY} L ${rightX} ${busY} `;
+    children.forEach(c => {
+      const childTopY = c.y - c.height / 2;
+      const arrowSpace = CONFIG.arrowSize * 1.6;
+      pathD += `M ${c.x} ${busY} L ${c.x} ${childTopY - arrowSpace} `;
+      arrowPositions.push({ x: c.x, y: childTopY });
+    });
+  });
+  return { pathD, arrowPositions };
+}
+
+function getNodeStyle(variant, mode) {
+  const base = {
+    position: 'absolute', display: 'flex', alignItems: 'center', justifyContent: 'center',
+    borderRadius: 4, color: '#fff', textAlign: 'center', transition: 'transform .2s, box-shadow .2s',
+    zIndex: 2, userSelect: 'none', boxSizing: 'border-box', cursor: 'default',
+  };
+  if (variant === 'root') return { ...base, background: '#1f3a63', fontSize: 14, fontWeight: 600, padding: '0 12px', lineHeight: 1.3 };
+  if (variant === 'level2') return { ...base, background: '#4a7cc7', fontSize: 13, fontWeight: 500, padding: '0 12px', lineHeight: 1.3 };
+  const isHighlight = variant.includes('highlight');
+  if (mode === 'vertical') {
+    return {
+      ...base, background: isHighlight ? '#f5b800' : '#4a7cc7',
+      color: isHighlight ? '#1f3a63' : '#fff',
+      fontSize: 13, fontWeight: isHighlight ? 600 : 500,
+      writingMode: 'vertical-rl', textOrientation: 'upright', letterSpacing: 2,
+      padding: '15px 6px', whiteSpace: 'normal', wordBreak: 'break-all', lineHeight: 1.4,
+    };
+  }
+  return { ...base, background: isHighlight ? '#f5b800' : '#4a7cc7', color: isHighlight ? '#1f3a63' : '#fff', fontSize: 12, fontWeight: isHighlight ? 600 : 500, padding: '0 8px', lineHeight: 1.3 };
+}
+
+/* ============================================================
+ *  渲染
+ * ============================================================ */
+function renderChart(containerId, edgesId, mode) {
+  const nodeMap = layout(chartData, mode);
+  const allNodes = Object.values(nodeMap);
+  const canvasW = Math.max(...allNodes.map(n => n.x + n.width / 2)) + CONFIG.padding;
+  const canvasH = Math.max(...allNodes.map(n => n.y + n.height / 2)) + CONFIG.padding;
+
+  const container = document.getElementById(containerId);
+  container.style.width = canvasW + 'px';
+  container.style.height = canvasH + 'px';
+
+  const svg = document.getElementById(edgesId);
+  svg.setAttribute('width', canvasW);
+  svg.setAttribute('height', canvasH);
+  svg.setAttribute('viewBox', `0 0 ${canvasW} ${canvasH}`);
+
+  const { pathD, arrowPositions } = buildEdges(nodeMap);
+  const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+  path.setAttribute('d', pathD);
+  path.setAttribute('fill', 'none');
+  path.setAttribute('stroke', '#5a7ca8');
+  path.setAttribute('stroke-width', '1.5');
+  path.setAttribute('stroke-linecap', 'round');
+  path.setAttribute('stroke-linejoin', 'round');
+  svg.appendChild(path);
+
+  arrowPositions.forEach(pos => {
+    const s = CONFIG.arrowSize;
+    const arrow = document.createElementNS('http://www.w3.org/2000/svg', 'polygon');
+    arrow.setAttribute('points', `${pos.x},${pos.y} ${pos.x - s},${pos.y - s * 1.4} ${pos.x + s},${pos.y - s * 1.4}`);
+    arrow.setAttribute('fill', '#5a7ca8');
+    svg.appendChild(arrow);
+  });
+
+  allNodes.forEach(n => {
+    const div = document.createElement('div');
+    const classes = ['node'];
+    if (n.variant === 'root') classes.push('root');
+    else if (n.variant === 'level2') classes.push('level2');
+    else { classes.push('level3'); if (n.variant.includes('highlight')) classes.push('highlight'); }
+    if (mode === 'vertical' && n.variant !== 'root' && n.variant !== 'level2') classes.push('vertical');
+    div.className = classes.join(' ');
+    div.style.width = n.width + 'px';
+    div.style.height = n.height + 'px';
+    div.style.left = (n.x - n.width / 2) + 'px';
+    div.style.top = (n.y - n.height / 2) + 'px';
+    div.textContent = n.label;
+    container.appendChild(div);
+  });
+
+  return { canvasW, canvasH, nodeCount: allNodes.length };
+}
+
+// 渲染竖排模式
+const l3Count = countLeaves(chartData);
+const mode = l3Count > _VERTICAL_THRESHOLD ? 'vertical' : 'horizontal';
+const result = renderChart('chart-vertical', 'edges-vertical', mode);
+console.log(`竖排模式: ${mode}, L3数量: ${l3Count}, 画布: ${result.canvasW}x${result.canvasH}px`);
+</script>
+
+</body>
+</html>

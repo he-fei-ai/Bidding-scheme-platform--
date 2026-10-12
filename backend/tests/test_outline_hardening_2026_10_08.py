@@ -14,6 +14,7 @@
 10. BUG-08  手工 PATCH 标题/改名的编号前缀剥离与编号重算联动
 """
 from pathlib import Path
+import logging
 import sqlite3
 import sys
 import threading
@@ -37,9 +38,34 @@ from app.services import sections as sections_service  # noqa: E402
 from app.services.ai.workflows_outline_utils import (  # noqa: E402
     _dedupe_outline_titles,
     _flatten_outline_tree,
-    _renumber_items,
     normalize_outline_items,
 )
+
+logger = logging.getLogger(__name__)
+
+
+# 2026-10-11 修复（O-11）：_renumber_items 已从生产代码删除（死代码，零生产调用方）。
+# 此测试保留该函数的本地副本以验证编号逻辑的正确性。
+def _renumber_items(items: list[dict], parent_number: str = "") -> list[dict]:
+    """为目录项附加 number 字段（测试用本地副本）"""
+    result = []
+    for i, item in enumerate(items):
+        if not isinstance(item, dict):
+            continue
+        num = f"{parent_number}{i + 1}" if parent_number else str(i + 1)
+        new_item = dict(item)
+        new_item["number"] = num
+        children = new_item.get("children")
+        if children and not isinstance(children, list):
+            logger.warning(
+                "目录节点 children 类型非法（期望 list，实际 %s），其子树编号已跳过: %s",
+                type(children).__name__,
+                new_item.get("title", ""),
+            )
+        if isinstance(children, list) and children:
+            new_item["children"] = _renumber_items(children, f"{num}.")
+        result.append(new_item)
+    return result
 
 
 @pytest.fixture()

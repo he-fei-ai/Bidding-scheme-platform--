@@ -289,7 +289,12 @@ def _render_labor_image_v2(labor_data: dict) -> BytesIO | None:
         try:
             draw.polygon(fill_pts, fill=(43, 87, 154))  # 移除了 alpha 通道，兼容 RGB 模式
         except Exception as _e:
-            logger.debug("[silent-except] mermaid_labor.py: line 291 - %s", _e)
+            # ENHANCE 2026-10-11（渲染完整性可观测性）：polygon 填充失败
+            # 劳动力图折线下半部分会缺失颜色填充，用户可见。debug 级别运维
+            # 无法感知图表不完整，升级为 warning。
+            logger.warning(
+                "[渲染] 劳动力图折线填充失败（图表下半部分可能缺失颜色）: %s", _e
+            )
 
     for i, (x, y) in enumerate(points):
         draw.ellipse(

@@ -12,7 +12,7 @@ from .config import DATABASE_PATH, PROJECT_ROOT
 # SQLite 写锁串行化（全局级，所有线程/协程共享）
 # 解决高并发下 "database is locked" 错误：
 # - WAL 模式允许并发读，但写操作仍需要串行
-# - 使用 threading.RLock 允许同一线程重入（避免嵌套 get_db() 调用自锁 60s）
+# - 使用 threading.RLock 允许同一线程重入（避免嵌套 get_db() 调用自锁）
 # - 读操作不受影响（readonly=True 时跳过锁）
 _db_write_lock = threading.RLock()
 # 写锁获取超时：缩到 8 秒以在 SQLite 被杀毒扫描/外部进程短暂锁库时
@@ -647,9 +647,11 @@ def get_db(readonly: bool = False):
     """获取数据库连接（自动重试 I/O 错误，向后兼容）
 
     V2.0 增强：增加全局写锁串行化，解决高并发下 SQLite "database is locked" 错误。
-    - 写操作（任何非 SELECT 语句）通过 threading.Lock 串行
+    - 写操作（任何非 SELECT 语句）通过 threading.RLock 串行
     - 读操作不受影响（readonly=True 时跳过写锁）
-    - 写锁超时 60 秒后抛出异常，避免死锁
+    - 写锁超时后抛出 DatabaseWriteLockTimeout，避免死锁。超时值是**可配置的**
+      ``_db_write_lock_timeout``（当前 8.0s，见模块顶部），不是硬编码常量；
+      改超时请改配置项，不要在本 docstring 里再抄一份数字。
 
     BUG-FIX 2026-09-16（中）：重入（嵌套）支持。连接按线程缓存，同线程嵌套
     `with get_db()` 拿到的是**同一个连接**；旧实现内层退出即 `conn.commit()`
@@ -657,6 +659,13 @@ def get_db(readonly: bool = False):
     close 掉外层仍在使用的连接。现在用线程本地位记录嵌套深度：
     只有**最外层**负责 commit / 丢弃连接 / 释放写锁，内层只是借用。
     注意：内层块内**禁止**执行耗时操作（外层写锁仍被本线程持有）。
+
+    临界区约定（HARDEN 2026-10-11·R-11）：写锁只串行化**单个事务块**，
+    **不覆盖块与块之间的间隙**。因此任何「读 → 内存修改 → 写」必须落在同一个
+    ``with get_db()`` 块内，拆成两个块会产生 lost update（A 读空快照 → B 读空
+    快照 → A 写 → B 写覆盖 A）。锁内 I/O 还会把持锁时长推过
+    ``_db_write_lock_timeout``（当前 8.0s），让争用方超时失败。范例与三条
+    完整约定见 ``services/consistency_backflow.py`` 模块 docstring。
 
     BUG-FIX 2026-09-16（P1）：depth 的恢复放在**覆盖全流程**的 finally 里。
     旧实现在 try 之前自增 depth，而取连接失败发生在 try 之外 —— 一旦重试耗尽
@@ -869,9 +878,14 @@ def init_db():
     # 超时（30s）或初始化失败时会被静默跳过，导致线上库 generation_tasks
     # 保持旧表结构（缺 generation_id/outline_version 等列）、
     # section_generation_progress 表缺失，正文生成暂停/恢复功能失效。
-    from .db_migrations import ensure_enhancement_tables
+    from .db_migrations import clean_legacy_outline_title_suffixes, ensure_enhancement_tables
 
     ensure_enhancement_tables()
+
+    # 2026-10-11：清理旧版全树去重写进库的「（其2）（其3）…」式无意义标题后缀。
+    # 幂等；缺表/坏 JSON 均静默跳过，失败不影响启动。
+    with get_db() as conn:
+        clean_legacy_outline_title_suffixes(conn)
 
 
 def _migrate(conn: sqlite3.Connection):
@@ -1970,6 +1984,58 @@ def _migrate(conn: sqlite3.Connection):
             "VALUES (?, ?, ?, ?, ?, ?, 1)",
             (_tier_key, _label, _target, _ratio, _default, _order),
         )
+
+    # ========== 字数控制配置与快照（ENHANCE 2026-10-12，移植自易标）==========
+    # 移植自《报告_易标文字生成数量控制规则与标准_2026-10-12》：
+    #   R2 万字输入单位 / R5 强控 ±20% 小节区间 / R14 配置快照锚定。
+    #
+    # 核心设计是「快照配对」：用户在目录阶段设置的字数配置，必须在目录生成
+    # 成功那一刻固化为 outline_word_control_snapshot_json，正文生成只认快照，
+    # 从而杜绝「用户手工改了目录但控制链仍按旧配置跑」的静默脱节。
+    # 快照与 outline 数据同 checkpoint 落盘，因此两列放在同一张表里。
+    #
+    # 该表与上方 word_count_tiers（档位配置）**职责不同、互不覆盖**：
+    #   word_count_tiers   —— 全局「档位」字典（简短/标准/详细/超长），
+    #                         由管理员维护，sections.word_count_tier 引用；
+    #   word_control_settings —— 每个项目一次正文任务的**绝对字数目标**
+    #                         （最少/最多/每节 + 强控开关）与其生效快照，
+    #                         由项目作者在生成前填写。
+    # 迁移安全：CREATE TABLE IF NOT EXISTS + _ensure_column，老库零破坏。
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS word_control_settings (
+            project_id INTEGER PRIMARY KEY,
+            minimum_words INTEGER NOT NULL DEFAULT 0,
+            maximum_words INTEGER NOT NULL DEFAULT 0,
+            section_words INTEGER NOT NULL DEFAULT 0,
+            strict_section_words INTEGER NOT NULL DEFAULT 0,
+            outline_word_control_snapshot_json TEXT DEFAULT NULL,
+            snapshot_at TEXT DEFAULT NULL,
+            word_control_warning TEXT DEFAULT NULL,
+            created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+            updated_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+            FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+        )
+    """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_word_control_settings_project "
+        "ON word_control_settings(project_id)"
+    )
+
+    # sections 表补充易标口径的字数落库列。
+    # - readable_word_count：按 R1 可读字数口径重算的实际字数
+    #   （剔除 Markdown 标记 / 图片 / 代码块 / URL / HTML 后的
+    #    CJK 字符数 + 西文词数）。与 word_count 并存以便迁移期对比。
+    # - word_count_target：本轮生成的目标字数（来自快照派生），
+    #   config.py 2026-10-11 修复说明里已承诺该列但当时未落库。
+    # - word_count_deviation：实际字数 − 目标字数，正为超写、负为欠写。
+    for _wc_col, _wc_def in [
+        ("readable_word_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("word_count_target", "INTEGER NOT NULL DEFAULT 0"),
+        ("word_count_deviation", "INTEGER NOT NULL DEFAULT 0"),
+    ]:
+        _ensure_column(conn, "sections", _wc_col, _wc_def)
 
     # ========== 任务组互斥锁（ENHANCE 2026-09-15）==========
     # 多进程（FastAPI + Celery worker）下内存锁无效，锁必须下沉到 sqlite 行级唯一约束。

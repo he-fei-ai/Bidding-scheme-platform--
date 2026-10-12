@@ -256,41 +256,78 @@ def _render_arrange_sys(
     return rendered or get_prompt(key)
 
 
-def repair_mermaid(code: str) -> str:
+def repair_mermaid(code: str, return_diff: bool = False) -> str | tuple[str, dict]:
     """修复常见 Mermaid 语法问题
 
     BUG-FIX 2026-10-04（图表模块 D6）：原实现仅做围栏去除/行尾空白/空行折叠，
     不处理 AI 高频输出问题（BOM、智能引号、全角标点、缺图类型头、括号不配对、
     未闭合链接形状）。现补充机械化修复；修复后仍非法的块由调用方删除（validate）。
+
+    Args:
+        code: 原始 Mermaid 代码字符串
+        return_diff: True 时返回 (fixed_code, diff_dict)，diff_dict 列出哪些修复
+                     步骤实际触发，便于 chart_data_fix AI 拿到更精确的 error context；
+                     False（默认）时仅返回 fixed_code（向后兼容）
+
+    Returns:
+        return_diff=False → str（修复后代码）
+        return_diff=True  → (str, dict)  dict 格式:
+            {
+                "changed": bool,      # 修复前后是否有差异
+                "steps": list[str],   # 触发的修复步骤名列表
+                "before": str,        # 修复前代码（截断到 500 字）
+                "after": str,         # 修复后代码（截断到 500 字）
+            }
     """
+    _original = code or ""
+    diff_steps: list[str] = []
+    step_counts: dict[str, int] = {}  # ENHANCE 2026-10-11: 步骤触发次数计数
+
+    def _track(step_name: str, before: str, after: str) -> str:
+        """辅助：比较单步修复前后，记录是否触发 + 次数计数"""
+        if before != after:
+            diff_steps.append(step_name)
+            step_counts[step_name] = step_counts.get(step_name, 0) + 1
+        return after
+
     if not code:
-        return ""
+        return ("", {"changed": False, "steps": [], "step_counts": {},
+                     "version": "repair_mermaid_v3.2-2026-10-11",
+                     "before": "", "after": ""}) if return_diff else ""
 
     code = code.strip()
 
     # 去 UTF-8 BOM（Windows 模型输出偶带）
+    _before = code
     code = code.lstrip("\ufeff")
+    code = _track("strip_bom", _before, code)
 
+    _before = code
     code = re.sub(r"```mermaid\s*\n?", "", code)
     code = re.sub(r"\n?```", "", code)
     # 残留的内联反引号（代码块嵌套错位）：行内 `x` → x
     code = re.sub(r"`([^`\n]*)`", r"\1", code)
+    code = _track("strip_fence_and_inline_backticks", _before, code)
 
-    # 智能引号 → ASCII（Mermaid 不识别 “ ” 作为字符串定界符）
+    # 智能引号 → ASCII（Mermaid 不识别 " " 作为字符串定界符）
+    _before = code
     code = code.replace("\u201c", '"').replace("\u201d", '"')
     code = code.replace("\u2018", "'").replace("\u2019", "'")
+    code = _track("smart_quotes_to_ascii", _before, code)
 
     # 引号配对：奇数个双引号 → 删最后一个（AI 截断行尾多补的引号）
     _dq = code.count('"')
     if _dq % 2 == 1:
+        _before = code
         _last = code.rfind('"')
         _line_start = code.rfind("\n", 0, _last) + 1
         # 仅当孤立引号所在行非注释行时删除
         if not code[_line_start:_line_start + 2].startswith("%%"):
             code = code[:_last] + code[_last + 1:]
+            code = _track("pair_unmatched_quotes", _before, code)
 
-    # 全角括号/花括号归一化（节点形状声明处）：仅对「形状括号含全角且无引号保护」
-    # 的行做替换，引号内的标签文本（可能合法包含中文括号）保持不变。
+    # 全角括号/花括号归一化
+    _before = code
     _shape_lines = []
     for _ln in code.split("\n"):
         if '"' not in _ln and ("（" in _ln or "）" in _ln or "【" in _ln or "】" in _ln or "｛" in _ln or "｝" in _ln):
@@ -299,13 +336,14 @@ def repair_mermaid(code: str) -> str:
                 .replace("｛", "{").replace("｝", "}")
         _shape_lines.append(_ln)
     code = "\n".join(_shape_lines)
+    code = _track("fullwidth_brackets_to_ascii", _before, code)
 
-    # 行末分号剔除（validate 拒绝行末半角分号；全角；同步剔除）
+    # 行末分号剔除 + 空白清理
+    _before = code
     code = re.sub(r"[;；][ \t]*$", "", code, flags=re.MULTILINE)
-
     code = re.sub(r"[ \t]+$", "", code, flags=re.MULTILINE)
-
     code = re.sub(r"\n{3,}", "\n\n", code)
+    code = _track("strip_trailing_semicolons_and_ws", _before, code)
 
     # 形状括号配对：[ （ 多于 ] → 行末补齐（仅处理节点声明行，跳过注释）
     _fixed_lines = []
@@ -337,16 +375,18 @@ def repair_mermaid(code: str) -> str:
                 _s += "]" * (_s.count("[") - _s.count("]"))
             _sq_fixed.append(_s)
         code = "\n".join(_sq_fixed)
+    code = _track("fix_unmatched_brackets", _before, code)
 
-    # 缺图类型头：含箭头但首行非类型关键字 → 补 graph TD（与 validate 的
-    # 「无头流程图」识别同源，确保 repair 后能进入合法分支）
+    # 缺图类型头：含箭头但首行非类型关键字 → 补 graph TD
     _first = code.split("\n", 1)[0].strip().lower()
     _known_heads = (
         "graph", "flowchart", "gantt", "sequencediagram", "classdiagram",
         "statediagram", "pie", "erdiagram", "timeline", "xychart", "journey",
     )
     if "-->" in code and not _first.startswith(_known_heads):
+        _before = code
         code = "graph TD\n" + code
+        code = _track("prepend_graph_td_head", _before, code)
 
     # 全角冒号归一化：只剔除行尾孤立的中文冒号（标签内的中文冒号不在行尾，不受影响）
     code = re.sub(r"[ \t]*：[ \t]*$", "", code, flags=re.MULTILINE)
@@ -363,6 +403,17 @@ def repair_mermaid(code: str) -> str:
             cleaned.append(line.rstrip())
     code = "\n".join(cleaned).strip()
 
+    if return_diff:
+        changed = code != (_original or "")
+        diff = {
+            "version": "repair_mermaid_v3.2-2026-10-11",
+            "changed": changed,
+            "steps": diff_steps,
+            "step_counts": step_counts,  # ENHANCE 2026-10-11: 每个步骤触发次数
+            "before": (_original or "")[:500],
+            "after": code[:500],
+        }
+        return code, diff
     return code
 
 
@@ -419,12 +470,69 @@ async def chart_data_fix(
     section_content: str,
     error_message: str = "",
     original_data: str = "",
+    repair_context: dict | None = None,
 ) -> str | dict:
-    """图表修复兜底 — 任意图表生成失败后调用"""
+    """图表修复兜底 — 任意图表生成失败后调用
+
+    Args:
+        repair_context: validate_chart_for_ai_pipeline(verbose=True) 返回的完整修复上下文。
+            包含 repair_mermaid 机械化修复的 diff（version/steps/before/after）和
+            结构化校验错误列表——让 AI 知道机械化修复已经尝试了什么、哪些步骤触发了。
+    """
     fix_sys = get_prompt("CHART_DATA_FIX")
 
-    user_prompt = f"""图表类型：{chart_type}
+    # ENHANCE 2026-10-11: repair_context 注入 AI prompt（含 step_counts + parsed_structure）
+    _repair_prompt = ""
+    if repair_context:
+        _rm = repair_context.get("repair_mermaid") or {}
+        _steps = _rm.get("steps") or []
+        _counts = _rm.get("step_counts") or {}
+        _version = _rm.get("version") or "unknown"
+        _changed = _rm.get("changed", False)
+        _struct_errs = repair_context.get("structural_validation_errors") or []
+        # parsed_structure：Mermaid parser 输出的 nodes/edges/tasks，让 AI 看到解析出了哪些节点连线
+        _parsed = repair_context.get("parsed_structure")
+        _parsed_summary = ""
+        if _parsed:
+            if "nodes" in _parsed and "edges" in _parsed:
+                _nn = len(_parsed.get("nodes", []))
+                _ne = len(_parsed.get("edges", []))
+                _node_preview = _parsed.get("nodes", [])[:8]
+                _edge_preview = _parsed.get("edges", [])[:5]
+                _parsed_summary = (
+                    f"\n  Mermaid 解析预览: nodes={_nn}, edges={_ne}\n"
+                    f"    节点: {[(n.get('id'), n.get('label','')[:10]) for n in _node_preview]}\n"
+                    f"    连线: {[(f.get('from'), f.get('to'), f.get('label','')) for f in _edge_preview]}"
+                )
+            elif "tasks" in _parsed:
+                _parsed_summary = f"\n  Mermaid 解析预览: tasks={len(_parsed.get('tasks', []))}"
+        _counts_str = ", ".join(f"{k}×{v}" for k, v in _counts.items()) if _counts else "无"
+        _repair_prompt = f"""
+[机械化修复上下文 v{_version}]
+  repair_mermaid 触发: {'是' if _changed else '否'}
+  已执行修复步骤: {', '.join(_steps) if _steps else '无'}
+  步骤触发次数: {_counts_str}
+  结构化校验错误: {'; '.join(_struct_errs) if _struct_errs else '无'}
+  修复前代码片段: {str(_rm.get('before', ''))[:300]}
+  修复后代码片段: {str(_rm.get('after', ''))[:300]}{_parsed_summary}
 
+"""
+
+    # ENHANCE 2026-10-11: 高频 type mismatch 动态注入
+    # 如果当前 chart_type 在 _REPAIR_TYPE_MISMATCHES 里有高频错位记录（≥3 次），
+    # 在 prompt 里明确警告「请输出正确类型格式，不要输出 X 格式」
+    _mismatch_warning = ""
+    try:
+        _high_freq = _get_high_freq_mismatches()
+        _relevant = [m for m in _high_freq if m["outer_type"] == chart_type]
+        if _relevant:
+            _types_to_avoid = ", ".join(m["original_type"] for m in _relevant)
+            _mismatch_warning = f"\n⚠️ 历史上 {chart_type} 类型曾多次（≥{_REPAIR_MISMATCH_THRESHOLD}次）被误输出为 {_types_to_avoid} 格式，请务必输出正确的 {chart_type} 格式，不要混淆！\n"
+    except Exception:
+        pass  # 统计模块不可用时静默跳过
+
+    user_prompt = f"""图表类型：{chart_type}
+{_mismatch_warning}
 章节标题：{section_title}
 
 章节内容：
@@ -432,8 +540,7 @@ async def chart_data_fix(
 
 错误信息：
 {error_message or "未提供错误信息"}
-
-原始数据：
+{_repair_prompt}原始数据：
 {original_data or "未提供原始数据"}
 
 请根据以上信息生成降级可用的图表数据。"""
@@ -1450,6 +1557,34 @@ async def generate_all_chart_arrangements(
     """
     _time = __import__("time")
     t0 = _time.perf_counter()
+    # === 正文配图位置提示（CHART-MARKER 2026-09-16 / R1 2026-10-12）===
+    # 正文写作阶段已用 `<<CHART:类型>>` 标定了配图意图与位置，这类意图优先于
+    # 编排阶段的二次判断；原来用硬编码 `batch_arrange_sys += ...` 拼接，
+    # R1 改为模板变量注入，管理员可通过管理页编辑时统一处理 hints 段落。
+    _hints = {str(k).lower(): v for k, v in (chart_hints or {}).items() if k}
+    if _hints:
+        _hint_lines = "\n".join(
+            f"- {ct}：{title or '（正文已标注该配图位置，标题由你根据章节内容拟定）'}"
+            for ct, title in sorted(_hints.items())
+        )
+        _hint_block = (
+            "\n\n### 正文已标注的配图意图（最高优先级，必须 needed=true）\n"
+            "下列图表类型在正文写作阶段已被作者显式标注为配图对象，"
+            "**无论你的通用判定如何，这些类型的 `needed` 必须为 true**，"
+            "并为其补充准确的 `type`（子类型）与 `priority`：\n"
+            f"{_hint_lines}"
+        )
+        _hint_user_block = f"\n**正文已标注配图**：{', '.join(sorted(_hints))}\n"
+    else:
+        _hint_block = ""
+        _hint_user_block = ""
+    # ENHANCE 2026-10-12: 批量编排系统提示词已注册进 prompts 注册表（_integrate.py），
+    # DB 优先 + 硬编码回退的 get_prompt 已覆盖全部场景，管理员可通过管理页覆盖/重置。
+    # R1: chart_hints 通过模板变量注入，不再硬编码拼接。
+    batch_arrange_sys = (
+        get_prompt("CHART_BATCH_ARRANGE_SYSTEM", chart_hints_block=_hint_block)
+        or (_BATCH_ARRANGE_SYS_FALLBACK + _hint_block)
+    )
     logger.info(
         "[批量编排] 开始 章节=%s 内容长度=%d 概述长度=%d 正文配图提示=%s",
         section_title,
@@ -1458,7 +1593,7 @@ async def generate_all_chart_arrangements(
         sorted((chart_hints or {}).keys()),
     )
 
-    batch_arrange_sys = """# 批量图表编排（系统提示词）— V8.0 商业级优化版
+    _BATCH_ARRANGE_SYS_FALLBACK = """# 批量图表编排（系统提示词）— V8.0 商业级优化版
 > **设计目标**：单次 AI 调用同时判断所有 7 种图表类型的适配性，
 > 确保后续 v2 商业级渲染器获得高质量数据（2x 超采样 + 300 DPI 输出）。
 
@@ -1520,28 +1655,9 @@ async def generate_all_chart_arrangements(
 | layout | 3个功能区 | 坐标不重叠，有连接关系；区域名含具体功能描述 |
 | timeline | 3个里程碑 | 日期有序，状态合理分配；里程碑描述含具体验收标准 |"""
 
-    # === 正文配图位置提示（CHART-MARKER 2026-09-16）===
-    # 正文写作阶段已用 `<<CHART:类型>>` 标定了配图意图与位置，这类意图优先于
-    # 编排阶段的二次判断；这里显式告知模型，避免它把已标注的类型判为 needed=false
-    # 导致「正文标注了配图位置、最终却没有图」。
-    _hints = {str(k).lower(): v for k, v in (chart_hints or {}).items() if k}
-    if _hints:
-        _hint_lines = "\n".join(
-            f"- {ct}：{title or '（正文已标注该配图位置，标题由你根据章节内容拟定）'}"
-            for ct, title in sorted(_hints.items())
-        )
-        batch_arrange_sys += (
-            "\n\n### 正文已标注的配图意图（最高优先级，必须 needed=true）\n"
-            "下列图表类型在正文写作阶段已被作者显式标注为配图对象，"
-            "**无论你的通用判定如何，这些类型的 `needed` 必须为 true**，"
-            "并为其补充准确的 `type`（子类型）与 `priority`：\n"
-            f"{_hint_lines}"
-        )
-        _hint_user_block = f"\n**正文已标注配图**：{', '.join(sorted(_hints))}\n"
-    else:
-        _hint_user_block = ""
-
-    user_prompt = f"""## 章节信息
+    # ENHANCE 2026-10-12: 从注册表读取用户提示词模板，支持管理页覆盖。
+    # 保留 f-string 作为 DB 不可用时的 fallback。
+    _user_fallback = f"""## 章节信息
 **章节标题**：{section_title}
 
 **章节内容**：
@@ -1553,6 +1669,15 @@ async def generate_all_chart_arrangements(
 **行业背景**：{industry_profile or "未提供行业背景"}
 
 请根据以上信息，同时判断所有7种图表类型的适配性，返回JSON对象。"""
+    user_prompt = get_prompt(
+        "CHART_BATCH_ARRANGE_USER",
+        section_title=section_title or "",
+        section_content=(section_content or "（暂无正文内容）")[:2000],
+        hint_user_block=_hint_user_block,
+        project_overview=project_overview or "未提供项目概述",
+        scoring_standard=scoring_standard or "未提供评分标准",
+        industry_profile=industry_profile or "未提供行业背景",
+    ) or _user_fallback
 
     messages = [
         AIMessage(role="system", content=batch_arrange_sys),
@@ -2037,3 +2162,463 @@ async def with_timeout(coro, timeout: int = 30, error_msg: str = "AI调用超时
         return await asyncio.wait_for(coro, timeout=timeout)
     except TimeoutError:
         raise TimeoutError(f"{error_msg}（{timeout}秒）")
+# ============================================================
+# E-7：图表数据校验统一入口 + AI 生图成本拦截
+# ============================================================
+
+
+def validate_chart_payload(chart_type: str, data: Any) -> tuple[bool, list]:
+    """图表数据校验统一入口（E-7，chart_validators v3.1 接入）。
+
+    此前 chart_validators.py 的 v3.1 全套校验器「零引用」——完整实现了却从未
+    接入生成链路。本函数是接入的统一闸门：按图表类型分发到对应校验器，
+    任何异常都不会炸穿调用方（校验失败即返回 False + 原因，由调用方按
+    无降级原则丢弃劣质数据）。
+
+    Args:
+        chart_type: flowchart / gantt / architecture / timeline / labor / comparison / layout
+        data: 图表数据（AI 生成的 dict）
+
+    Returns:
+        (是否通过, 错误列表前 5 条)
+    """
+    from .. import chart_validators as _cv
+
+    validators = {
+        "architecture": _cv.validate_architecture_tree,
+        "gantt": _cv.validate_gantt_plan,
+        "flowchart": _cv.validate_flowchart_structure,
+        "timeline": _cv.validate_timeline_data,
+        "labor": _cv.validate_labor_data,
+        "comparison": _cv.validate_comparison_pie,
+        "layout": _cv.validate_layout_data,
+    }
+    fn = validators.get(str(chart_type or "").lower())
+    if fn is None:
+        # 未知类型不预判：交给上层按「有标记无数据」处理，不夸大校验
+        return True, []
+
+    # 字段提取：各校验器期望输入格式不同，统一入口需要做适配。
+    #   - architecture: 期望根节点 dict（有 label/children），chart_data 含 "tree" 包
+    #   - labor: 期望 phases/categories/data 在顶层，格式天然对齐
+    #   - flowchart/gantt 等 Mermaid 型: 期望 nodes/edges/tasks 等结构化字段，
+    #     在 validate_chart_for_ai_pipeline 里已通过 Mermaid parser 注入
+    try:
+        data_for_validator = data
+        if chart_type == "architecture" and isinstance(data, dict):
+            # chart-json 格式: {"type": "architecture", "tree": {...}, ...}
+            tree = data.get("tree") or data.get("structure")
+            if isinstance(tree, dict):
+                data_for_validator = tree
+    except Exception:
+        data_for_validator = data
+
+    try:
+        ok, errs = fn(data_for_validator)
+        return bool(ok), (errs or [])[:5]
+    except Exception as e:
+        return False, [f"校验器执行异常: {e!s}"]
+
+
+# ──────────────────────────────────────────────────────────────────────
+# repair_mermaid 步骤统计（ENHANCE 2026-10-11）
+# ──────────────────────────────────────────────────────────────────────
+# 模块级 in-memory 统计。validate_chart_for_ai_pipeline(verbose=True)
+# 每次调用 repair_mermaid 后累加 step_counts。celery beat 每小时触发
+# flush_repair_stats() 打印汇总 + reset。
+# 为什么不用 DB 表？——这个统计是运维洞察用的（哪些 chart_type 高频触发
+# 哪些修复步骤），数据量不大、不需要持久化到跨重启粒度、无迁移风险。
+_REPAIR_STATS: dict[str, dict[str, int]] = {}  # {chart_type: {step_name: count}}
+_REPAIR_STATS_TOTAL: int = 0
+# ENHANCE 2026-10-11: original_chart_type ≠ 外层 chart_type 不匹配统计
+# 结构: {外层chart_type: {原始chart_type: count}}
+_REPAIR_TYPE_MISMATCHES: dict[str, dict[str, int]] = {}
+# ENHANCE 2026-10-11: 环形 buffer 存具体 mismatch case（section_title + 原始数据片段）
+# 用于 flush 输出 top-3 典型例子，帮助定位 AI 错位模式
+from collections import deque as _deque
+from ...config import REPAIR_MISMATCH_THRESHOLD as _REPAIR_MISMATCH_THRESHOLD, REPAIR_MISMATCH_CASE_BUFFER as _REPAIR_MISMATCH_CASE_BUFFER
+_REPAIR_MISMATCH_CASES: _deque = _deque(maxlen=_REPAIR_MISMATCH_CASE_BUFFER)
+import threading as _threading
+_repair_stats_lock = _threading.Lock()
+
+
+def get_repair_stats() -> dict[str, Any]:
+    """当前累计统计快照（供运维/API 调用）"""
+    with _repair_stats_lock:
+        return {
+            "total_validations": _REPAIR_STATS_TOTAL,
+            "per_chart_type": {
+                ct: dict(sorted(st.items(), key=lambda x: -x[1]))
+                for ct, st in sorted(_REPAIR_STATS.items())
+            },
+            "type_mismatches": {
+                ct: dict(sorted(mism.items(), key=lambda x: -x[1]))
+                for ct, mism in sorted(_REPAIR_TYPE_MISMATCHES.items())
+            },
+            # ENHANCE 2026-10-11: 高频 mismatch 规则 + 典型 case
+            "high_freq_mismatches": _get_high_freq_mismatches(),
+            "mismatch_case_count": len(_REPAIR_MISMATCH_CASES),
+        }
+
+
+def _get_high_freq_mismatches() -> list[dict]:
+    """筛选高频 mismatch（≥ threshold 次），供 system prompt 动态注入 + API 输出"""
+    with _repair_stats_lock:
+        result = []
+        for _outer, _origins in sorted(_REPAIR_TYPE_MISMATCHES.items()):
+            for _orig, _cnt in sorted(_origins.items(), key=lambda x: -x[1]):
+                if _cnt >= _REPAIR_MISMATCH_THRESHOLD:
+                    result.append({
+                        "outer_type": _outer,
+                        "original_type": _orig,
+                        "count": _cnt,
+                        "suggestion": (
+                            f"chart_data_fix prompt 里给 {_outer} 类型加约束："
+                            f"'请输出该类型的正确格式，不要输出 {_orig} 格式'"
+                        ),
+                    })
+        return result
+
+
+def flush_repair_stats() -> dict[str, Any]:
+    """打印汇总 + reset + DB 持久化（celery beat 每小时触发）"""
+    global _REPAIR_STATS_TOTAL, _REPAIR_STATS, _REPAIR_TYPE_MISMATCHES
+    with _repair_stats_lock:
+        snapshot = {
+            "total": _REPAIR_STATS_TOTAL,
+            "stats": {ct: dict(st) for ct, st in _REPAIR_STATS.items()},
+            "type_mismatches": {ct: dict(mism) for ct, mism in _REPAIR_TYPE_MISMATCHES.items()},
+            "mismatch_cases": list(_REPAIR_MISMATCH_CASES),
+            # ENHANCE 2026-10-11: 把高频规则也一起存入 DB
+            "high_freq_mismatches": _get_high_freq_mismatches(),
+        }
+        _REPAIR_STATS = {}
+        _REPAIR_STATS_TOTAL = 0
+        _REPAIR_TYPE_MISMATCHES = {}
+        _REPAIR_MISMATCH_CASES.clear()
+
+    # ── 持久化到 DB（JSON blob 方式，INSERT 一行快照）──
+    if snapshot["total"] > 0:
+        try:
+            import json as _json
+            from ...db import get_db as _get_db
+            with _get_db() as _conn:
+                _conn.execute(
+                    "INSERT INTO repair_stats_snapshots "
+                    "(total_validations, stats_json, mismatches_json, cases_json, high_freq_json) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (
+                        snapshot["total"],
+                        _json.dumps(snapshot["stats"], ensure_ascii=False),
+                        _json.dumps(snapshot["type_mismatches"], ensure_ascii=False),
+                        _json.dumps(snapshot["mismatch_cases"], ensure_ascii=False),
+                        _json.dumps(snapshot["high_freq_mismatches"], ensure_ascii=False),
+                    ),
+                )
+        except Exception as _dbe:
+            logger.warning("repair_stats flush DB 写入失败（不影响内存 reset）: %s", _dbe)
+
+    if snapshot["total"] > 0:
+        _lines = [
+            f"  {ct:12s}: {', '.join(f'{s}×{c}' for s, c in sorted(st.items(), key=lambda x: -x[1]))}"
+            for ct, st in sorted(snapshot["stats"].items())
+        ]
+        # type mismatch 汇总
+        _mism_lines = []
+        _mism_total = 0
+        for _outer, _origins in snapshot["type_mismatches"].items():
+            for _orig, _cnt in _origins.items():
+                _mism_lines.append(f"    {_outer} → {_orig}: {_cnt}")
+                _mism_total += _cnt
+
+        _extra = ""
+        if _mism_total > 0:
+            _extra = f"\n[类型错位] 累计 {_mism_total} 次 mismatch:" + "\n" + "\n".join(_mism_lines)
+            # ENHANCE 2026-10-11: top-3 典型 case
+            _cases = snapshot["mismatch_cases"][:3]
+            if _cases:
+                _case_lines = []
+                for _c in _cases:
+                    _case_lines.append(
+                        f"    [{_c.get('outer')}→{_c.get('original')}] section={_c.get('section_title','')[:40]}"
+                    )
+                _extra += "\n[典型 case TOP-3]:" + "\n" + "\n".join(_case_lines)
+
+        logger.warning(
+            "[repair_mermaid 统计汇总] 累计校验 %d 次，按类型:\n%s%s",
+            snapshot["total"], "\n".join(_lines), _extra,
+        )
+    return snapshot
+
+
+# ──────────────────────────────────────────────────────────────────────
+# DB 历史查询 / 清理 / 启动回填（ENHANCE 2026-10-11）
+# ──────────────────────────────────────────────────────────────────────
+def get_repair_stats_history(limit: int = 72) -> list[dict]:
+    """从 DB 读取最近 N 条快照（历史趋势）
+
+    Args:
+        limit: 返回最近多少行快照。默认 72 = 3 天 × 24 小时
+
+    Returns:
+        [{id, total_validations, created_at, stats_json, mismatches_json, high_freq_json}, ...]
+        已按 id DESC 排序，时间近的在前。失败返回 []（静默）。
+    """
+    try:
+        import json as _json
+        from ...db import get_db as _get_db
+        with _get_db() as _conn:
+            _rows = _conn.execute(
+                "SELECT id, total_validations, created_at, stats_json, mismatches_json, high_freq_json "
+                "FROM repair_stats_snapshots ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        _result = []
+        for _r in _rows:
+            _result.append({
+                "id": _r["id"],
+                "total_validations": _r["total_validations"],
+                "created_at": _r["created_at"],
+                "stats": _json.loads(_r["stats_json"] or "{}"),
+                "mismatches": _json.loads(_r["mismatches_json"] or "{}"),
+                "high_freq": _json.loads(_r["high_freq_json"] or "[]"),
+            })
+        return _result
+    except Exception as e:
+        logger.debug("get_repair_stats_history 失败（表不存在？）: %s", e)
+        return []
+
+
+def cleanup_repair_stats_snapshots(keep_rows: int = 720) -> int:
+    """清理过期快照（保留最近 keep_rows 行）
+
+    Args:
+        keep_rows: 保留行数，默认 720 = 30 天 × 24 小时
+
+    Returns:
+        删除的行数。失败返回 0。
+    """
+    try:
+        from ...db import get_db as _get_db
+        with _get_db() as _conn:
+            _cursor = _conn.execute(
+                "DELETE FROM repair_stats_snapshots WHERE id NOT IN "
+                "(SELECT id FROM repair_stats_snapshots ORDER BY id DESC LIMIT ?)",
+                (keep_rows,),
+            )
+            _deleted = _cursor.rowcount
+        if _deleted > 0:
+            logger.info("repair_stats_snapshots 清理: 删除 %d 行（保留最近 %d 行）", _deleted, keep_rows)
+        return _deleted
+    except Exception as e:
+        logger.warning("cleanup_repair_stats_snapshots 失败: %s", e)
+        return 0
+
+
+def restore_repair_stats_from_db(limit: int = 720) -> dict:
+    """启动时从 DB 回填高频规则到内存（跨重启保留历史洞察）
+
+    遍历最近 N 条 snapshots，把每条的 mismatches_json 聚合到
+    内存的 _REPAIR_TYPE_MISMATCHES 里——这样 _get_high_freq_mismatches()
+    就能在进程刚启动时（还没跑过任何校验）就有历史高频数据，
+    prompt 动态注入立即生效。
+
+    只回填 mismatches（频次统计），不回填 steps（steps 是即时性的）。
+    """
+    try:
+        import json as _json
+        from ...db import get_db as _get_db
+        with _get_db() as _conn:
+            _rows = _conn.execute(
+                "SELECT mismatches_json FROM repair_stats_snapshots ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        _restored = 0
+        with _repair_stats_lock:
+            for _r in _rows:
+                _mism = _json.loads(_r["mismatches_json"] or "{}")
+                for _outer, _origins in _mism.items():
+                    _target = _REPAIR_TYPE_MISMATCHES.setdefault(_outer, {})
+                    for _orig, _cnt in _origins.items():
+                        _target[_orig] = _target.get(_orig, 0) + _cnt
+                        _restored += 1
+        if _restored > 0:
+            logger.info(
+                "[repair_stats] 启动回填完成: %d 条 mismatch 记录从 DB 注入（%d 条快照）",
+                _restored, len(_rows),
+            )
+        return {"restored": _restored, "snapshots_used": len(_rows)}
+    except Exception as e:
+        logger.debug("restore_repair_stats_from_db 跳过（表不存在？）: %s", e)
+        return {"restored": 0, "snapshots_used": 0}
+
+
+def validate_chart_for_ai_pipeline(
+    chart_type: str,
+    chart_data: dict,
+    verbose: bool = False,
+    section_title: str | None = None,
+) -> tuple[bool, list[str], dict, bool, dict | None]:
+    """SSE 图表管线完整校验（纯逻辑，可独立单元测试）。
+
+    封装 sse_charts.py _validate_and_fix helper 内部的「首轮校验」逻辑——
+    对 Mermaid 代码型做 repair + validate_mermaid + 结构化解析 →
+    validate_chart_payload；对结构化 JSON 型直接 validate_chart_payload。
+
+    Args:
+        chart_type: flowchart / gantt / architecture / timeline / labor / comparison / layout
+        chart_data: AI 生成的原始 dict（Mermaid 型含 code 字段，结构化型含 tree/phases 等）
+        verbose: True 时返回 repair_context（完整修复上下文）；False（默认）时为 None
+
+    Returns:
+        (是否通过, 错误列表, chart_data, mutated标记, repair_context_or_None)
+          - repair_context 结构 (仅 verbose=True + Mermaid 代码型):
+              {
+                "repair_mermaid": {version, changed, steps, before, after},
+                "parsed_structure": dict | None,
+                "structural_validation_errors": list[str],
+              }
+    """
+    chart_type = str(chart_type or "").lower()
+    errors: list[str] = []
+    mutated = False
+    repair_context: dict | None = None
+
+    MERMAID_CODE_TYPES = {"flowchart", "gantt", "comparison", "layout", "timeline"}
+    STRUCTURED_TYPES = {"architecture", "labor"}
+
+    if chart_type in STRUCTURED_TYPES:
+        # 结构化 JSON 型 → chart_validators 全套校验器
+        try:
+            ok, errs = validate_chart_payload(chart_type, chart_data)
+            if not ok:
+                errors = list(errs or ["校验未通过"])
+        except Exception as ve:
+            errors.append(f"结构化校验异常: {ve!s}")
+
+    elif chart_type in MERMAID_CODE_TYPES:
+        # Mermaid 代码型 → repair_mermaid + validate_mermaid + 结构化完整性校验
+        raw = str(chart_data.get("code") or "")
+        # 始终拿 repair_mermaid diff（return_diff=True 开销极小——只组 dict），
+        # 保证 step_counts 统计完整；verbose 参数只控制 repair_context 是否收集给调用方
+        repaired, _rm_diff = repair_mermaid(raw, return_diff=True)
+        ok, msg = validate_mermaid(repaired)
+        if not ok:
+            errors.append(f"语法: {msg}")
+        elif repaired != raw:
+            chart_data = {**chart_data, "code": repaired}
+            mutated = True
+
+        # 结构化完整性校验
+        structured: dict | None = None
+        try:
+            if chart_type == "flowchart":
+                from .mermaid_flowchart import _parse_flowchart_structure as _pf
+                structured = _pf(repaired)
+            elif chart_type == "gantt":
+                from .mermaid_gantt import _parse_mermaid_gantt as _pg
+                tasks = _pg(repaired)
+                if tasks:
+                    structured = {"tasks": tasks}
+            elif chart_type == "comparison":
+                from .mermaid_comparison import _parse_mermaid_pie as _pp, _parse_mermaid_xychart as _px
+                pie = _pp(repaired)
+                if pie:
+                    structured = pie
+                else:
+                    xy = _px(repaired)
+                    if xy:
+                        structured = xy
+        except Exception:
+            pass
+
+        structural_errors: list[str] = []
+        if structured:
+            chart_data = {**chart_data, **structured}
+            mutated = True
+            try:
+                sok, serrs = validate_chart_payload(chart_type, chart_data)
+                if not sok:
+                    structural_errors = list(serrs or [])
+                    errors.extend(structural_errors)
+            except Exception:
+                pass
+
+        # 收集 repair_context（verbose 模式）
+        _orig_ct = (chart_data.get("type") or chart_type)
+        if verbose:
+            repair_context = {
+                "repair_mermaid": _rm_diff,
+                "parsed_structure": structured,
+                "structural_validation_errors": structural_errors,
+                "original_chart_type": _orig_ct,
+            }
+
+        # ENHANCE 2026-10-11: 模块级统计收集（chart_type × step_name → 累计次数）
+        # 用于后续 celery beat 定时批量汇总
+        if _rm_diff and _rm_diff.get("step_counts"):
+            with _repair_stats_lock:
+                _step_stats = _REPAIR_STATS.setdefault(chart_type, {})
+                for _sn, _cnt in _rm_diff["step_counts"].items():
+                    _step_stats[_sn] = _step_stats.get(_sn, 0) + _cnt
+                _REPAIR_STATS_TOTAL += 1
+                # type mismatch: original ≠ 外层 → 统计 + 存具体 case（环形 buffer）
+                if _orig_ct != chart_type:
+                    _mism_outer = _REPAIR_TYPE_MISMATCHES.setdefault(chart_type, {})
+                    _mism_outer[_orig_ct] = _mism_outer.get(_orig_ct, 0) + 1
+                    # 存环形 buffer（maxlen=200，先进先出）
+                    _REPAIR_MISMATCH_CASES.append({
+                        "outer": chart_type,
+                        "original": _orig_ct,
+                        "section_title": section_title or chart_data.get("title") or "",
+                        "code_snippet": str(chart_data.get("code") or "")[:120],
+                    })
+
+    return (len(errors) == 0, errors, chart_data, mutated, repair_context)
+
+
+def resolve_image_budget(requested: int | None, project_id: int | None = None) -> int:
+    """AI 生图上限的成本拦截（E-7.4）。
+
+    编排拍板阶段按 `max_ai_images` 全局择优，但「全局配置是否允许生图 / 项目
+    生图配额」此前没有在生成路径里生效（配置存在、校验不存在 —— 图表调研
+    报告项 7）。这里在编排入口做钳制：
+
+      - 请求数 <= 0 → 0（禁用）；
+      - ai_config 显式 `is_image_enabled=False` → 0；
+      - ai_config 提供 `max_images_per_project` 且为有限值 → min(requested, 配额)。
+
+    配置键不存在时**不做任何假设**（保持调用方原值），避免误伤旧配置。
+
+    Args:
+        requested: 调用方请求的 AI 生图上限（orch_max_ai_images）
+        project_id: 预留（未来按项目配额钳制），当前仅透传 config
+
+    Returns:
+        钳制后的生图上限（int，>=0）
+    """
+    if requested is None:
+        return 0
+    try:
+        requested = int(requested)
+    except (TypeError, ValueError):
+        return 0
+    if requested <= 0:
+        return 0
+    try:
+        from .provider_factory import get_ai_config
+
+        cfg = get_ai_config() or {}
+        # BUG-FIX 2026-10-09：`bool(None) is False` 恒为 True —— 若写成
+        # `if bool(cfg.get("is_image_enabled")) is False`，配置未显式提供该键时
+        # （旧配置/默认配置）会把请求一律钳成 0，误禁 AI 生图。只有**显式**给出
+        # 该键且值为 False 时才判定为禁用。
+        _flag = cfg.get("is_image_enabled")
+        if _flag is not None and bool(_flag) is False:
+            return 0
+        limit = cfg.get("max_images_per_project")
+        if isinstance(limit, (int, float)) and int(limit) > 0:
+            requested = min(requested, int(limit))
+    except Exception:
+        pass
+    return requested

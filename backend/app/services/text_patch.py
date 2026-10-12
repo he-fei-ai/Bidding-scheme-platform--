@@ -35,7 +35,7 @@ import hashlib
 import itertools
 import logging
 import re
-from typing import Any
+from typing import Any, Callable
 
 
 logger = logging.getLogger(__name__)
@@ -287,17 +287,46 @@ def describe_patch_match(content: Any, patch: dict) -> dict:
     return detail
 
 
+def _resolve_unique_strict(unique_strict: "bool | None") -> bool:
+    """解析「唯一命中收紧」开关。
+
+    ENHANCE 2026-10-11（引入项 #13）：`config.CONSISTENCY_UNIQUE_EDIT_STRICT`
+    此前被声明为默认 `true` 却无任何消费点——属技术架构文档 v4.1 附录 A 记录的
+    「配置宣称已收紧、实际未收紧」同类落差。现由补丁引擎真正读取该开关：
+
+      - 显式传参（测试用）优先；
+      - 否则读 `config.CONSISTENCY_UNIQUE_EDIT_STRICT`（默认 true）；
+      - 读取失败回退 true（保持既有更安全语义）。
+
+    默认（true）下的判定与本模块引入前**逐字一致**：非唯一命中一律拒绝。
+    """
+    if unique_strict is not None:
+        return bool(unique_strict)
+    try:
+        from ..config import CONSISTENCY_UNIQUE_EDIT_STRICT
+
+        return bool(CONSISTENCY_UNIQUE_EDIT_STRICT)
+    except Exception:
+        return True
+
+
 def apply_exact_patch(
     content: Any,
     patch: dict,
     *,
     disproportionate_ratio: float | None = DISPROPORTIONATE_RATIO,
+    unique_strict: "bool | None" = None,
 ) -> str:
     """精确应用单个补丁，返回新正文。失败抛 `PatchApplyError`。
 
     两级定位：行号区间命中且逐字相等 → 区间替换；否则要求全局唯一精确匹配。
 
     `disproportionate_ratio` 为区间占比保护的阈值（传 None 或 0 关闭）。
+
+    `unique_strict`（引入项 #13，消费 `CONSISTENCY_UNIQUE_EDIT_STRICT`）：
+      - None → 读取 config（默认 true）；
+      - True → `old_text` 必须唯一命中，多命中/零命中都拒绝（默认，与既有行为一致）；
+      - False → 允许多命中并**替换全部**出现位置（回退旧的宽松容错行为）。
     """
     current = normalize_newlines(content)
     old_text = normalize_patch_text(patch.get("old_text"))
@@ -331,7 +360,16 @@ def apply_exact_patch(
     if not matches:
         raise PatchApplyError("old_text 未在当前小节正文中找到")
     if len(matches) > 1:
-        raise PatchApplyError(f"old_text 在当前小节正文中出现 {len(matches)} 次，请提供更多上下文确保唯一定位")
+        # 引入项 #13：收紧开关为 True（默认）时维持既有「多命中即拒绝」语义；
+        # 显式关闭（False）时回退旧的宽松行为——替换全部出现位置。
+        if _resolve_unique_strict(unique_strict):
+            raise PatchApplyError(
+                f"old_text 在当前小节正文中出现 {len(matches)} 次，请提供更多上下文确保唯一定位"
+            )
+        replacement = current
+        for index in reversed(matches):
+            replacement = f"{replacement[:index]}{new_text}{replacement[index + len(old_text):]}"
+        return replacement
 
     index = matches[0]
     return f"{current[:index]}{new_text}{current[index + len(old_text):]}"
@@ -342,10 +380,12 @@ def apply_patches(
     patches: Any,
     *,
     disproportionate_ratio: float | None = DISPROPORTIONATE_RATIO,
+    unique_strict: "bool | None" = None,
 ) -> dict:
     """串行应用多个补丁，**逐条错误隔离**：单条失败只记录，不影响其余条。
 
     `disproportionate_ratio` 透传给 `apply_exact_patch` 的区间占比保护。
+    `unique_strict` 透传给 `apply_exact_patch`（引入项 #13；None = 读 config，默认收紧）。
 
     返回：
       {
@@ -367,7 +407,8 @@ def apply_patches(
         detail = {"index": index, **describe_patch_match(next_content, patch)}
         try:
             next_content = apply_exact_patch(
-                next_content, patch, disproportionate_ratio=disproportionate_ratio
+                next_content, patch, disproportionate_ratio=disproportionate_ratio,
+                unique_strict=unique_strict,
             )
             applied_count += 1
             results.append({**detail, "applied": True, "after_metrics": text_metrics(next_content)})
@@ -428,16 +469,27 @@ def build_value_replacement_edits(
     new_value: Any,
     *,
     digit_boundary: bool = True,
+    keep: Callable[[int, int], bool] | None = None,
 ) -> list[dict]:
-    """为「把 old_value 统一成 new_value」构造字符区间编辑列表。"""
+    """为「把 old_value 统一成 new_value」构造字符区间编辑列表。
+
+    Args:
+        keep: 可选的逐处出现位置过滤器 ``keep(start, end) -> bool``。
+            返回 False 的出现位置将被跳过。用于一致性 autofix 的「事实标签词
+            就近校验」（避免把「钢筋直径 30 mm」里的 30 当成工期改掉）。
+            默认 None = 全部保留（与既有行为完全一致）。
+    """
     text = str(content or "")
     replacement = str(new_value or "")
     edits = []
     for position in find_value_occurrences(text, old_value, digit_boundary=digit_boundary):
+        end = position + len(str(old_value or ""))
+        if keep is not None and not keep(position, end):
+            continue
         edits.append(
             {
                 "start": position,
-                "end": position + len(str(old_value or "")),
+                "end": end,
                 "new_text": replacement,
             }
         )
@@ -520,12 +572,17 @@ def replace_values(
     replacements: Any,
     *,
     digit_boundary: bool = True,
+    keep: Callable[[int, int], bool] | None = None,
 ) -> dict:
     """把多组 `{old_value → new_value}` 一次性替换进正文（宿主路径）。
 
     `replacements` 接受 `{old: new}` 字典或 `[(old, new)]` 列表。
     所有替换合并成一批区间编辑，因此**任意一处区间非法或重叠就整批拒绝**——
     这是有意的：一致性修复要么整体成功，要么交回人工，不做半吊子修改。
+
+    Args:
+        keep: 逐处出现位置的过滤器 ``keep(start, end) -> bool``，透传给
+            :func:`build_value_replacement_edits`。默认 None = 不过滤。
     """
     if isinstance(replacements, dict):
         pairs = list(replacements.items())
@@ -537,7 +594,15 @@ def replace_values(
     for old_value, new_value in pairs:
         if not old_value or str(old_value) == str(new_value):
             continue
-        edits.extend(build_value_replacement_edits(text, old_value, new_value, digit_boundary=digit_boundary))
+        edits.extend(
+            build_value_replacement_edits(
+                text,
+                old_value,
+                new_value,
+                digit_boundary=digit_boundary,
+                keep=keep,
+            )
+        )
 
     if not edits:
         return {"content": text, "changed": False, "applied": [], "errors": []}

@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback, useRef } from "react";
-import { Card, Upload, Button, message, List, Tag, Space, Typography, Spin, Alert } from "antd";
+import { Card, Upload, Button, message, List, Tag, Space, Typography, Spin, Alert, Popconfirm } from "antd";
 import {
   UploadOutlined,
   DeleteOutlined,
@@ -12,6 +12,7 @@ import {
   ArrowRightOutlined,
   InfoCircleOutlined,
   StarOutlined,
+  ClearOutlined,
 } from "@ant-design/icons";
 import type { UploadProps } from "antd";
 import { useParams, useNavigate } from "react-router-dom";
@@ -23,6 +24,7 @@ import {
   updateFileRole,
   fetchFileParsingStatus,
   asyncReparseFile,
+  clearProjectTexts,
 } from "../api";
 import type { FileInfo, FileParsingStatus } from "../types";
 import {
@@ -89,6 +91,8 @@ export default function FileUploadPage() {
   // 状态聚合此前前端完全没有消费方。上传在途期间按 1.5s 轮询，让批量上传有可见进度。
   const [parseStatus, setParseStatus] = useState<FileParsingStatus | null>(null);
   const loadFilesRef = useRef(false);
+  // Gap-1 2026-10-11：清空提取按钮的在途状态（防重复点击）
+  const [clearing, setClearing] = useState(false);
 
   const loadFiles = useCallback(async () => {
     if (!projectId) return;
@@ -303,6 +307,24 @@ export default function FileUploadPage() {
   }));
   const progressTotal = Math.max(files.length, extractedCount + failedCount + uploadingCount);
 
+  // Gap-1 2026-10-11：清空项目所有已提取文本
+  const handleClearTexts = useCallback(async () => {
+    if (!projectId || clearing) return;
+    setClearing(true);
+    try {
+      const result = await clearProjectTexts(projectId);
+      message.success(
+        `已重置 ${result.files_reset} 个文件状态为待提取，清理 ${result.tasks_cleared} 条旧解析记录`
+      );
+      await loadFiles();
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      message.error(`清空提取失败：${detail}`);
+    } finally {
+      setClearing(false);
+    }
+  }, [projectId, clearing, loadFiles]);
+
   return (
     <div>
       <PageHeader
@@ -311,12 +333,29 @@ export default function FileUploadPage() {
         description="支持 Word（含 .wps）、PDF、Excel 清单（.xlsx/.xls）、PPT、Markdown、HTML、图片扫描件（png/jpg 等，需 OCR）等格式，系统将自动解析正文内容，用于后续要点提取与方案生成。清单类文件请命名为含“清单/工程量”的文件名，便于工程量自动分析。"
         extra={
           files.length > 0 ? (
-            <Button
-              type="primary"
-              onClick={() => navigate(`/projects/${projectId}/review`)}
-            >
-              下一步：要点提取 <ArrowRightOutlined />
-            </Button>
+            <Space size={12}>
+              {/* Gap-1 2026-10-11：清空提取按钮 —— 带二次确认，防误触
+                  不删除原始文件，只清空提取文本 + 重置状态 */}
+              <Popconfirm
+                title="确认清空已提取文本？"
+                description="将清空所有文件的提取文本并重置为「待提取」状态（不会删除已上传的原始文件）。解析失败记录也会一起清理。"
+                okText="确认清空"
+                okButtonProps={{ danger: true }}
+                cancelText="取消"
+                onConfirm={handleClearTexts}
+                disabled={clearing || files.length === 0}
+              >
+                <Button danger icon={<ClearOutlined />} loading={clearing}>
+                  清空提取
+                </Button>
+              </Popconfirm>
+              <Button
+                type="primary"
+                onClick={() => navigate(`/projects/${projectId}/review`)}
+              >
+                下一步：要点提取 <ArrowRightOutlined />
+              </Button>
+            </Space>
           ) : null
         }
       />

@@ -6,7 +6,7 @@ import {
   DeleteOutlined,
   ReloadOutlined,
   FileTextOutlined,
-  ImportOutlined,
+  DownloadOutlined,
   CheckCircleOutlined,
   CloseCircleOutlined,
   EllipsisOutlined,
@@ -808,7 +808,7 @@ export default function RejectionCheckPage() {
             </Col>
             <Col>
               <a href={getRejectionReportUrl(task.id, "docx")} target="_blank" rel="noopener noreferrer">
-                <Button icon={ImportOutlined as any}>下载报告</Button>
+                <Button icon={<DownloadOutlined />}>下载报告</Button>
               </a>
             </Col>
             {/* ENHANCE 2026-09-15：Excel 报告（检查概览/废标项/错别字/逻辑问题 四 Sheet），

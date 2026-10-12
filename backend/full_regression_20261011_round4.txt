@@ -1,0 +1,147 @@
+﻿..............................................................s......... [  1%]
+........................................................................ [  3%]
+........................................................................ [  5%]
+........................................................................ [  7%]
+........................................................................ [  9%]
+........................................................................ [ 11%]
+........................................................................ [ 13%]
+........................................................................ [ 15%]
+........................................................................ [ 17%]
+........................................................................ [ 19%]
+........................................................................ [ 21%]
+........................................................................ [ 23%]
+........................................................................ [ 25%]
+........................................................................ [ 27%]
+................................................F....................... [ 29%]
+........................................................................ [ 31%]
+........................................................................ [ 33%]
+.....................................s.................................. [ 35%]
+........................................................................ [ 37%]
+........................................................................ [ 39%]
+........................................................................ [ 41%]
+........................................................................ [ 43%]
+........................................................................ [ 45%]
+........................................................................ [ 47%]
+........................................................................ [ 49%]
+........................................................................ [ 50%]
+........................................................................ [ 52%]
+........................................................................ [ 54%]
+........................................................................ [ 56%]
+........................................................................ [ 58%]
+........................................................................ [ 60%]
+........................................................................ [ 62%]
+........................................................................ [ 64%]
+........................................................................ [ 66%]
+........................................................................ [ 68%]
+........................................................................ [ 70%]
+........................................................................ [ 72%]
+........................................................................ [ 74%]
+........................................................................ [ 76%]
+.............................................ssssssssssssssssssss....... [ 78%]
+...............sssssssssssssssssssssssssssssssssssssssssssssssssssssssss [ 80%]
+sssss.....................................ssssssssssssssssssssss........ [ 82%]
+..............................................................FF........ [ 84%]
+........................................................................ [ 86%]
+........................................................................ [ 88%]
+................................................s....................... [ 90%]
+........................................................................ [ 92%]
+........................................................................ [ 94%]
+........................................s.........................ssssss [ 96%]
+ssss.................................................................... [ 98%]
+..................s.....sssss...................ssssssssssssssssssssss.  [100%]
+================================== FAILURES ===================================
+______ TestRateGateCooldown.test_cooldown_waits_in_chunks_until_finished ______
+
+self = <backend.tests.test_contentgen_audit_fixes_2026_10_08b.TestRateGateCooldown object at 0x0000018882B179D0>
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x0000018882B2B4D0>
+
+    def test_cooldown_waits_in_chunks_until_finished(self, monkeypatch):
+        import app.services.ai.rate_gate as rg
+    
+        gate = rg.rate_gate
+        st = gate._state("http://cooldown-test-fullwait", 60.0, 2)
+        calls: list[float] = []
+        orig_cooldown = st.cooldown_until
+    
+        async def fake_sleep(seconds, ev):
+            calls.append(round(seconds, 3))
+            st.cooldown_until -= seconds
+    
+        monkeypatch.setattr(rg, "_interruptible_sleep", fake_sleep)
+        st.cooldown_until = time.monotonic() + 75.0
+    
+        async def run():
+            async with gate.slot("http://cooldown-test-fullwait", rpm=60.0, concurrency=2):
+                pass
+    
+        asyncio.run(run())
+        try:
+            # ÿƬ �� _MAX_SLEEP����Ƭ���̶�Ϊ 3�����ܵȴ�����������ȴ���ڣ�������Ư�ƣ�
+            assert len(calls) == 3
+            assert all(c <= 30.0 for c in calls)
+>           assert sum(calls) >= 74.9
+E           assert 71.378 >= 74.9
+E            +  where 71.378 = sum([30.0, 30.0, 11.378])
+
+tests\test_contentgen_audit_fixes_2026_10_08b.py:193: AssertionError
+---------------------------- Captured stdout call -----------------------------
+2026-10-11 01:36:05 [INFO] app.services.ai.rate_gate [rid=- pid=- sid=- tid=-]: [����բ��] ��ʼ�� base_url=http://cooldown-test-fullwait rpm=60 ��������=2
+------------------------------ Captured log call ------------------------------
+INFO     app.services.ai.rate_gate:rate_gate.py:235 [����բ��] ��ʼ�� base_url=http://cooldown-test-fullwait rpm=60 ��������=2
+DEBUG    asyncio:proactor_events.py:633 Using proactor: IocpProactor
+_______ TestL1CacheKeyChartType.test_get_cached_uses_chart_type_in_key ________
+
+self = <backend.tests.test_perf_bottleneck_fixes.TestL1CacheKeyChartType object at 0x0000018883757390>
+
+    def test_get_cached_uses_chart_type_in_key(self):
+        """_get_cached_chart_render Ӧ�� chart_type ƴ�� cache key"""
+        import inspect
+        from app.services.export import _get_cached_chart_render
+    
+        source = inspect.getsource(_get_cached_chart_render)
+>       assert "cache_key" in source, (
+            "_get_cached_chart_render Ӧ���� cache_key ����"
+        )
+E       AssertionError: _get_cached_chart_render Ӧ���� cache_key ����
+E       assert 'cache_key' in '    ͳһ��`_detect_inline_chart_types` ���ص����ͼ��� == `parse_content` ʵ��\n'
+
+tests\test_perf_bottleneck_fixes.py:550: AssertionError
+______ TestL1CacheKeyChartType.test_store_cached_uses_chart_type_in_key _______
+
+self = <backend.tests.test_perf_bottleneck_fixes.TestL1CacheKeyChartType object at 0x00000188837574D0>
+
+    def test_store_cached_uses_chart_type_in_key(self):
+        """_store_chart_render Ӧ�� chart_type ƴ�� cache key"""
+        import inspect
+        from app.services.export import _store_chart_render
+    
+        source = inspect.getsource(_store_chart_render)
+>       assert "cache_key" in source, (
+            "_store_chart_render Ӧ���� cache_key ����"
+        )
+E       AssertionError: _store_chart_render Ӧ���� cache_key ����
+E       assert 'cache_key' in '    """\n    if not content:\n        return set(), set()\n\n    from .content_cleaning import iter_chart_fences, ite...ne_chart_markers(section_detail) -> tuple[set[str], set[str]]:\n    """�� section_detail id ��������ͼ���Ǽ������(ȫ��, ��ʾ�Ӽ�)����\n'
+
+tests\test_perf_bottleneck_fixes.py:563: AssertionError
+============================== warnings summary ===============================
+C:\Program Files\Python314\Lib\site-packages\_pytest\config\__init__.py:1464
+  C:\Program Files\Python314\Lib\site-packages\_pytest\config\__init__.py:1464: PytestConfigWarning: Unknown config option: cache_dir
+  
+    self._warn_or_fail_if_strict(f"Unknown config option: {key}\n")
+
+C:\Program Files\Python314\Lib\site-packages\fastapi\testclient.py:1
+  C:\Program Files\Python314\Lib\site-packages\fastapi\testclient.py:1: StarletteDeprecationWarning: Using `httpx` with `starlette.testclient` is deprecated; install `httpx2` instead.
+    from starlette.testclient import TestClient as TestClient  # noqa
+
+tests/test_async_blocking_gate.py::test_backlog_is_confined_to_declared_module
+  C:\Program Files\Python314\Lib\ast.py:46: RuntimeWarning: coroutine '_schedule_cleanup.<locals>._cleanup_loop' was never awaited
+    return compile(source, filename, mode, flags,
+  Enable tracemalloc to get traceback where the object was allocated.
+  See https://docs.pytest.org/en/stable/how-to/capture-warnings.html#resource-warnings for more info.
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ===========================
+FAILED tests/test_contentgen_audit_fixes_2026_10_08b.py::TestRateGateCooldown::test_cooldown_waits_in_chunks_until_finished
+FAILED tests/test_perf_bottleneck_fixes.py::TestL1CacheKeyChartType::test_get_cached_uses_chart_type_in_key
+FAILED tests/test_perf_bottleneck_fixes.py::TestL1CacheKeyChartType::test_store_cached_uses_chart_type_in_key
+3 failed, 3522 passed, 146 skipped, 3 warnings in 641.34s (0:10:41)

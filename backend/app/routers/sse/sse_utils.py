@@ -236,9 +236,17 @@ def _get_effective_target_words(
         tw = section.get("target_words")
         if isinstance(tw, int) and tw > 0:
             return tw
-        # 2) L3 自身正文（方案三 2026-10-09）：300 字左右 ±20%（240~360 字）
-        #    四档 800/1200/2000/2500 作为「L3 子树总字数」口径，仅在 L3
-        #    存在下级目录章节（L4+）时参与校验；无下级的 L3 以自身正文
+        # 2) 单节点档位覆盖（混合口径 2026-10-12）：显式设置 word_count_tier 时
+        #    按该档位目标生成，与校验侧 routers/word_count.py、压缩侧
+        #    workflows_sections 保持一致（否则用户给叶子 L3 选档位无效）。
+        tier_key = section.get("word_count_tier")
+        if tier_key:
+            cfg = get_tier_config(tier_key)
+            if cfg:
+                return int(cfg["target_words"])
+        # 3) L3 自身正文（方案三 2026-10-09）：无档位覆盖时固定 300 字左右 ±20%
+        #    （240~360 字）。四档 800/1200/2000/2500 作为「L3 子树总字数」口径，
+        #    仅在 L3 存在下级目录章节（L4+）时参与校验；无下级的 L3 以自身正文
         #    300 ± 20% 为唯一测量口径，生成层与校验层必须一致。
         return get_l3_own_target()
 

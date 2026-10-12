@@ -12,15 +12,40 @@ import re
 import time
 from typing import Any, Callable
 
+# BUG-FIX 2026-10-12（P0 字数口径）：
+# 原实现两级导入均失败——`app.services.utils` 模块不存在（backend/app/services/
+# 下无 utils.py），`from ..utils import count_words` 从 app.services.ai 上溯到
+# app.services 后再进 utils，仍是错路径。两级 ImportError 后落入本地兜底
+# `len(text.replace(" ", "").replace("\n", ""))`——把中英文一律按「非空白字符
+# 计数」，中文段落字数被系统性放大 ~14%（如 70 字→80 字）。三条连锁问题：
+#   ① progress_callback 上报的 word_count 虚高，SSE 事件字数 ≠ DB 字数；
+#   ② condense_overlong_content 入口判定用同一虚高口径，L3 目标 300±20%
+#      对应 hi=360，边界章节（真实 346 字）被误判为超标（虚高 394>360），
+#      触发不必要的 AI 压缩；
+#   ③ 与 sse_content 落库使用的 `sections._count_words`（源自 app.utils 权威
+#      实现：中文逐字 + 英文按词的正则分词）分叉，用户刷新后看到字数变化。
+# 修复：三级相对导入 `from ...utils import count_words` 指向 app.utils；
+# 兜底分支同构复用相同正则口径，防止未来 app.utils 重构再次静默退化。
 try:
-    from app.services.utils import count_words
-except ImportError:
-    try:
-        from ..utils import count_words
-    except ImportError:
-        def count_words(text: str) -> int:
-            """简易字数统计（兜底）"""
-            return len(text.replace(" ", "").replace("\n", ""))
+    from ...utils import count_words, normalize_newlines  # 权威口径 + CRLF 归一
+except ImportError:  # pragma: no cover - 兜底路径，与权威实现语义等价
+    import re as _re_count
+
+    _COUNT_WORDS_FALLBACK_RE = _re_count.compile(r"[\u4e00-\u9fff]|[a-zA-Z0-9]+")
+
+    def count_words(text: str) -> int:
+        """字数统计兜底实现（与 app.utils.count_words 口径一致）。"""
+        if not text:
+            return 0
+        return len(_COUNT_WORDS_FALLBACK_RE.findall(text))
+
+    def normalize_newlines(text: str) -> str:
+        """CRLF / CR → LF 兜底实现（与 app.utils.normalize_newlines 等价）。"""
+        if not text:
+            return ""
+        if "\r" not in text:
+            return text
+        return text.replace("\r\n", "\n").replace("\r", "\n")
 from ...utils.scoring_points import is_scoring_placeholder
 from .cache_metrics import record_prompt_cache, record_store
 from .heading_standard import HeadingNumberingGenerator
@@ -99,6 +124,11 @@ class SectionContentCache:
     而 `/monitor` 与正文生成的 `cache_stats` SSE 事件都会把它下发给前端 ——
     诊断面板里的「缓存命中率」永远是无意义的 0，无法判断"生成变快"是缓存生效
     还是 AI 变快。现在真实维护命中/未命中计数（过期条目计入 misses）。
+
+    Risk-P3c NOTE 2026-10-11：本缓存是**进程内单例**（模块级 `section_content_cache`）。
+    在 uvicorn 多 worker 部署时，每个 worker 有独立缓存 → worker A 写入的缓存
+    worker B 无法命中，且 invalidate_by_ids 只清本进程。项目当前单 worker 模式
+    下无影响；若后期横向扩容，需引入 Redis 共享缓存层替换本类。
     """
 
     def __init__(self, max_size: int = 100, ttl: int = 3600):
@@ -697,6 +727,50 @@ def _scoring_context_to_text(scoring_context: Any) -> str:
     return "\n".join(items)
 
 
+def _resolve_word_control_override(word_control: Any, chapter_info: Any) -> dict | None:
+    """从强控覆盖表取本章节参数（易标 R5/R8，2026-10-12）。
+
+    覆盖表由 sse_content 按「字数控制生效快照」装配（``word_control_runtime.
+    build_section_override``）后经 context 透传；未配置/未强控/章节未命中时
+    返回 None，调用方回落既有档位逻辑。解析异常不阻断生成（记 debug 日志）。
+    """
+    if not word_control or not isinstance(chapter_info, dict):
+        return None
+    try:
+        from ..word_control_runtime import resolve_override
+
+        return resolve_override(word_control, chapter_info)
+    except Exception as e:
+        logger.debug("[silent-except] 强控覆盖解析失败 - %s", e)
+        return None
+
+
+def _build_strict_redline(override: dict) -> str:
+    """强控章节字数红线（R5 话术 + R13 保真条款 + 平台防堆砌/防省略约束）。
+
+    R5/R8/R13 的话术唯一来源是 ``word_control_runtime.build_strict_section_
+    requirement``（内部引用纯函数常量），此处只追加平台级红线；严禁在本函数
+    内重写区间/目标数字，避免与校验侧口径分叉。
+    """
+    try:
+        from ..word_control_runtime import build_strict_section_requirement
+
+        requirement = build_strict_section_requirement(override)
+    except Exception as e:
+        logger.debug("[silent-except] 强控话术构造失败 - %s", e)
+        requirement = ""
+    return (
+        "【强控字数红线】" + requirement +
+        "测量口径为本章节自身正文（不含下级目录章节——下级目录章节由下级章节"
+        "独立生成并自行控制字数）。必须严格遵守："
+        "① 不得为凑字数而堆砌空话套话、不重复表述同一意思；"
+        "② 不得为省字数而省略必含要素（项目概况、评分要点响应、施工部署、"
+        "质量控制、安全保证、进度安排、资源配置、应急预案、验收标准等）；"
+        "③ 不得出现【待补充】等占位内容；"
+        "④ 数据详实、结构清晰、专业术语准确，紧扣评分点。"
+    )
+
+
 def build_chapter_content_messages(chapter_info: dict, facts: Any = None, 
                                     scoring_context: str = "",
                                     project_scope: str = "",
@@ -923,6 +997,59 @@ def build_chapter_content_messages(chapter_info: dict, facts: Any = None,
                 content="下级目录章节（仅作交叉引用参考，禁止复述其文字；文字由下级章节在独立任务中生成）:\n" + "\n".join(_c_lines)
             ))
 
+    # --- [3.7] 全篇叙事骨架（E-4，跨章连贯约束）---
+    # ENHANCE 2026-10-09：正文按叶子独立并发生成，几十万字时各章「各自成文」。
+    # 编排阶段一次性生成的全篇骨架在此按章节前缀匹配注入（祖先链相关段），
+    # 只约束行文衔接与章节定位、不含数据，因此同项目内注入文本稳定，
+    # 不影响 [0]+[1] 的缓存前缀。
+    _skeleton = kwargs.get("full_skeleton")
+    if _skeleton is None:
+        _skeleton = chapter_info.get("full_skeleton")
+    if isinstance(_skeleton, dict) and _skeleton:
+        try:
+            from .workflows_orchestration import select_skeleton_for_section
+        except Exception:  # pragma: no cover - 防御性（与事实筛选同一兜底策略）
+            select_skeleton_for_section = None
+        if select_skeleton_for_section is not None:
+            _skel_text = select_skeleton_for_section(_skeleton, str(chapter_info.get("id", "")))
+            if _skel_text:
+                _safe_skel = sanitize_prompt_value(_skel_text) if sanitize_prompt_value else _skel_text
+                messages.append(AIMessage(
+                    role="user",
+                    content=(
+                        "全篇叙事骨架（跨章承接约束：与本骨架衔接、不抢后续章节的内容；"
+                        "骨架不含数据，具体数据以全局事实为准）:\n" + _safe_skel
+                    ),
+                ))
+
+    # --- [3.8] 编排选定的知识库素材（E-2）---
+    # ENHANCE 2026-10-09：补齐易标规格 D7 的 knowledge.item_ids 通道 —— 编排阶段
+    # AI 从素材清单中为本节挑选的条目，在此取全文注入（条目缺失自动跳过）。
+    _kn_items = kwargs.get("knowledge_items")
+    if _kn_items is None:
+        _kn_items = chapter_info.get("knowledge_items")
+    if isinstance(_kn_items, list) and _kn_items:
+        _kn_lines = []
+        _kn_budget = 1500
+        for _it in _kn_items:
+            if not isinstance(_it, dict):
+                continue
+            _kt = str(_it.get("title") or "").strip()
+            _kc = str(_it.get("content") or "").strip()
+            if not _kt and not _kc:
+                continue
+            if len(_kc) > 600:
+                _kc = _kc[:600] + "…"
+            _line = f"[{_it.get('id', '')}] {_kt}: {_kc}" if _kt else f"[{_it.get('id', '')}] {_kc}"
+            if _kn_budget - len(_line) < 0:
+                break
+            _kn_budget -= len(_line)
+            _kn_lines.append(_line)
+        if _kn_lines:
+            _kn_text = "知识库素材（编排为本节选定，仅作参考依据；禁止虚构素材中不存在的数据）:\n" + "\n".join(_kn_lines)
+            _safe_kn = sanitize_prompt_value(_kn_text) if sanitize_prompt_value else _kn_text
+            messages.append(AIMessage(role="user", content=_safe_kn))
+
     # --- [4] 当前章节任务（唯一随章节变化的部分）---
     # SECURITY-FIX 2026-10-06：章节标题/概要/评分要点均来自解析结果（用户内容），做元标记中和。
     safe_title = sanitize_prompt_value(title) if sanitize_prompt_value else title
@@ -973,26 +1100,64 @@ def build_chapter_content_messages(chapter_info: dict, facts: Any = None,
 
     lo = int(_tier_target * (1 - _tolerance))
     hi = int(_tier_target * (1 + _tolerance))
-    target_wc = f"{lo}-{hi}"
+    # BUG-FIX 2026-10-11（字数偏差控制）：将「240-360」范围表达改为
+    # 「约 300 字左右（硬性上限 360 字，最低 240 字）」—— 实测 10 个 L3 章节
+    # 平均偏差 +34.2%、100% 系统性偏高、最极端 +120%。根因：模型面对
+    # 「240-360」区间时会按「至少 240」理解，倾向超长。改为「约 N 字 + 硬性
+    # 上限 M」后，模型有明确锚点值与不可逾越的上限，超长倾向显著降低。
+    target_wc = f"约 {_tier_target} 字左右（硬性上限 {hi} 字，最低 {lo} 字）"
     target_note = (
         f"（{_tier_label}档位·目标 {_tier_target} 字，"
         f"允许浮动 \u00b1{int(_tolerance * 100)}%）"
     )
 
+    # 易标 R5/R8（2026-10-12）：强控覆盖 —— 项目配置了「每节字数 + 强控」并已
+    # 固化生效快照时，本节按快照派生的 ±20% 硬性区间控制，优先于既有档位口径。
+    # 覆盖表经 context['word_control'] 透传；未命中（未配置/未强控/章节不在
+    # 本次生成集合）时下面全部逻辑与既往行为逐字一致。
+    _wc_ov = _resolve_word_control_override(kwargs.get("word_control"), chapter_info)
+    if _wc_ov and _chapter_level >= 3:
+        _wc_s = int(_wc_ov.get("section_words") or 0)
+        _wc_lo_v = int(_wc_ov.get("lo") or 0)
+        _wc_hi_v = int(_wc_ov.get("hi") or 0)
+        if _wc_s > 0 and _wc_hi_v > 0:
+            from ..word_control import STRICT_SECTION_TOLERANCE
+
+            # 倒推目标 G（R8，可能为 0=未设全文上限）作为初稿锚点；
+            # 无 G 时以每节目标 S 为锚点（build_strict_section_requirement 同口径）。
+            _wc_anchor = int(_wc_ov.get("generation_target") or 0) or _wc_s
+            _tier_target = _wc_s
+            _tolerance = float(STRICT_SECTION_TOLERANCE)
+            lo, hi = _wc_lo_v, _wc_hi_v
+            target_wc = f"约 {_wc_anchor} 字左右（硬性上限 {hi} 字，最低 {lo} 字）"
+            target_note = (
+                f"（强控·每节目标 {_wc_s} 字，硬性区间 {lo}~{hi} 字，"
+                f"允许浮动 \u00b1{int(_tolerance * 100)}%）"
+            )
+        else:
+            _wc_ov = None
+
     # 字数控制核心指令
     if _chapter_level >= 3:
         prompt_parts.append(
-            f"请撰写本章节完整内容，目标 {target_wc} 字{target_note}。"
+            f"请撰写本章节完整内容，字数严格控制在 {target_wc}{target_note}。"
             f"要求：① 结构清晰有小标题；② 数据详实有具体参数；③ 专业术语准确；"
             f"④ 紧扣评分点。"
+            f"【自检要求】撰写完成后请自查总字数是否落在目标区间内——"
+            f"若超出硬性上限 {hi} 字，请主动删减空话套话、重复表述与冗余举例，"
+            f"再输出；若低于最低 {lo} 字，请补充具体数据、参数或细节。"
         )
         # 字数控制红线（防止堆砌与省略）
-        if _chapter_level == 3 and chapter_info.get("is_l3_own"):
-            # L3 自身正文：300 \u00b1 20%，测量口径=自身正文，不含下级目录章节
+        if _wc_ov:
+            # 易标 R5/R8/R13：强控命中 → 统一强控话术（数字源自快照派生，
+            # 与压缩侧/校验侧同源），盖过下面的档位化红线分支
+            prompt_parts.append(_build_strict_redline(_wc_ov))
+        elif _chapter_level == 3 and chapter_info.get("is_l3_own"):
+            # L3 自身正文：300 ± 20%，测量口径=自身正文，不含下级目录章节
             prompt_parts.append(
                 "【字数控制红线】"
                 f"本章节为三级目录（L3），目标字数 {_tier_target} 字"
-                f"（允许浮动 \u00b1{int(_tolerance * 100)}%，{lo}~{hi} 字）。"
+                f"（允许浮动 ±{int(_tolerance * 100)}%，{lo}~{hi} 字，硬性上限 {hi} 字）。"
                 "测量口径为 L3 自身正文（标题、描述、项目数据、全局事实、专项方案名称相关内容），"
                 "不含下级目录章节。必须严格遵守："
                 "① 不得为凑字数而堆砌空话套话、不重复表述同一意思；"
@@ -1094,6 +1259,26 @@ def build_chapter_content_messages(chapter_info: dict, facts: Any = None,
         title, len(messages),
         sum(len(m.content) for m in messages if m.role == "user"),
     )
+
+    # ENHANCE 2026-10-11（引入项 #8）：正文分层消息栈「格式稳定」原则消费点。
+    # 现实校正：本函数**已**实现易标「大稳定前置、任务差异后置」的分层排布
+    # （[0] system →[1] 项目稳定 →[2] 事实 →…→[4] 当前任务），且比
+    # `prompt_layering.build_chapter_content_messages` 的通用 8 层栈多了
+    # 事实按标题筛选 / 评分点关键词裁剪 / 暗标脱敏 / 全局字段契约 / 全篇骨架 /
+    # 知识库条目注入等能力。故**不采纳**引入报告 §4.2 原设想的「整体切换到
+    # prompt_layering」——那会回退上述既有能力，属负优化。
+    # 门禁 SPLIT_PROMPT_LAYERS=true 时仅落地方法论第 4 条「同一份数据组织格式
+    # 保持稳定」：用 `normalize_readable_text` 统一各层换行符与行尾空白，抬高
+    # 跨章节前缀缓存命中率；false（默认）时逐字保持既有消息，行为零变更。
+    try:
+        from ...config import SPLIT_PROMPT_LAYERS
+    except Exception:  # pragma: no cover - 配置读取兜底
+        SPLIT_PROMPT_LAYERS = False
+    if SPLIT_PROMPT_LAYERS:
+        from .prompt_layering import normalize_readable_text
+        for _m in messages:
+            _m.content = normalize_readable_text(_m.content)
+
     return messages
 
 
@@ -1115,7 +1300,8 @@ async def orchestrate_content(provider: Any, outline: list,
                                max_ai_images: int = 6,
                                table_ratio: str = "moderate",
                                prefer_mermaid: bool = True,
-                               section_per_segment: int = 10) -> list:
+                               section_per_segment: int = 10,
+                               knowledge_catalog: list | None = None) -> list:
     """编排正文生成任务（标书智能体六完整实现）
 
     主实现见 workflows_orchestration.orchestrate_content()。
@@ -1123,6 +1309,7 @@ async def orchestrate_content(provider: Any, outline: list,
 
     ENHANCE 2026-10-05（P-11）：新增 max_ai_images / table_ratio /
     prefer_mermaid / section_per_segment 透传，见 workflows_orchestration 同名参数。
+    ENHANCE 2026-10-09（E-2）：新增 knowledge_catalog 透传（知识素材通道）。
     """
     return await _orch_impl(
         provider, outline,
@@ -1136,6 +1323,7 @@ async def orchestrate_content(provider: Any, outline: list,
         table_ratio=table_ratio,
         prefer_mermaid=prefer_mermaid,
         section_per_segment=section_per_segment,
+        knowledge_catalog=knowledge_catalog,
     )
 
 
@@ -1145,6 +1333,372 @@ async def orchestrate_content(provider: Any, outline: list,
 # `_extract_charts_from_content(content)` 的代码拿到的都是 coroutine 对象
 # （既不会抛错也不会返回图表，属最难排查的一类静默失效）。
 # 全仓检索确认该名字已无调用方，故直接删除重复定义，保留上面那一个实现。
+
+
+# =============================================================================
+# 2026-10-11：正文超长压缩（字数偏差控制）
+# -----------------------------------------------------------------------------
+# 背景：DB 实测 10 个 L3 章节平均偏差 +34.2%、100% 系统性偏高、最极端 +120%。
+# 根因：提示词以区间表达，模型倾向超长；生成后无压缩机制。
+# 修复：本函数在检测到实际字数 > target × threshold 时，调用 AI 将正文压缩到
+# 目标区间内，保留必含要素与结构，剔除空话套话。调用方（sse_content.py）在
+# 主生成完成后、兜底扩写之前调用。
+# 幂等与安全：
+#   - 若原文字数 <= target × threshold：直接返回原文（零 AI 调用）
+#   - 若压缩后字数仍 > 原字数：保留原文（AI 未成功压缩，避免越压越长）
+#   - 若 AI 调用失败或返回空：返回原文（零回归）
+#   - 图表代码块（```mermaid / ```chart-json / ```table）原样保留
+# =============================================================================
+
+
+# =============================================================================
+# 2026-10-11：字数偏差控制批处理函数（供 sse_content 生成完成后调用）
+# -----------------------------------------------------------------------------
+# 缺口：DB 实测 10 个 L3 章节平均偏差 +34.2%、100% 系统性偏高、最极端 +120%。
+# 修复：主生成完成后，对超出 target × threshold 的章节批量压缩到目标区间。
+# 失败安全：压缩失败/超时/取消均保留原文；异常向上被捕获，不影响主生成。
+# =============================================================================
+
+
+async def condense_overlong_results(
+    results: list,
+    sections_by_id: dict,
+    provider: Any,
+    writing_length: str | None = None,
+    *,
+    threshold: float | None = None,
+    max_rounds: int | None = None,
+    enabled: bool | None = None,
+    cancel_event: Any = None,
+    word_control: dict | None = None,
+) -> dict:
+    """对超长章节批量压缩到目标区间内（就地修改 results）。
+
+    Args:
+        results: 生成结果列表（每项含 id/content/status）
+        sections_by_id: 章节字典索引
+        provider: AI provider
+        writing_length: 全局档位
+        threshold: 触发压缩的偏差率阈值（None 时从 config 读）
+        max_rounds: 最多压缩轮数
+        enabled: 总开关（None 时从 config 读）
+        cancel_event: 取消事件
+        word_control: 强控覆盖表（易标 R5/R8，2026-10-12）。命中的章节以
+            R1 可读字数计量、目标 S、容差 ±20%，超过硬性上限（1.2S）即触发
+            压缩；未命中回落既有档位/单节目标逻辑（口径不变）。
+
+    Returns:
+        dict: {
+            'condensed_count': 压缩成功章节数,
+            'fail_count': 失败章节数,
+            'total_before': 压缩前字数总和,
+            'total_after': 压缩后字数总和,
+            'enabled': 是否启用,
+            'threshold': 使用的阈值,
+            'max_rounds': 使用的最大轮数,
+        }
+    """
+    from .writing_length_config import (
+        get_l3_own_target,
+        get_l3_own_tolerance,
+        get_tier_config,
+        get_default_tier_config,
+        DEFAULT_WORD_COUNT_TIER,
+    )
+    from ...services.sections import _count_words as _cw
+    from ...config import (
+        CONTENT_USE_WORD_COUNT_ENFORCEMENT_DEFAULT,
+        CONTENT_WORD_COUNT_CONDENSE_THRESHOLD,
+        CONTENT_WORD_COUNT_CONDENSE_MAX_ROUNDS,
+    )
+
+    if enabled is None:
+        enabled = CONTENT_USE_WORD_COUNT_ENFORCEMENT_DEFAULT
+    if threshold is None:
+        threshold = CONTENT_WORD_COUNT_CONDENSE_THRESHOLD
+    if max_rounds is None:
+        max_rounds = CONTENT_WORD_COUNT_CONDENSE_MAX_ROUNDS
+
+    summary = {
+        "condensed_count": 0,
+        "fail_count": 0,
+        "total_before": 0,
+        "total_after": 0,
+        "enabled": enabled,
+        "threshold": threshold,
+        "max_rounds": max_rounds,
+        # HARDEN 2026-10-12（契约显式化）：调用方（sse_content.py）需要按
+        # section_id 批量落库。此前依赖隐式约定「r["original_content"] != r["content"]
+        # ⇒ 已压缩」，若 condense_overlong_content 内部返回与原文等价的字符串
+        # （如 AI 判定不修改），会被漏更新；若未来 results 结构演进（新增
+        # pre_expand_content / post_audit_content 字段），隐式约定会失效。
+        # 显式维护 condensed_ids，让调用方按需精确落库。
+        "condensed_ids": [],
+    }
+    if not enabled or max_rounds <= 0:
+        return summary
+
+    for r in results:
+        if cancel_event is not None and getattr(cancel_event, "is_set", lambda: False)():
+            break
+        if r.get("status") != "completed":
+            continue
+        sid = r.get("id")
+        sec = sections_by_id.get(sid) if sections_by_id else None
+        if not sec:
+            continue
+        sec_level = sec.get("level", 3)
+        if sec_level < 3:
+            continue
+        r_content = r.get("content") or ""
+        r_wc = _cw(r_content) if r_content else 0
+        if r_wc == 0:
+            continue
+
+        # 解析目标字数与容差（与 sse_utils._get_effective_target_words 同口径）
+        tw = sec.get("target_words")
+        tier_key = sec.get("word_count_tier")
+        tolerance = 0.10
+        target = None
+        if isinstance(tw, int) and tw > 0:
+            target = tw
+            tolerance = 0.10
+        elif sec_level == 3 and not tier_key and not tw:
+            # L3 自身正文：300 ±20%
+            target = get_l3_own_target()
+            tolerance = float(get_l3_own_tolerance())
+        else:
+            key = tier_key or writing_length or DEFAULT_WORD_COUNT_TIER
+            cfg = get_tier_config(key) or get_default_tier_config()
+            if cfg:
+                target = int(cfg.get("target_words", 1200))
+                tolerance = float(cfg.get("tolerance_ratio", 0.10))
+        if not target or target <= 0:
+            continue
+
+        summary["total_before"] += r_wc
+        thr = target * threshold
+        if r_wc > thr:
+            try:
+                condensed, meta = await condense_overlong_content(
+                    r_content,
+                    target_words=target,
+                    tolerance_ratio=tolerance,
+                    provider=provider,
+                    section_title=sec.get("title", ""),
+                    max_rounds=max_rounds,
+                    cancel_event=cancel_event,
+                )
+                if meta.get("condensed") and condensed:
+                    # HARDEN 2026-10-12：AI 压缩返回值可能带 \r\n（AI 网关在
+                    # Windows 环境下常见），压缩链路不经过 clean_generated_content,
+                    # 必须在接受判定前显式归一，否则会把 CRLF 写回 DB，
+                    # 让下游围栏识别 / parse_content 再次踩坑（BUG-2 同源问题）。
+                    condensed = normalize_newlines(condensed)
+                    new_wc = _cw(condensed)
+                    r["content"] = condensed
+                    r["original_content"] = r_content
+                    r["original_wc"] = r_wc
+                    r["condensed_wc"] = new_wc
+                    summary["total_after"] += new_wc
+                    summary["condensed_count"] += 1
+                    # HARDEN 2026-10-12：显式记录被压缩章节 id（契约给调用方）。
+                    summary["condensed_ids"].append(sid)
+                    logger.info(
+                        "[字数偏差控制] 章节 %s 压缩成功: %d → %d 字 (目标 %d)",
+                        sid, r_wc, new_wc, target,
+                    )
+                else:
+                    summary["total_after"] += r_wc
+                    if meta.get("error"):
+                        summary["fail_count"] += 1
+            except Exception as ce:
+                logger.warning("[字数偏差控制] 章节 %s 压缩异常: %s", sid, ce)
+                summary["total_after"] += r_wc
+                summary["fail_count"] += 1
+        else:
+            summary["total_after"] += r_wc
+        # 偏差可追溯：无论是否触发压缩，都记录目标与偏差
+        final_wc = r.get("condensed_wc", r_wc)
+        r["word_count_target"] = target
+        r["word_count_deviation"] = final_wc - target
+        r["word_count_deviation_rate"] = round((final_wc - target) / target, 4)
+
+    return summary
+
+
+async def condense_overlong_content(
+    content: str,
+    *,
+    target_words: int,
+    tolerance_ratio: float,
+    provider: Any,
+    model: str | None = None,
+    section_title: str = "",
+    timeout_seconds: int = 120,
+    max_rounds: int = 1,
+    cancel_event: Any = None,
+) -> tuple[str, dict]:
+    """将超长正文压缩到目标字数区间内（异步）。
+
+    Args:
+        content: 原始正文（含图表代码块）
+        target_words: 目标字数（例如 L3 自身正文 = 300）
+        tolerance_ratio: 允许浮动比例（例如 0.20 即 ±20%）
+        provider: AI provider 实例（需有 chat 异步接口）
+        model: 可选，指定模型
+        section_title: 章节标题（仅用于日志与提示词上下文）
+        timeout_seconds: 单次 AI 调用超时
+        max_rounds: 最多压缩轮数（默认 1）
+        cancel_event: asyncio.Event，取消事件（与主生成共享）
+
+    Returns:
+        tuple[str, dict]:
+            - content: 压缩后的正文（若无需压缩或压缩失败则返回原文）
+            - meta: 元数据
+                - target_words, tolerance, lo, hi: 目标区间
+                - original_wc, condensed_wc: 原始与压缩后字数
+                - rounds: 实际执行轮数
+                - condensed: 是否发生实际压缩
+                - error: 压缩失败原因（成功时为空字符串）
+    """
+    meta = {
+        "target_words": target_words,
+        "tolerance": tolerance_ratio,
+        "lo": int(target_words * (1 - tolerance_ratio)),
+        "hi": int(target_words * (1 + tolerance_ratio)),
+        "original_wc": 0,
+        "condensed_wc": 0,
+        "rounds": 0,
+        "condensed": False,
+        "error": "",
+    }
+    try:
+        _wc = count_words(content) if content else 0
+    except Exception:
+        _wc = len(content or "")
+    meta["original_wc"] = _wc
+
+    threshold = int(target_words * (1 + tolerance_ratio))
+    if _wc <= threshold:
+        meta["condensed_wc"] = _wc
+        return content, meta
+
+    # 触发压缩：加载系统提示词
+    try:
+        from .prompts._cache import get_prompt as _get_prompt
+
+        sys_prompt = None
+        try:
+            if _get_prompt is not None:
+                sys_prompt = _get_prompt("CONTENT_CONDENSE_SYSTEM")
+        except Exception:
+            sys_prompt = None
+        if not sys_prompt:
+            meta["error"] = "CONTENT_CONDENSE_SYSTEM 提示词不可用"
+            meta["condensed_wc"] = _wc
+            return content, meta
+    except Exception as _e:
+        meta["error"] = f"提示词加载失败: {_e}"
+        meta["condensed_wc"] = _wc
+        return content, meta
+
+    current_content = content
+    current_wc = _wc
+    actual_rounds = 0
+    for _round in range(max(1, max_rounds)):
+        if cancel_event is not None and getattr(cancel_event, "is_set", lambda: False)():
+            meta["error"] = "用户取消"
+            break
+        actual_rounds += 1
+        try:
+            # BUG-P1b FIX 2026-10-11：压缩前先把所有图表代码块替换为占位符。
+            # AI 压缩时可能会截断/篡改 ```mermaid / ```chart-json 围栏内容，
+            # 导致渲染失败。占位符是纯文本 <<CHART_BLOCK_N>>，不参与字数统计
+            # 且 AI 不理解其含义（不会修改），压缩完成后按序还原为原文。
+            _masked_content, _chart_originals = _mask_chart_fences_for_compression(
+                current_content
+            )
+            # 占位符自身是简单文本，字数远小于原始图表代码块——把目标字数
+            # 相应下调，否则 AI 看到的正文偏短、会错误扩张图表块的占位符
+            # （虽然无法真正扩张，但可能把占位符字面量写进压缩后正文）。
+            _charts_delta = _wc - count_words(_masked_content)
+            _effective_target = max(target_words - _charts_delta, 100)
+
+            user_msg = (
+                f"章节标题：{section_title}\n\n"
+                f"目标字数：约 {_effective_target} 字（允许浮动 ±{int(tolerance_ratio * 100)}%，"
+                f"区间 {max(meta['lo'] - _charts_delta, 50)}~{max(meta['hi'] - _charts_delta, 100)} 字）。\n\n"
+                f"以下是当前正文（{count_words(_masked_content)} 字，原文 {_wc} 字），超出目标区间，请压缩到目标区间内，"
+                f"保留必含要素、数据、结构与小标题，删除空话套话与冗余表述：\n\n"
+                f"{_masked_content}"
+            )
+            messages = [
+                AIMessage(role="system", content=sys_prompt),
+                AIMessage(role="user", content=user_msg),
+            ]
+            if provider is None or not hasattr(provider, "chat"):
+                raise RuntimeError("provider 为空或无 chat 接口")
+            # 使用统一的 with_timeout 保护（来自 workflows_base）
+            try:
+                from .workflows_base import with_timeout
+            except Exception:
+                with_timeout = None
+            if with_timeout is not None:
+                raw = await with_timeout(
+                    provider.chat(messages, temperature=0.3),
+                    timeout=timeout_seconds,
+                )
+            else:
+                raw = await provider.chat(messages, temperature=0.3)
+            # HARDEN 2026-10-12：AI 网关在 Windows 环境下常返回 \r\n，
+            # 压缩链路不走 clean_generated_content（否则会把图表占位符
+            # <<CHART_BLOCK_N>> 识别为普通段落），此处独立归一一层。
+            condensed_masked = normalize_newlines(str(raw or "")).strip()
+            if not condensed_masked:
+                meta["error"] = "AI 返回空内容"
+                break
+            # BUG-P1b FIX 2026-10-11：压缩后还原图表代码块。
+            condensed = _restore_chart_fences_after_compression(
+                condensed_masked, _chart_originals
+            )
+            # Risk-P2b FIX 2026-10-11：检查残留占位符。
+            # AI 可能在压缩时篡改占位符（加标点、改字符、把占位符写进正文），
+            # 导致 restore 无法匹配，condensed 里残留占位符痕迹。
+            # 用正则匹配 <<...BLOCK...>> 模式（中间可能被篡改），比硬编码
+            # 子串搜索更鲁棒。残留则拒绝压缩，保留原文。
+            _leftover_re = re.compile(r"<<[^>]*[Bb][Ll][Oo][Cc][Kk][^>]*>>")
+            _leftover_placeholder = bool(_leftover_re.search(condensed))
+            if _leftover_placeholder:
+                logger.warning(
+                    "[压缩] 第 %d 轮还原后仍残留占位符（AI 可能篡改了占位符文本），"
+                    "拒绝本次压缩、保留原文", _round + 1,
+                )
+                meta["error"] = "AI 篡改占位符导致还原失败，保留原文"
+                break
+            _new_wc = count_words(condensed) if condensed else 0
+            # 关键：仅当压缩后字数 ≤ 原字数 且 ≤ 目标上限时才接受
+            if _new_wc <= current_wc and _new_wc <= threshold:
+                current_content = condensed
+                current_wc = _new_wc
+                if _new_wc <= meta["hi"]:
+                    break
+            else:
+                meta["error"] = f"压缩后字数未减少（原 {_wc} → 新 {_new_wc}）"
+                break
+        except Exception as _e:
+            meta["error"] = f"压缩第 {_round + 1} 轮异常: {_e}"
+            break
+
+    meta["rounds"] = actual_rounds
+    meta["condensed_wc"] = current_wc
+    meta["condensed"] = current_wc < _wc
+    if current_wc < _wc:
+        return current_content, meta
+    return content, meta
+
+
+
 
 
 def _is_rate_limit_error(error: Exception) -> bool:
@@ -1205,6 +1759,161 @@ def _strip_seam_overlap(final_content: str, extra: str) -> str:
     return extra
 
 
+# =====================================================================
+# BUG-P1a FIX 2026-10-11：续写截断在图表围栏内部 → 产生未闭合围栏
+# -----------------------------------------------------------------------------
+# 缺口：AI 输出因 finish_reason=='length' 被截断时，截断点可能正处于
+# ```mermaid / ```chart-json 围栏内部。续写路径 _auto_continue_on_length
+# 不感知围栏状态，续写出的正文会包含一个永远不会被闭合的图表围栏 →
+# content_cleaning.parse_content 把它当成坏块整块删除 → 图表静默丢失。
+#
+# 修复：检测未闭合图表围栏，改写续写 prompt 明确告知 AI 先补完截断处
+# 并闭合围栏再继续写正文。
+# =====================================================================
+def _detect_unclosed_chart_fence(content: str) -> dict | None:
+    """检测正文中是否存在未闭合的图表围栏。
+
+    Returns:
+        dict: {
+            "lang": "mermaid" / "chart-json",
+            "open_line": str,        # 围栏开启行原文（含 ``` 前缀）
+            "open_line_no": int,     # 围栏开启所在行号（1-based）
+            "content_before_open": str,  # 围栏之前的正文
+            "content_inside": str,      # 围栏内部（截断的）内容
+        }
+        None: 无未闭合图表围栏
+    """
+    if not content:
+        return None
+    _FENCE_OPEN_RE = re.compile(
+        r"^(`{3,}|~{3,})[ \t]*(mermaid|chart[-_]?json)",
+        re.IGNORECASE | re.MULTILINE,
+    )
+    _FENCE_CLOSE_RE = re.compile(
+        r"^(`{3,}|~{3,})[ \t]*([A-Za-z0-9_\-+.#]*)?[ \t]*$",
+        re.MULTILINE,
+    )
+    lines = content.split("\n")
+    open_fence_pos = None  # (line_idx, lang)
+    for i, line in enumerate(lines):
+        m_open = _FENCE_OPEN_RE.match(line)
+        if m_open:
+            open_fence_pos = (i, m_open.group(2).lower())
+            continue
+        if open_fence_pos is not None:
+            # 只看闭合标记行（匹配 ``` 或 ~~~ 等围栏标记，允许空尾或 info-string）
+            if line.strip().startswith("```") or line.strip().startswith("~~~"):
+                m_close = _FENCE_CLOSE_RE.match(line.strip())
+                if m_close:
+                    # 找到了匹配的闭合行 → 围栏已闭合
+                    open_fence_pos = None
+    if open_fence_pos is None:
+        return None
+    open_line_no, lang = open_fence_pos
+    # 找到最后一个非空行作为截断位置
+    last_nonempty_idx = open_line_no
+    for idx in range(len(lines) - 1, open_line_no - 1, -1):
+        if lines[idx].strip():
+            last_nonempty_idx = idx
+            break
+    return {
+        "lang": lang,
+        "open_line": lines[open_line_no] if open_line_no < len(lines) else "```mermaid",
+        "open_line_no": open_line_no + 1,
+        "content_before_open": "\n".join(lines[:open_line_no]),
+        "content_inside": "\n".join(lines[open_line_no + 1:last_nonempty_idx + 1])
+        if last_nonempty_idx > open_line_no
+        else "",
+    }
+
+
+# =====================================================================
+# Risk-P2a FIX 2026-10-11：程序化兜底闭合未闭合图表围栏
+# -----------------------------------------------------------------------------
+# BUG-P1a 的 prompt 追加指令是"软约束"——AI 可能仍忽略、或续写后又被
+# length 截断（续写的续写），最终内容里仍残留未闭合围栏。
+# 本函数在 AI 返回后做确定性后处理：检测到未闭合围栏 → 直接在末尾
+# 追加 ``` 闭合行。比 content_cleaning 把整块当坏块删除好：
+#   - 至少保留了图表源码（用户能看到原始 mermaid/chart-json）
+#   - 渲染器会尝试渲染，失败则记录警告（不是静默丢失）
+# =====================================================================
+def _force_close_unclosed_chart_fence(content: str) -> tuple[str, bool]:
+    """程序化兜底：检测并闭合未闭合的图表围栏。
+
+    Returns:
+        tuple: (处理后的内容, 是否发生了闭合)
+    """
+    unclosed = _detect_unclosed_chart_fence(content)
+    if unclosed is None:
+        return content, False
+    lang = unclosed["lang"]
+    logger.warning(
+        "[围栏兜底] 检测到未闭合 %s 围栏（第 %d 行），程序化补 ``` 闭合",
+        lang, unclosed["open_line_no"],
+    )
+    stripped = content.rstrip()
+    if not stripped.endswith("\n"):
+        stripped += "\n"
+    stripped += "```\n"
+    return stripped, True
+
+
+# =====================================================================
+# BUG-P1b FIX 2026-10-11：压缩正文时保护图表代码块
+# -----------------------------------------------------------------------------
+# 缺口：condense_overlong_content 直接把含 ```mermaid / ```chart-json
+# 的正文送给 AI 压缩。虽然提示词 CONTENT_CONDENSE_SYSTEM 写了"图表代码块
+# 原样保留"，但 AI 不总是遵守指令——特别是当图表块很长、压缩目标很紧时，
+# AI 可能截断 mermaid 源码或修改 JSON payload → 渲染失败。
+#
+# 修复：压缩前把所有图表代码块替换为占位符 <<CHART_BLOCK_1>>，
+# 压缩后再按序还原。占位符不参与压缩计数，还原后语法 100% 与原文一致。
+# =====================================================================
+def _mask_chart_fences_for_compression(content: str) -> tuple[str, list[str]]:
+    """把正文中的 ```mermaid / ```chart-json 围栏代码块替换为占位符。
+
+    Returns:
+        tuple: (masked_content, originals)
+        - masked_content: 替换后的文本（含 <<CHART_BLOCK_1>> 等占位符）
+        - originals: 被替换掉的原始围栏代码块列表（完整 ```...``` 内容）
+    """
+    if not content:
+        return content, []
+    _FENCE_BLOCK_RE = re.compile(
+        r"(```[ \t]*(?:mermaid|chart[-_]?json)[^\n]*\n"
+        r"[\s\S]*?"
+        r"```[ \t]*(?:mermaid|chart[-_]?json)?[ \t]*\n?)",
+        re.IGNORECASE,
+    )
+    originals: list[str] = []
+    counter = 0
+
+    def _replacer(match: re.Match) -> str:
+        nonlocal counter
+        counter += 1
+        originals.append(match.group(0))
+        # 占位符直接替换原始代码块位置，不带额外 \n
+        # （原始代码块前后的 \n 由 fence regex 本身捕获或保留）
+        return f"<<CHART_BLOCK_{counter}>>"
+
+    masked = _FENCE_BLOCK_RE.sub(_replacer, content)
+    return masked, originals
+
+
+def _restore_chart_fences_after_compression(masked_content: str, originals: list[str]) -> str:
+    """把压缩后正文中的占位符还原为原始图表代码块。"""
+    if not originals:
+        return masked_content
+    restored = masked_content
+    for i, original in enumerate(originals, start=1):
+        placeholder = f"<<CHART_BLOCK_{i}>>"
+        # 精确匹配占位符字面量，不吞前后空白
+        # 这样 original 前后的所有 \n（来自 mask 时的 regex 捕获 + AI 压缩可能添加的段落分隔）
+        # 都能被完整保留
+        restored = restored.replace(placeholder, original)
+    return restored
+
+
 async def _auto_continue_on_length(
     provider: Any,
     existing_content: str,
@@ -1256,6 +1965,29 @@ async def _auto_continue_on_length(
                 writing_length=writing_length,
                 sanitize=True,
             )
+            # BUG-P1a FIX 2026-10-11：检测截断是否发生在图表围栏内部。
+            # 若 final_content 有未闭合的 ```mermaid / ```chart-json 围栏，
+            # 则续写 prompt 末尾追加强制指令：先补完截断处、闭合围栏再继续写正文。
+            # 否则 AI 会在未闭合的围栏后直接写普通正文 → 最终正文包含一个
+            # 永远不会被闭合的图表围栏 → content_cleaning 把整块当坏块删除 →
+            # 图表静默丢失（前端无任何感知）。
+            _unclosed = _detect_unclosed_chart_fence(final_content)
+            if _unclosed is not None:
+                _logger.info(
+                    "[续写] 检测到未闭合 %s 围栏（第 %d 行），追加闭合指令",
+                    _unclosed["lang"], _unclosed["open_line_no"],
+                )
+                _fence_guard = (
+                    f"\n\n### 强制指令（围栏修复）\n"
+                    f"上方正文在第 {_unclosed['open_line_no']} 行开始了一个 ```{_unclosed['lang']} "
+                    f"代码块，但该代码块因输出被截断而未闭合。"
+                    f"请先从截断处继续补完该 {_unclosed['lang']} 代码块的剩余部分，"
+                    f"然后用 ``` 标记闭合围栏。"
+                    f"**闭合围栏之后**再继续写正文剩余内容。"
+                    f"严禁跳过闭合围栏直接从截断处写普通正文，"
+                    f"那样会导致图表永远无法被正确解析。"
+                )
+                prompt_text = prompt_text + _fence_guard
         except Exception as prompt_err:
             _logger.warning("[续写] prompt 渲染失败: %s", prompt_err)
             break
@@ -1316,6 +2048,10 @@ async def _auto_continue_on_length(
 
         if next_finish != "length":
             break
+
+    # Risk-P2a FIX 2026-10-11：续写退出前做一次程序化兜底闭合。
+    # 无论正常结束还是 max_rounds 耗尽，都保证最终返回的 content 不含未闭合围栏。
+    final_content, _closed = _force_close_unclosed_chart_fence(final_content)
 
     return final_content
 
@@ -1391,6 +2127,13 @@ async def _do_generate_section_with_optimizations(
             content = await _auto_continue_on_length(
                 provider, content, section, context, chat_kwargs
             )
+
+        # Risk-P2a FIX 2026-10-11：最终出口的双保险兜底闭合。
+        # 必须在 cache.set 之前做——否则缓存里存的仍是未闭合围栏版本，
+        # 后续缓存命中会绕过所有安全网。续写内部已经做过一次，
+        # 但主调用直接返回（没走续写）时也可能被 finish_reason=="stop"
+        # 截断在围栏内部（AI 自己输出不完整）。
+        content, _closed = _force_close_unclosed_chart_fence(content)
 
         if use_cache:
             await _section_content_cache.set(cache_key, content)
@@ -1492,6 +2235,9 @@ async def generate_sections(
         "field_trace": "field_trace",
         # ENHANCE 2026-10-07（第二轮）：行业名 → 章节归属随行业模板词表匹配
         "industry": "industry",
+        # 易标 R5/R8（2026-10-12）：强控覆盖表（{section_id: {...}}），由
+        # sse_content 按快照装配后透传；空表/缺省时下游回落既有档位逻辑。
+        "word_control": "word_control",
     }
     # P0-TEXT-FLOW: 注入同级/上级章节映射（防车轱辘话、承上启下）
     # 从 sections_by_id + children_map 计算，每个 _gen_one 时按需取用
@@ -1732,16 +2478,4 @@ async def generate_sections(
 
             _reports = run_content_self_checks(
                 [r for r in results if r is not None],
-                merged_context["field_contract"].get("global_dictionary"),
-            )
-            _bad = [rep for rep in _reports if not rep.get("ok")]
-            if _bad:
-                logger.info(
-                    "[正文生成] 生成后自检: %d/%d 章存在待处理问题（详情见 result.self_check）",
-                    len(_bad), len(_reports),
-                )
-        except Exception as _sc_e:
-            logger.warning("[正文生成] 生成后自检执行失败（忽略）: %s", _sc_e)
-
-    # 最终返回干净的 list[dict]（过滤掉 None 异常占位）
-    return [r for r in results if r is not None]
+                merged_context["field_contract"].get("global_

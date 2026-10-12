@@ -16,8 +16,58 @@ describe("parseScoringPoints（评分点解析容错）", () => {
       ]),
     );
     expect(out).toHaveLength(2);
-    expect(out[0]).toEqual({ id: "R1", name: "施工组织", weight: 10, standard: "优 5 分", source: "" });
-    expect(out[1]).toEqual({ id: "R2", name: "报价", weight: 30, standard: "合理低价", source: "评标办法" });
+    // BUG-FIX 2026-10-09：断言从「整体 toEqual」改为逐字段校验。
+    // parseScoringPoints 现在会**透传**原始条目（`...p`）并补齐
+    // category / source_ref / source_page / confidence —— 目的是让要点提取页
+    // 用表格视图确认时，JSON.stringify(scoringPoints) 不再把后端
+    // normalize_writing_targets 写出的溯源字段整条丢掉（原先是数据破坏）。
+    // 旧的 toEqual 精确断言等于把「丢弃字段」这个 bug 钉死成了契约，
+    // 因此改为断言真正需要保证的不变量：5 个核心字段按别名规则归一化。
+    expect(out[0].id).toBe("R1");
+    expect(out[0].name).toBe("施工组织");
+    expect(out[0].weight).toBe(10);
+    expect(out[0].standard).toBe("优 5 分");
+    expect(out[0].source).toBe("");
+    expect(out[1].id).toBe("R2");
+    expect(out[1].name).toBe("报价");
+    expect(out[1].weight).toBe(30);
+    expect(out[1].standard).toBe("合理低价");
+    expect(out[1].source).toBe("评标办法");
+  });
+
+  // BUG-FIX 2026-10-09（跨模块数据链回归）：后端 normalize_writing_targets
+  // 会写出 category / source_ref / source_page / confidence 四项结构化溯源字段，
+  // 它们经「表格视图确认 → POST /ai/scoring/confirm」回写数据库。
+  // 修复前 mapPoint 只挑 5 个字段，这条链路上四项全部丢失（数据破坏）。
+  it("保留后端结构化溯源字段（category/source_ref/source_page/confidence）", () => {
+    const raw = [
+      {
+        id: "R1",
+        name: "施工组织",
+        weight: "10",
+        standard: "优",
+        source: "评标办法",
+        category: "技术评分",
+        source_ref: "第三章 3.2",
+        source_page: 12,
+        confidence: 0.87,
+      },
+    ];
+    const out = parseScoringPoints(JSON.stringify(raw));
+    expect(out[0].category).toBe("技术评分");
+    expect(out[0].source_ref).toBe("第三章 3.2");
+    expect(out[0].source_page).toBe(12);
+    expect(out[0].confidence).toBe(0.87);
+    // 关键契约：经一次 stringify/parse 往返（模拟前端确认保存）后仍完整。
+    expect(JSON.parse(JSON.stringify(out))[0]).toMatchObject(raw[0]);
+  });
+
+  it("缺失溯源字段时补后端默认值，不产生 undefined", () => {
+    const out = parseScoringPoints(JSON.stringify([{ name: "甲" }]));
+    expect(out[0].category).toBe("评分项");
+    expect(out[0].source_ref).toBe("");
+    expect(out[0].source_page).toBeNull();
+    expect(out[0].confidence).toBe(1.0);
   });
 
   it("保留显式 id", () => {

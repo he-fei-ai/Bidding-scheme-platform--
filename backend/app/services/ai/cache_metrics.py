@@ -43,6 +43,11 @@ _PROMPT_CACHE: dict[str, int] = {
     "input_tokens": 0,
     "output_tokens": 0,
     "requests_with_cache": 0,
+    # ENHANCE 2026-10-09（E-3）：OpenAI 兼容链路（prompt_tokens_details.cached_tokens）
+    "openai_prompt_tokens": 0,
+    "openai_cached_tokens": 0,
+    "openai_completion_tokens": 0,
+    "openai_requests": 0,
 }
 
 
@@ -74,7 +79,13 @@ def record_prompt_cache(usage: dict | None) -> None:
     Anthropic 官方端点在启用 ``cache_control`` 后，``usage`` 会带
     ``cache_creation_input_tokens``（本次新写入缓存的 token）与
     ``cache_read_input_tokens``（本次从缓存读取命中的 token）。
-    其他 provider 不返回这些字段时，按 0 累加（不报错）。
+
+    ENHANCE 2026-10-09（E-3 缓存度量闭环）：OpenAI 兼容链路的 usage 带
+    ``prompt_tokens_details.cached_tokens``（DeepSeek / OpenRouter / 智谱 /
+    火山方舟等中转普遍透出该字段，语义同易标 D5 文章中的 ``cached_tokens``）。
+    此前只认 Anthropic 字段 → OpenAI 兼容供应商「缓存命中了多少」完全不可见。
+    现两条链路分开累计、分别计算命中率（Anthropic 口径保持不变，避免破坏
+    既有监控语义）。
 
     Args:
         usage: 响应里的 usage 字典，可为 None。
@@ -83,15 +94,27 @@ def record_prompt_cache(usage: dict | None) -> None:
         return
     creation = int(usage.get("cache_creation_input_tokens", 0) or 0)
     read = int(usage.get("cache_read_input_tokens", 0) or 0)
-    if creation <= 0 and read <= 0:
-        # 非 Anthropic 端点或该次调用未走缓存路径：不计数，避免稀释命中率
+    details = usage.get("prompt_tokens_details")
+    cached_openai = 0
+    if isinstance(details, dict):
+        cached_openai = int(details.get("cached_tokens", 0) or 0)
+    prompt_tokens = int(usage.get("prompt_tokens", 0) or 0)
+    completion_tokens = int(usage.get("completion_tokens", 0) or 0)
+    if creation <= 0 and read <= 0 and cached_openai <= 0 and prompt_tokens <= 0:
+        # 无任何可用计量信息（如仅返回 content 的旧版响应）：不计数
         return
     with _lock:
-        _PROMPT_CACHE["cache_creation_input_tokens"] += creation
-        _PROMPT_CACHE["cache_read_input_tokens"] += read
-        _PROMPT_CACHE["input_tokens"] += int(usage.get("input_tokens", 0) or 0)
-        _PROMPT_CACHE["output_tokens"] += int(usage.get("output_tokens", 0) or 0)
-        _PROMPT_CACHE["requests_with_cache"] += 1
+        if creation > 0 or read > 0:
+            _PROMPT_CACHE["cache_creation_input_tokens"] += creation
+            _PROMPT_CACHE["cache_read_input_tokens"] += read
+            _PROMPT_CACHE["input_tokens"] += int(usage.get("input_tokens", 0) or 0)
+            _PROMPT_CACHE["output_tokens"] += int(usage.get("output_tokens", 0) or 0)
+            _PROMPT_CACHE["requests_with_cache"] += 1
+        if prompt_tokens > 0 or cached_openai > 0:
+            _PROMPT_CACHE["openai_prompt_tokens"] += prompt_tokens
+            _PROMPT_CACHE["openai_cached_tokens"] += cached_openai
+            _PROMPT_CACHE["openai_completion_tokens"] += completion_tokens
+            _PROMPT_CACHE["openai_requests"] += 1
 
 
 def snapshot() -> dict[str, Any]:
@@ -124,10 +147,23 @@ def snapshot() -> dict[str, Any]:
             ),
             "total_cached_tokens": cached,
         }
+        # ENHANCE 2026-10-09（E-3）：OpenAI 兼容链路的缓存命中率独立口径：
+        # 命中率 = cached_tokens / prompt_tokens（与易标 D5 文章实测口径一致）
+        oc_prompt = pc["openai_prompt_tokens"]
+        oc_cached = pc["openai_cached_tokens"]
+        openai_prompt_cache = {
+            "requests": pc["openai_requests"],
+            "prompt_tokens": oc_prompt,
+            "cached_tokens": oc_cached,
+            "completion_tokens": pc["openai_completion_tokens"],
+            "hit_rate": round(oc_cached / oc_prompt * 100, 1) if oc_prompt else 0.0,
+        }
 
     return {
         "stores": stores,
         "prompt_cache": prompt_cache,
+        # ENHANCE 2026-10-09（E-3）：OpenAI 兼容链路命中率独立暴露
+        "openai_prompt_cache": openai_prompt_cache,
     }
 
 

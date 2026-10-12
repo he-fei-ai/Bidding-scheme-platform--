@@ -100,6 +100,13 @@ def _sync_reset_facts_audit(project_id: int) -> None:
     覆盖 global_facts_json 后，库里针对旧事实集的审计结论仍会被 GET /facts 回看成
     「本次事实的一致性结果」（与 facts 路由 POST /facts 的作废口径不一致）。
     列可能在旧库尚未迁移，先 PRAGMA 判存在再写。
+
+    约定「事实基准 global_facts_json 变更 → confirmed_facts 回退 + facts_audit_*
+    抹除」共 4 处强制点，改口径须四处同改：
+      ① routers/facts.py POST /facts 手工保存
+      ② routers/facts.py 重新提取端点 _persist
+      ③ services/consistency_backflow.py accept_fact_proposals（审计回流采纳）
+      ④ 本函数（清除分析 / 重跑评分），由 _sync_clear_analysis 调用
     """
     with get_db() as conn:
         cols = {row['name'] for row in conn.execute('PRAGMA table_info(analysis)').fetchall()}
@@ -293,7 +300,21 @@ async def generate_scoring(project_id: int, current_user: Annotated[object, Depe
             normalized = normalize_writing_targets(points)
             if normalized and len(normalized) > 0:
                 cached_scoring_json = json.dumps(normalized, ensure_ascii=False, indent=2)
-                await asyncio.to_thread(_sync_update_field, project_id, 'scoring_points_json', cached_scoring_json)
+                # BUG-FIX 2026-10-09（确认态谎报）：此处原来调 `_sync_update_field`
+                # （普通 upsert，**不复位** confirmed 列），而 fresh 路径调的是
+                # `_sync_insert_or_update`（会把 confirmed_* 复位为 0）。
+                # 两条路径对「评分点已被改写」这一事实的处理不一致：
+                # 用户点一次「识别评分点」即重写了数据，却仍被标记为「已确认」，
+                # 于是「下一步：生成目录」的闸门（前端依赖 confirmed_scoring）
+                # 在数据已变的情况下依然放行，目录基于**用户从未确认过的**
+                # 评分点生成。
+                # 改为复用 `_sync_insert_or_update`，与 fresh 路径语义一致。
+                # 向后兼容：仅在评分点内容真的被重写时才复位 confirmed_scoring；
+                # 内容与库中完全一致时不触碰（幂等重入不打断已确认状态）。
+                if json.dumps(normalized, ensure_ascii=False, indent=2) != cached:
+                    await asyncio.to_thread(
+                        _sync_insert_or_update, project_id, cached_scoring_json, 'scoring_points_json'
+                    )
         except Exception as _e:
             logger.debug('[silent-except] ai.py: line 370 - %s', _e)
     if cached_scoring_json:
@@ -318,29 +339,65 @@ async def generate_scoring(project_id: int, current_user: Annotated[object, Depe
         logger.exception('AI识别评分点失败: %s', e)
         raise HTTPException(status_code=502, detail=f'AI服务调用失败: {str(e)[:200]} | 请检查AI配置或稍后重试') from e
     if not scoring_points or len(scoring_points) == 0:
-        raise HTTPException(status_code=500, detail='AI 未能识别出评分点，请重试或检查招标文件内容')
-    scoring_json = cached_scoring_json or json.dumps(scoring_points, ensure_ascii=False, indent=2)
+        # BUG-FIX 2026-10-09（错误分类）：`extract_scoring_points` 在第一轮失败时
+        # 吞掉异常并返回 []（workflows_analysis.py:149-151），此处据此抛 500
+        # 「AI 未能识别出评分点，请重试」——把一次**上游 AI 调用/网络故障**
+        # 伪装成「识别结果为空」。本路由其余所有 AI 失败路径均映射为 502，
+        # 此处口径不一致，前端会给出误导性的「检查招标文件内容」提示。
+        # 统一为 502，并在 detail 里点明可能的两种原因。
+        raise HTTPException(status_code=502, detail='AI服务调用失败或未能识别出评分点，请检查AI配置、招标文件内容或稍后重试')
+    # BUG-FIX 2026-10-09（死表达式）：原为 `cached_scoring_json or json.dumps(...)`。
+    # 但 `cached_scoring_json` 在此行必然为 None —— 若为真，函数早在 :299 就
+    # return 了。该表达式纯属误导（读起来像会复用缓存，实际永远不会）。
+    scoring_json = json.dumps(scoring_points, ensure_ascii=False, indent=2)
+    # BUG-FIX 2026-10-09（数据丢失 / 重复付费）：`:312` 可能刚刚调用
+    # `generate_tender_summary` 生成了新摘要（need_regenerate 为真时），
+    # 但只把 scoring_points_json 落库，**摘要从未写回 DB**。
+    # 于是下一次点「识别评分点」时 need_regenerate 再次为真，重复付费调用
+    # AI 生成同一份摘要，且刷新页面后摘要仍是旧的「待AI解析」占位。
+    # 现把新摘要一并落库（`_sync_insert_or_update` 内部会复位 confirmed_summary，
+    # 与评分点重跑语义一致）。
+    if need_regenerate:
+        try:
+            await asyncio.to_thread(
+                _sync_insert_or_update,
+                project_id,
+                json.dumps(summary, ensure_ascii=False, indent=2),
+                'summary_json',
+            )
+        except Exception as _e:
+            # 摘要落库失败不应连带回滚已成功的评分点结果
+            logger.warning('[评分] 摘要落库失败（忽略，评分点已保存）: %s', _e)
     await asyncio.to_thread(_sync_insert_or_update, project_id, scoring_json, 'scoring_points_json')
-    _analysis_row = await asyncio.to_thread(_sync_get_analysis, project_id)
-    global_facts = await extract_global_facts(provider, tender_context, summary, work_interface=_analysis_row['work_interface_json'] if _analysis_row else '', construction_method=_analysis_row['construction_method_json'] if _analysis_row else '', policy=(_analysis_row or {}).get('facts_policy') or 'fabricate')
-    logger.info('[评分] 提取到全局事实 %d 项', len(global_facts))
-    if global_facts:
-        # BUG-FIX 2026-09-18（P2）：原评分流程无条件覆写 global_facts_json，
-        # 用户已确认（confirmed_facts=1）并人工修订过的事实在重跑评分时被
-        # 新提取结果静默覆盖，且 _sync_insert_or_update 会把 confirmed_facts
-        # 标记打回。现检测到已确认即跳过覆盖，保护人工定稿成果。
-        if _analysis_row and _analysis_row.get('confirmed_facts'):
-            logger.info('[全局事实] 用户已确认事实(confirmed_facts=1)，跳过评分流程覆盖, project=%d', project_id)
-            # 返回值同步改回 DB 中已确认事实，避免前端展示与 DB 不一致
-            global_facts = parse_stored_items(_analysis_row.get('global_facts_json') or '[]')
+    # BUG-FIX 2026-10-11（I-9）：`extract_global_facts` 原在 try 之外，
+    # :364 已把 scoring_points_json 落库；若此处抛异常（provider 502/超时/网络错误），
+    # 整段 500 冒到前端，但评分点已入库 —— 前端展示的是「失败」而 DB 已有新评分点，
+    # 下次点识别评分点会因缓存直接返回旧评分点、用户误以为「我上次成功了但页面崩了」。
+    # 现把事实提取包裹，异常时降级为 global_facts=[] 返回，评分点已保存不受影响。
+    try:
+        _analysis_row = await asyncio.to_thread(_sync_get_analysis, project_id)
+        global_facts = await extract_global_facts(provider, tender_context, summary, work_interface=_analysis_row['work_interface_json'] if _analysis_row else '', construction_method=_analysis_row['construction_method_json'] if _analysis_row else '', policy=(_analysis_row or {}).get('facts_policy') or 'fabricate')
+        logger.info('[评分] 提取到全局事实 %d 项', len(global_facts))
+        if global_facts:
+            # BUG-FIX 2026-09-18（P2）：原评分流程无条件覆写 global_facts_json，
+            # 用户已确认（confirmed_facts=1）并人工修订过的事实在重跑评分时被
+            # 新提取结果静默覆盖，且 _sync_insert_or_update 会把 confirmed_facts
+            # 标记打回。现检测到已确认即跳过覆盖，保护人工定稿成果。
+            if _analysis_row and _analysis_row.get('confirmed_facts'):
+                logger.info('[全局事实] 用户已确认事实(confirmed_facts=1)，跳过评分流程覆盖, project=%d', project_id)
+                # 返回值同步改回 DB 中已确认事实，避免前端展示与 DB 不一致
+                global_facts = parse_stored_items(_analysis_row.get('global_facts_json') or '[]')
+            else:
+                facts_json = json.dumps(global_facts, ensure_ascii=False, indent=2)
+                await asyncio.to_thread(_sync_insert_or_update, project_id, facts_json, 'global_facts_json')
+                # BUG-FIX 2026-09-29：事实被新提取结果整体覆盖，旧审计随之作废
+                await asyncio.to_thread(_sync_reset_facts_audit, project_id)
+                logger.info('[评分] 保存 global_facts 到 DB, 项数=%d', len(global_facts))
         else:
-            facts_json = json.dumps(global_facts, ensure_ascii=False, indent=2)
-            await asyncio.to_thread(_sync_insert_or_update, project_id, facts_json, 'global_facts_json')
-            # BUG-FIX 2026-09-29：事实被新提取结果整体覆盖，旧审计随之作废
-            await asyncio.to_thread(_sync_reset_facts_audit, project_id)
-            logger.info('[评分] 保存 global_facts 到 DB, 项数=%d', len(global_facts))
-    else:
-        logger.info('[全局事实] 评分模块提取为空，跳过保存')
+            logger.info('[全局事实] 评分模块提取为空，跳过保存')
+    except Exception as _facts_e:
+        logger.error('[评分] 提取全局事实失败（评分点已保存，不阻断返回）: %s', _facts_e)
+        global_facts = []
     return {'scoring_points_json': scoring_json, 'summary_json': summary, 'global_facts': global_facts}
 
 @router.post('/summary/confirm')

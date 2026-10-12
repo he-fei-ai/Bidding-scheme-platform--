@@ -163,33 +163,46 @@ function collectHeadingPaths(
   parentPath: number[],
   result: Map<number, number[]>,
 ): void {
-  const levelCounters: Map<number, number> = new Map();
-
-  for (const node of nodes) {
+  // BUG-FIX 2026-10-11（BUG-08 · 深递归爆栈）：原实现为原生深度递归，2000 层链式
+  // 目录会抛 `RangeError: Maximum call stack size exceeded`（见
+  // utils.outlineNumbering.test.ts 的 2000 层回归用例）。改为显式栈驱动的先序遍历，
+  // 语义与递归版**完全一致**：逐层计数器（levelCounters）作用域仍限于单个兄弟数组，
+  // result.set 的先序覆盖顺序不变，path 派生口径不变。
+  type Frame = {
+    nodes: readonly SectionTreeNode[];
+    idx: number;
+    parentPath: number[];
+    counters: Map<number, number>;
+  };
+  const stack: Frame[] = [
+    { nodes: Array.isArray(nodes) ? nodes : [], idx: 0, parentPath, counters: new Map() },
+  ];
+  while (stack.length > 0) {
+    const frame = stack[stack.length - 1];
+    if (frame.idx >= frame.nodes.length) {
+      stack.pop();
+      continue;
+    }
+    const node = frame.nodes[frame.idx];
+    frame.idx += 1;
     if (!node || typeof node !== "object") continue;
     const level = normalizeNodeLevel(node.level);
-    // 当前层级的计数
-    const currentCount = (levelCounters.get(level) || 0) + 1;
-    levelCounters.set(level, currentCount);
+    // 当前层级的计数（frame.counters 为本兄弟数组的局部计数器，同递归版语义）
+    const currentCount = (frame.counters.get(level) || 0) + 1;
+    frame.counters.set(level, currentCount);
 
     // 重置比当前层级深的所有计数器
     for (let l = level + 1; l <= 8; l++) {
-      levelCounters.set(l, 0);
+      frame.counters.set(l, 0);
     }
 
-    // V3.0 构建 path（与后端 _format_outline_number 一致）
-    // BUG-FIX 2026-10-04（多级编号不同步）：levelCounters 是「每次递归新建的局部
-    // 计数器」，L4 节点所在递归层的 Map 里根本没有 level=3/4/5 的计数，
-    // 原实现 levelCounters.get(3) 永远 undefined → 落回默认 1，导致所有四级
-    // 标题无论挂在哪个三级下都显示「1.x、」，五级永远「1.1.x」，与后端导出
-    // （export.py 用 parent_section_number 实算）不一致。parentPath 参数此前
-    // 形同虚设：父节点 path 已携带祖先编号（L3=[n]、L4=[n,m]），改用它派生。
-    const path = deriveHeadingPath(level, currentCount, parentPath, levelCounters);
+    // V3.0 构建 path（与后端 _format_outline_number 一致；parentPath 携带祖先编号）
+    const path = deriveHeadingPath(level, currentCount, frame.parentPath, frame.counters);
 
     result.set(node.id, path);
 
     if (Array.isArray(node.children) && node.children.length > 0) {
-      collectHeadingPaths(node.children, path, result);
+      stack.push({ nodes: node.children, idx: 0, parentPath: path, counters: new Map() });
     }
   }
 }
@@ -243,25 +256,60 @@ function annotateInto(
   parentPath: number[],
   out: Array<SectionTreeNode & { number?: string }>,
 ): void {
-  const levelCounters: Map<number, number> = new Map();
-  for (const node of nodes) {
+  // BUG-FIX 2026-10-11（BUG-08 收尾 · 深递归爆栈）：原实现为原生递归
+  // （`annotateInto(node.children, ...)`），2000 层链式目录会抛
+  // `RangeError: Maximum call stack size exceeded`（见 utils.outlineNumbering.test.ts
+  // 的 2000 层回归用例；`collectHeadingPaths` 已于同日改为显式栈，本函数是漏改的
+  // 并行副本）。现改为**显式栈驱动的先序遍历**，语义与递归版完全一致：每层
+  // levelCounters 作用域仍限于单个兄弟数组，path 派生口径不变；子级写入独立的
+  // childrenOut（与递归版同一份数组引用），不影响兄弟在 out 中的先后，展示编号不变。
+  type Frame = {
+    nodes: readonly SectionTreeNode[];
+    idx: number;
+    parentPath: number[];
+    levelCounters: Map<number, number>;
+    sink: Array<SectionTreeNode & { number?: string }>;
+  };
+  const stack: Frame[] = [
+    {
+      nodes: Array.isArray(nodes) ? nodes : [],
+      idx: 0,
+      parentPath,
+      levelCounters: new Map(),
+      sink: out,
+    },
+  ];
+  while (stack.length > 0) {
+    const frame = stack[stack.length - 1];
+    if (frame.idx >= frame.nodes.length) {
+      stack.pop();
+      continue;
+    }
+    const node = frame.nodes[frame.idx];
+    frame.idx += 1;
     if (!node || typeof node !== "object") continue;
     const level = normalizeNodeLevel(node.level);
-    const currentCount = (levelCounters.get(level) || 0) + 1;
-    levelCounters.set(level, currentCount);
+    const currentCount = (frame.levelCounters.get(level) || 0) + 1;
+    frame.levelCounters.set(level, currentCount);
     for (let l = level + 1; l <= 8; l++) {
-      levelCounters.set(l, 0);
+      frame.levelCounters.set(l, 0);
     }
-    const path = deriveHeadingPath(level, currentCount, parentPath, levelCounters);
+    const path = deriveHeadingPath(level, currentCount, frame.parentPath, frame.levelCounters);
     const childrenOut: Array<SectionTreeNode & { number?: string }> = [];
-    if (Array.isArray(node.children) && node.children.length > 0) {
-      annotateInto(node.children, path, childrenOut);
-    }
-    out.push({
+    frame.sink.push({
       ...node,
       number: formatV21Heading(level, path, ""),
       children: childrenOut as SectionTreeNode[],
     });
+    if (Array.isArray(node.children) && node.children.length > 0) {
+      stack.push({
+        nodes: node.children,
+        idx: 0,
+        parentPath: path,
+        levelCounters: new Map(),
+        sink: childrenOut,
+      });
+    }
   }
 }
 
@@ -298,8 +346,16 @@ export function allocTempNodeId(): number {
 
 /** 标题归一化（BUG-FIX 2026-10-08·空数据/编码）：AI 可能给出 null/数字/对象，
  *  原实现 `n.title || ""` 留下非字符串，下游 `!n.title.trim()` 直接 TypeError
- *  让整个审核弹窗白屏。这里统一转成字符串并裁掉首尾空白。 */
-function normalizeNodeTitle(raw: unknown): string {
+*  让整个审核弹窗白屏。这里统一转成字符串并裁掉首尾空白。
+ *
+ * BUG-FIX 2026-10-09：此前本函数是模块私有，但 OutlineEditorPage 的
+ * `handleReviewConfirm.applyTitles` 也调用它（标题非字符串时的兜底分支），
+ * 却未从 utils 导入 → 点击「V5.1 审核确认」时抛
+ * `ReferenceError: normalizeNodeTitle is not defined`，编辑后的目录永远提交
+ * 不上去，V5.1 流程只能等 `_wait_for_v51_review` 的 3600s 超时。
+ * 现在正式导出，供审核确认链路复用。
+ */
+export function normalizeNodeTitle(raw: unknown): string {
   if (typeof raw === "string") return raw.trim();
   if (raw === null || raw === undefined) return "";
   if (typeof raw === "number" || typeof raw === "boolean") return String(raw);
@@ -328,47 +384,102 @@ export function outlineDictToTreeNodes(
 ): SectionTreeNode[] {
   if (!Array.isArray(nodes)) return [];
   const seen = usedIds ?? new Set<number>();
-  const derivedLevel = depth > 8 ? 8 : depth;
 
-  // 先算出本层所有节点的 sort_order：已显式给出的保留，缺省的从 1 起找空位
-  const takenOrders = new Set<number>();
-  nodes.forEach((n: any) => {
-    const so = n && typeof n === "object" ? Number(n.sort_order) : NaN;
-    if (Number.isInteger(so) && so > 0) takenOrders.add(so);
-  });
-  let cursor = 1;
-  const resolveOrder = (raw: unknown): number => {
-    const so = Number(raw);
-    if (Number.isInteger(so) && so > 0) return so;
-    while (takenOrders.has(cursor)) cursor += 1;
-    takenOrders.add(cursor);
-    return cursor;
+  // BUG-FIX 2026-10-11（BUG-08 收尾 · 深递归爆栈）：原实现 `children:
+  // outlineDictToTreeNodes(n.children, derivedLevel + 1, seen)` 是原生递归，
+  // 2000 层链式目录直接抛 `RangeError: Maximum call stack size exceeded`
+  // （utils.outlineNumbering.test.ts 的 2000 层回归用例即在此处炸；
+  // collectHeadingPaths / annotateInto 已于同日改为显式栈，本函数是漏改的
+  // 并行副本）。现改为**显式栈驱动的先序遍历**，与递归版语义逐条对齐：
+  //   · 先序遍历顺序完全一致（节点自身先分配 id 并入 sink，其子树随后
+  //     整体处理，再回到下一个兄弟）→ allocTempNodeId / seen.add 的调用
+  //     次序不变，临时 ID 分配结果与递归版逐字节相同；
+  //   · 每个兄弟数组独立维护 takenOrders + cursor（resolveOrder 的
+  //     「1 起找空位、避开已占用值」口径不变）；
+  //   · derivedLevel = min(depth, 8) 的封顶规则不变；
+  //   · seen 集合跨整树共享（闭包捕获），与递归版传参语义一致。
+  type Frame = {
+    nodes: any[];
+    idx: number;
+    depth: number;
+    sink: SectionTreeNode[];
+    takenOrders: Set<number>;
+    cursor: number;
   };
 
-  return nodes
-    .filter((n: any) => n !== null && n !== undefined && typeof n === "object")
-    .map((n: any) => {
-      const ownId =
-        typeof n.id === "number" && Number.isFinite(n.id) && n.id > 0 ? n.id : null;
-      let id = ownId;
-      if (id === null || seen.has(id)) {
-        // 兜底：后端若下发重复/非法 id，也不得与同树其它节点撞号
-        id = allocTempNodeId();
-      }
-      seen.add(id);
-      return {
-        id,
-        title: normalizeNodeTitle(n.title),
-        level: Number.isInteger(Number(n.level)) && Number(n.level) > 0 ? Number(n.level) : derivedLevel,
-        sort_order: resolveOrder(n.sort_order),
-        section_type: typeof n.section_type === "string" ? n.section_type : "text",
-        scoring_point_id: n.scoring_point_id ?? null,
-        status: "active",
-        children: outlineDictToTreeNodes(n.children, derivedLevel + 1, seen),
-        has_content: Boolean(n.has_content),
-        word_count: Number.isInteger(Number(n.word_count)) ? Number(n.word_count) : 0,
-      } as SectionTreeNode;
-    });
+  const makeFrame = (list: any[], d: number, sink: SectionTreeNode[]): Frame => {
+    // 先算出本层所有节点的 sort_order：已显式给出的保留，缺省的从 1 起找空位
+    const takenOrders = new Set<number>();
+    for (const n of list) {
+      const so = n && typeof n === "object" ? Number(n.sort_order) : NaN;
+      if (Number.isInteger(so) && so > 0) takenOrders.add(so);
+    }
+    return { nodes: list, idx: 0, depth: d, sink, takenOrders, cursor: 1 };
+  };
+
+  const rootOut: SectionTreeNode[] = [];
+  const stack: Frame[] = [makeFrame(nodes, depth, rootOut)];
+
+  while (stack.length > 0) {
+    const frame = stack[stack.length - 1];
+    if (frame.idx >= frame.nodes.length) {
+      stack.pop();
+      continue;
+    }
+    const n = frame.nodes[frame.idx];
+    frame.idx += 1;
+    // 与原实现 .filter(对象) 等价：非对象节点跳过，不占用 id / sort_order
+    if (n === null || n === undefined || typeof n !== "object") continue;
+
+    const derivedLevel = frame.depth > 8 ? 8 : frame.depth;
+
+    const ownId =
+      typeof n.id === "number" && Number.isFinite(n.id) && n.id > 0 ? n.id : null;
+    let id = ownId;
+    if (id === null || seen.has(id)) {
+      // 兜底：后端若下发重复/非法 id，也不得与同树其它节点撞号
+      id = allocTempNodeId();
+    }
+    seen.add(id);
+
+    // sort_order 解析（原 resolveOrder，作用域为本兄弟数组）
+    let sortOrder: number;
+    const soNum = Number(n.sort_order);
+    if (Number.isInteger(soNum) && soNum > 0) {
+      sortOrder = soNum;
+    } else {
+      while (frame.takenOrders.has(frame.cursor)) frame.cursor += 1;
+      sortOrder = frame.cursor;
+      frame.takenOrders.add(sortOrder);
+    }
+
+    const childrenOut: SectionTreeNode[] = [];
+    frame.sink.push({
+      id,
+      title: normalizeNodeTitle(n.title),
+      level: Number.isInteger(Number(n.level)) && Number(n.level) > 0 ? Number(n.level) : derivedLevel,
+      sort_order: sortOrder,
+      section_type: typeof n.section_type === "string" ? n.section_type : "text",
+      scoring_point_id: n.scoring_point_id ?? null,
+      // BUG-FIX 2026-10-09（跨模块数据链 / 章节状态机）：
+      // 原实现硬编码 `status: "active"` —— 这是一个全仓库无人写入、
+      // 也不被任何消费者识别的幽灵状态。它让目录审核弹窗里的每个节点
+      // 都被判为「非 pending/非 failed」，于是 collectLeafIds(true)
+      // 选不中它们，「补全生成」对刚生成的大纲完全失效。
+      // 现改为透传后端真实状态；后端未给或给出未知值时归一化为 'pending'
+      //（与 sections 表默认值、以及目录 INSERT 的写入值一致）。
+      status: normalizeSectionStatus(n.status, n.has_content),
+      children: childrenOut,
+      has_content: Boolean(n.has_content),
+      word_count: Number.isInteger(Number(n.word_count)) ? Number(n.word_count) : 0,
+    } as SectionTreeNode);
+
+    if (Array.isArray(n.children) && n.children.length > 0) {
+      stack.push(makeFrame(n.children, derivedLevel + 1, childrenOut));
+    }
+  }
+
+  return rootOut;
 }
 
 
@@ -415,6 +526,38 @@ export function updateNodeInTree(
     }
     return n;
   });
+}
+
+/**
+ * 章节状态归一化（BUG-FIX 2026-10-09）
+ *
+ * 后端 sections 表的真实状态机只有五个取值：
+ *   pending → generating → completed | failed | cancelled
+ * （写入方：sse_db_ops.py 的 _save_section_to_db / _mark_sections_generating /
+ *   _rollback_dirty_sections，task_control.py 的 stop_generation；
+ *   表默认值 'pending' 见 db.py:914）
+ *
+ * 历史脏数据里存在 'active'：目录生成的 INSERT 曾硬编码该值。它不属于上述集合，
+ * 导致 collectLeafIds(filterPendingFailed=true) 选不中这些章节，
+ * 「补全生成」对刚生成的目录完全失效。此处做单向收敛：
+ *   · 已知状态原样透传；
+ *   · 'active'（或任何未知值）按「是否有正文」归一 —— 有正文记 completed，
+ *     否则记 pending，从而重新进入可补全集合。
+ * 后端已同步修正写入侧并提供一次性迁移（db_migrations.py 的 active→pending），
+ * 此处作为前端侧的兜底，保证新旧数据都能正确渲染与选取。
+ */
+const KNOWN_SECTION_STATUSES = new Set([
+  "pending",
+  "generating",
+  "completed",
+  "failed",
+  "cancelled",
+]);
+
+export function normalizeSectionStatus(raw: unknown, hasContent?: boolean): SectionTreeNode["status"] {
+  const s = typeof raw === "string" ? raw : "";
+  if (KNOWN_SECTION_STATUSES.has(s)) return s as SectionTreeNode["status"];
+  return hasContent ? "completed" : "pending";
 }
 
 export function collectLeafIds(nodes: SectionTreeNode[], filterPendingFailed?: boolean): number[] {
@@ -506,7 +649,7 @@ export function isWithinL3OwnRange(wordCount: number): boolean {
  * 优先级：单节点 target_words > 单节点 word_count_tier > 全局 writing_length > 默认档位
  */
 export function resolveTargetForNode(
-  node: Pick<SectionTreeNode, 'level' | 'target_words' | 'word_count_tier'>,
+  node: Pick<SectionTreeNode, 'level' | 'target_words' | 'word_count_tier'> & { children?: SectionTreeNode[] },
   globalTierKey?: string,
 ): number | null {
   const level = node.level || 3;
@@ -524,33 +667,49 @@ export function resolveTargetForNode(
     if (tier) return tier.targetWords;
   }
 
-  // 3) 全局档位
-  if (globalTierKey) {
-    const tier = WORD_COUNT_TIERS.find(t => t.key === globalTierKey);
-    if (tier) return tier.targetWords;
+  const hasChildren = Array.isArray(node.children) && node.children.length > 0;
+
+  // 3) 含下级的 L3：四档（全局档位）作为「子树总字数」
+  if (level === 3 && hasChildren) {
+    if (globalTierKey) {
+      const tier = WORD_COUNT_TIERS.find(t => t.key === globalTierKey);
+      if (tier) return tier.targetWords;
+    }
+    return WORD_COUNT_TIERS.find(t => t.isDefault)?.targetWords ?? 1200;
   }
 
-  // 4) L3 自身正文（方案三 2026-10-09）：300 ± 20%（240~360）
-  //    四档 800/1200/2000/2500 作为「L3 子树总字数」口径，仅存在下级目录章节
-  //   （L4+）时生效；无下级的 L3 以自身正文 300 字为唯一口径。
+  // 4) 叶子 L3 自身正文（方案三 2026-10-09）：固定 300 ± 20%（240~360），
+  //    不受四档下拉影响；四档仅对含下级目录（L4+）的 L3 作为子树总字数生效。
   if (level === 3) {
     return getL3OwnTarget();
   }
 
-  // 5) 默认档位
+  // 5) L4+ 深层叶子：跟随全局档位，回落默认档位
+  if (globalTierKey) {
+    const tier = WORD_COUNT_TIERS.find(t => t.key === globalTierKey);
+    if (tier) return tier.targetWords;
+  }
   return WORD_COUNT_TIERS.find(t => t.isDefault)?.targetWords ?? 1200;
 }
 
-/** 按方案三口径解析节点字数容差：L3 自身正文 ±20%，四档 ±10%，自定义目标 ±10% */
+/**
+ * 按方案三混合口径解析节点字数容差：
+ *   - 单节点 word_count_tier → 该档位 ±10%
+ *   - 叶子 L3（无下级/无覆盖）→ L3 自身正文 ±20%
+ *   - 含下级的 L3（子树总字数）→ ±10%
+ *   - 自定义精确目标 / L4+ → ±10%
+ */
 export function resolveToleranceForNode(
-  node: Pick<SectionTreeNode, 'level' | 'target_words' | 'word_count_tier'>,
+  node: Pick<SectionTreeNode, 'level' | 'target_words' | 'word_count_tier'> & { children?: SectionTreeNode[] },
 ): number {
   if (node.word_count_tier) {
     const tier = WORD_COUNT_TIERS.find(t => t.key === node.word_count_tier);
     return tier?.toleranceRatio ?? 0.10;
   }
-  if (node.level === 3) {
-    return L3_OWN_TOLERANCE_RATIO;
+  const hasChildren = Array.isArray(node.children) && node.children.length > 0;
+  if ((node.level || 3) === 3) {
+    // 叶子 L3 → ±20%；含下级的 L3（子树总字数）→ ±10%
+    return hasChildren ? 0.10 : L3_OWN_TOLERANCE_RATIO;
   }
   return 0.10;
 }
@@ -567,6 +726,41 @@ export function isWithinTolerance(wordCount: number, targetWords: number, tolera
   const lo = Math.floor(targetWords * (1 - toleranceRatio));
   const hi = Math.ceil(targetWords * (1 + toleranceRatio));
   return wordCount >= lo && wordCount <= hi;
+}
+
+/**
+ * 字数明细行的「达标区间下界」（BUG-FIX 2026-10-09）
+ *
+ * `WordCountPage` 的「达成进度」列需要算出「还缺多少字」。此前该列直接用
+ * `target_words - word_count`（零容差），与后端 `on_target`（含容差判定）
+ * 相互矛盾。此处按与后端 `word_count.py::_target_bounds` 相同的优先级
+ * 推导下界：
+ *   1. 有档位 → 档位 tolerance_ratio（±10%，可被管理员配置覆盖）
+ *   2. L3 自身正文 → L3_OWN_TOLERANCE_RATIO（±20%）
+ *   3. 其它 → 0.10
+ *
+ * 说明：真正的达标结论始终以服务端 `on_target` 为准（见
+ * `_is_within_tolerance` 的实现），本函数只用于**展示**缺字数，
+ * 使红色进度条的语义与后端判定对齐。
+ */
+export function resolveProgressLowerBound(item: {
+  level?: number | null;
+  target_words?: number | null;
+  word_count_tier?: string | null;
+  tier_target?: number | null;
+}): number {
+  const target = item.target_words ?? 0;
+  if (!target || target <= 0) return 0;
+  const tierKey = item.word_count_tier;
+  if (tierKey) {
+    const tier = WORD_COUNT_TIERS.find(t => t.key === tierKey);
+    const tol = tier?.toleranceRatio ?? 0.10;
+    return Math.floor(target * (1 - tol));
+  }
+  if ((item.level ?? 3) === 3) {
+    return Math.floor(target * (1 - L3_OWN_TOLERANCE_RATIO));
+  }
+  return Math.floor(target * (1 - 0.10));
 }
 
 
@@ -1099,6 +1293,24 @@ export interface ScoringPoint {
   weight: string;
   standard: string;
   source: string;
+  /**
+   * BUG-FIX 2026-10-09（跨模块数据链 / 要点提取字段丢失）：
+   * 后端 `normalize_writing_targets`（workflows_analysis.py）除上面 5 个字段外
+   * 还会写出 category / source_ref / source_page / confidence 四项结构化溯源字段，
+   * 但 `parseScoringPoints` 的 mapPoint 只挑了 5 个字段。
+   * 后果：要点提取页用**表格视图**确认时执行
+   * `confirmScoring(projectId, JSON.stringify(scoringPoints))`，
+   * 这四个字段被整条丢掉并**覆盖回数据库**（raw-JSON 视图则不会丢，
+   * 于是同一份数据在两个视图下行为不一致）。
+   * 缺失项声明为可选，保持对既有调用方与旧数据的向后兼容；
+   * 未声明时按后端默认值补齐（category 默认「评分项」，confidence 默认 1.0）。
+   */
+  category?: string;
+  source_ref?: string;
+  source_page?: string | number | null;
+  confidence?: number;
+  /** 原始条目其余未声明字段（透传保留，避免未来新增字段再次被丢弃） */
+  [extra: string]: unknown;
 }
 
 /** 摘要文本有效性：排除空/“{}”/“[]”，JSON 对象视为有效，非 JSON 靠长度判定 */
@@ -1122,12 +1334,24 @@ export function isValidSummary(text: string): boolean {
 export function parseScoringPoints(text: string): ScoringPoint[] {
   const mapPoint = (p: any, i: number): ScoringPoint => {
     if (!p) return { id: `R${i + 1}`, name: "", weight: "", standard: "", source: "" };
+    if (typeof p !== "object") return { id: `R${i + 1}`, name: "", weight: "", standard: "", source: "" };
+    // BUG-FIX 2026-10-09（跨模块数据链 / 要点提取字段丢失）：
+    // 先以原条目为基底整体透传（`...p`），再覆盖已归一化的 5 个核心字段。
+    // 这样后端 `normalize_writing_targets` 写出的 category / source_ref /
+    // source_page / confidence 以及未来新增的任何字段，都能在
+    // 「表格视图确认 → POST /ai/scoring/confirm → 覆盖回 DB」这条链路上存活，
+    // 不再被前端静默丢弃。核心字段仍按既有别名规则归一化，行为不变。
     return {
+      ...p,
       id: p.id || `R${i + 1}`,
       name: p.name || p.title || "",
       weight: p.weight || p.score || "",
       standard: p.standard || p.criteria || "",
       source: p.source || "",
+      category: p.category ?? "评分项",
+      source_ref: p.source_ref ?? "",
+      source_page: p.source_page ?? null,
+      confidence: typeof p.confidence === "number" ? p.confidence : 1.0,
     };
   };
   try {

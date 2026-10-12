@@ -166,7 +166,7 @@ def _collect_provided() -> dict[str, set[str]]:
                 if key:
                     provided[key] |= {
                         "OUTLINE", "SCORING_STANDARDS", "PROJECT_OVERVIEW", "SUMMARY",
-                        "LEAF_LIST_JSON", "SCORING_SUMMARY",
+                        "LEAF_LIST_JSON", "SCORING_SUMMARY", "KNOWLEDGE_CATALOG",
                     }
             elif fname == "_render_arrange_sys":
                 key = self._key_of(node.args[0]) if node.args else None
@@ -185,6 +185,15 @@ def _collect_provided() -> dict[str, set[str]]:
             except Exception:
                 continue
             v.visit(tree)
+    # ENHANCE 2026-10-12：已注册的 legacy 编排模板 CONTENT_ORCHESTRATION_LEGACY_USER
+    # 也走 _render_orch_user 渲染（三元表达式链 AST 无法静态推断 user_template 的值），
+    # 这里手动标记其注入覆盖范围，防止误报 missing variables。
+    _orch_full_vars = {
+        "OUTLINE", "SCORING_STANDARDS", "PROJECT_OVERVIEW", "SUMMARY",
+        "LEAF_LIST_JSON", "SCORING_SUMMARY", "KNOWLEDGE_CATALOG",
+    }
+    provided.setdefault("CONTENT_ORCHESTRATION_LEGACY_USER", set())
+    provided["CONTENT_ORCHESTRATION_LEGACY_USER"] |= _orch_full_vars
     return provided
 
 
@@ -221,13 +230,45 @@ def test_shared_refs_in_templates_resolve():
 
 
 def test_fill_template_sanitize_neutralizes_meta_markers_in_data():
-    # sanitize=True 时，注入的数据值里的元标记应被中和（与 render_prompt 对变量值口径一致）
+    # sanitize=True 时，注入的数据值里的**模块自有元标记**应被中和
+    # （与 render_prompt 对变量值口径一致）。
+    #
+    # BUG-FIX-PROMPT-S1（2026-10-09 语义修正）：本用例原先还断言裸 `{fake}`
+    # 也被中和。该断言编码的是「防御性过度」行为，且会破坏真实内容：
+    # 本项目两条渲染链路（_registry.render_prompt 与 base._fill_template）
+    # 均为单遍 re.sub，插入的变量值不会被二次扫描，裸 `{var}` 在值里本就
+    # 不会被重新解释，因此它不是注入面；而中和它会毁掉 Mermaid 判定节点
+    # `A{开始}` 与图表数据。现改为：模块元语法照常中和，裸 `{var}` 默认保留
+    # （可用 inline_vars=True 显式开启中和）。
     malicious = "正常数据 {shared:SHARED_OUTPUT_SPEC} 和 __SECRET__ 与 {fake}"
     out = base._fill_template("数据:__X__", {"__X__": malicious}, {}, sanitize=True)
     assert "{shared:" not in out
     assert "__SECRET__" not in out
-    assert "{fake}" not in out
     assert "正常数据" in out
+    # 裸 {var} 默认保留（单遍渲染下无害，且中和会破坏 Mermaid/图表数据）
+    assert "{fake}" in out
+    # 显式开启 inline_vars 后仍可中和
+    from app.services.ai.prompts._security import sanitize_prompt_value
+
+    assert "{fake}" not in sanitize_prompt_value(malicious, inline_vars=True)
+
+
+def test_sanitize_preserves_mermaid_and_chart_payloads():
+    # BUG-FIX-PROMPT-S1 回归守卫：sanitize 不得破坏图表/流程图管线依赖的语法。
+    # 修复前 neutralize_meta_markers 无条件中和裸 {var}，实测会把
+    #   flowchart TD / A{开始} --> B[结束]
+    # 改写为 A[占位符已屏蔽]，导致 Mermaid 渲染管线拿到坏数据。
+    from app.services.ai.prompts._security import sanitize_prompt_value
+
+    mermaid = "flowchart TD\n    A{开始} --> B[结束]\n    B --> C{是否通过}"
+    assert sanitize_prompt_value(mermaid) == mermaid
+
+    chart_json = '{"type": "bar", "series": [{"name": "a", "data": [1, 2]}]}'
+    assert sanitize_prompt_value(chart_json) == chart_json
+
+    # 真正需要中和的仍然生效
+    assert "共享规则引用已屏蔽" in sanitize_prompt_value("注入 {shared:SHARED_OUTPUT_SPEC}")
+    assert "元占位符已屏蔽" in sanitize_prompt_value("注入 __GLOBAL_FACTS__")
 
 
 def test_fill_template_desensitize_masks_sensitive_info():

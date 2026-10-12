@@ -288,11 +288,11 @@ FLOWCHART_ARRANGE_SYSTEM = """# 流程图编排（系统提示词）— 优化�
 
 你将收到以下输入：
 
-- **章节标题**：`__SECTION_TITLE__`（字符串）
+- **章节标题**：`{SECTION_TITLE}`（字符串）
 - **章节描述**：由用户消息提供（字符串，可选）
-- **项目概述**：`__SUMMARY__`（含项目规模、工程类型、主要施工内容等）
+- **项目概述**：`{SUMMARY}`（含项目规模、工程类型、主要施工内容等）
 - **关联评分点**：由用户消息提供（该章节关联的评分点，含权重和标准）
-- **写作长度**：`__WRITING_LENGTH__`（short/standard/detailed/extra_long，用于调整推荐粒度）
+- **写作长度**：`{WRITING_LENGTH}`（short/standard/detailed/extra_long，用于调整推荐粒度）
 
 ### 一、适用场景与触发判定（严格执行）
 
@@ -960,12 +960,12 @@ MERMAID_FLOWCHART_USER = """### 输入数据
 
 请基于以下信息生成 Mermaid 流程图代码：
 
-- **章节标题**：__SECTION_TITLE__
-- **章节正文**（前 500 字）：__SECTION_CONTENT__
-- **评分标准**：__SCORING_STANDARD__
-- **行业背景**：__INDUSTRY_PROFILE__
-- **项目概述**：__PROJECT_OVERVIEW__
-- **编排结果**：__ARRANGE_INFO__
+- **章节标题**：{SECTION_TITLE}
+- **章节正文**（前 500 字）：{SECTION_CONTENT}
+- **评分标准**：{SCORING_STANDARD}
+- **行业背景**：{INDUSTRY_PROFILE}
+- **项目概述**：{PROJECT_OVERVIEW}
+- **编排结果**：{ARRANGE_INFO}
 
 ### 任务
 
@@ -1229,12 +1229,12 @@ MERMAID_GANTT_USER = """### 输入数据
 
 请基于以下信息生成 Mermaid 甘特图代码：
 
-- **章节标题**：__SECTION_TITLE__
-- **章节正文**（前 500 字）：__SECTION_CONTENT__
-- **评分标准**：__SCORING_STANDARD__
-- **行业背景**：__INDUSTRY_PROFILE__
-- **项目概述**：__SUMMARY__
-- **编排结果**：__ARRANGE_INFO__
+- **章节标题**：{SECTION_TITLE}
+- **章节正文**（前 500 字）：{SECTION_CONTENT}
+- **评分标准**：{SCORING_STANDARD}
+- **行业背景**：{INDUSTRY_PROFILE}
+- **项目概述**：{SUMMARY}
+- **编排结果**：{ARRANGE_INFO}
 
 ### 任务
 

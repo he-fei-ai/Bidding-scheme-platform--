@@ -234,6 +234,81 @@ class TestOcrCacheKeyToctou:
 
 
 # ============================================================================
+# BUG-FIX 2026-10-11（P3·OCR 缓存键亚秒碰撞）回归锁定
+#   与 files._get_file_hash（CF-03）同一类缺陷：原 _get_cache_key 用
+#   `{mtime:.0f}` 截断到整秒，同大小 PDF 在同一秒内替换会算出同一 key →
+#   MinerU 缓存把旧解析文本错配给新文件。现改为 st_mtime_ns + size + 4KB 内容哈希。
+# ============================================================================
+class TestOcrCacheKeySubSecondCollision:
+    """_get_cache_key 亚秒/同刻度碰撞修复锁定。"""
+
+    @staticmethod
+    def _parser():
+        from app.services.ocr_parser import MinerUParser
+
+        return MinerUParser.__new__(MinerUParser)
+
+    def test_same_content_same_key(self):
+        """同一文件 key 稳定（缓存可命中）。"""
+        p = self._parser()
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+            f.write(b"%PDF-1.4 stable content")
+            path = f.name
+        try:
+            assert p._get_cache_key(path) == p._get_cache_key(path)
+        finally:
+            os.unlink(path)
+
+    def test_same_size_same_mtime_different_content_no_collision(self):
+        """同大小 + 强制对齐 mtime 的不同内容文件，key 不得碰撞（CF-03 同款回归）。"""
+        p = self._parser()
+        d = tempfile.mkdtemp()
+        path1 = os.path.join(d, "a.pdf")
+        path2 = os.path.join(d, "b.pdf")
+        # 同大小（均为 9 字节），内容不同
+        with open(path1, "wb") as f1:
+            f1.write(b"content A")
+        with open(path2, "wb") as f2:
+            f2.write(b"content B")
+        try:
+            # 对齐 mtime 到同一纳秒刻度，复现旧实现必然碰撞的条件
+            os.utime(path1, ns=(1_000_000_000, 1_000_000_000))
+            os.utime(path2, ns=(1_000_000_000, 1_000_000_000))
+            assert p._get_cache_key(path1) != p._get_cache_key(path2), (
+                "同大小同 mtime 的不同内容 PDF，缓存 key 不得碰撞"
+            )
+        finally:
+            os.unlink(path1)
+            os.unlink(path2)
+            import shutil
+
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_subsecond_reparse_produces_distinct_key(self):
+        """同路径内容在亚秒级被替换后，key 应不同（防旧内容缓存错配）。"""
+        p = self._parser()
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+            f.write(b"%PDF-1.4 version-one")
+            path = f.name
+        try:
+            key1 = p._get_cache_key(path)
+            # 亚秒内改写内容（不显式改 mtime，依赖纳秒刻度差异 + 内容哈希）
+            with open(path, "wb") as f:
+                f.write(b"%PDF-1.4 version-two-different")
+            os.utime(path, None)  # 刷新 mtime 到「现在」
+            key2 = p._get_cache_key(path)
+            assert key1 != key2, "内容变化后缓存 key 必须变化，否则命中旧解析结果"
+        finally:
+            os.unlink(path)
+
+    def test_missing_file_returns_path(self):
+        """缺失文件仍回退返回原路径（TOCTOU 契约不回归）。"""
+        p = self._parser()
+        assert p._get_cache_key("/nonexistent/x.pdf") == "/nonexistent/x.pdf"
+
+
+
+# ============================================================================
 # Bug 5: MinerU 单例从函数属性改为模块级
 # ============================================================================
 

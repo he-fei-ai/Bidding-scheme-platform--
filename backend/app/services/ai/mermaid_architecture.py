@@ -37,21 +37,113 @@ _MAX_ARCH_NODES = 120
 _MAX_ARCH_DEPTH = 10
 _MAX_ARCH_CANVAS_PX = 6000
 
+# L3 叶子层竖排阈值：叶子节点数 > 此值时自动启用竖排布局
+_VERTICAL_THRESHOLD = 6
 
-def _layout_architecture_tree(root: dict) -> tuple[list[dict], int, int]:
-    """为架构树节点计算坐标（自顶向下、横向展开）。"""
+# L3 竖排布局参数
+_L3_VERTICAL_W = 60
+_L3_VERTICAL_H = 200
+_L3_VERTICAL_GAP = 8
+_L3_HORIZONTAL_W = 220
+_L3_HORIZONTAL_H = 52
+_L3_HORIZONTAL_GAP = 24
+
+# L2 中间节点在竖排模式下适度收窄（220→160），进一步压缩画布宽度
+_L2_VERTICAL_W = 160
+
+
+def _count_leaves(node: dict) -> int:
+    """递归统计叶子节点数量。"""
+    children = (
+        node.get("children")
+        or node.get("nodes")
+        or node.get("sub_units")
+        or node.get("branches")
+        or []
+    )
+    if not isinstance(children, list) or len(children) == 0:
+        return 1
+    return sum(_count_leaves(c) for c in children if isinstance(c, dict))
+
+
+def _draw_text_vertical(draw, box, text: str, font, fill: str, letter_spacing: int = 2):
+    """在指定矩形内垂直绘制文字（从上到下，字符保持直立）。
+
+    模拟 CSS writing-mode: vertical-rl + text-orientation: upright 的效果。
+    """
+    x1, y1, x2, y2 = box
+    text = str(text or "").strip()
+    if not text:
+        return
+
+    # 计算单字符尺寸
+    test_bbox = draw.textbbox((0, 0), "国", font=font)
+    char_w = max(1, test_bbox[2] - test_bbox[0])
+    char_h = max(1, test_bbox[3] - test_bbox[1])
+
+    # 可用区域（留边距）
+    usable_w = max(1, x2 - x1 - 8)
+    usable_h = max(1, y2 - y1 - 8)
+
+    # 计算可显示的字符数（垂直方向）
+    max_chars = max(1, int(usable_h / (char_h + letter_spacing)))
+
+    # 分列显示：如果文本太长，分多列
+    lines = []
+    current = ""
+    for char in text:
+        current += char
+        if len(current) >= max_chars:
+            lines.append(current)
+            current = ""
+    if current:
+        lines.append(current)
+
+    # 如果只有一列，居中显示
+    num_cols = len(lines)
+    total_text_w = num_cols * (char_w + letter_spacing)
+    col_x = x1 + max(0, (x2 - x1 - total_text_w) / 2)
+
+    for col_idx, line in enumerate(lines):
+        # 计算列的垂直居中位置
+        line_h = len(line) * (char_h + letter_spacing) - letter_spacing
+        col_y = y1 + max(0, (y2 - y1 - line_h) / 2)
+
+        for char_idx, char in enumerate(line):
+            if char == ' ':
+                col_y += char_h * 0.5
+                continue
+            bbox = draw.textbbox((0, 0), char, font=font)
+            cw = bbox[2] - bbox[0]
+            ch = bbox[3] - bbox[1]
+            draw.text(
+                (col_x + (char_w - cw) / 2, col_y + char_idx * (char_h + letter_spacing)),
+                char,
+                fill=fill,
+                font=font,
+            )
+
+    # 如果文本被截断，添加省略号
+    if len(lines) * max_chars < len(text):
+        last_line = lines[-1]
+        if len(last_line) < max_chars:
+            last_line += "…"
+            lines[-1] = last_line
+
+
+def _layout_architecture_tree(root: dict, vertical_l3: bool = False) -> tuple[list[dict], int, int]:
+    """为架构树节点计算坐标（自顶向下、横向展开）。
+
+    vertical_l3=True 时，L3 叶子节点使用竖排布局（窄高矩形，文字垂直排列）。
+    """
     nodes_pos: list[dict] = []
     leaf_counter = [0]
 
     def _dfs(node: dict, depth: int, x_start: float, parent_id: str | None = None) -> float:
         """DFS 返回该子树的 x 结束位置（独占宽度）。"""
-        # 深度护栏：超限即停止展开，防止递归过深
         if depth > _MAX_ARCH_DEPTH:
             return x_start
-        node_w = 220
-        node_h = 52
-        h_gap = 24
-        v_gap = 48
+
         label = str(node.get("label") or node.get("name") or "").strip()
         nid = str(node.get("id") or f"n{leaf_counter[0]}")
         leaf_counter[0] += 1
@@ -66,8 +158,24 @@ def _layout_architecture_tree(root: dict) -> tuple[list[dict], int, int]:
         if not isinstance(children, list):
             children = []
 
-        if not children:
-            # 叶子节点：自己占用一个位置
+        is_leaf = len(children) == 0
+
+        # 根据节点类型和布局模式决定尺寸
+        if is_leaf and depth >= 2:
+            # L3 及更深层叶子：竖排/横排两套配置
+            if vertical_l3:
+                node_w, node_h, gap = _L3_VERTICAL_W, _L3_VERTICAL_H, _L3_VERTICAL_GAP
+            else:
+                node_w, node_h, gap = _L3_HORIZONTAL_W, _L3_HORIZONTAL_H, _L3_HORIZONTAL_GAP
+        elif vertical_l3 and not is_leaf and depth >= 1:
+            # 竖排模式下 L2 中间节点适度收窄（220→160），压缩画布宽度
+            node_w, node_h, gap = _L2_VERTICAL_W, 52, 24
+        else:
+            node_w, node_h, gap = 220, 52, 24
+
+        v_gap = 48
+
+        if is_leaf:
             x = x_start
             y = depth * (node_h + v_gap) + 60
             if len(nodes_pos) >= _MAX_ARCH_NODES:
@@ -83,22 +191,23 @@ def _layout_architecture_tree(root: dict) -> tuple[list[dict], int, int]:
                     "depth": depth,
                     "has_children": False,
                     "parent_id": parent_id,
+                    "is_leaf": True,
+                    "vertical": vertical_l3,
                 }
             )
-            return x + node_w + h_gap
+            return x + node_w + gap
 
         # 有子节点：先布局子节点，再居中放置自己
         child_x = x_start
-        child_positions: list[float] = []
+        child_positions: list[tuple[float, float]] = []
         for child in children:
             if not isinstance(child, dict):
                 continue
             end_x = _dfs(child, depth + 1, child_x, parent_id=nid)
-            child_positions.append((child_x, end_x - child_x - h_gap))
+            child_positions.append((child_x, end_x - child_x - gap))
             child_x = end_x
 
         if not child_positions:
-            # 过滤后无有效子节点
             x = x_start
             y = depth * (node_h + v_gap) + 60
             if len(nodes_pos) >= _MAX_ARCH_NODES:
@@ -114,9 +223,11 @@ def _layout_architecture_tree(root: dict) -> tuple[list[dict], int, int]:
                     "depth": depth,
                     "has_children": False,
                     "parent_id": parent_id,
+                    "is_leaf": True,
+                    "vertical": vertical_l3,
                 }
             )
-            return x + node_w + h_gap
+            return x + node_w + gap
 
         # 自己的 x = 第一个子节点中心 - 自己宽度的一半
         first_x, first_w = child_positions[0]
@@ -125,7 +236,7 @@ def _layout_architecture_tree(root: dict) -> tuple[list[dict], int, int]:
         x = children_center - node_w / 2
         y = depth * (node_h + v_gap) + 60
         if len(nodes_pos) >= _MAX_ARCH_NODES:
-            return max(child_x, x + node_w + h_gap)
+            return max(child_x, x + node_w + gap)
         nodes_pos.append(
             {
                 "id": nid,
@@ -137,9 +248,11 @@ def _layout_architecture_tree(root: dict) -> tuple[list[dict], int, int]:
                 "depth": depth,
                 "has_children": True,
                 "parent_id": parent_id,
+                "is_leaf": False,
+                "vertical": False,
             }
         )
-        return max(child_x, x + node_w + h_gap)
+        return max(child_x, x + node_w + gap)
 
     _dfs(root, 0, 40)
 
@@ -179,7 +292,11 @@ def _layout_architecture_tree(root: dict) -> tuple[list[dict], int, int]:
 
 @_render_hq
 def _render_architecture_image_v2(data: dict) -> BytesIO | None:
-    """商业级架构图渲染器 v2：真正的树形可视化，含父子连线。"""
+    """商业级架构图渲染器 v2：真正的树形可视化，含父子连线。
+
+    当 L3 叶子节点数 > _VERTICAL_THRESHOLD 时，自动启用竖排布局，
+    将画布宽度从横向 ~1600px 缩减至 ~800px，适配 A4 纸宽。
+    """
     if not isinstance(data, dict):
         return None
     # 兼容嵌套结构：{"root": {...}} / {"tree": {...}} / {"data": {...}}
@@ -189,7 +306,15 @@ def _render_architecture_image_v2(data: dict) -> BytesIO | None:
     if not (root.get("label") or root.get("name")):
         return None
 
-    nodes_pos, width, height = _layout_architecture_tree(root)
+    # 检测 L3 叶子节点数，决定是否启用竖排
+    leaf_count = _count_leaves(root)
+    vertical_l3 = leaf_count > _VERTICAL_THRESHOLD
+    logger.info(
+        "[PIL v2渲染] 叶子节点数=%d, 竖排模式=%s (阈值=%d)",
+        leaf_count, vertical_l3, _VERTICAL_THRESHOLD,
+    )
+
+    nodes_pos, width, height = _layout_architecture_tree(root, vertical_l3=vertical_l3)
     if not nodes_pos:
         return None
     logger.info(
@@ -338,14 +463,28 @@ def _render_architecture_image_v2(data: dict) -> BytesIO | None:
             draw.rounded_rectangle(
                 [x, y, x + w, y + h], radius=8, fill=fill_c, outline="#1E3A5F", width=int(1 * scale)
             )
-            _draw_text_center(
-                draw,
-                (x + 4, y + 4, x + w - 4, y + h - 4),
-                n["label"],
-                font_node,
-                text_c,
-                max_lines=2,
-            )
+            # 根据布局模式选择文字渲染方式
+            if n.get("vertical"):
+                # 竖排文字：垂直排列
+                font_vert = _image_font(int(14 * scale), bold=False)
+                _draw_text_vertical(
+                    draw,
+                    (x + 4, y + 4, x + w - 4, y + h - 4),
+                    n["label"],
+                    font_vert,
+                    text_c,
+                    letter_spacing=int(2 * scale),
+                )
+            else:
+                # 横排文字
+                _draw_text_center(
+                    draw,
+                    (x + 4, y + 4, x + w - 4, y + h - 4),
+                    n["label"],
+                    font_node,
+                    text_c,
+                    max_lines=2,
+                )
 
     result_stream = _image_to_stream(img)
     size_kb = len(result_stream.getvalue()) // 1024

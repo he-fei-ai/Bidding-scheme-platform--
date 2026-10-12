@@ -6,7 +6,7 @@ import re
 from typing import Any
 
 from ...utils.json_parser import extract_json_from_text
-from ...utils.scoring_points import is_scoring_placeholder
+from ...utils.scoring_points import is_scoring_placeholder, strip_scoring_placeholders
 from ..facts_service import (
     DEFAULT_FACTS_POLICY,
     dict_to_fact_items,
@@ -14,12 +14,36 @@ from ..facts_service import (
     normalize_fact_items,
     normalize_facts_policy,
 )
-from .prompts import get_prompt, render_prompt, truncate_to_tokens
+from .prompts import (
+    assemble_prompt_context,
+    get_prompt,
+    render_prompt,
+    sanitize_prompt_value,
+    truncate_to_tokens,
+)
 
 # 安全增强 2026-10-06（G5+G3）：招标原文（用户/外部内容）注入统一经
 # 元标记中和（sanitize）+ 敏感信息脱敏（desensitize）+ Token 软上限保护。
 # 默认 20000 token ≈ 2 万中文字；仅极端长标书被裁切，正常标书不降级。
 ANALYSIS_CONTEXT_TOKEN_CAP = 20000
+
+# BUG-FIX-PROMPT-C1（全局事实上下文无上限/无优先级/无脱敏）：
+# extract_global_facts 原用裸 f-string 把**整篇招标原文**拼进 user message：
+#   1) 无 Token 上限 —— 300 页标书约 20 万 token 一次性灌入，单次调用即可能撑爆
+#      上下文窗口（本文件其余 5 处解析链路都走 _safe_tender_context 做了 20k 截断，
+#      唯独此处绕过，破坏了同文件内的口径一致性）；
+#   2) 无优先级 —— 补充来源（Step02 解析结果）与辅助来源（项目摘要）被追加在
+#      核心来源之后，一旦核心原文吃满预算，后两类高价值信息会被整段挤掉；
+#   3) 无脱敏 —— 招标原文中的邮箱/手机/身份证/密钥原样出网。
+# 修复：改用提示词模块统一上下文组装入口 assemble_prompt_context，按
+# GLOBAL_FACTS(核心原文) > 解析提取结果 > 项目摘要 的优先级在总预算内组装，
+# 并对各片段做元标记中和 + 敏感信息脱敏。
+FACTS_CONTEXT_TOKEN_CAP = 20000
+
+# 缓存优化（文档四）：全局事实提取把「核心招标原文」拆到共享上下文块后，
+# 补充来源（Step02 解析结果 + 项目摘要）单独一个小得多的预算。
+# 原文走 ANALYSIS_CONTEXT_BLOCK 与其余解析任务共享同一前缀（命中缓存）。
+FACTS_EXTRA_CONTEXT_TOKEN_CAP = 8000
 
 
 def _safe_tender_context(tender_context: str) -> str:
@@ -30,6 +54,62 @@ def _safe_tender_context(tender_context: str) -> str:
     {shared:...}/__VAR__ 元标记，且邮箱/手机/身份证/密钥被掩码。
     """
     return truncate_to_tokens(tender_context, ANALYSIS_CONTEXT_TOKEN_CAP)
+
+
+# 缓存优化（标书智能体设计文档（四）——提示词顺序优化）：
+# 所有「解析招标文件」类任务共用同一份稳定 system 前缀（ANALYSIS_SYSTEM），
+# 把占 token 最大、且跨任务不变的招标原文拆成独立的 user 消息并前置，
+# 任务差异（原各任务 system/user 指令）一律放到最后一条 user 消息。
+# 这样「概述 / 评分 / 清单 / 工界 / 工法」等不同解析任务就能共享同一前缀，
+# 命中服务商 Prompt Cache，输入成本可降一个数量级（实测约 10 倍）。
+ANALYSIS_SYSTEM = get_prompt("ANALYSIS_SYSTEM")
+
+
+def _build_analysis_messages(
+    system_prompt_name: str,
+    user_prompt_name: str,
+    context: str,
+    *,
+    user_vars: "dict | None" = None,
+    render_system_labels: "dict | None" = None,
+) -> "list":
+    """构造缓存友好的解析类消息列表。
+
+    结构固定为 4 条：
+      [0] system  : 通用稳定前缀（ANALYSIS_SYSTEM，跨任务一致）
+      [1] user    : 招标原文上下文块（大且稳定，前置，跨任务一致 → 可复用缓存）
+      [2] user    : 本任务专属指令（原 *SYSTEM 提示词正文）
+      [3] user    : 本任务输入与差异（原 *USER 提示词，已剔除 CONTEXT）
+
+    Args:
+        system_prompt_name: 任务专属 system 提示词名（如 "SCORING_FIRST_ROUND_SYSTEM"）
+        user_prompt_name:   任务专属 user 提示词名（如 "SCORING_FIRST_ROUND_USER"）
+        context:            原始招标全文（内部做 Token 截断 + 脱敏）
+        user_vars:          渲染 user 提示词所需的变量（如 SUMMARY / EXISTING_POINTS）
+        render_system_labels: 若任务 system 提示词含 __CONTEXT__ 等语义标签，
+                              在此传入标签映射（如 {"CONTEXT": "招标文件上下文"}）
+    """
+    ctx_block = get_prompt(
+        "ANALYSIS_CONTEXT_BLOCK",
+        CONTEXT=_safe_tender_context(context),
+        sanitize=True,
+        desensitize=True,
+    )
+    if render_system_labels is not None:
+        sys_text = render_prompt(get_prompt(system_prompt_name), **render_system_labels)
+    else:
+        sys_text = get_prompt(system_prompt_name)
+    user_text = get_prompt(
+        user_prompt_name, sanitize=True, desensitize=True, **(user_vars or {})
+    )
+    return [
+        AIMessage(role="system", content=ANALYSIS_SYSTEM),
+        AIMessage(role="user", content=ctx_block),
+        AIMessage(role="user", content=sys_text),
+        AIMessage(role="user", content=user_text),
+    ]
+
+
 from .providers.base import AIMessage
 
 
@@ -42,18 +122,9 @@ from .workflows_base import call_ai_text, collect_json_response, with_timeout
 async def generate_tender_summary(provider: Any, tender_context: str) -> str:
     """生成招标摘要"""
     logger.info("[AI摘要] 开始生成招标摘要，上下文长度: %d 字符", len(tender_context))
-    sys_prompt = get_prompt("TENDER_SUMMARY_SYSTEM")
-    user_prompt = get_prompt(
-        "TENDER_SUMMARY_USER",
-        CONTEXT=_safe_tender_context(tender_context),
-        sanitize=True,
-        desensitize=True,
+    messages = _build_analysis_messages(
+        "TENDER_SUMMARY_SYSTEM", "TENDER_SUMMARY_USER", tender_context
     )
-
-    messages = [
-        AIMessage(role="system", content=sys_prompt),
-        AIMessage(role="user", content=user_prompt),
-    ]
 
     # F-P0-2（2026-10-07）：改用 call_ai_text，空响应显式告警+重试+抛错，
     # 避免空摘要被静默落库（日志曾出现"响应长度: 0 字符"）。
@@ -95,17 +166,25 @@ async def extract_scoring_points(provider: Any, tender_context: str, summary: st
     Returns:
         list[dict]: 标准化后的评分点列表
     """
+    # 共享上下文块：占 token 最大的招标原文，跨两阶段与跨任务复用缓存前缀
+    _ctx_block = get_prompt(
+        "ANALYSIS_CONTEXT_BLOCK",
+        CONTEXT=_safe_tender_context(tender_context),
+        sanitize=True,
+        desensitize=True,
+    )
     scoring_first_sys = get_prompt("SCORING_FIRST_ROUND_SYSTEM")
     scoring_first_user = get_prompt(
         "SCORING_FIRST_ROUND_USER",
-        CONTEXT=_safe_tender_context(tender_context),
         SUMMARY=summary,
         sanitize=True,
+        desensitize=True,
     )
     # BUG-FIX 2026-09-14（中）：模板里的 __CONTEXT__ / __SUMMARY__ / __EXISTING_POINTS__
     # 未在 system 侧渲染 → 模型收到字面量占位符（框架日志 missing variables）。
     # system 提示词只做规则描述，这里替换成**语义标签**而非整段数据，
     # 避免把 4 万字招标上下文在 system/user 里重复注入一遍（token 翻倍）。
+    # 注意：上下文已统一由 ANALYSIS_CONTEXT_BLOCK 前置提供，本 system 仅保留规则描述。
     scoring_review_sys = render_prompt(
         get_prompt("SCORING_REVIEW_SYSTEM"),
         CONTEXT="招标文件上下文",
@@ -134,7 +213,9 @@ async def extract_scoring_points(provider: Any, tender_context: str, summary: st
 
     # 第一阶段：初次识别
     first_messages = [
-        AIMessage(role="system", content=scoring_first_sys),
+        AIMessage(role="system", content=ANALYSIS_SYSTEM),
+        AIMessage(role="user", content=_ctx_block),
+        AIMessage(role="user", content=scoring_first_sys),
         AIMessage(role="user", content=scoring_first_user),
     ]
 
@@ -153,7 +234,6 @@ async def extract_scoring_points(provider: Any, tender_context: str, summary: st
     existing_points_json = json.dumps(first_points, ensure_ascii=False, indent=2)
     review_user = render_prompt(
         scoring_review_user_template,
-        CONTEXT=_safe_tender_context(tender_context),
         SUMMARY=summary,
         EXISTING_POINTS=existing_points_json,
         sanitize=True,
@@ -162,7 +242,9 @@ async def extract_scoring_points(provider: Any, tender_context: str, summary: st
     # 第二阶段：二次审查（查漏补缺）
     logger.info("[评分点] 第二阶段开始：二次审查，已有评分点=%d个", len(first_points))
     review_messages = [
-        AIMessage(role="system", content=scoring_review_sys),
+        AIMessage(role="system", content=ANALYSIS_SYSTEM),
+        AIMessage(role="user", content=_ctx_block),
+        AIMessage(role="user", content=scoring_review_sys),
         AIMessage(role="user", content=review_user),
     ]
 
@@ -232,20 +314,43 @@ async def extract_global_facts(
         except (json.JSONDecodeError, TypeError):
             pass
 
-    multi_source_context = f"""请从以下多源项目文档中提取全局事实变量（后序来源作为补充，与核心来源冲突时以核心来源为准）：\n\n【核心来源：招标文件全文】\n{tender_context}\n"""
-    if step02_parts:
-        multi_source_context += "\n\n【补充来源：Step02 关键解析结果】\n" + "\n\n".join(
-            step02_parts
-        )
-    if summary:
-        multi_source_context += f"\n\n【辅助来源：项目摘要】\n{summary}"
+    # 缓存优化（文档四）：占 token 最大的核心招标原文走共享上下文块前置，
+    # 与「概述/评分/清单/工界/工法」等解析任务共享同一前缀 → 命中 Prompt Cache。
+    # 补充来源（Step02 解析结果 + 项目摘要）留在任务消息里，与原文冲突时以原文为准。
+    ctx_block = get_prompt(
+        "ANALYSIS_CONTEXT_BLOCK",
+        CONTEXT=_safe_tender_context(tender_context),
+        sanitize=True,
+        desensitize=True,
+    )
+    extra_context = assemble_prompt_context(
+        {
+            "STEP02_ANALYSIS": sanitize_prompt_value(
+                "\n\n".join(step02_parts)
+            ) if step02_parts else "",
+            "SUMMARY": sanitize_prompt_value(summary or ""),
+        },
+        max_tokens=FACTS_EXTRA_CONTEXT_TOKEN_CAP,
+        priorities={
+            # Step02 解析结果（已结构化，信息密度高）优先于项目摘要（与原文高度重叠）
+            "STEP02_ANALYSIS": 95,
+            "SUMMARY": 90,
+        },
+    )
+    task_context = (
+        "请从以下补充来源中提取全局事实变量"
+        "（核心招标原文已在上方提供；补充来源与核心来源冲突时以核心来源为准）：\n\n"
+        + extra_context
+    )
 
     try:
         result = await collect_json_response(
             provider,
             [
-                AIMessage(role="system", content=sys_prompt),
-                AIMessage(role="user", content=multi_source_context),
+                AIMessage(role="system", content=ANALYSIS_SYSTEM),
+                AIMessage(role="user", content=ctx_block),
+                AIMessage(role="user", content=sys_prompt),
+                AIMessage(role="user", content=task_context),
             ],
             temperature=0.3,
             max_retries=1,
@@ -306,12 +411,30 @@ def normalize_writing_targets(raw_points: list[dict]) -> list[dict]:
         "营业执照",
         "资质",
         "注册资金",
-    ]
+]
 
     seen = set()
     normalized = []
 
-    for point in raw_points:
+    # BUG-FIX 2026-10-09（跨模块数据链 / 要点提取幂等性）：
+    # 本函数此前对已规范化数据不幂等，根因是两处叠加：
+    #   1) 下方循环无条件用 `f"R{len(normalized)+1}"` 重写 id，把上一轮插入的
+    #      `__weight_warning__` 系统提示伪项也纳入编号，于是伪项被"升格"成 R1；
+    #   2) 末尾的 `has_warning = is_scoring_placeholder(normalized[0])` 判据在
+    #      重编号后永远为假（首元素已是普通评分点），守卫成为死代码，
+    #      于是每次调用都再追加一条新的 `[权重异常]` 伪项。
+    # 实测：连续三次调用同一输入，伪项由 1 条膨胀为 2 条，真实评分点 id
+    # 从 R1/R2 漂移到 R2/R3。
+    # 影响面（跨模块）：`sections.scoring_point_id` 存的就是这里的 `R{n}`
+    # （sse_db_ops.py:659）。id 漂移后，目录↔评分点的映射在
+    # scoring_compliance（评分覆盖审计）与 export（导出预检）两处同时断裂，
+    # 表现为永久性的假「评分点未覆盖」；而 `strip_scoring_placeholders`
+    # 按 id 过滤（app/utils/scoring_points.py），被升格成 R1 的伪项无法被剔除。
+    # 修复：入参先剥离所有系统提示伪项，伪项不参与编号，末尾再统一补一条，
+    # 保证任意次调用结果一致。
+    incoming = strip_scoring_placeholders(raw_points if isinstance(raw_points, list) else [])
+
+    for point in incoming:
         if not isinstance(point, dict):
             continue
 
@@ -365,26 +488,24 @@ def normalize_writing_targets(raw_points: list[dict]) -> list[dict]:
         # 权重总和偏差超过1个百分点，且有正数权重时才发出警告
         if total > 0 and abs(total - 100) > 1:
             logger.warning("评分项权重之和为 %s，可能遗漏评分项", total)  # BUG-FIX-59: 改用延迟格式化避免无谓字符串构造
-            # 检查是否已有警告项（避免重复插入）
-            # ENHANCE 2026-09-18：判据收敛到 app.utils.scoring_points（与
-            # outline_gate / workflows_sections / workflows_outline_v51 / export 同源）。
-            has_warning = len(normalized) > 0 and is_scoring_placeholder(normalized[0])
-            if not has_warning:
-                # 在第一个元素中附加警告信息（不改变返回结构）
-                normalized.insert(
-                    0,
-                    {
-                        "id": "__weight_warning__",
-                        "name": f"[权重异常] 评分项权重之和为 {total}，请检查是否遗漏评分项",
-                        "weight": "",
-                        "standard": "",
-                        "source": "系统自动校验",
-                        "category": "系统提示",
-                        "source_ref": "",
-                        "source_page": None,
-                        "confidence": 1.0,
-                    },
-                )
+            # BUG-FIX 2026-10-09（幂等性）：入参已在函数开头统一剥离系统提示伪项，
+            # 因此此处必然不存在已有警告项，无需再做 `has_warning` 判据
+            # （旧判据在 id 重编号后恒为假，属死代码）。直接补一条即可，
+            # 重复调用得到完全相同的结果。
+            normalized.insert(
+                0,
+                {
+                    "id": "__weight_warning__",
+                    "name": f"[权重异常] 评分项权重之和为 {total}，请检查是否遗漏评分项",
+                    "weight": "",
+                    "standard": "",
+                    "source": "系统自动校验",
+                    "category": "系统提示",
+                    "source_ref": "",
+                    "source_page": None,
+                    "confidence": 1.0,
+                },
+            )
 
     return normalized
 
@@ -429,18 +550,9 @@ def _sanitize_scoring_points(scoring_points: str) -> str:
 async def analyze_boq(provider: Any, tender_context: str) -> list[dict]:
     """分析清单工程量"""
     logger.info("[AI清单] 开始分析清单工程量，上下文长度: %d 字符", len(tender_context))
-    sys_prompt = get_prompt("BOQ_ANALYSIS_SYSTEM")
-    user_prompt = get_prompt(
-        "BOQ_ANALYSIS_USER",
-        CONTEXT=_safe_tender_context(tender_context),
-        sanitize=True,
-        desensitize=True,
+    messages = _build_analysis_messages(
+        "BOQ_ANALYSIS_SYSTEM", "BOQ_ANALYSIS_USER", tender_context
     )
-
-    messages = [
-        AIMessage(role="system", content=sys_prompt),
-        AIMessage(role="user", content=user_prompt),
-    ]
 
     # BUG-FIX 2026-09-18（高）：`collect_json_response` 在 AI 不可用 / 返回非 JSON 时
     # 抛 `RuntimeError`（workflows_base.py 末尾的 `raise RuntimeError(...)`），而本函数
@@ -485,18 +597,9 @@ async def analyze_boq(provider: Any, tender_context: str) -> list[dict]:
 async def analyze_work_interface(provider: Any, tender_context: str) -> list[dict]:
     """分析工作界面"""
     logger.info("[AI工界] 开始分析工作界面，上下文长度: %d 字符", len(tender_context))
-    sys_prompt = get_prompt("WORK_INTERFACE_ANALYSIS_SYSTEM")
-    user_prompt = get_prompt(
-        "WORK_INTERFACE_ANALYSIS_USER",
-        CONTEXT=_safe_tender_context(tender_context),
-        sanitize=True,
-        desensitize=True,
+    messages = _build_analysis_messages(
+        "WORK_INTERFACE_ANALYSIS_SYSTEM", "WORK_INTERFACE_ANALYSIS_USER", tender_context
     )
-
-    messages = [
-        AIMessage(role="system", content=sys_prompt),
-        AIMessage(role="user", content=user_prompt),
-    ]
 
     # BUG-FIX 2026-09-18（高）：同 `analyze_boq` —— 原先无 try 包裹，
     # `collect_json_response` 抛 RuntimeError 时下面的 WI1~WI3 默认工作界面
@@ -540,18 +643,11 @@ async def analyze_work_interface(provider: Any, tender_context: str) -> list[dic
 async def analyze_construction_method(provider: Any, tender_context: str) -> list[dict]:
     """分析工程作法"""
     logger.info("[AI工法] 开始分析工程作法，上下文长度: %d 字符", len(tender_context))
-    sys_prompt = get_prompt("CONSTRUCTION_METHOD_ANALYSIS_SYSTEM")
-    user_prompt = get_prompt(
+    messages = _build_analysis_messages(
+        "CONSTRUCTION_METHOD_ANALYSIS_SYSTEM",
         "CONSTRUCTION_METHOD_ANALYSIS_USER",
-        CONTEXT=_safe_tender_context(tender_context),
-        sanitize=True,
-        desensitize=True,
+        tender_context,
     )
-
-    messages = [
-        AIMessage(role="system", content=sys_prompt),
-        AIMessage(role="user", content=user_prompt),
-    ]
 
     # BUG-X-02 修复：max_retries 从 1 改为 2，AI 弱模型常见"加 markdown 包裹"的非 JSON 输出，
     # 给 JSON 自修复一次额外机会；并在调用外层 catch RuntimeError 触发兜底默认值（CM1~CM5）。

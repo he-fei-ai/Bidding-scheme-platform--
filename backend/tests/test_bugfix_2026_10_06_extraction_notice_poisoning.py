@@ -239,3 +239,83 @@ class TestCeleryPathAligned:
         """Celery 路径的返回 status 必须跟随判定结果"""
         src = (BACKEND_DIR / "app" / "tasks" / "__init__.py").read_text(encoding="utf-8")
         assert "'status': _status" in src
+
+
+# ---------- 5. I-6（2026-10-11）Excel/PPT 动态错误串必须被识别为降级 ----------
+
+class TestExcelPptxErrorNoticeRecognition:
+    """I-6：Excel/PPTX 分支的 f-string 错误串此前不在 EXTRACTION_NOTICES 里，
+    导致 `is_extraction_notice` 返回 False，损坏文件被写成 status='success'、
+    错误文本被缓存并喂给下游 AI。现改为「前缀精确匹配 + 长度上界」判定。"""
+
+    EXCEL_PREFIXES = (
+        "[Excel 解析错误]",
+        "[Excel 文件损坏]",
+        "[Excel 文件不存在]",
+        "[Excel 权限不足]",
+        "[PPTX 解析错误]",
+    )
+
+    def test_prefix_constants_are_exported(self):
+        assert files_mod.EXTRACT_ERROR_PREFIXES == frozenset(self.EXCEL_PREFIXES)
+        assert files_mod.EXTRACT_ERROR_MAX_LEN == 120
+
+    def test_each_prefix_is_registered_with_distinct_body(self):
+        """前缀必须两两不互相前缀，避免 "[Excel 文件]" 这类过宽前缀吞掉兄弟分支"""
+        for p in self.EXCEL_PREFIXES:
+            for q in self.EXCEL_PREFIXES:
+                if p != q:
+                    assert not p.startswith(q), f"前缀 {p!r} 被 {q!r} 前缀吞并"
+
+    @pytest.mark.parametrize("msg", [
+        "[Excel 解析错误] bad magic number",
+        "[Excel 文件损坏] Bad magic number for central directory",
+        "[Excel 文件不存在] [Errno 2] No such file or directory: 'x.xlsx'",
+        "[Excel 权限不足] [Errno 13] Permission denied",
+        "[PPTX 解析错误] missing package member",
+    ])
+    def test_dynamic_excel_pptx_errors_are_recognized(self, msg):
+        """真实错误串（前缀 + 一个 str(e)）必须被判定为降级"""
+        assert files_mod.is_extraction_notice(msg) is True, msg
+
+    def test_long_real_content_is_not_misidentified(self):
+        """长度护栏：真实标书正文即便偶发以 "[Excel 解析错误] " 起头也不得误判"""
+        long_text = "[Excel 解析错误] " + "这是一段真实正文" * 40
+        assert len(long_text) > files_mod.EXTRACT_ERROR_MAX_LEN
+        assert files_mod.is_extraction_notice(long_text) is False
+
+    def test_prefix_must_be_followed_by_whitespace(self):
+        """前缀后必须紧跟空白/冒号/字符串结尾，禁止吃下伪造前缀如 '[Excel 解析错误xxx真实正文]'"""
+        assert files_mod.is_extraction_notice("[Excel 解析错误xxx真实正文]") is False
+        assert files_mod.is_extraction_notice("[Excel 解析错误]") is True
+
+    def test_registry_no_drift_with_error_prefix_literals(self):
+        """防漂移守卫：files.py 里所有以 `[Excel`/`[PPTX` 起头的 f-string 错误前缀
+        必须已登记进 EXTRACT_ERROR_PREFIXES。新增前缀而未登记会让该分支
+        重新退化成「被标 success 的假正文」。"""
+        import re
+
+        src = (BACKEND_DIR / "app" / "services" / "files.py").read_text(encoding="utf-8")
+        code_lines = [
+            line for line in src.splitlines()
+            if not line.strip().startswith("#") and 'return f"' in line
+        ]
+        # 抓形如 return f"[前缀] {e}" 的字面量前缀（不含 f-string 内插）
+        literals = set(re.findall(
+            r'return f"\[(?:Excel|PPTX)[^"]*?\]\s*\{e\}"', "\n".join(code_lines)
+        ))
+        prefixes = {lit[len('return f"'):-len('"{e}"')] for lit in literals}
+        unregistered = prefixes - files_mod.EXTRACT_ERROR_PREFIXES
+        assert not unregistered, f"以下错误前缀未登记：{unregistered}"
+
+    def test_save_upload_marks_excel_error_as_failed(self, monkeypatch):
+        """save_upload 对 Excel 错误串必须写 status='failed'，且 message 保留原文"""
+        pid = _mk_project("I6-Excel错误判失败")
+        err_msg = "[Excel 解析错误] Bad magic number for central directory"
+        monkeypatch.setattr(files_mod, "extract_text_from_path", lambda _p: err_msg)
+        try:
+            res = files_mod.save_upload(pid, f"工程量清单_{uuid.uuid4().hex[:6]}.xlsx", b"PK\x03\x04fake")
+        finally:
+            monkeypatch.undo()
+        assert res["status"] == "failed", "Excel 错误串不得再被标为解析成功"
+        assert res["message"] == err_msg, "message 必须保留原文错误（用户可自助修复）"

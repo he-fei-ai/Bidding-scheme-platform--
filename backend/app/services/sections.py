@@ -4,7 +4,9 @@ import threading
 
 from ..db import get_db, safe_update
 from ..models import Section, SectionCreate, SectionTreeNode, SectionUpdate
+from ..utils import count_readable_words as _count_readable_words
 from ..utils import count_words as _count_words
+from ..utils import normalize_newlines  # HARDEN 2026-10-12：读出侧 CRLF 归一
 from ..utils.performance import timer
 
 
@@ -92,6 +94,8 @@ def list_sections(project_id: int, *, readonly: bool = False) -> list[Section]:
         result = []
         for r in rows:
             d = dict(r)
+            # HARDEN 2026-10-12：与 get_section 同构，读出侧统一归一 CRLF。
+            d["content"] = normalize_newlines(d.get("content", "") or "")
             d["word_count"] = _count_words(d.get("content", "") or "")
             result.append(Section(**d))
         return result
@@ -103,6 +107,12 @@ def get_section(section_id: int) -> Section | None:
         if not row:
             return None
         d = dict(row)
+        # HARDEN 2026-10-12（数据链最上游归一）：Windows 环境下 DB 里历史正文
+        # 可能带 \r\n（AI 网关未清洗前的旧数据 / 通过旧接口写入的内容）。
+        # get_section 是所有单节读出的唯一入口（详情接口 / 编辑器回填 / 前端渲染），
+        # 在此一次性归一，等价于把 clean_generated_content 的入口保护向前再推一层，
+        # 保证下游 content_cleaning / 围栏识别 / 前端 Markdown 编辑器看到的都是纯 LF。
+        d["content"] = normalize_newlines(d.get("content", "") or "")
         d["word_count"] = _count_words(d.get("content", "") or "")
         return Section(**d)
 
@@ -347,6 +357,29 @@ def update_section(section_id: int, data: SectionUpdate) -> Section | None:
                     "UPDATE sections SET level = ? WHERE id = ?",
                     [(_base_level + r["depth"], r["id"]) for r in _depth_rows],
                 )
+            # BUG-P3-B FIX 2026-10-11：换父后正文内 Markdown 标题编号残留净化。
+            # 此前只重算 level、不触及 content——重排后导出端从目录结构重新生成
+            # 编号时，目录层级与正文内嵌编号（## 1.1 xxx / ### 2.3.1 yyy）
+            # 可能不一致。现对整棵子树的 content 剥离内嵌编号前缀，只保留标题正文。
+            try:
+                from .content_cleaning import strip_heading_numbering_from_content
+                for r in _depth_rows:
+                    _cid = r["id"]
+                    _content_row = conn.execute(
+                        "SELECT id, content FROM sections WHERE id = ?", (_cid,)
+                    ).fetchone()
+                    if _content_row and _content_row["content"]:
+                        _new_content = strip_heading_numbering_from_content(_content_row["content"])
+                        if _new_content != _content_row["content"]:
+                            _wc = _count_words(_new_content)
+                            conn.execute(
+                                "UPDATE sections SET content = ?, word_count = ?, "
+                                "readable_word_count = ? WHERE id = ?",
+                                (_new_content, _wc, _count_readable_words(_new_content), _cid),
+                            )
+            except Exception as _strip_err:
+                # 编号净化是非关键路径；失败降级为只重算 level
+                logger.debug("[章节重排] 正文编号净化跳过: %s", _strip_err)
             # 换父后同级 sort_order 可能与既有节点撞号（前端拖拽只带 order 不带
             # sort_order 时尤其明显），落库前归一到 1 起连续，编号/展示顺序才确定。
             _normalize_sibling_sort_order(conn, section_id, updates.get("sort_order"))
@@ -355,8 +388,12 @@ def update_section(section_id: int, data: SectionUpdate) -> Section | None:
         # （sse_content.update_section(SectionUpdate(content=...))）与前端编辑保存后，
         # 目录字数列/达标判定与正文实际字数不一致。口径对齐兜底扩写的裸 SQL（已同步）。
         if "content" in updates:
-            _wc = _count_words(updates.get("content") or "")
-            conn.execute("UPDATE sections SET word_count = ? WHERE id = ?", (_wc, section_id))
+            _content_new = updates.get("content") or ""
+            _wc = _count_words(_content_new)
+            conn.execute(
+                "UPDATE sections SET word_count = ?, readable_word_count = ? WHERE id = ?",
+                (_wc, _count_readable_words(_content_new), section_id),
+            )
         # 回读最新数据
         row = conn.execute("SELECT * FROM sections WHERE id = ?", (section_id,)).fetchone()
         if row:
@@ -490,14 +527,55 @@ _TREE_LIGHT_COLUMNS = """
     id, project_id, parent_id, title, level, sort_order, section_type,
     scoring_point_id, target_words, status, created_at,
     COALESCE(word_count, 0) AS word_count,
+    COALESCE(readable_word_count, 0) AS readable_word_count,
     CASE WHEN length(content) > 0 THEN 1 ELSE 0 END AS has_content,
     COALESCE(length(flowchart_json), 0) > 0 AS has_flowchart,
     COALESCE(length(gantt_json), 0) > 0 AS has_gantt,
     COALESCE(length(architecture_json), 0) > 0 AS has_architecture,
     COALESCE(length(labor_json), 0) > 0 AS has_labor,
-    CASE WHEN graph_suitable = 1 THEN 1 ELSE 0 END AS graph_suitable,
-    COALESCE(suggested_chart, '') AS suggested_chart
+CASE WHEN graph_suitable = 1 THEN 1 ELSE 0 END AS graph_suitable,
+    COALESCE(suggested_chart, '') AS suggested_chart,
+    -- BUG-FIX 2026-10-09（跨模块数据链 / 字数档位）：此前 build_tree 的
+    -- 轻量列清单不含 word_count_tier，而 SectionTreeNode 的
+    -- word_count_tier / tier_label / tier_target 三个字段在构造时也没传，
+    -- 于是 models.py 里那三个字段永远取默认值 None。
+    -- 后果：前端 utils.ts 的 resolveTargetForNode / resolveToleranceForNode
+    -- 其「档位分支」是整段死代码，PATCH /sections/{id}/word-count-tier
+    -- 在 UI 上完全无效。现补齐 SELECT 与构造，保证 目录 → 章节编写 →
+    -- 字数校验 三段共用同一份档位事实。
+COALESCE(word_count_tier, '') AS word_count_tier
 """
+
+
+def _load_tier_label_maps() -> tuple[dict[str, str], dict[str, int]]:
+    """一次性载入字数档位的 {key: label} 与 {key: target_words} 映射。
+
+    BUG-FIX 2026-10-09（跨模块数据链 / 字数档位）：`build_tree` 需要给每个
+    SectionTreeNode 填 `tier_label` / `tier_target`，而这两个值来自
+    `word_count_tiers` 表。若在逐节点循环里调 `get_tier_config` 会产生 N+1
+    查询（一次 build_tree 最多几百个节点）；这里改为循环外查一次并复用。
+
+    失败（表不存在 / DB 不可用）时返回两个空 dict，此时 `tier_label` 与
+    `tier_target` 为 None，前端按层级默认值回落 —— 与本修复前的行为一致。
+    """
+    try:
+        from .ai.writing_length_config import list_tier_configs
+
+        cfgs = list_tier_configs() or []
+    except Exception as e:  # pragma: no cover - 档位表异常不应影响目录树
+        logger.warning("字数档位配置载入失败，档位展示字段留空（忽略）: %s", e)
+        return {}, {}
+    labels: dict[str, str] = {}
+    targets: dict[str, int] = {}
+    for cfg in cfgs:
+        key = cfg.get("key")
+        if not key:
+            continue
+        labels[key] = cfg.get("label") or ""
+        tw = cfg.get("target_words")
+        if isinstance(tw, int) and tw > 0:
+            targets[key] = tw
+    return labels, targets
 
 
 @timer
@@ -521,22 +599,34 @@ def build_tree(project_id: int) -> list[SectionTreeNode]:
             (project_id,),
         ).fetchall()]
         # 惰性自愈：脏行（persisted=0 但正文非空）单独回读正文重算；
-        # 回填另开写会话走全局写锁，readonly 会话内绝不可写
-        dirty_ids = [r["id"] for r in rows if r["word_count"] == 0 and r["has_content"]]
+        # 回填另开写会话走全局写锁，readonly 会话内绝不可写。
+        # readable_word_count 同样纳入自愈条件：老库该列默认 0，此处顺带按
+        # R1 口径把存量正文一次性补齐（与 word_count 同一次回读，零额外 SELECT）。
+        dirty_ids = [
+            r["id"] for r in rows
+            if (r["word_count"] == 0 or r.get("readable_word_count", 0) == 0)
+            and r["has_content"]
+        ]
         if dirty_ids:
             placeholders = ",".join("?" * len(dirty_ids))
             content_rows = conn.execute(
                 f"SELECT id, content FROM sections WHERE id IN ({placeholders})",
                 dirty_ids,
             ).fetchall()
-            wc_map = {cr["id"]: _count_words(cr["content"] or "") for cr in content_rows}
+            wc_map = {
+                cr["id"]: (
+                    _count_words(cr["content"] or ""),
+                    _count_readable_words(cr["content"] or ""),
+                )
+                for cr in content_rows
+            }
 
     if wc_map:
         try:
             with get_db() as wconn:
                 wconn.executemany(
-                    "UPDATE sections SET word_count = ? WHERE id = ?",
-                    [(wc, sid) for sid, wc in wc_map.items()],
+                    "UPDATE sections SET word_count = ?, readable_word_count = ? WHERE id = ?",
+                    [(wc, rwc, sid) for sid, (wc, rwc) in wc_map.items()],
                 )
         except Exception as e:
             # 回填失败不影响树正确性（本次已重算），下次重建重试
@@ -544,6 +634,12 @@ def build_tree(project_id: int) -> list[SectionTreeNode]:
 
     by_id: dict[int, SectionTreeNode] = {}
     roots: list[SectionTreeNode] = []
+
+    # BUG-FIX 2026-10-09（跨模块数据链 / 字数档位）：一次性载入档位配置表，
+    # 避免在逐节点循环里反复查库（N+1）。档位缺失时保持 None，
+    # 由前端回落到层级默认值，行为与修复前一致（向后兼容）。
+    # `_build_tier_label_map` 失败不影响树本身，仅档位展示字段为空。
+    tier_label_map, tier_target_map = _load_tier_label_maps()
 
     for r in rows:
         flags: list[str] = []
@@ -555,6 +651,10 @@ def build_tree(project_id: int) -> list[SectionTreeNode]:
             flags.append("architecture")
         if r["has_labor"]:
             flags.append("labor")
+        _tier_key = (r.get("word_count_tier") or "").strip() or None
+        # 惰性回填的 (word_count, readable_word_count) 元组优先于可能为 0 的列值；
+        # 未命中回填集合时直接用列值（readable 列仅回填过才非 0）。
+        _wc_pair = wc_map.get(r["id"])
         node = SectionTreeNode(
             id=r["id"],
             title=r["title"],
@@ -566,10 +666,16 @@ def build_tree(project_id: int) -> list[SectionTreeNode]:
             status=r["status"],
             created_at=r["created_at"],
             has_content=bool(r["has_content"]),
-            word_count=wc_map.get(r["id"], r["word_count"]),
+            word_count=_wc_pair[0] if _wc_pair else r["word_count"],
             chart_flags=flags,
-            graph_suitable=bool(r["graph_suitable"]),
+graph_suitable=bool(r["graph_suitable"]),
             suggested_chart=r["suggested_chart"] or "",
+            # BUG-FIX 2026-10-09：透出档位三元组，让前端
+            # resolveTargetForNode / resolveToleranceForNode 的档位分支真正生效。
+            # key 为空（未设档位）时三个字段均保持 None，行为与修复前完全一致。
+            word_count_tier=_tier_key,
+            tier_label=tier_label_map.get(_tier_key) if _tier_key else None,
+            tier_target=tier_target_map.get(_tier_key) if _tier_key else None,
         )
         by_id[r["id"]] = node
 
@@ -903,6 +1009,9 @@ def get_section_word_budget(project_id: int, default_level2: int = 3500) -> dict
     from ..services.ai.writing_length_config import (
         get_tier_config,
         get_default_tier_config,
+        get_l3_own_target,
+        get_l3_own_tolerance,
+        get_l3_own_range,
         WRITING_LENGTH_TIER_CONFIG,
     )
 
@@ -917,25 +1026,53 @@ def get_section_word_budget(project_id: int, default_level2: int = 3500) -> dict
     tier_target = int(default_cfg.get("target_words", 1200))
     tier_tolerance = float(default_cfg.get("tolerance_ratio", 0.10))
 
+    # 方案三（2026-10-12 混合口径）：预估总字数只按「每个 L3」累加，
+    #   L1/L2 不生成正文不计入；L4+ 并入父 L3 子树不单独计入（避免重复计数）。
+    #   - 叶子 L3（无下级）：固定 L3 自身正文 300 ± 20%，不受四档下拉影响；
+    #   - 含下级的 L3：四档 target 作为「子树总字数」；
+    #   - 覆盖优先级：单节点 target_words > 单节点 word_count_tier > 上述规则。
+    l3_own_target = get_l3_own_target()
+    l3_own_tolerance = get_l3_own_tolerance()
+    l3_own_lo, l3_own_hi = get_l3_own_range()
+
+    # 有下级的父节点 id 集合，用于判定某 L3 是否为叶子
+    parent_ids = {s.parent_id for s in sections if s.parent_id is not None}
+
     total_estimate = 0
+    leaf_l3_count = 0
+    subtree_l3_count = 0
     for s in sections:
         level = s.level or 3
-        tw = s.target_words or 0
-        # 三级目录：优先使用单节点 target_words（精确覆盖）
-        if tw > 0:
-            total_estimate += tw
-            has_custom_target += 1
-        elif level >= 3:
-            # 使用单节点档位或全局档位
-            node_tier = getattr(s, "word_count_tier", None) or tier_key
-            cfg = get_tier_config(node_tier)
-            total_estimate += int(cfg["target_words"]) if cfg else tier_target
-        # L1/L2 不计入 total_estimate（它们不生成正文）
-
         if level in (1, 2, 3, 4):
             level_counts[level] += 1
         else:
             level_counts["leaf_deep"] += 1
+
+        # 预估总字数只累加每个 L3；L1/L2/L4+ 不单独计入
+        if level != 3:
+            continue
+
+        has_children = s.id in parent_ids
+        if has_children:
+            subtree_l3_count += 1
+        else:
+            leaf_l3_count += 1
+
+        tw = s.target_words or 0
+        if tw > 0:
+            # 1) 单节点精确覆盖
+            total_estimate += tw
+            has_custom_target += 1
+        elif getattr(s, "word_count_tier", None):
+            # 2) 单节点档位覆盖
+            cfg = get_tier_config(s.word_count_tier)
+            total_estimate += int(cfg["target_words"]) if cfg else tier_target
+        elif has_children:
+            # 3) 含下级的 L3：四档作为子树总字数
+            total_estimate += tier_target
+        else:
+            # 4) 叶子 L3：自身正文固定 L3_OWN(300)
+            total_estimate += l3_own_target
 
     return {
         "level1_count": level_counts[1],
@@ -943,13 +1080,21 @@ def get_section_word_budget(project_id: int, default_level2: int = 3500) -> dict
         "level3_count": level_counts[3],
         "level4_count": level_counts[4],
         "level_deep_count": level_counts["leaf_deep"],
-        # 2026-10-08 新增：三级目录档位信息（字数控制核心）
+        # 三级目录档位信息（四档 = 子树总字数，仅对含下级目录的 L3 生效）
         "tier_key": tier_key,
         "tier_label": tier_label,
         "tier_target": tier_target,
         "tier_tolerance": tier_tolerance,
-        "level3_default": tier_target,
-        # 保留旧字段以兼容（但值为 0，L2 不再直接控制）
+        # 方案三：叶子 L3 自身正文口径（默认 300±20%）——前端预算卡片每章展示以此为准
+        "l3_own_target": l3_own_target,
+        "l3_own_tolerance": l3_own_tolerance,
+        "l3_own_lo": l3_own_lo,
+        "l3_own_hi": l3_own_hi,
+        "leaf_l3_count": leaf_l3_count,
+        "subtree_l3_count": subtree_l3_count,
+        # level3_default 改为叶子 L3 自身正文目标（旧值 = 四档 tier_target 会虚高约 4 倍）
+        "level3_default": l3_own_target,
+        # 保留旧字段以兼容（值为 0，L2 不再直接控制）
         "level1_min": 0,
         "level2_default": 0,
         "level4_default": 0,
@@ -962,6 +1107,11 @@ def get_section_path(section_id: int) -> str:
     """获取章节路径（如 1.1.3）
 
     性能优化：一次性获取整棵树，避免递归 N+1 查询。
+
+    2026-10-11 标记（O-12）：此为后端路径式编号的**唯一权威实现**。
+    前端 `collectHeadingPaths`（`frontend/src/utils.ts:161-195`）为独立实现，
+    审核态可能显示不同编号。后续需将前端实现对齐到本函数口径，
+    或改为调用后端 API 获取路径，消除双实现漂移风险。
     """
     section = get_section(section_id)
     if not section:

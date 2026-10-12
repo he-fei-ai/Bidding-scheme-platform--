@@ -325,6 +325,21 @@ class TestStreamJournalUnit:
 
 
 class TestSseDisconnectResume:
+    """SSE 断线后 resume 全链路测试（含超量淘汰隔离 fixture）。
+
+    STABILITY 2026-10-12（加固）：前序测试累积的 _STREAM_JOURNALS 条目
+    可能超过 _STREAM_JOURNAL_MAX=50 上限，popitem(last=False) 会把本测试
+    刚注册的 journal 挤掉 → journal.terminal 永远为 False → 测试超时失败。
+    加 autouse fixture 每次测试前清空 journal dict，隔离测试间状态泄漏。
+    """
+
+    @pytest.fixture(autouse=True)
+    def _isolate_stream_journals(self):
+        from app.routers.export import _STREAM_JOURNALS
+        _STREAM_JOURNALS.clear()
+        yield
+        _STREAM_JOURNALS.clear()
+
     def test_disconnect_drains_journal_and_resume_replays(self):
         """全链路：真实流 → 第 2 次轮询判失联 → drain 接管 → 终态入 journal →
         resume 携 last_event_id 只回放未收事件直到 completed。"""
@@ -474,6 +489,12 @@ class TestConvertDocxToPdf:
         docx.write_bytes(b"docx")
         pdf = tmp_path / "a.pdf"
         pdf.write_bytes(b"pdf")
+        # 2026-10-11 加固：pdf_export 改为「严格 > 才复用」后，粗粒度 mtime
+        # 文件系统（同秒写入）会让 pdf.mtime == docx.mtime → 误触发 subprocess。
+        # 显式把 pdf 的 mtime 设到 docx 之后，消除文件系统时间粒度竞态。
+        _future = docx.stat().st_mtime + 5
+        import os as _os
+        _os.utime(pdf, (_future, _future))
         monkeypatch.setattr(pdf_export, "find_soffice", lambda **kw: "soffice")
 
         def _never(*a, **kw):
@@ -481,6 +502,37 @@ class TestConvertDocxToPdf:
 
         monkeypatch.setattr(pdf_export.subprocess, "run", _never)
         assert pdf_export.convert_docx_to_pdf(docx) == pdf
+
+    def test_equal_mtime_reconverts_stale_pdf(self, monkeypatch, tmp_path):
+        """BUG-1 回归（2026-10-11）：pdf.mtime == docx.mtime 必须重新转换。
+
+        这是真实可达的陈旧 PDF 场景：build_docx 以秒级时间戳命名且可原地覆盖，
+        在 FAT/exFAT（2s 取整）等粗粒度 mtime 文件系统上，「旧 PDF 与新 DOCX
+        落得相同 mtime」时，若判据用 `>=` 会把上一版内容的 PDF 当成最新交付件
+        返回。严格 `>` 判据下，相等即视为「无法证明 PDF 新于 DOCX」→ 重新转换。
+        """
+        docx = tmp_path / "e.docx"
+        docx.write_bytes(b"new content")
+        pdf = tmp_path / "e.pdf"
+        pdf.write_bytes(b"stale pdf")
+        # 把 pdf 与 docx 的 mtime 强制设为完全相等（模拟粗粒度 FS 上的歧义态）
+        import os as _os
+        _same = docx.stat().st_mtime
+        _os.utime(pdf, (_same, _same))
+        _os.utime(docx, (_same, _same))
+        monkeypatch.setattr(pdf_export, "find_soffice", lambda **kw: "soffice")
+
+        converted = {"n": 0}
+
+        def _fake_run(cmd, **kw):
+            converted["n"] += 1
+            pdf.write_bytes(b"freshly converted pdf")  # 模拟 LibreOffice 覆写产物
+            return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+        monkeypatch.setattr(pdf_export.subprocess, "run", _fake_run)
+        out = pdf_export.convert_docx_to_pdf(docx)
+        assert converted["n"] == 1, "mtime 相等时不得复用陈旧 PDF，必须重新转换"
+        assert out == pdf
 
     def test_success_invokes_soffice_with_isolated_profile(self, monkeypatch, tmp_path):
         docx = tmp_path / "b.docx"

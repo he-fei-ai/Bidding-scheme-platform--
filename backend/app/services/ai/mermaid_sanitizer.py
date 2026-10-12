@@ -38,6 +38,58 @@ _CHINESE_CHARS = re.compile(r"[\u4e00-\u9fff]")
 # 因此本正则同时覆盖 ASCII ID 与中文 ID 两种情况。
 _NODE_LABEL_PATTERN = re.compile(r"(\w+)\[([^\[\]]+)\]")
 
+# ------------------------------------------------------------------
+# 裸节点边修复（BUG-2026-1008-01 P0 核心修复）
+# ------------------------------------------------------------------
+# AI 经常直接输出「无方括号」的裸节点边，例如修复方案中的失败样例：
+#   flowchart TD
+#   开工: 2026-09-22 --> 出地面: 2026-12-15
+#   出地面: 2026-12-15 --> 主体50%: 2027-04-30
+# 这类代码既无节点 ID 也无方括号，Mermaid 解析失败、PIL 解析器也无法
+# 识别，导致图表被静默降级（丢失或占位）。本模块在语法预处理阶段将其
+# 改写为合法的 `N1["开工: 2026-09-22"] --> N2["出地面: 2026-12-15"]`。
+# 箭头切分正则：长模式优先，避免 `--` 被 `--x` / `-->` 误切。
+_ARROW_SPLIT_RE = re.compile(r"(<-->|-\.->|==>|--x|--o|-\.-|-->|---|==)")
+# 不参与裸节点处理的声明/结构行前缀
+_SKIP_LINE_PREFIXES = (
+    "flowchart", "graph", "subgraph", "end", "classDef", "class",
+    "style", "click", "linkStyle", "%%",
+)
+# 边标签 `A -->|说明| B` 中的 `|...|`
+_EDGE_LABEL_RE = re.compile(r"^\|(.*?)\|\s*(.*)$")
+
+# ------------------------------------------------------------------
+# 边文本（legacy edge text）修复（BUG-2026-1011-01 P0）
+# ------------------------------------------------------------------
+# Mermaid 允许用「连接符 + 文本 + 箭头」给边加标签：
+#   A -- "通过" --> B     /     A -- 通过 --> B     /     A ==> 通过 ==> B
+# 这类行里的 `A -- 通过` 既不是节点，也不是「裸节点标签」。但
+# `_ARROW_SPLIT_RE` 只识别 `-->` 这类完整箭头，于是 `A -- 通过` 会被
+# `_bracketize_bare_nodes` 当成裸节点，括号化成 `N1["A -- \"通过\""]`：
+#   - 渲染出 `A -- "通过"` 这种垃圾节点（且含「通过/合格」等词会被判成菱形）
+#   - 真实边标签丢失，A 与 B 之间的连线变成 N1 -> B（拓扑错乱、ID 被顶替）
+# 因此必须在裸节点括号化【之前】把边文本改写为规范形式 `A -->|通过| B`。
+#
+# 匹配约束（避免误伤合规代码）：
+#   - 连接符只取 `--` / `==>`（后面必须紧跟「文本 + 箭头」）；`-->` 本身
+#     因箭头后紧跟 `>` 而非「文本」，不会命中；
+#   - src 允许 `ID` 或 `ID["标签"]` 形式的完整节点，括号内即使含 `--`
+#     也已作为整体消费，不会被切断。
+# 例：N1["工期 2026-09-22 -- 2026-12-15"] --> N2 不会命中（src 消费完
+# 整个方括号后，剩余 ` --> N2` 无法匹配「文本 + 箭头」）。
+_LEGACY_EDGE_TEXT_RE = re.compile(
+    r"^\s*"
+    r"(?P<src>[^\s|>]+(?:\[[^\]]*\]|\{[^}]*\}|\([^()]*\))*)"  # 源节点（ID 或带括号标签）
+    r"\s*"
+    r"(?P<conn>(?:--|==)(?!>))"                             # 连接符 -- 或 ==，但【不能】后接 >（否则会把 --> 拆成 "--" + ">" 误判为边文本）
+    r"\s*"
+    r"(?P<label>[^|\n>]+?)"                                 # 边文本：非空、不含 > 和 |（不能跨越箭头或另一个标签）
+    r"\s*"
+    r"(?P<arrow>-->|==>)"                                    # 目标箭头
+    r"\s*"
+    r"(?P<dst>.*)$"
+)
+
 # 匹配节点 ID 行首（后跟括号形式的标签）—— 用于识别非 ASCII ID。
 _NODE_ID_PREFIX_PATTERN = re.compile(r"^(\w+)\s*[\[\(\{]", re.MULTILINE)
 class MermaidSanitizer:
@@ -67,6 +119,15 @@ class MermaidSanitizer:
             return code
 
         original = code
+        # Step 0a: 边文本规范化（必须最先执行）
+        # 把 Mermaid 的 legacy 边文本写法 `A -- "通过" --> B` 改写为
+        # 规范的 `A -->|"通过"| B`。若不先处理，下一步 `_bracketize_bare_nodes`
+        # 会把 `A -- "通过"` 当成裸节点标签括号化，产生垃圾节点并破坏拓扑。
+        code = self._normalize_edge_text(code)
+        # Step 0: 裸节点边修复（核心 P0 修复，必须最先执行——
+        # 把 `文本 --> 文本` 改写为 `N1["文本"] --> N2["文本"]`，
+        # 否则后续步骤无法识别节点，图表仍会降级）
+        code = self._bracketize_bare_nodes(code)
         # Step 1: 为未加引号且含特殊字符/中文的节点标签添加双引号
         code = self._add_quotes_to_labels(code)
         # Step 2: 展开 A --> B --> C 形式的多节点连写
@@ -83,6 +144,143 @@ class MermaidSanitizer:
                 len(code),
             )
         return code
+
+    # ------------------------------------------------------------------
+    # Step 0a: 边文本规范化（BUG-2026-1011-01 P0）
+    # ------------------------------------------------------------------
+    def _normalize_edge_text(self, code: str) -> str:
+        """把 legacy 边文本写法改写为规范的 `|label|` 形式。
+
+        Mermaid 支持两种给边加标签的语法，AI 两种都会输出：
+          规范:  A -->|"通过"| B          A ==>|通过| B
+          legacy: A -- "通过" --> B       A ==> 通过 ==> B
+        本方法只负责把后者改写为前者，且对已是规范形式的代码零改动（幂等）。
+
+        示例：
+          D1 -- "通过" --> N3["竣工验收"]   →   D1 -->|"通过"| N3["竣工验收"]
+          A[开工] -- 是 --> B[竣工]         →   A[开工] -->|是| B[竣工]
+          A ==> 通过 ==> B                  →   A ==>|通过| B
+          A -->|"通过"| B                   →   原样（已规范）
+          A[工期 2026-09-22 -- 2026-12-15] --> B → 原样（括号内文本不算边文本）
+        """
+        if not code:
+            return code
+        if "--" not in code and "==>" not in code:
+            return code
+
+        out_lines: list[str] = []
+        for line in code.split("\n"):
+            stripped = line.strip()
+            # 声明/结构行跳过（与裸节点修复保持一致）
+            if not stripped:
+                out_lines.append(line)
+                continue
+            _first = stripped.split()[0].rstrip(":")
+            if _first in _SKIP_LINE_PREFIXES or stripped.startswith(_SKIP_LINE_PREFIXES):
+                out_lines.append(line)
+                continue
+            # 最多迭代 3 次，覆盖 `A -- 是 --> B -- 否 --> C` 这类多次改写
+            current = line
+            for _ in range(3):
+                m = _LEGACY_EDGE_TEXT_RE.match(current)
+                if not m:
+                    break
+                src = m.group("src").strip()
+                label = m.group("label").strip().replace('\\"', '"')
+                arrow = m.group("arrow")
+                dst = m.group("dst").strip()
+                if not src or not label:
+                    break
+                current = f"{src} {arrow}|{label}| {dst}" if dst else f"{src} {arrow}|{label}|"
+            out_lines.append(current)
+        return "\n".join(out_lines)
+
+    # ------------------------------------------------------------------
+    # Step 0: 裸节点边修复（核心 P0 修复）
+    # ------------------------------------------------------------------
+    def _bracketize_bare_nodes(self, code: str) -> str:
+        """将「无方括号」的裸节点边改写为合法 Mermaid 节点声明。
+
+        例：
+          flowchart TD
+          开工: 2026-09-22 --> 出地面: 2026-12-15
+            ↓
+          flowchart TD
+          N1["开工: 2026-09-22"] --> N2["出地面: 2026-12-15"]
+
+        规则：
+          - 仅处理含箭头的边行；已带 `[`/`{`/`(` 的节点保持原样；
+          - 同一裸标签跨行共享同一 ID（保证连线连通、方向正确）；
+          - 边标签 `|说明|` 原样保留并附加到后续节点；
+          - 声明行（flowchart/graph/subgraph/end/样式/注释）跳过。
+        """
+        if not code:
+            return code
+        if not ("-->" in code or "---" in code or "==>" in code):
+            return code
+
+        label_to_id: dict[str, str] = {}
+        counter = [0]
+
+        def _wrap(seg_text: str) -> str:
+            seg = seg_text.strip()
+            if not seg:
+                return ""
+            # 已带形状括号（方/花/圆）→ 保持原样
+            if "[" in seg or "{" in seg or "(" in seg:
+                return seg
+            # 悬挂的边文本（legacy 写法残留）：`B -- 否` / `B ==> 通过`。
+            # 这既不是节点也不是裸节点标签，若直接括号化会渲染出
+            # `B -- 否` 这样的垃圾节点。只保留节点部分，避免污染拓扑。
+            m_edge = re.match(
+                r"^(?P<node>[^\s|>\[\]{()}]+(?:\[[^\]]*\]|\{[^}]*\}|\([^()]*\))*)"
+                r"\s+(?:--|-\.->|==>)\s*\S",
+                seg,
+            )
+            if m_edge:
+                return m_edge.group("node")
+            # 边标签 |...|
+            m = _EDGE_LABEL_RE.match(seg)
+            if m:
+                label = m.group(1)
+                rest = m.group(2).strip()
+                if rest:
+                    return f"|{label}|{_wrap(rest)}"
+                return seg
+            # 合法 ASCII 节点 ID（字母开头、仅字母/数字/下划线）→ Mermaid 原生支持，
+            # 保持原样（如 `A --> B`、`start --> end`），避免过度改写。
+            if re.match(r"^[A-Za-z][A-Za-z0-9_]*$", seg):
+                return seg
+            nid = label_to_id.get(seg)
+            if nid is None:
+                counter[0] += 1
+                nid = f"N{counter[0]}"
+                label_to_id[seg] = nid
+            escaped = seg.replace('"', '\\"')
+            return f'{nid}["{escaped}"]'
+
+        out_lines: list[str] = []
+        for line in code.split("\n"):
+            stripped = line.strip()
+            if not stripped:
+                out_lines.append(line)
+                continue
+            _first = stripped.split()[0].rstrip(":")
+            if _first in _SKIP_LINE_PREFIXES or stripped.startswith(_SKIP_LINE_PREFIXES):
+                out_lines.append(line)
+                continue
+            if not _ARROW_SPLIT_RE.search(line):
+                out_lines.append(line)
+                continue
+            parts = _ARROW_SPLIT_RE.split(line)
+            rebuilt = ""
+            for i, p in enumerate(parts):
+                if i % 2 == 1:
+                    rebuilt += f" {p} "  # 箭头，带空格保持可读
+                else:
+                    rebuilt += _wrap(p)
+            out_lines.append(rebuilt)
+        return "\n".join(out_lines)
 
     # ------------------------------------------------------------------
     # Step 1: 节点标签加引号
@@ -251,6 +449,11 @@ class MermaidSanitizer:
             if line.count("-->") > 1:
                 return True
 
+        # legacy 边文本：`A -- 说明 --> B`（应改写为 `A -->|说明| B`）
+        for line in code.split("\n"):
+            if _LEGACY_EDGE_TEXT_RE.match(line):
+                return True
+
         # 行末分号
         if re.search(r";\s*$", code, re.MULTILINE):
             return True
@@ -271,6 +474,29 @@ class MermaidSanitizer:
             old_id = m.group(3)
             if not re.match(r"^[A-Za-z][A-Za-z0-9_]*$", old_id):
                 return True
+
+        # 裸节点边：`文本 --> 文本` 其中某侧无方括号/花括号/圆括号
+        for line in code.split("\n"):
+            if not _ARROW_SPLIT_RE.search(line):
+                continue
+            _first = line.strip().split()
+            if _first:
+                _fw = _first[0].rstrip(":")
+                if _fw in _SKIP_LINE_PREFIXES:
+                    continue
+            parts = _ARROW_SPLIT_RE.split(line)
+            for i in range(0, len(parts), 2):  # 仅文本段
+                seg = parts[i].strip()
+                if not seg:
+                    continue
+                if "[" in seg or "{" in seg or "(" in seg:
+                    continue
+                if _EDGE_LABEL_RE.match(seg):
+                    continue
+                # 合法 ASCII 节点 ID 无需处理；仅非法裸节点（含中文/特殊字符/空格）才需修复
+                if re.match(r"^[A-Za-z][A-Za-z0-9_]*$", seg):
+                    continue
+                return True  # 发现裸节点
 
         return False
 

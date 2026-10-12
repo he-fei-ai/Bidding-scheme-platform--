@@ -463,6 +463,13 @@ async def save_facts(project_id: int, body: GlobalFactList, current_user: Annota
                 # BUG-FIX 2026-09-29（缓存未失效）：人工保存会全量覆写事实集，
                 # 旧审计是针对另一批值的结论，继续留在库里会被 GET /facts 回看成
                 # 「本次事实的一致性结果」，直接误导确认决策。一并抹除。
+                #
+                # 约定「事实基准 global_facts_json 变更 → confirmed_facts 回退 +
+                # facts_audit_* 抹除」共 4 处强制点，改口径须四处同改：
+                #  ① 本处 POST /facts 手工保存（本节）
+                #  ② routers/facts.py 重新提取端点（下方 _persist，同一口径）
+                #  ③ services/consistency_backflow.py accept_fact_proposals（审计回流采纳）
+                #  ④ routers/ai.py _sync_reset_facts_audit（清除分析 / 重跑评分）
                 "facts_audit_json = '', facts_audit_at = NULL",
                 (project_id, facts_json, _ef_json),
             )
@@ -683,7 +690,10 @@ async def generate_facts(project_id: int, body: FactsGenerateRequest | None = No
                 "global_facts_json = excluded.global_facts_json, "
                 "extraction_fields_json = excluded.extraction_fields_json, "
                 "facts_policy = excluded.facts_policy, "
-                # 重新提取同样作废审计结果（与 POST /facts 同一口径）
+                # 重新提取同样作废审计结果（与 POST /facts 同一口径）。
+                # 约定共 4 处强制点（本处 + POST /facts + consistency_backflow.
+                # accept_fact_proposals + routers/ai.py _sync_reset_facts_audit），
+                # 改口径须四处同改，见 POST /facts 处的完整注释。
                 "confirmed_facts = 0, facts_audit_json = '', facts_audit_at = NULL",
                 (project_id, facts_json, _ef_json, policy),
             )

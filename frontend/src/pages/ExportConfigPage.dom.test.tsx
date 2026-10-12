@@ -15,10 +15,11 @@
  *  4. 导出历史记录渲染到右侧表格。
  */
 import { describe, it, expect, vi, beforeAll } from "vitest";
+import type { DocumentCheckResult } from "../types";
 
 const hasDom = typeof window !== "undefined" && typeof document !== "undefined";
 
-const CHECK_RESULT = {
+const CHECK_RESULT: DocumentCheckResult = {
   passed: true,
   total_sections: 10,
   total_chars: 5000,
@@ -38,8 +39,8 @@ const HISTORY_RECORD = {
   created_at: "2026-01-01 00:00:00",
 };
 
-const checkDocumentMock = vi.fn(async () => CHECK_RESULT);
-const exportDocxMock = vi.fn(async () => ({
+const checkDocumentMock = vi.fn(async (_pid: number, _strict?: boolean) => CHECK_RESULT);
+const exportDocxMock = vi.fn(async (_pid: number, _cfg?: Record<string, unknown>) => ({
   filename: "out.docx",
   file_path: "/x",
   file_size: 12345,
@@ -57,15 +58,16 @@ const exportDocxStreamMock = vi.fn((_pid: number, _cfg: Record<string, unknown>,
     check: CHECK_RESULT,
   }),
 }));
-const getExportHistoryMock = vi.fn(async () => [HISTORY_RECORD]);
-const exportPdfMock = vi.fn(async () => undefined);
+const getExportHistoryMock = vi.fn(async (_pid: number) => [HISTORY_RECORD]);
+const exportPdfMock = vi.fn(async (_pid: number) => undefined);
 
 vi.mock("../api", () => ({
   getProject: vi.fn(async () => ({ id: 1, name: "测试项目", bidder_name: "测试单位" })),
-  checkDocument: (...args: unknown[]) => checkDocumentMock(...args),
-  exportDocx: (...args: unknown[]) => exportDocxMock(...args),
-  exportDocxStream: (...args: unknown[]) => exportDocxStreamMock(...args),
-  getExportHistory: (...args: unknown[]) => getExportHistoryMock(...args),
+  // spread 用显式元组类型，避免 TS2556（vi.fn 的 Parameters 退化为 unknown[] 不可 spread）
+  checkDocument: (...args: [number, boolean?]) => checkDocumentMock(...args),
+  exportDocx: (...args: [number, Record<string, unknown>?]) => exportDocxMock(...args),
+  exportDocxStream: (...args: [number, Record<string, unknown>, ((e: unknown) => void)?]) => exportDocxStreamMock(...args),
+  getExportHistory: (...args: [number]) => getExportHistoryMock(...args),
   getExportDownloadUrl: vi.fn((pid: number, eid: number) => `/api/v1/projects/${pid}/export/download/${eid}`),
   getLatestExportUrl: vi.fn((pid: number) => `/api/v1/projects/${pid}/export/latest`),
   getExportPresets: vi.fn(async () => ({
@@ -73,7 +75,7 @@ vi.mock("../api", () => ({
     themes: [],
     defaults: { layout_id: "formal-binding", theme_id: "" },
   })),
-  exportPdf: (...args: unknown[]) => exportPdfMock(...args),
+  exportPdf: (...args: [number]) => exportPdfMock(...args),
 }));
 
 vi.mock("react-router-dom", async () => {
@@ -112,7 +114,10 @@ describe.skipIf(!hasDom)("ExportConfigPage 组件级交互（导出链契约）"
     }
   });
 
-  it("挂载后渲染「完整性检查 / 导出 DOCX」主操作按钮", { timeout: 120_000 }, async () => {
+  // 首个用例需先由 Vite 冷加载 ExportConfigPage + antd 全量依赖，本机实测可达
+  // 180s+，故放宽到 300s（与 quality_issues 用例一致）；否则慢机器上恒超时，
+  // 且超时残留的定时器/React 树会级联污染后续用例。
+  it("挂载后渲染「完整性检查 / 导出 DOCX」主操作按钮", { timeout: 300_000 }, async () => {
     const rtl = await loadRtl();
     if (!rtl) return;
 
@@ -139,8 +144,51 @@ describe.skipIf(!hasDom)("ExportConfigPage 组件级交互（导出链契约）"
     expect(await rtl.screen.findByText("通过")).toBeTruthy();
     expect(checkDocumentMock).toHaveBeenCalled();
     // 第二参 strictMode 默认开关态 false
-    const [, strict] = checkDocumentMock.mock.calls[0] as [number, boolean];
+    const [, strict] = checkDocumentMock.mock.calls[0] ?? [0, false];
     expect(strict).toBe(false);
+    rtl.cleanup();
+  });
+
+  // 说明：本文件首个用例需先由 Vite 冷加载 ExportConfigPage + antd 全量依赖，
+  // 慢机器上加载耗时可达 130s+（超过 120s 默认预算），故此处放宽到 300s。
+  it("检查结果含 quality_issues 时渲染内容质量规则问题列表", { timeout: 300_000 }, async () => {
+    const rtl = await loadRtl();
+    if (!rtl) return;
+    checkDocumentMock.mockClear();
+    // async mock 的返回值类型是 Promise<...>，故需包一层 Promise.resolve
+    checkDocumentMock.mockReturnValueOnce(
+      Promise.resolve({
+        ...CHECK_RESULT,
+        quality_issues: [
+          {
+            rule_id: "CON-01",
+            severity: "high",
+            title: "工期不一致",
+            message: "各阶段工期之和与总工期不符",
+            suggestion: "修正阶段工期使其加和等于总工期",
+            section_id: 12,
+            section_title: "6.3 施工进度计划",
+          },
+        ],
+      }),
+    );
+
+    const Page = (await import("./ExportConfigPage")).default;
+    rtl.render(<Page />);
+
+    const btn = await rtl.screen.findByText("完整性检查");
+    rtl.fireEvent.click(btn);
+
+    // 标题（含条数）、规则号、正文、建议、章节定位都应出现
+    // 注意：Alert 外层 span 的 textContent 会串起 message 与定位文本，
+    // 因此统一用 findAllByText（≥1）而非 findByText（唯一匹配）
+    expect((await rtl.screen.findAllByText(/内容质量规则问题/)).length).toBeGreaterThan(0);
+    expect((await rtl.screen.findAllByText(/\[CON-01\]/)).length).toBeGreaterThan(0);
+    expect(
+      (await rtl.screen.findAllByText((_, el) => el?.textContent === "各阶段工期之和与总工期不符")).length
+    ).toBeGreaterThan(0);
+    expect((await rtl.screen.findAllByText(/建议：修正阶段工期使其加和等于总工期/)).length).toBeGreaterThan(0);
+    expect((await rtl.screen.findAllByText(/定位：6\.3 施工进度计划/)).length).toBeGreaterThan(0);
     rtl.cleanup();
   });
 

@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 import re
 import sqlite3
 import threading
@@ -315,6 +316,34 @@ async def save_ai_config(data: AIConfigData, request: Request = None):
     await asyncio.to_thread(_post_save_bookkeeping)
     return {'status': 'ok'}
 
+
+@router.post('/config/clear-api-key')
+async def clear_ai_config_api_key(request: Request = None):
+    """G-6（2026-10-11）：显式清空主配置 API Key。
+
+    动机：此前若用户想"重置密钥"，唯一入口是 PUT /config 传占位符；
+    但占位符回填会把库内**原密文**保留（F-1 加密修复），前端无法区分
+    "保持原密钥" 与 "清空密钥"。新增独立端点，前端「重置密钥」按钮直连。
+
+    语义：
+      - 只改 api_key（清空为空串），其他字段（provider/model/base_url/…）保留；
+      - 版本号递增，跨进程 ≤5s 收敛（与 save 同口径）；
+      - 写审计行 action=clear_api_key，方便追溯谁在什么时候清空。
+
+    幂等：主配置行不存在时也不报错（新建库首次调用安全）。
+    """
+    def _clear_api_key():
+        with get_db_with_retry() as conn:
+            conn.execute("UPDATE ai_config SET api_key = '' WHERE id = 1")
+            conn.commit()
+    await asyncio.to_thread(_clear_api_key)
+    bump_ai_config_version()
+    await asyncio.to_thread(
+        lambda: _audit('clear_api_key', 'ai_config', '(main config)', request)
+    )
+    return {'status': 'ok', 'cleared': True}
+
+
 class ModelFetchRequest(BaseModel):
     api_key: str
     base_url: str
@@ -427,8 +456,46 @@ class AIConfigTest(BaseModel):
 def _get_china_accessible_providers() -> list[dict]:
     """返回国内可直接访问的推荐提供商列表（D-1：正本在 provider_catalog）"""
     return provider_catalog.china_accessible_providers()
+
+
+def _clamp_test_ai_params(max_tokens, temperature) -> tuple:
+    """G-2（2026-10-11）：`POST /test` 的连通性探针参数钳制。
+
+    现状：AIConfigTest 直接落 chat()，max_tokens=1_000_000 / temperature=999
+    会打挂厂商侧（400/500）并让「测试连接」返回失败——用户会误判为密钥问题。
+    钳制口径与 save_ai_config 对齐（[256, 65536] / [0, 2]），默认探针行为
+    （4096 / 0.7）不变。
+    """
+    try:
+        t = min(max(float(temperature if temperature is not None else 0.7), 0.0), 2.0)
+    except (TypeError, ValueError):
+        t = 0.7
+    try:
+        m = min(max(int(max_tokens or 4096), 256), 65536)
+    except (TypeError, ValueError):
+        m = 4096
+    return m, t
+
 _DEFAULT_MAX_TOKENS = 4096
 _DEFAULT_CONCURRENCY = 4
+
+# HARDENING 2026-10-11（遗留·并发 test 无 rate limit）：
+# 进程级信号量限制 `POST /test` 同时在飞探针数。环境变量 AI_TEST_CONCURRENCY_LIMIT
+# 可配（默认 5）；`asyncio.Semaphore` 不能跨事件循环复用，但模块级单例 + 锁保证
+# 同一进程内只建一次，测试中可 monkeypatch 该函数换新信号量。
+_TEST_CONCURRENCY_LIMIT = max(1, int(os.environ.get("AI_TEST_CONCURRENCY_LIMIT", "5")))
+_TEST_CONNECTION_SEMAPHORE: asyncio.Semaphore | None = None
+_TEST_CONNECTION_SEMAPHORE_LOCK = threading.Lock()
+
+
+def _get_test_connection_semaphore() -> asyncio.Semaphore:
+    """返回进程级 test 并发信号量（惰性初始化，线程安全）。"""
+    global _TEST_CONNECTION_SEMAPHORE
+    if _TEST_CONNECTION_SEMAPHORE is None:
+        with _TEST_CONNECTION_SEMAPHORE_LOCK:
+            if _TEST_CONNECTION_SEMAPHORE is None:
+                _TEST_CONNECTION_SEMAPHORE = asyncio.Semaphore(_TEST_CONCURRENCY_LIMIT)
+    return _TEST_CONNECTION_SEMAPHORE
 
 @router.get('/health')
 async def check_ai_health():
@@ -485,22 +552,49 @@ async def check_ai_health():
 
 @router.post('/test')
 async def test_ai_connection(data: AIConfigTest):
+    # HARDENING 2026-10-11（遗留·并发 test 无 rate limit）：多 provider 并发压测
+    # 可能触发厂商速率限制。进程级 Semaphore 限制同时在飞探针数（默认 5，
+    # 环境变量 AI_TEST_CONCURRENCY_LIMIT 可配），超出排队等待，30s 拿不到槽位返回 429。
+    _sem = _get_test_connection_semaphore()
     try:
-        from ..services.ai.providers.base import AIMessage
-        if not data.model:
-            from ..services.ai.provider_factory import _AI_CONFIG_DEFAULTS
-            data.model = _AI_CONFIG_DEFAULTS.get('model', 'gpt-4o')
-        config = {'provider': data.provider, 'api_key': _resolve_api_key(data.api_key), 'model': data.model, 'base_url': data.base_url, 'max_tokens': data.max_tokens, 'temperature': data.temperature}
-        url_err = _validate_base_url(data.base_url)
-        if url_err:
-            raise HTTPException(status_code=400, detail=url_err)
-        provider = _create_shared_provider(config)
-        result = await provider.chat(messages=[AIMessage(role='user', content='回复OK即可')], max_tokens=256, temperature=0.1)
-        record_provider_usage(data.provider, data.provider, data.base_url, success=True)
-        return {'status': 'ok', 'message': f'连接成功: {result[:50]}'}
-    except Exception as e:
-        record_provider_usage(data.provider, data.provider, data.base_url, success=False)
-        raise HTTPException(status_code=400, detail=f'连接失败: {e!s}') from e
+        await asyncio.wait_for(_sem.acquire(), timeout=30)
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            status_code=429,
+            detail=f'测试连接请求过载，请稍后重试（并发上限 {_TEST_CONCURRENCY_LIMIT}）',
+        ) from None
+    try:
+        try:
+            from ..services.ai.providers.base import AIMessage
+            if not data.model:
+                from ..services.ai.provider_factory import _AI_CONFIG_DEFAULTS
+                data.model = _AI_CONFIG_DEFAULTS.get('model', 'gpt-4o')
+            # G-2（2026-10-11）：探针参数钳制 + base_url SSRF 校验前置。
+            # 此前：AIConfigTest 直接落 chat()，max_tokens=1_000_000 会打挂厂商侧
+            # 让"测试连接"报失败（用户误判为密钥问题）；base_url 传 file:// 之类
+            # 危险协议可被上游 httpx 意外跟随。
+            data.max_tokens, data.temperature = _clamp_test_ai_params(data.max_tokens, data.temperature)
+            url_err = _validate_base_url(data.base_url)
+            if url_err:
+                raise HTTPException(status_code=400, detail=url_err)
+            # 空 base_url 兜底（兼容"仅填模型/密钥"）——回落到厂商默认 base_url，
+            # 否则 create_provider 会用空 base_url 直接 400。
+            if not data.base_url:
+                from ..services.ai.provider_catalog import find_default_base_url_for_provider
+                default_base = find_default_base_url_for_provider(data.provider) or ''
+                if not default_base:
+                    raise HTTPException(status_code=400, detail='base_url 不能为空')
+                data.base_url = default_base
+            config = {'provider': data.provider, 'api_key': _resolve_api_key(data.api_key), 'model': data.model, 'base_url': data.base_url, 'max_tokens': data.max_tokens, 'temperature': data.temperature}
+            provider = _create_shared_provider(config)
+            result = await provider.chat(messages=[AIMessage(role='user', content='回复OK即可')], max_tokens=256, temperature=0.1)
+            record_provider_usage(data.provider, data.provider, data.base_url, success=True)
+            return {'status': 'ok', 'message': f'连接成功: {result[:50]}'}
+        except Exception as e:
+            record_provider_usage(data.provider, data.provider, data.base_url, success=False)
+            raise HTTPException(status_code=400, detail=f'连接失败: {e!s}') from e
+    finally:
+        _sem.release()
 
 class QuickSetupRequest(BaseModel):
     """快速配置请求：提供 API Key，自动检测可用提供商"""
@@ -892,16 +986,35 @@ async def clear_provider_history():
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 @router.get('/config-audit')
-async def get_config_audit(limit: int=50):
+async def get_config_audit(limit: int = 50, action: str | None = None, target: str | None = None):
     """L-5（2026-10-04 遗留闭环）：配置变更审计日志查询。
 
     仅返回 who/action/target/脱敏摘要；detail 写入时已不含密钥原文，
     此处再防御一层（任何尾号信息仅对已认证用户可见，路由级
     Depends(get_current_user) 已覆盖本 router）。
+
+    G-5（2026-10-11）：新增 ``action`` / ``target`` 过滤参数。
+    此前只能按时间倒序翻，前端要区分「保存配置 / 激活 / 应用 Profile」
+    必须拉全量再本地过滤；运维在 500 条截断前无法看到历史事件。
+    过滤语义：``action`` 精确匹配；``target`` 前缀匹配（LIKE 'target%'），
+    便于按厂商/Profile 名过滤。
     """
     limit = min(max(int(limit or 50), 1), 500)
+    clauses = []
+    params: list = []
+    if action:
+        clauses.append('action = ?')
+        params.append(action)
+    if target:
+        clauses.append('target LIKE ?')
+        params.append(target + '%')
+    where = (' WHERE ' + ' AND '.join(clauses)) if clauses else ''
+    params.append(limit)
     with get_db_with_retry(readonly=True) as conn:
-        rows = conn.execute('\n            SELECT actor, action, target, detail, created_at\n            FROM ai_config_audit ORDER BY id DESC LIMIT ?\n        ', (limit,)).fetchall()
+        rows = conn.execute(
+            f' SELECT actor, action, target, detail, created_at FROM ai_config_audit{where} ORDER BY id DESC LIMIT ? ',
+            params,
+        ).fetchall()
     items = []
     for r in rows:
         d = dict(r) if hasattr(r, 'keys') else dict(zip(['actor', 'action', 'target', 'detail', 'created_at'], r, strict=False))
@@ -1010,6 +1123,10 @@ async def create_profile(data: ProfileCreateRequest):
         profile = _create(data.model_dump())
         return {**profile, 'is_default': bool(profile.get('is_default', 0)), 'is_active': True, 'json_mode': bool(profile.get('json_mode', 0))}
     except ValueError as e:
+        # HARDENING 2026-10-11（遗留·命名冲突未映射 409）：同名 Profile 冲突
+        # 原实现一律 400；语义上属资源已存在，应返回 409 Conflict。
+        if "已存在" in str(e):
+            raise HTTPException(status_code=409, detail=str(e)) from e
         raise HTTPException(status_code=400, detail=str(e)) from e
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
@@ -1200,9 +1317,11 @@ async def get_text_provider_config(provider_name: str):
         row = conn.execute('\n            SELECT provider_name, provider_type, api_key, base_url, model,\n                   max_tokens, concurrency, temperature, document_profile, is_active, updated_at\n            FROM text_provider_configs WHERE provider_name = ?\n        ', [provider_name]).fetchone()
     if not row:
         known = next((p for p in KNOWN_PROVIDERS if p['name'] == provider_name), None)
-        return {'provider_name': provider_name, 'provider_type': known.get('type', 'openai_compatible') if known else 'openai_compatible', 'api_key': '', 'base_url': known.get('base_url', '') if known else '', 'model': '', 'max_tokens': 4096, 'concurrency': 4, 'temperature': 0.7, 'document_profile': '', 'is_active': False, 'updated_at': ''}
+        # G-3（2026-10-11）：补 api_key_set 布尔提示，与 /image-provider-configs 单查口径一致
+        return {'provider_name': provider_name, 'provider_type': known.get('type', 'openai_compatible') if known else 'openai_compatible', 'api_key': '', 'api_key_set': False, 'base_url': known.get('base_url', '') if known else '', 'model': '', 'max_tokens': 4096, 'concurrency': 4, 'temperature': 0.7, 'document_profile': '', 'is_active': False, 'updated_at': ''}
     d = dict(row) if hasattr(row, 'keys') else dict(zip(['provider_name', 'provider_type', 'api_key', 'base_url', 'model', 'max_tokens', 'concurrency', 'temperature', 'document_profile', 'is_active', 'updated_at'], row, strict=False))
-    return {'provider_name': d.get('provider_name', ''), 'provider_type': d.get('provider_type', 'openai_compatible'), 'api_key': _display_api_key(d.get('api_key') or ''), 'base_url': d.get('base_url') or '', 'model': d.get('model') or '', 'max_tokens': d.get('max_tokens') or 4096, 'concurrency': d.get('concurrency') or 4, 'temperature': d.get('temperature') or 0.7, 'document_profile': d.get('document_profile') or '', 'is_active': bool(d.get('is_active', 1)), 'updated_at': d.get('updated_at', '')}
+    # G-3：api_key_set 前端可据它显示「已配置/未配置」，无需再判字符串
+    return {'provider_name': d.get('provider_name', ''), 'provider_type': d.get('provider_type', 'openai_compatible'), 'api_key': _display_api_key(d.get('api_key') or ''), 'api_key_set': bool(d.get('api_key')), 'base_url': d.get('base_url') or '', 'model': d.get('model') or '', 'max_tokens': d.get('max_tokens') or 4096, 'concurrency': d.get('concurrency') or 4, 'temperature': d.get('temperature') or 0.7, 'document_profile': d.get('document_profile') or '', 'is_active': bool(d.get('is_active', 1)), 'updated_at': d.get('updated_at', '')}
 
 # F-13：单厂商 GET 与列表接口口径不一致（列表有 updated_at，单查无），
 # 前端刷新单卡时拿不到更新时间。补列保持两接口同构，新增字段向后兼容。
@@ -1353,12 +1472,13 @@ async def save_image_provider_config(provider_name: str, data: ImageProviderConf
 async def get_image_provider_config(provider_name: str):
     """获取单个厂商的图像模型配置"""
     with get_db_with_retry(readonly=True) as conn:
-        row = conn.execute('\n            SELECT provider_name, api_key, base_url, model, max_concurrency,\n                   max_per_project, quality, style_injection, enabled,\n                   default_size, default_ratio, price_per_image\n            FROM image_provider_configs WHERE provider_name = ?\n        ', [provider_name]).fetchone()
+        row = conn.execute('\n            SELECT provider_name, api_key, base_url, model, max_concurrency,\n                   max_per_project, quality, style_injection, enabled,\n                   default_size, default_ratio, price_per_image, updated_at\n            FROM image_provider_configs WHERE provider_name = ?\n        ', [provider_name]).fetchone()
     if not row:
-        return {'provider_name': provider_name, 'api_key': '', 'base_url': '', 'model': '', 'max_concurrency': 2, 'max_per_project': 10, 'quality': 'standard', 'style_injection': '', 'enabled': False, 'default_size': '1024x1024', 'default_ratio': '1:1', 'price_per_image': 0.0}
-    col_names = ['provider_name', 'api_key', 'base_url', 'model', 'max_concurrency', 'max_per_project', 'quality', 'style_injection', 'enabled', 'default_size', 'default_ratio', 'price_per_image']
+        # G-4（2026-10-11）：补齐 updated_at（列表接口 F-13 口径同构）+ api_key_set 提示
+        return {'provider_name': provider_name, 'api_key': '', 'api_key_set': False, 'base_url': '', 'model': '', 'max_concurrency': 2, 'max_per_project': 10, 'quality': 'standard', 'style_injection': '', 'enabled': False, 'default_size': '1024x1024', 'default_ratio': '1:1', 'price_per_image': 0.0, 'updated_at': ''}
+    col_names = ['provider_name', 'api_key', 'base_url', 'model', 'max_concurrency', 'max_per_project', 'quality', 'style_injection', 'enabled', 'default_size', 'default_ratio', 'price_per_image', 'updated_at']
     d = dict(row) if hasattr(row, 'keys') else dict(zip(col_names, row, strict=False))
-    return {'provider_name': d.get('provider_name', ''), 'api_key': _display_api_key(d.get('api_key') or ''), 'base_url': d.get('base_url') or '', 'model': d.get('model') or '', 'max_concurrency': d.get('max_concurrency') or 2, 'max_per_project': d.get('max_per_project') or 10, 'quality': d.get('quality') or 'standard', 'style_injection': d.get('style_injection') or '', 'enabled': bool(d.get('enabled', 1)), 'default_size': d.get('default_size') or '1024x1024', 'default_ratio': d.get('default_ratio') or '1:1', 'price_per_image': d.get('price_per_image') or 0.0}
+    return {'provider_name': d.get('provider_name', ''), 'api_key': _display_api_key(d.get('api_key') or ''), 'api_key_set': bool(d.get('api_key')), 'base_url': d.get('base_url') or '', 'model': d.get('model') or '', 'max_concurrency': d.get('max_concurrency') or 2, 'max_per_project': d.get('max_per_project') or 10, 'quality': d.get('quality') or 'standard', 'style_injection': d.get('style_injection') or '', 'enabled': bool(d.get('enabled', 1)), 'default_size': d.get('default_size') or '1024x1024', 'default_ratio': d.get('default_ratio') or '1:1', 'price_per_image': d.get('price_per_image') or 0.0, 'updated_at': d.get('updated_at', '')}
 
 @router.put('/image-provider-configs/{provider_name}/activate')
 async def activate_image_provider_config(provider_name: str, request: Request = None):

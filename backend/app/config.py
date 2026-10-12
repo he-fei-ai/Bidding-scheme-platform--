@@ -121,6 +121,39 @@ CONTENT_USE_ORCHESTRATION_DEFAULT = _env_bool("CONTENT_USE_ORCHESTRATION_DEFAULT
 CONTENT_USE_WORD_SAMPLING_DEFAULT = _env_bool("CONTENT_USE_WORD_SAMPLING_DEFAULT", "false")
 CONTENT_USE_CONSISTENCY_AUDIT_DEFAULT = _env_bool("CONTENT_USE_CONSISTENCY_AUDIT_DEFAULT", "false")
 
+# ========== 2026-10-11：字数偏差控制（正文生成模块深度修复）==========
+# 缺口（2026-10-11 深度探索实测）：DB 中 10 个已生成 L3 章节的达标率仅 30%，
+# 平均偏差率 +34.2%，100% 系统性偏高，最极端达 +120%。根因：
+#   1. 提示词以「240-360 字」区间表达，模型按「至少」而非「不超过」理解；
+#   2. 生成后无超长压缩机制（use_fallback_expand 只处理不足，且默认关闭）；
+#   3. 偏差不可追溯，无 audit 端点。
+#
+# 修复：
+#   - 提示词强化：具体目标值 + 硬性上限 + 自检要求（workflows_sections.py）
+#   - 生成后压缩：新 CONTENT_CONDENSE_SYSTEM + condense_overlong_content()
+#   - 偏差记录：sections 表新增 word_count_target / word_count_deviation 列
+#
+# 可配置项：
+#   CONTENT_USE_WORD_COUNT_ENFORCEMENT_DEFAULT 生成后超长自动压缩总开关。
+#     默认 True —— 相比三个「静默关闭」的历史门禁，字数控制属于核心需求
+#     （PRD 明确要求「字数符合目标要求」），默认开启以对齐产品预期。
+#     关闭时行为与修复前完全一致（零压缩、零额外 AI 调用）。
+#   CONTENT_WORD_COUNT_CONDENSE_THRESHOLD 触发压缩的偏差率阈值。
+#     默认 1.15（15%）—— 实测 100% 偏高、平均 +34%，15% 略高于 L3 ±20%
+#     下界的镜像位置，兼顾「不误压缩」与「及时压缩」。
+#     设 1.00 表示零容差（严格按达标区间压缩）；设 999.0 表示禁用压缩。
+#   CONTENT_WORD_COUNT_CONDENSE_MAX_ROUNDS 单次生成最多压缩轮数。
+#     默认 1（一轮压缩足以覆盖实测 +120% 的极端偏差；如需更严可设 2）。
+CONTENT_USE_WORD_COUNT_ENFORCEMENT_DEFAULT = _env_bool(
+    "CONTENT_USE_WORD_COUNT_ENFORCEMENT_DEFAULT", "true"
+)
+CONTENT_WORD_COUNT_CONDENSE_THRESHOLD = float(
+    os.environ.get("CONTENT_WORD_COUNT_CONDENSE_THRESHOLD", "1.15")
+)
+CONTENT_WORD_COUNT_CONDENSE_MAX_ROUNDS = max(
+    0, int(os.environ.get("CONTENT_WORD_COUNT_CONDENSE_MAX_ROUNDS", "1"))
+)
+
 
 # ========== 增强 1.1: OCR 配置 ==========
 OCR_ENABLED = os.environ.get("OCR_ENABLED", "true").lower() == "true"
@@ -182,6 +215,31 @@ OUTLINE_MAX_TOKENS_L1 = int(os.environ.get("OUTLINE_MAX_TOKENS_L1", "8192"))
 OUTLINE_MAX_TOKENS_L2 = int(os.environ.get("OUTLINE_MAX_TOKENS_L2", "4096"))
 OUTLINE_MAX_TOKENS_SELFCHECK = int(os.environ.get("OUTLINE_MAX_TOKENS_SELFCHECK", "5000"))
 
+# ========== 2026-10-11：目录生成自动确认开关（P-2） ==========
+# 旧实现在 sse_outline.py 硬编码 auto_confirm=True，多阶段人工审核闸门不可达。
+# 现改为配置项，默认 True（保持向后兼容，生产环境行为不变）。
+# 设为 False 时启用多阶段人工审核：L1/L2/L3 各阶段生成后暂停，等待用户审核确认。
+OUTLINE_AUTO_CONFIRM = os.environ.get("OUTLINE_AUTO_CONFIRM", "true").lower() == "true"
+
+# ========== 增强 2026-10-10：三级标题质量收口（占位泛化标题治理） ==========
+# 问题：L3 阶段完全不调用 AI，仅靠规则拼接；当二级标题为通用型
+# （如「总体方案与实施策划」）时，三级标题大量退化为「总体实施策划（2）」「专项6」
+# 这类占位式泛化名称，且伴随（2）/（3）/（第N项）等裸编号冲突后缀。
+# 详见 backend/tests/test_l3_title_quality_2026_10_10.py 的复现用例。
+# OUTLINE_L3_QUALITY_ENHANCE_ENABLED=false 可完全回退到历史行为（向后兼容）。
+OUTLINE_L3_QUALITY_ENHANCE_ENABLED = (
+    os.environ.get("OUTLINE_L3_QUALITY_ENHANCE_ENABLED", "true").lower() == "true"
+)
+# 三级标题 AI 修复单次最多修复的条数（旧实现硬编码 10，大目录必然残留脏标题）
+OUTLINE_L3_REPAIR_MAX = int(os.environ.get("OUTLINE_L3_REPAIR_MAX", "24"))
+# 三级标题 AI 修复的并发上限。修复任务用 asyncio.gather 全量并发，
+# 每条任务都携带项目上下文（≤6000 token），大目录会瞬时打出数十个请求，
+# 既压垮 provider 速率限制，也会在超时重试时成倍放大负载。见
+# workflows_outline_utils.repair_l3_generic_titles 的信号量实现。
+OUTLINE_L3_REPAIR_CONCURRENCY = max(
+    1, int(os.environ.get("OUTLINE_L3_REPAIR_CONCURRENCY", "5"))
+)
+
 
 # ========== 增强 2.1: RAG 向量检索配置 ==========
 RAG_ENABLED = os.environ.get("RAG_ENABLED", "true").lower() == "true"
@@ -216,6 +274,16 @@ MERMAID_SERVICE_URL = os.environ.get("MERMAID_SERVICE_URL", "http://localhost:80
 
 # Mermaid HTTP 服务请求超时时间（秒）
 MERMAID_SERVICE_TIMEOUT = int(os.environ.get("MERMAID_SERVICE_TIMEOUT", "30"))
+
+# ──────────────────────────────────────────────────────────────────────
+# repair_mermaid 统计（2026-10-11 图表增强）
+# ──────────────────────────────────────────────────────────────────────
+# type mismatch 高频判定阈值：同类型 AI 误输出累计次数 ≥ 此值算高频，
+# 触发 chart_data_fix prompt 动态注入警告。调低更敏感、调高更宽松。
+REPAIR_MISMATCH_THRESHOLD = int(os.environ.get("REPAIR_MISMATCH_THRESHOLD", "3"))
+
+# mismatch case 环形 buffer 最大条数（先进先出）
+REPAIR_MISMATCH_CASE_BUFFER = int(os.environ.get("REPAIR_MISMATCH_CASE_BUFFER", "200"))
 
 # Mermaid 渲染结果 Redis 缓存开关（启用后可减少重复渲染）
 MERMAID_CACHE_REDIS_ENABLED = (
@@ -272,6 +340,52 @@ CHART_FAIL_PLACEHOLDER = os.environ.get("CHART_FAIL_PLACEHOLDER", "false").lower
 STRIP_PLAIN_CODE_BLOCKS = os.environ.get("STRIP_PLAIN_CODE_BLOCKS", "false").lower() == "true"
 
 
+# ========== 增强: 一致性自动修复（autofix）防护口径 ==========
+# BUG-FIX 2026-10-09（P1·autofix 过度替换污染正文）：
+# `apply_autofix` 此前把待统一值在**全文所有章节**里的所有出现位置一律替换。
+# 事实取值多为「30」「1」这类极短串，数字边界保护挡不住「钢筋直径 30 mm」、
+# 「本项目划分为 1 个标段」这些与事实无关的数字 —— 实测一次 autofix 会在无关
+# 章节改出 4 处错误（钢筋直径、构件数量、批次号被改成工期/人数），而冲突却因
+# 「替换成功」被标为已解决，正文被静默污染。
+# 默认口径：只扫冲突来源章节 + 要求取值就近出现事实标签词（详见
+# `consistency_rules.fact_has_keyword_nearby`）。
+
+# 是否把替换范围限定在「冲突来源章节」内。
+#   true（默认）：只改 `sources_json` 中 `section_<id>` 指向的章节 —— 修复范围
+#     与审计证据严格一致，不会波及其他章节；
+#   false：回退历史行为（全文所有章节）—— 仅在来源信息缺失（旧数据只存了
+#     摘要/基准来源）导致「无来源章节」时才需要。
+# 向后兼容：默认值只收紧范围，不改变响应体字段名与语义；接口签名不变。
+CONSISTENCY_AUTOFIX_SCOPE_TO_SOURCE_SECTIONS = os.environ.get(
+    "CONSISTENCY_AUTOFIX_SCOPE_TO_SOURCE_SECTIONS", "true"
+).lower() == "true"
+
+# 是否启用「事实标签词就近校验」。
+#   true（默认）：取值出现位置前向 AUTOFIX_KEYWORD_WINDOW_BEFORE、后向
+#     AUTOFIX_KEYWORD_WINDOW_AFTER 字符内必须出现该事实的标签词
+#     （工期→工期/周期/天数，金额→金额/造价/预算/报价/合同价…）才允许替换；
+#     人员类事实改走「取值后必须紧跟人数单位「人」」的结构校验；
+#   false：只做数字边界保护（历史行为）。
+# 无标签词定义的事实项（未来新增且未登记 FACT_KEYWORDS 的事实）不受此开关影响，
+# 自动回退到原有行为 —— 保证「宁多报不漏报」的既有承诺不被破坏。
+CONSISTENCY_AUTOFIX_REQUIRE_FACT_KEYWORD = os.environ.get(
+    "CONSISTENCY_AUTOFIX_REQUIRE_FACT_KEYWORD", "true"
+).lower() == "true"
+
+# 标签词就近校验的**非对称**搜索半径（前向 / 后向，单位：字符）。
+# BUG-FIX 2026-10-09（P1 续·同章内无关短数字被误改）：原先取值**左右各 40 字符**
+# 都算「附近」，于是「总工期 30 天，其中钢筋进场 30 批」里的第二个 30 —— 「工期」
+# 距离它 14 个字 —— 也被判成工期取值改成了 45。中文习惯是**标签词在数值之前**
+# （「工期 30 天」），因此前向窗口收紧、后向窗口更窄（后向仅覆盖「30 天工期」
+# 这种倒装），实测足以拦掉上述误改且不影响既有正确用例。
+# 需要放宽时用环境变量调整，例如超长句里标签词与数值隔 20 字。
+CONSISTENCY_AUTOFIX_KEYWORD_WINDOW_BEFORE = int(
+    os.environ.get("CONSISTENCY_AUTOFIX_KEYWORD_WINDOW_BEFORE", "12")
+)
+CONSISTENCY_AUTOFIX_KEYWORD_WINDOW_AFTER = int(
+    os.environ.get("CONSISTENCY_AUTOFIX_KEYWORD_WINDOW_AFTER", "6")
+)
+
 # ========== 增强 4.3: DOCX 导出表格样式配置 ==========
 # BUG-E-06 修复：将表格样式魔法数字提取至配置，支持环境变量覆盖
 # 表头背景色（16进制无 # 前缀，默认深蓝 "2B579A"）
@@ -325,3 +439,128 @@ if ENVIRONMENT == "production" and AI_ALLOW_INTERNAL_URL:
         "⚠️  生产环境仍允许 AI base_url 指向内网/元数据地址（AI_ALLOW_INTERNAL_URL=true）。\n"
         "   若无内网自建模型需求，建议设置 AI_ALLOW_INTERNAL_URL=false 启用 SSRF 防护。"
     )
+
+
+# ==================================================================
+# 2026-10-12 引入：OpenBidKit 易标 2026-09-14 方法论第二批移植
+# 说明：本段配置项均默认关闭或保持现有行为，仅新增能力开关。
+# 参考软件：J:\编程\OpenBidKit 易标\OpenBidKit_Yibiao-main-2026-09-14
+# 引入项编号 P0/P1/P2/E 见 deliverables/报告_平台软件架构分析与OpenBidKit差距对照_2026-10-12.md
+# ==================================================================
+
+# ========== P0-1：目录编号模板化 ==========
+# 易标 outlineNumbering.ts 支持 {zh}/{num}/{tail}/{circled}/{alpha}/{roman}
+# 占位符模板。此前本平台 outline_gate.renumber_outline_ids 只支持位置式
+# 点号编号（1/1.1/1.1.1），无中文数字/圈号/罗马数字/字母模板。
+# OUTLINE_NUMBERING_ENABLED=false 保持现有行为，避免任何目录变更。
+OUTLINE_NUMBERING_ENABLED = os.environ.get("OUTLINE_NUMBERING_ENABLED", "false").lower() == "true"
+
+# 编号模板：level -> template；level 为 1-based（1/2/3），未列出的 level 走 _DEFAULT
+# 可用占位符：{zh} 中文数字、{num} 阿拉伯数字、{tail} 分隔符、{circled} 圈号、
+# {alpha} 字母、{roman} 罗马数字。示例：
+#   {"1": "第{num}章", "2": "{num}.{num}", "3": "{num}.{num}.{num}"}
+#   {"1": "第{zh}章", "2": "{circled}{num}", "3": "（{zh}）"}
+OUTLINE_NUMBERING_TEMPLATE = os.environ.get(
+    "OUTLINE_NUMBERING_TEMPLATE",
+    '{"1": "第{num}章", "2": "{num:1}.{num:2}", "3": "{num:1}.{num:2}.{num:3}"}',
+)
+
+# ========== P0-2：目录对齐模式（一一对应锁死评分项）==========
+# 易标 outlineGenerationTaskV2 「aligned」模式：从技术评分要求提取评分大类，
+# 程序构造 L1，锁死标题顺序与评分项关联，模型只生成 L2/L3。
+# 平台此前 L1 完全由 AI 生成，无法保证与评分项一一对应。
+# ALIGN_OUTLINE_TO_SCORING=false 保持现有行为。
+ALIGN_OUTLINE_TO_SCORING = os.environ.get(
+    "ALIGN_OUTLINE_TO_SCORING", "false"
+).lower() == "true"
+
+# 目录生成模式选择器
+#   'standalone-technical'：独立技术方案模式（默认，与现有行为一致）
+#   'aligned'：一一对应模式（L1 从评分项锁定）
+#   'response-file'：应标文件模式（L1 从评分项锁定，L2/L3 强调响应性）
+OUTLINE_MODE_DEFAULT = os.environ.get(
+    "OUTLINE_MODE_DEFAULT", "standalone-technical"
+)
+
+# ========== P0-3：正文提示词分层消息栈 ==========
+# 易标「提示词顺序优化」：把大且稳定的上下文放前面，任务差异放最后，
+# 实测缓存命中后输入成本从 0.0058 降到 0.00067，降低约 10 倍。
+# SPLIT_PROMPT_LAYERS=false 保持现有 build_chapter_content_messages 行为；
+# =true 时启用 8 层消息栈（system/项目概述/全局事实/参考素材/编排/上级/同级/当前）。
+SPLIT_PROMPT_LAYERS = os.environ.get("SPLIT_PROMPT_LAYERS", "false").lower() == "true"
+
+# ========== P1-1：配图预编排 ==========
+# 易标：正文生成前先全文级预编排配图（illustration-plan.json），
+# 每章节规划好配图意图（kind/title/section_ids/priority），
+# 正文生成时模型可提前呼应；配图数量按 maxAiImages 分段择优。
+# PRE_PLAN_ILLUSTRATIONS=false 保持现有章节内嵌配图行为。
+PRE_PLAN_ILLUSTRATIONS = os.environ.get(
+    "PRE_PLAN_ILLUSTRATIONS", "false"
+).lower() == "true"
+
+# 配图规划单次送审的章节数上限（避免超长上下文）
+ILLUSTRATION_PLAN_MAX_SECTIONS = int(
+    os.environ.get("ILLUSTRATION_PLAN_MAX_SECTIONS", "20")
+)
+
+# ========== P1-2：Mermaid/HTML 修复轮次 ==========
+# 易标：Mermaid 生成后若渲染失败，最多 3 轮 AI 修复；HTML 图溢出最多 2 轮修复。
+# 平台此前默认为 1 轮。
+MERMAID_REPAIR_ROUNDS = int(os.environ.get("MERMAID_REPAIR_ROUNDS", "3"))
+HTML_LAYOUT_REPAIR_ROUNDS = int(os.environ.get("HTML_LAYOUT_REPAIR_ROUNDS", "2"))
+
+# ========== P1-3：一致性修复严格唯一命中 ==========
+# 易标 textEdit.cjs：applyTextEdit 要求 old_text 唯一命中才替换，
+# 多命中或零命中都返回错误，避免追加到末尾造成静默污染。
+# CONSISTENCY_UNIQUE_EDIT_STRICT=true（默认开启，属于行为收紧但更安全）。
+CONSISTENCY_UNIQUE_EDIT_STRICT = os.environ.get(
+    "CONSISTENCY_UNIQUE_EDIT_STRICT", "true"
+).lower() == "true"
+
+# ========== P1-4：目录/正文 JSON 修复循环 ==========
+# 易标：AI 生成 JSON 失败后先尝试修复（而非直接抛错），最多 N 轮。
+OUTLINE_JSON_REPAIR_ROUNDS = int(os.environ.get("OUTLINE_JSON_REPAIR_ROUNDS", "3"))
+CONTENT_JSON_REPAIR_ROUNDS = int(os.environ.get("CONTENT_JSON_REPAIR_ROUNDS", "2"))
+
+# ========== P2-1：Agent 修复工作区持久化 ==========
+# 易标 D1：Agent 修复在持久工作区写 global-facts.md / technical-plan.md，
+# 支持搜索关键词→分段读取→建立索引→多轮修改→程序校验回写。
+# AGENT_REPAIR_PERSIST_WORKSPACE=false 保持现有 jsonl 日志行为。
+AGENT_REPAIR_PERSIST_WORKSPACE = os.environ.get(
+    "AGENT_REPAIR_PERSIST_WORKSPACE", "false"
+).lower() == "true"
+
+# Agent 修复工作区根目录（相对 DATA_DIR）
+AGENT_REPAIR_WORKSPACE_SUBDIR = os.environ.get(
+    "AGENT_REPAIR_WORKSPACE_SUBDIR", "agent_repair"
+)
+
+# ========== P2-2：知识库两轮提取 + 遗漏补漏 ==========
+# 易标：第一轮一次性结构化提取，第二轮按目录树叶子节点逐个匹配找遗漏。
+# KNOWLEDGE_REFILL_TWO_ROUND=false 保持单轮行为。
+KNOWLEDGE_REFILL_TWO_ROUND = os.environ.get(
+    "KNOWLEDGE_REFILL_TWO_ROUND", "false"
+).lower() == "true"
+
+# 第二轮补漏的分批大小（叶子节点分批送入匹配，避免超长上下文）
+KNOWLEDGE_REFILL_BATCH_SIZE = int(
+    os.environ.get("KNOWLEDGE_REFILL_BATCH_SIZE", "10")
+)
+
+# ========== E-1：九大章节字段契约注入 ==========
+# 已存在的 NINE_CHAPER_FIELDS 契约（content_field_contract.py:53-99）在此
+# 增加注入开关：目录生成时把章节名映射到契约字段，正文生成时按字段注入。
+NINE_CHAPTER_CONTRACT_INJECT = os.environ.get(
+    "NINE_CHAPTER_CONTRACT_INJECT", "true"
+).lower() == "true"
+
+# ========== E-2：六大类危大工程覆盖 ==========
+# 易标无此项，本平台独有竞争力。HAZARD_PROJECT_SCAN=true（默认开启）
+# 时目录生成前扫描招标文件关键词，识别危大工程类型并强制加入专项章节。
+HAZARD_PROJECT_SCAN = os.environ.get(
+    "HAZARD_PROJECT_SCAN", "true"
+).lower() == "true"
+
+# 六大类危大工程：深基坑/高支模/脚手架/起重吊装/临时用电/消防保卫
+# 详见 services/ai/hazard_projects.py 的 HAZARD_PROJECTS 常量。
+

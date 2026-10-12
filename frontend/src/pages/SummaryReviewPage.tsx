@@ -196,7 +196,15 @@ export default function SummaryReviewPage() {
     try {
       const result = await generateSummary(projectId);
       setSummaryText(result.summary_json);
-      message.success("招标摘要已生成");
+      // BUG-FIX 2026-10-09（确认态谎报）：重新生成了摘要却没有复位「已确认」。
+      // 后端 `_sync_insert_or_update` 会把 confirmed_summary 置 0，但前端
+      // 本地 state 仍是 true → 「下一步：生成目录」的闸门
+      // （`:1141` 依赖 summaryConfirmed && scoringConfirmed）在数据已换新的
+      // 情况下依然放行，用户会在毫不知情时用一份**未确认的新摘要**继续流程。
+      // 评分点重跑路径本来就有 `setSummaryConfirmed(false)`（见
+      // handleGenerateScoring:215），此处补齐对称行为。
+      setSummaryConfirmed(false);
+      message.success("招标摘要已生成（请重新确认）");
     } catch (e: any) {
       message.error(extractApiError(e));
     } finally {
@@ -216,6 +224,10 @@ export default function SummaryReviewPage() {
       }
       syncScoringPoints(result.scoring_points_json);
       setShowRawJson(false);
+      // BUG-FIX 2026-10-09（确认态谎报）：评分点已整体重写，「已确认」必须复位。
+      // 后端 `_sync_insert_or_update` 会把 confirmed_scoring 置 0，前端此前
+      // 未同步复位 → 「下一步：生成目录」闸门在用户未确认新数据时即放行。
+      setScoringConfirmed(false);
       // 评分模块配套提取的全局事实变量：自动刷新事实区 + 从 DB 刷新确认态
       if (result.global_facts && result.global_facts.length > 0) {
         setFactsData(result.global_facts);

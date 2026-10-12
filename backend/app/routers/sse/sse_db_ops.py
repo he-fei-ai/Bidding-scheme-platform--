@@ -20,6 +20,8 @@ from ...services.projects import update_step
 from ...services.redis_cache import CacheService
 from ...services.sections import (
 
+    _count_readable_words,
+
     _count_words,
 
     _invalidate_build_tree_cache,
@@ -123,11 +125,16 @@ def _save_section_to_db(
 
             word_count = _count_words(content) if content else 0
 
+            # 易标 R1（2026-10-12）：同一条 SQL 同步持久化可读字数口径
+            # （CJK 逐字 + 西文按词，剔除 Markdown/图片/代码块/URL），与
+            # word_count 并存以便迁移期双口径对比。
+            readable_word_count = _count_readable_words(content) if content else 0
+
             conn.execute(
 
-                "UPDATE sections SET content = ?, status = 'completed', word_count = ?, updated_at = datetime('now', 'localtime') WHERE id = ?",
+                "UPDATE sections SET content = ?, status = 'completed', word_count = ?, readable_word_count = ?, updated_at = datetime('now', 'localtime') WHERE id = ?",
 
-                (content, word_count, section_id),
+                (content, word_count, readable_word_count, section_id),
 
             )
 
@@ -527,6 +534,66 @@ def _clear_and_save_outline(project_id: int, outline: list) -> list:
     # 会出现重复条目）。落库前再跑一次全树去重，与 _dedupe_outline_titles 的文档意图一致。
     outline = _dedupe_outline_titles(outline)
 
+    # 2026-10-12 加固（最后一道占位标题安全网）：无论上游是 AI 生成流、
+    # 直出流还是人工编辑后回写，落库前再过一遍占位/泛化标题清洗。
+    # 顺序严格：先剥编号 → 再去重 → 最后清占位。
+    #   _cleanup_placeholder_titles 内部用全局 used 集合 + 父级语义派生，
+    #   若先清占位后去重，改写产生的新标题可能再次撞名被 _dedupe_outline_titles
+    #   追加（其N）后缀，反而引入新的脏标题。
+    try:
+        from ...services.ai.outline_common import _cleanup_placeholder_titles
+        _ph_fixed = _cleanup_placeholder_titles(outline)
+        if _ph_fixed > 0:
+            logger.info(
+                "_clear_and_save_outline: 落库前清洗 %d 处 L3+ 占位/泛化标题 project=%d",
+                _ph_fixed, project_id,
+            )
+    except Exception as _ph_exc:
+        # 安全网失败不阻塞落库，上游（L3 质量收口链 + db_migrations 启动清理）
+        # 已有两道防线覆盖绝大多数场景
+        logger.warning(
+            "_clear_and_save_outline: 占位标题安全网跳过（不阻塞落库）: %s", _ph_exc
+        )
+
+    # 2026-10-12 收尾闭环：cleanup 内部已用 global_used 防跨父撞名，
+    # 但 _dedupe_outline_titles 的副产物（如"总体实施策划（2）"）被
+    # cleanup 改写后可能因 dedupe 已跑完而无法消歧。这里追加轻量撞名
+    # 检测（只检查同级兄弟节点），有则 warning 日志暴露问题（不阻塞落库）。
+    try:
+        _dup_count = 0
+        def _check_siblings(nodes, depth=0):
+            nonlocal _dup_count
+            if not isinstance(nodes, list):
+                return
+            seen = {}
+            for _n in nodes:
+                if not isinstance(_n, dict):
+                    continue
+                _t = (_n.get("title") or "").strip()
+                if not _t:
+                    continue
+                if _t in seen:
+                    _dup_count += 1
+                    logger.warning(
+                        "_clear_and_save_outline: 检测到 %d 级同级撞名 '%s' project=%d "
+                        "(父级路径上的兄弟节点编号 %s 与 %s)",
+                        depth, _t, project_id, seen[_t], _n.get("id"),
+                    )
+                else:
+                    seen[_t] = _n.get("id")
+                _sub = _n.get("children")
+                if isinstance(_sub, list):
+                    _check_siblings(_sub, depth + 1)
+        _check_siblings(outline)
+        if _dup_count > 0:
+            logger.warning(
+                "_clear_and_save_outline: 落库前撞名检测发现 %d 处同级撞名 project=%d "
+                "（已通过 warning 暴露，不阻塞落库；可重跑目录生成解决）",
+                _dup_count, project_id,
+            )
+    except Exception as _chk_exc:
+        logger.debug("_clear_and_save_outline: 撞名检测跳过: %s", _chk_exc)
+
     with get_db() as conn:
 
         # ENHANCE 2026-09-18（跨模块数据保全）：
@@ -604,7 +671,8 @@ def _clear_and_save_outline(project_id: int, outline: list) -> list:
         # 递归保存章节，返回带数据库 ID 的节点
 
         def _save_nodes(
-            nodes: list, parent_id: int | None = None, base_level: int = 1, parent_path: str = ""
+            nodes: list, parent_id: int | None = None, base_level: int = 1, parent_path: str = "",
+            parent_number: str = "",
         ) -> list:
 
             nonlocal _restored_count
@@ -636,13 +704,26 @@ def _clear_and_save_outline(project_id: int, outline: list) -> list:
 
                 scoring_point_id = node.get("scoring_point_id")
 
+                # BUG-FIX 2026-10-09（编号命名空间统一 · 跨模块数据传递丢失）：
+                # _renumber_items（workflows_outline_utils.py:281）本就是「路径式编号」的
+                # 权威实现（"1" / "1.2" / "1.2.3"，与 services.sections.get_section_path
+                # 的 DB 动态路径号同一口径），但它是**死代码** —— 全仓库没有任何生产
+                # 调用方，落库后的目录树从不携带 number 字段。后果是三层各算一遍：
+                #   1. 前端 OutlineEditorPage 靠 outlineDictToTreeNodes 自算展示编号；
+                #   2. 导出/正文模块靠 get_section_path 从 DB 现算；
+                #   3. 任何 API 直取 outline JSON 的消费方（如 v51-confirm 回显、
+                #      前端刷新后重建树、外部对接方）拿不到编号，只能重新实现。
+                # 现在落库时随节点透出 path_number，与 get_section_path 同口径，
+                # 作为跨模块的唯一编号事实源；title 保持纯文本，不改动。
+                node_number = f"{parent_number}{sort_order}" if parent_number else str(sort_order)
+
 
 
                 cursor = conn.execute(
 
                     """INSERT INTO sections (project_id, parent_id, title, level, sort_order, section_type, scoring_point_id, target_words, status, graph_suitable, suggested_chart)
 
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)""",
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)""",
 
                     (
 
@@ -697,19 +778,36 @@ def _clear_and_save_outline(project_id: int, outline: list) -> list:
                     if not _cands:
                         del _prev_content[(level, title)]
 
+                # BUG-FIX 2026-10-11（O-6）：把「回填时写入 DB 的 status」和
+                # 「saved_node 里返回给前端/上层 workflow 的 status」抽成同一份变量
+                # `_node_status`。旧实现：
+                #   · UPDATE 分支写入 `_prev.get("status") or "completed"`（正文已回填
+                #     → 视为已生成完毕）；
+                #   · saved_node 却固定写 "pending"。
+                # 二者不一致的后果：`_save_nodes` 返回结果里 `status="pending"`，但
+                # DB 里该 section 是 "completed"。上层（sse_outline._send_outline_nodes /
+                # outline_gate / 前端 SectionTreeNode 直消费 saved_node 的 SSE 事件）
+                # 会把「已保留正文」的章节误判为「空白待生成」，用户点「补全生成」时
+                # collectLeafIds 会把它们选进叶子集合，AI 生成时整体覆盖旧正文 ——
+                # 与「正文保全」的初衷正相反。
+                _node_status = "pending"
                 if _prev and _prev.get("content"):
+                    _node_status = _prev.get("status") or "completed"
 
+                if _prev and _prev.get("content"):
                     # BUG-FIX 2026-09-29：回填正文时同步 word_count 列——此前只写
                     # content/status/target_words，DB 的 word_count 停留在 NULL，
                     # build_tree/list_sections 从 DB 读该列，目录重建后前端字数显示 0。
                     conn.execute(
                         "UPDATE sections SET content = ?, status = ?, word_count = ?, "
+                        "readable_word_count = ?, "
                         "target_words = COALESCE(target_words, ?), "
                         "updated_at = datetime('now', 'localtime') WHERE id = ?",
                         (
                             _prev["content"],
-                            _prev.get("status") or "completed",
+                            _node_status,
                             _count_words(_prev["content"]),
+                            _count_readable_words(_prev["content"]),
                             _prev.get("target_words"),
                             new_id,
                         ),
@@ -719,7 +817,7 @@ def _clear_and_save_outline(project_id: int, outline: list) -> list:
 
 
 
-                saved_children = _save_nodes(children, new_id, level, _node_path) if children else []
+                saved_children = _save_nodes(children, new_id, level, _node_path, f"{node_number}.") if children else []
 
 
 
@@ -733,7 +831,16 @@ def _clear_and_save_outline(project_id: int, outline: list) -> list:
 
                     "sort_order": sort_order,
 
-                    "status": "active",
+                    # BUG-FIX 2026-10-09（跨模块数据传递）：随节点透出路式编号
+                    # （"1" / "1.2" / "1.2.3"），口径同 services.sections.get_section_path，
+                    # 让前端 / 导出 / 正文 / v51-confirm 回显共用同一份编号事实源。
+                    "number": node_number,
+
+                    # BUG-FIX 2026-10-11（O-6）：与上方 UPDATE 写入 DB 的 status 保持
+                    # 一致（回填正文的节点为 "completed"，未回填的新章节保持 "pending"），
+                    # 避免前端 / SSE 事件 / 上层 workflow 把「已保留正文」的章节误判为
+                    # 待生成而被「补全生成」覆盖旧内容。
+                    "status": _node_status,
 
                     # ENHANCE 2026-10-08（跨模块数据链修复）：把目录阶段 AI 标注的图表适配
                     # 信号随节点透出，build_tree / 前端 / 图表模块均可读取（此前被丢弃）。

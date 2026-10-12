@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import logging
 import os
+import re
 from pathlib import Path
 import shutil
 import threading
@@ -103,18 +104,55 @@ _mineru_parser_instance = None
 # 后写者覆盖前者的原始文件与提取文本，DB 却生成两行 → 解析结果丢失/字段错位。
 # 现按 project_id 维护写入互斥锁，仅锁住"命名+落盘"临界区（不含耗时的文本提取），
 # 既消除竞态又不 serialize 解析本身。不同项目互不阻塞。
-_upload_write_locks: dict[int, threading.Lock] = {}
+#
+# BUG-FIX 2026-10-11（Memory Leak）：此前 _upload_write_locks 字典永不清理 ——
+# 长期运行的服务器处理完上万个项目后会累积上万把不再使用的 threading.Lock 对象。
+# 现追踪每把锁的最后访问时间，超过上限（_UPLOAD_WRITE_LOCK_MAX）且闲置超时
+# （_UPLOAD_WRITE_LOCK_IDLE_SECS）时惰性淘汰最旧的（下次创建新锁时触发清理）。
+_upload_write_locks: dict[int, tuple[threading.Lock, float]] = {}
 _upload_write_locks_guard = threading.Lock()
+_UPLOAD_WRITE_LOCK_MAX = 500
+_UPLOAD_WRITE_LOCK_IDLE_SECS = 3600  # 闲置超过 1 小时的锁可清理
 
 
 def _get_upload_write_lock(project_id: int) -> threading.Lock:
-    """获取（惰性创建）指定项目的上传写入互斥锁"""
+    """获取（惰性创建）指定项目的上传写入互斥锁，带 LRU 清理。
+
+    BUG-FIX 2026-10-11（Memory Leak）：每次调用更新最后访问时间戳；当锁数超过
+    ``_UPLOAD_WRITE_LOCK_MAX`` 时清理闲置超时的最旧锁，使长期运行的服务器
+    不会因累积废弃锁对象而缓慢泄漏内存。
+    """
+    now = time.monotonic()
     with _upload_write_locks_guard:
-        lock = _upload_write_locks.get(project_id)
-        if lock is None:
+        entry = _upload_write_locks.get(project_id)
+        if entry is None:
+            # 创建新锁前，若字典已满先清理最旧的闲置锁
+            if len(_upload_write_locks) >= _UPLOAD_WRITE_LOCK_MAX:
+                _lru_cleanup_upload_write_locks_locked(now)
             lock = threading.Lock()
-            _upload_write_locks[project_id] = lock
+            _upload_write_locks[project_id] = (lock, now)
+            return lock
+        lock, _ts = entry
+        # 更新最后访问时间戳（锁本身只含一个对象，赋值 tuple 成本可忽略）
+        _upload_write_locks[project_id] = (lock, now)
         return lock
+
+
+def _lru_cleanup_upload_write_locks_locked(now: float) -> None:
+    """清理闲置超时的废弃写入锁（调用方需持有 _upload_write_locks_guard）"""
+    if not _upload_write_locks:
+        return
+    to_delete = [
+        pid
+        for pid, (_lock, ts) in _upload_write_locks.items()
+        if now - ts > _UPLOAD_WRITE_LOCK_IDLE_SECS
+    ]
+    for pid in to_delete:
+        del _upload_write_locks[pid]
+    logger.debug(
+        "[upload_write_locks] LRU 清理：淘汰 %d 个闲置锁，剩余 %d 个",
+        len(to_delete), len(_upload_write_locks),
+    )
 
 
 def _get_file_hash(file_path: str) -> str:
@@ -219,8 +257,12 @@ def _create_parse_task(project_id: int, filename: str, file_type: str = ""):
             )
         logger.info("文件解析任务已创建: project=%d, file=%s", project_id, filename)
     except Exception as e:
-        logger.warning("创建文件解析任务失败（不影响核心功能）: %s", e)
-        return
+        # 2026-10-11 加固（P-3）：旧实现仅 warning 后 return，导致任务行缺失、
+        # 状态端点无解析痕迹、前端进度条永远卡在 processing。
+        # 现改为 raise 让上游感知任务行缺失——若 DB 写入失败，整个上传流程应
+        # 失败而非静默继续（后续 _update_parse_task 会 UPDATE 0 行，终态丢失）。
+        logger.error("创建文件解析任务失败（将中断上传流程）: %s", e)
+        raise
 
     # 遗留修复 2026-10-06（L3）：写入后即时裁剪，把表规模压在配置上限内。
     # 放在写入之后（而不是之前）是为了保证本次任务行一定存在。
@@ -325,17 +367,59 @@ EXTRACTION_NOTICES: frozenset[str] = frozenset(
     {EXTRACT_DOC_NOTICE, EXTRACT_PPT_NOTICE, EXTRACT_WPS_NOTICE}
 )
 
+# BUG-FIX 2026-10-11（I-6）：Excel/PPT 分支的降级返回值是 **f-string 动态拼接**
+# （`f"[Excel 解析错误] {e}"`），无法纳入上面的 frozenset 精确登记 —— 于是
+# `is_extraction_notice` 对它返回 False，save_upload / Celery parse_and_extract_file
+# / latest_extracted_text 全部按「提取成功」处理，损坏的 .xlsx/.pptx 的错误文本
+# 被写成 status='success'、缓存下来，并喂给下游评分/目录/正文三段 AI。
+#
+# 处理策略：登记表仍只收「完整常量串」，动态串单独走**前缀匹配**：
+#   - 前缀是本模块写死的固定子串（如 "[Excel 解析错误]"），真实标书正文不可能
+#     以 `"[Excel 解析错误] "` 起头（连中括号 + 中文 + 方括号 + 空格都齐了），
+#     故误判概率极低；
+#   - 叠加**长度上界**（120 字符）作二重防御：真实的 Excel 表格导出 / 招标正文
+#     不可能只有几十个字符，而错误串是「前缀 + 一个 str(e)」，天然很短。
+# 前缀必须两两不互相前缀（如 "[Excel 文件不存在]" 不能被误判为 "[Excel 文件]"），
+# 由 test_extraction_notice_prefixes_are_exact 守卫。
+EXTRACT_ERROR_PREFIXES: frozenset[str] = frozenset({
+    "[Excel 解析错误]",
+    "[Excel 文件损坏]",
+    "[Excel 文件不存在]",
+    "[Excel 权限不足]",
+    "[PPTX 解析错误]",
+})
+EXTRACT_ERROR_MAX_LEN = 120  # 错误串 = 前缀 + str(e)，正常不超过这个量级
+
+# 精确登记表 + 前缀登记表，合并供 is_extraction_notice 判定。
+_EXTRACT_ERROR_PREFIXES_TUPLED = tuple(EXTRACT_ERROR_PREFIXES)
+
 
 def is_extraction_notice(text: str | None) -> bool:
-    """判断提取结果是否为「无法提取」的降级提示串（而非真实正文）。
+    """判断提取结果是否为「无法提取 / 解析失败」的降级提示串（而非真实正文）。
 
-    精确匹配登记表中的三条已知提示串。供 save_upload、Celery 解析任务与
-    latest_extracted_text 共用，保证「上传 / 异步重解析 / 合并文本」三条
-    路径口径一致。
+    两路判定：
+      1. 精确匹配 EXTRACTION_NOTICES（.doc/.ppt/.wps 三条写死的常量串）；
+      2. 前缀匹配 EXTRACT_ERROR_PREFIXES 且总长度 ≤ EXTRACT_ERROR_MAX_LEN
+         （.xlsx/.xls/.pptx 分支的 f-string 错误串）。
+
+    供 save_upload、Celery 解析任务与 latest_extracted_text 共用，保证
+    「上传 / 异步重解析 / 合并文本」三条路径口径一致。
     """
     if not text:
         return False
-    return text.strip() in EXTRACTION_NOTICES
+    stripped = text.strip()
+    if stripped in EXTRACTION_NOTICES:
+        return True
+    if len(stripped) > EXTRACT_ERROR_MAX_LEN:
+        return False
+    # 前缀后必须紧跟空白或字符串结尾，避免 "[Excel 解析错误]" 误吃
+    # "[Excel 解析错误xxx真实正文]" 这类伪造输入。
+    return any(
+        stripped.startswith(pref) and (
+            len(stripped) == len(pref) or stripped[len(pref)] in (" ", "\t", "\n", ":")
+        )
+        for pref in _EXTRACT_ERROR_PREFIXES_TUPLED
+    )
 
 
 class MainFileRequiredError(ValueError):
@@ -411,7 +495,17 @@ def save_upload(project_id: int, filename: str, content: bytes, file_role: str =
         # status='processing' 的任务行 → UPDATE 命中 0 行，失败状态被丢弃，
         # 任务表停留在旧状态，前端无法感知保存失败。
         ext = Path(filename).suffix.lower()
-        _create_parse_task(project_id, filename, ext)
+        try:
+            _create_parse_task(project_id, filename, ext)
+        except Exception as _task_err:
+            # P-3 加固：任务行创建失败说明 DB 不可用，继续写入文件会导致后续
+            # _update_parse_task UPDATE 0 行（终态丢失）。直接返回失败让上游感知。
+            logger.error("任务行创建失败，中止上传: %s", _task_err)
+            return {
+                "status": "failed",
+                "message": f"任务行创建失败（数据库不可用）: {_task_err}",
+                "filename": filename,
+            }
 
         try:
             file_path.write_bytes(content)
@@ -629,14 +723,24 @@ def _sniff_extension(file_path: str) -> str:
 
 
 def _strip_invisible(text: str) -> str:
-    """清除文本中的 BOM 残留与 NUL 控制字符（读取边界统一清洗）"""
+    """清除文本中的 BOM 残留、NUL 控制字符及其他不可见字符（读取边界统一清洗）
+
+    2026-10-11 加固（I-11）：旧实现只剥首字符 ``\\ufeff`` 和全部 ``\\x00``，
+    中后段出现的 BOM（多次追加拼接导致）、零宽字符（``\\u200b`` / ``\\ufeff``）
+    和 C0/C1 控制字符均未被清除。现统一用正则一次遍历剥除全部不可见字符。
+    """
     if not text:
         return text
-    if text[0] == "\ufeff":
-        text = text[1:]
-    if "\x00" in text:
-        text = text.replace("\x00", "")
-    return text
+    # 剥除：BOM（所有出现位置）、NUL、零宽字符、C0/C1 控制字符（保留 \n \r \t）
+    # \x00-\x08, \x0b, \x0c, \x0e-\x1f, \x7f-\x9f
+    _INVISIBLE_RE = re.compile(
+        r"[\ufeff\x00"
+        r"\u200b\u200c\u200d\ufe0e\ufe0f"
+        r"\u2028\u2029"
+        r"\x00-\x08\x0b\x0c\x0e-\x1f"
+        r"\x7f-\x9f]"
+    )
+    return _INVISIBLE_RE.sub("", text)
 
 
 def _read_text_auto(file_path: str) -> str:
@@ -646,6 +750,11 @@ def _read_text_auto(file_path: str) -> str:
 
     修复 BUG：此前 .txt/.md 硬编码 utf-8，GBK/GB2312 编码的中文文件会抛
     UnicodeDecodeError 导致整个上传解析失败。
+
+    2026-10-11 加固（I-12）：无 BOM 的 UTF-16LE 此前走 utf-8 → gb18030 → 兜底
+    替换，中文内容全部变成乱码。现增加 BOM 探测失败后的奇偶零字节启发式检测，
+    识别 UTF-16LE/UTF-16BE 无 BOM 文件（部分系统导出的 xlsx 说明文本、
+    Windows Notepad 另存为「Unicode」时的中间态）。
     """
     path = Path(file_path)
     try:
@@ -664,6 +773,28 @@ def _read_text_auto(file_path: str) -> str:
     try:
         return _strip_invisible(path.read_text(encoding="utf-8"))
     except UnicodeDecodeError:
+        pass
+    # 无 BOM 的 UTF-16LE/BE 探测（I-12）：
+    # UTF-16LE 中文文本的特征是每个中文字符占 4 字节（UTF-16LE 编码为 4 字节：
+    # 2 字节字符 + 2 字节 ASCII），奇数位全为 0x00。
+    # 用启发式：前 512 字节中 0x00 字节占比 > 30% 时尝试 UTF-16。
+    try:
+        with path.open("rb") as _f:
+            sample = _f.read(512)
+        if len(sample) >= 4:
+            zero_count = sample.count(b"\x00")
+            if zero_count > len(sample) * 0.3:
+                # 判断 LE 还是 BE：
+                # UTF-16LE: ASCII 字符的 0x00 在奇数位（字节 1,3,5...）
+                # UTF-16BE: ASCII 字符的 0x00 在偶数位（字节 0,2,4...）
+                even_zeros = sum(1 for i in range(0, len(sample) - 1, 2) if sample[i] == 0)
+                odd_zeros = sum(1 for i in range(1, len(sample) - 1, 2) if sample[i] == 0)
+                encoding = "utf-16-le" if odd_zeros > even_zeros else "utf-16-be"
+                try:
+                    return _strip_invisible(path.read_text(encoding=encoding))
+                except UnicodeDecodeError:
+                    pass
+    except OSError:
         pass
     # gb18030 是 GBK/GB2312 的超集，覆盖常见中文编码
     try:
@@ -782,12 +913,23 @@ def _do_extract_text(file_path: str, ext: str, declared_ext: str = "") -> str:
     # 护栏：仅当文件头确实是 OLE2 魔数、且 ext 来自「魔数嗅探」或「与声明
     # 扩展名一致」时才走链 —— 伪装扩展名的非 OLE 文件保持原单分支行为
     # （避免损坏/伪造文件被无谓拉起 antiword/catdoc/PowerPoint COM 试错）。
-    if ext in _LEGACY_OLE_EXTS and _is_ole2_file(file_path) and ext in (
-        declared_ext,
-        # BUG-FIX 2026-10-08：_sniff_extension 在 extract_text_from_path 中已调用过，
-        # 此处避免重复的文件 I/O（Bug 11 冗余调用）。
-        # 用 Path 后缀做快速判断，仅在 declared_ext 为空时嗅探。
-        _sniff_extension(file_path) if not declared_ext else "",
+    # BUG-FIX 2026-10-09（格式误判 · 字段错位）：原条件
+    #   `ext in (declared_ext, _sniff_extension(...) if not declared_ext else "")`
+    # 里的 `if ... else ...` 只作用于元组**第二个元素**，当 declared_ext 非空时
+    # 整个元组退化为 `(declared_ext, "")`。于是 .xls/.ppt/.wps 声明的文件被彻底
+    # 排除在降级链之外：`.xls` 声明 → _sniff_extension 对 OLE2 一律返回 ".doc"
+    # （容器格式无法区分子格式）→ ext 被改写成 ".doc" → `".doc" in (".xls", "")`
+    # 为 False → 直接落到 `elif ext == ".doc"` 分支，用 Word 提取器（antiword/
+    # catdoc/olefile Word 流）去解析 Excel 二进制。工程量清单/报价表的表格结构
+    # 与数字全部错位成乱码，下游 get_boq_file_text / get_work_interface_file_text
+    # 拿到的全是噪声，且 status 仍为 success（静默）。
+    # 正确口径：文件头已确认是 OLE2，只要「声明扩展名本身是 4 个旧格式之一 /
+    # 声明为空 / 声明与嗅探结果一致」就应进降级链（链内已把 declared_ext 排到
+    # 优先位，不会白等 COM）。声明为 OOXML（.docx/.xlsx/.pptx）的伪装文件保持
+    # 原单分支行为，避免为其多余拉起一次 PowerPoint COM（可能到 PPT_COM_TIMEOUT）。
+    is_ole = _is_ole2_file(file_path)
+    if ext in _LEGACY_OLE_EXTS and is_ole and (
+        declared_ext in _LEGACY_OLE_EXTS or not declared_ext or declared_ext == ext
     ):
         return _extract_legacy_ole_chain(file_path, declared_ext)
     if ext == ".docx":
@@ -795,17 +937,39 @@ def _do_extract_text(file_path: str, ext: str, declared_ext: str = "") -> str:
     elif ext == ".pdf":
         return _extract_pdf(file_path)
     elif ext == ".doc":
-        return _extract_doc(file_path)
+        result = _extract_doc(file_path)
+        # Gap-6 2026-10-11：直连 _extract_doc 返回提示串/空串 且文件头是 OLE2 →
+        # 回退降级链（伪装扩展名、antiword 损坏、OLE 容器类型不匹配都可能导致直连失败）
+        if (is_extraction_notice(result) or not result) and is_ole:
+            logger.warning(
+                "[Gap-6] .doc 直连提取失败，回退 OLE2 降级链: %s (%s)", file_path, result[:40] if result else "empty"
+            )
+            return _extract_legacy_ole_chain(file_path, declared_ext or ".doc")
+        return result
     elif ext == ".xlsx":
         return _extract_xlsx_openpyxl(file_path)
     elif ext == ".xls":
-        return _extract_xls(file_path)
+        result = _extract_xls(file_path)
+        # Gap-6 2026-10-11：.xls 直连失败且文件头是 OLE2 → 回退降级链
+        if (is_extraction_notice(result) or not result) and is_ole:
+            logger.warning(
+                "[Gap-6] .xls 直连提取失败，回退 OLE2 降级链: %s (%s)", file_path, result[:40] if result else "empty"
+            )
+            return _extract_legacy_ole_chain(file_path, declared_ext or ".xls")
+        return result
     elif ext == ".txt":
         return _read_text_auto(file_path)
     elif ext == ".pptx":
         return _extract_pptx(file_path)
     elif ext == ".ppt":
-        return _extract_ppt(file_path)
+        result = _extract_ppt(file_path)
+        # Gap-6 2026-10-11：.ppt 直连失败且文件头是 OLE2 → 回退降级链
+        if (is_extraction_notice(result) or not result) and is_ole:
+            logger.warning(
+                "[Gap-6] .ppt 直连提取失败，回退 OLE2 降级链: %s (%s)", file_path, result[:40] if result else "empty"
+            )
+            return _extract_legacy_ole_chain(file_path, declared_ext or ".ppt")
+        return result
     elif ext in IMAGE_EXTENSIONS:
         if not OCR_ENABLED:
             logger.info("[文件解析] OCR 已禁用，跳过图片 OCR: %s", Path(file_path).name)
@@ -816,7 +980,14 @@ def _do_extract_text(file_path: str, ext: str, declared_ext: str = "") -> str:
     elif ext == ".md":
         return _read_text_auto(file_path)
     elif ext == ".wps":
-        return _extract_wps(file_path)
+        result = _extract_wps(file_path)
+        # Gap-6 2026-10-11：.wps 直连失败且文件头是 OLE2 → 回退降级链
+        if (is_extraction_notice(result) or not result) and is_ole:
+            logger.warning(
+                "[Gap-6] .wps 直连提取失败，回退 OLE2 降级链: %s (%s)", file_path, result[:40] if result else "empty"
+            )
+            return _extract_legacy_ole_chain(file_path, declared_ext or ".wps")
+        return result
     else:
         logger.warning("[文件解析] 不支持的文件格式: %s", ext)
         raise UnsupportedFileFormatError(
@@ -1116,7 +1287,11 @@ def _extract_doc(file_path: str) -> str:
                             text_parts.append(clean)
                     except Exception as _e:
                         logger.debug("[silent-except] files.py: line 452 - %s", _e)
-                # 表格、文本流等
+                # 表格、文本流等（可能含合同条款、工程量清单等）
+                # BUG-FIX 2026-10-11（Dead Code Removal）：原实现连续有两个完全相同的
+                # ``elif "text" in name or "table" in name:`` 分支 —— 第二个用旧的
+                # ``errors="ignore"``（违背 2026-10-08 的 ignore→replace 修复），
+                # 且因 if/elif/elif 结构**永远不可达**。已删除，仅保留第一个正确版本。
                 elif "text" in name or "table" in name:
                     data = ole.openstream(stream_name).read()
                     try:
@@ -1125,17 +1300,7 @@ def _extract_doc(file_path: str) -> str:
                         if clean.strip():
                             text_parts.append(clean)
                     except Exception as _e:
-                        logger.debug("[silent-except] files.py: line 452 - %s", _e)
-                # 表格、文本流等
-                elif "text" in name or "table" in name:
-                    data = ole.openstream(stream_name).read()
-                    try:
-                        raw = data.decode("utf-16-le", errors="ignore")
-                        clean = "".join(c for c in raw if c.isprintable() or c in "\n\r\t")
-                        if clean.strip():
-                            text_parts.append(clean)
-                    except Exception as _e:
-                        logger.debug("[silent-except] files.py: line 462 - %s", _e)
+                        logger.debug("[silent-except] files.py: _extract_doc ole - %s", _e)
             if text_parts:
                 return "\n".join(text_parts).strip()
         finally:
@@ -1165,34 +1330,41 @@ def _extract_doc(file_path: str) -> str:
             file_path_str = str(file_path)
             # BUG-FIX 2026-09-18（中）：原为字符串前缀比较，可被
             # `projects_evil` 或 `projects/../..` 绕过，改为真实父子关系判定。
-            if not _is_under_projects_dir(file_path):
-                return ""
-            result = subprocess.run(
-                [antiword_path, "-t", file_path_str],
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-            if result.returncode == 0 and result.stdout:
-                return result.stdout.strip()
+            #
+            # BUG-FIX 2026-10-10：原在此处 `return ""`。空串会被上层判定为
+            # 「解析成功但正文为空」（is_extraction_notice('') 为 False ->
+            # status='success'），而非「无法提取」——于是主文件静默变成空正文，
+            # 解析提取 -> 全局事实/摘要/评分点 -> 目录 -> 正文 整条提示词数据链
+            # 全部基于空上下文生成，且用户全程无感。
+            # 该分支可达性很高：Git for Windows 自带 antiword
+            # (C:\Program Files\Git\mingw64\bin\antiword.EXE)，shutil.which 必然命中。
+            # 正确做法：守卫命中时**跳过该命令行方法**并继续降级链，
+            # 最终落到 return EXTRACT_DOC_NOTICE，让文件如实标为 failed。
+            if _is_under_projects_dir(file_path):
+                result = subprocess.run(
+                    [antiword_path, "-t", file_path_str],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                if result.returncode == 0 and result.stdout:
+                    return result.stdout.strip()
         except Exception:
             logger.warning("doc提取方法3(antiword)失败", exc_info=True)
 
     if catdoc_path:
         try:
             file_path_str = str(file_path)
-            # BUG-FIX 2026-09-18（中）：原为字符串前缀比较，可被
-            # `projects_evil` 或 `projects/../..` 绕过，改为真实父子关系判定。
-            if not _is_under_projects_dir(file_path):
-                return ""
-            result = subprocess.run(
-                [catdoc_path, file_path_str],
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-            if result.returncode == 0 and result.stdout:
-                return result.stdout.strip()
+            # 同上：守卫命中时跳过本方法，而非提前返回空串。
+            if _is_under_projects_dir(file_path):
+                result = subprocess.run(
+                    [catdoc_path, file_path_str],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                if result.returncode == 0 and result.stdout:
+                    return result.stdout.strip()
         except Exception:
             logger.warning("doc提取方法4(catdoc)失败", exc_info=True)
 
@@ -2067,6 +2239,17 @@ _text_cache_lock = threading.Lock()
 _TEXT_CACHE_TTL = 600  # 秒（AI 连续多次分析时避免重复拼接大量文本）
 _TEXT_CACHE_MAX = 50  # 最多缓存 50 个项目的合并文本（每个文本可能很大）
 
+# 2026-10-11 加固（I-10）：项目版本号，防止并发上传/删除时读到中间态并写入陈旧缓存。
+# 每次 _text_cache_clear（即文件上传/删除/重提取等变更）时递增版本号；
+# _text_cache_set 在写入前检查版本是否已变更，若已变更则跳过写入（避免陈旧数据覆写）。
+_project_versions: dict[int, int] = {}
+
+
+def _get_project_version(project_id: int) -> int:
+    """获取当前项目版本号（单调递增，初始为 0）。"""
+    with _text_cache_lock:
+        return _project_versions.get(project_id, 0)
+
 
 def _text_cache_get(project_id: int) -> str | None:
     with _text_cache_lock:
@@ -2081,8 +2264,15 @@ def _text_cache_get(project_id: int) -> str | None:
     return text
 
 
-def _text_cache_set(project_id: int, text: str) -> None:
+def _text_cache_set(project_id: int, text: str, since_version: int | None = None) -> None:
     with _text_cache_lock:
+        # I-10：若版本号已变更（并发上传/删除），跳过写入，避免陈旧数据覆写。
+        if since_version is not None and _project_versions.get(project_id, 0) != since_version:
+            logger.debug(
+                "跳过缓存写入 project=%d: 版本已从 %d 变更为 %d（并发变更）",
+                project_id, since_version, _project_versions.get(project_id, 0),
+            )
+            return
         # BUG-FIX 2026-10-08：此前一次淘汰半数缓存（cache thrashing），
         # 现改为仅淘汰最旧的 1 条（LRU 单条淘汰）
         if len(_text_cache) >= _TEXT_CACHE_MAX:
@@ -2092,9 +2282,17 @@ def _text_cache_set(project_id: int, text: str) -> None:
 
 
 def _text_cache_clear(project_id: int) -> None:
-    """使项目文本缓存失效（上传/删除/重提取/清空后调用，防止 AI 使用旧文本）"""
+    """使项目文本缓存失效（上传/删除/重提取/清空后调用，防止 AI 使用旧文本）
+
+    BUG-FIX 2026-10-11（Race Condition）：此前 ``pop`` 与版本递增分在两个独立的
+    ``with _text_cache_lock`` 块中 —— 两个锁之间的间隙可能被并发读
+    （latest_extracted_text 的 start_version 记录）切入，在 pop 之后、版本
+    递增之前写入陈旧缓存条目且带着**旧**版本号，从而绕过 I-10 版本守卫。
+    现合并为单锁块，保证「缓存清除 + 版本递增」原子完成。
+    """
     with _text_cache_lock:
         _text_cache.pop(project_id, None)
+        _project_versions[project_id] = _project_versions.get(project_id, 0) + 1
 
 
 async def latest_extracted_text(project_id: int) -> str:
@@ -2102,6 +2300,9 @@ async def latest_extracted_text(project_id: int) -> str:
     cached = _text_cache_get(project_id)
     if cached is not None:
         return cached
+
+    # I-10：记录读取起始版本号，若并发变更导致版本递增，写入时跳过
+    start_version = _get_project_version(project_id)
 
     # BUG-FIX 2026-09-16（高 事件循环阻塞）：原实现在 `with get_db()` **内部**执行
     # 多 MB 正文文件的读取与辅助文件截断。数据库连接看上去是在 asyncio 线程里拿的，
@@ -2149,7 +2350,7 @@ async def latest_extracted_text(project_id: int) -> str:
         return raced
 
     result = f"{main_text}\n{supporting_text}".strip()
-    _text_cache_set(project_id, result)
+    _text_cache_set(project_id, result, since_version=start_version)
     return result
 
 
@@ -2389,8 +2590,11 @@ def delete_file(project_id: int, file_id: int) -> dict:
     }
 
 
-def clear_project_texts(project_id: int):
+def clear_project_texts(project_id: int) -> dict:
     """清理项目的提取文本（用于重新上传后重置）
+
+    返回值（Gap-1 2026-10-11 新增）：
+      {status: 'cleared', files_reset: N, tasks_cleared: M}
 
     BUG-FIX 2026-10-05（B6 数据链断裂）：原实现只删 ``texts/`` 目录与合并文本缓存，
     完全不动 ``uploaded_files`` —— 记录仍显示 ``status='success'`` 且
@@ -2398,24 +2602,70 @@ def clear_project_texts(project_id: int):
     空串、合并文本也随之变空，界面上却看不出任何异常（仍显示"已提取"）。
     现在把 DB 侧一并重置为 ``status='pending'`` + 空路径 + 空 message，
     与实际文件状态保持一致（pending 在前端状态映射中已有"待提取"文案）。
-    """
-    texts_dir = PROJECTS_DATA_DIR / str(project_id) / "texts"
-    if texts_dir.exists():
-        shutil.rmtree(texts_dir)
-        texts_dir.mkdir(exist_ok=True)
 
-    try:
-        with get_db() as conn:
-            conn.execute(
-                "UPDATE uploaded_files SET status = 'pending', message = '', "
-                "extracted_text_path = '' WHERE project_id = ?",
-                (project_id,),
-            )
-    except Exception as e:
-        logger.warning("清理项目文本后重置文件状态失败 project=%d: %s", project_id, e)
+    Gap-1 2026-10-11 增强：
+      1. 加上传写入锁保护 —— 防止与并发 save_upload 竞态（清空刚落盘的文件）。
+      2. 清理 file_parse_tasks 终态行 —— 让 GET /tasks/files/status 不再显示
+         已清空项目的旧解析记录。在途 processing 行一律保留。
+      3. 返回结构化结果 —— 便于 DELETE /projects/{id}/texts 端点向前端透出
+         实际重置的文件数与清理的任务行数（响应体不再是 silent void）。
+    """
+    write_lock = _get_upload_write_lock(project_id)
+    with write_lock:
+        texts_dir = PROJECTS_DATA_DIR / str(project_id) / "texts"
+        if texts_dir.exists():
+            shutil.rmtree(texts_dir)
+            texts_dir.mkdir(exist_ok=True)
+
+        # BUG-FIX 2026-10-09（缓存未失效 · 重置后重提取复活旧结果）：只删 texts/ 与
+        # 合并文本缓存，解析结果缓存 _parse_result_cache（TTL 300s）仍以原上传文件路径
+        # 为键保留着上一次的结果 —— 其中可能是降级提示串或空串。用户「清空后重新提取」
+        # 走 re_extract_text 时会按单文件清一次，但走异步重解析入口、或清空后直接触发
+        # 分析链（GET /files/text → latest_extracted_text 回落到重提取）时并不会清，
+        # 于是清空操作在 TTL 内被缓存抵消：界面上显示已重置，拿到的仍是旧文本。
+        # 这里在删目录的同时把该项目全部上传文件的解析缓存一并失效。
+        try:
+            with get_db(readonly=True) as _conn:
+                _rows = _conn.execute(
+                    "SELECT path FROM uploaded_files WHERE project_id = ?",
+                    (project_id,),
+                ).fetchall()
+            for _r in _rows:
+                _p = _r["path"] if hasattr(_r, "keys") else _r[0]
+                if _p:
+                    _clear_parse_cache(str(_p))
+        except Exception as e:
+            logger.warning("清空项目文本后失效解析缓存失败 project=%d: %s", project_id, e)
+
+        files_reset = 0
+        tasks_cleared = 0
+        try:
+            with get_db() as conn:
+                cur = conn.execute(
+                    "UPDATE uploaded_files SET status = 'pending', message = '', "
+                    "extracted_text_path = '' WHERE project_id = ?",
+                    (project_id,),
+                )
+                files_reset = cur.rowcount or 0
+
+                # Gap-1 2026-10-11：同时清理该项目的解析任务终态行（保留 processing 行）
+                # —— 让解析状态端点 GET /tasks/files/status 不再展示已清空项目的历史记录
+                cur2 = conn.execute(
+                    "DELETE FROM file_parse_tasks WHERE project_id = ? AND status IN ('completed', 'failed')",
+                    (project_id,),
+                )
+                tasks_cleared = cur2.rowcount or 0
+        except Exception as e:
+            logger.warning("清理项目文本后重置文件状态失败 project=%d: %s", project_id, e)
 
     # 文本已清空，使合并文本缓存失效
     _text_cache_clear(project_id)
+
+    logger.info(
+        "clear_project_texts project=%d: 重置 %d 个文件状态为 pending，清理 %d 条解析任务终态行",
+        project_id, files_reset, tasks_cleared,
+    )
+    return {"status": "cleared", "files_reset": files_reset, "tasks_cleared": tasks_cleared}
 
 
 def re_extract_text(project_id: int, file_id: int) -> dict:
@@ -2445,7 +2695,17 @@ def re_extract_text(project_id: int, file_id: int) -> dict:
     # 终态写回，而 re_extract 此前完全不碰任务表 —— GET /tasks/files/status 看到的
     # 永远是「上一次上传」的终态，重提取失败在该端点上不可感知（前端进度条一直显示
     # 上一次的 completed）。这里补上同口径的任务行，使两条写入路径状态一致。
-    _create_parse_task(project_id, filename, Path(filename).suffix.lower())
+    try:
+        _create_parse_task(project_id, filename, Path(filename).suffix.lower())
+    except Exception as _task_err:
+        # P-3 加固：任务行创建失败说明 DB 不可用，继续重提取会导致后续
+        # _update_parse_task UPDATE 0 行（终态丢失）。直接返回失败让上游感知。
+        logger.error("重提取任务行创建失败，中止重提取: %s", _task_err)
+        return {
+            "status": "failed",
+            "message": f"任务行创建失败（数据库不可用）: {_task_err}",
+            "filename": filename,
+        }
 
     try:
         extracted_text = extract_text_from_path(str(file_path))
@@ -2501,8 +2761,9 @@ def re_extract_text(project_id: int, file_id: int) -> dict:
 
     with get_db() as conn:
         conn.execute(
-            "UPDATE uploaded_files SET status = ?, message = ?, extracted_text_path = ? WHERE id = ?",
-            (status, message, str(text_path), file_id),
+            "UPDATE uploaded_files SET status = ?, message = ?, extracted_text_path = ? "
+            "WHERE id = ? AND project_id = ?",
+            (status, message, str(text_path), file_id, project_id),
         )
 
     # 清理旧文本文件（DB 已指向新路径后再删，避免中途失败导致新旧皆失）

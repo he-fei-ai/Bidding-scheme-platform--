@@ -9,7 +9,7 @@ from datetime import datetime
 import json
 import logging
 import re
-from typing import ClassVar
+from typing import Any, ClassVar
 
 from ..db import get_db
 from . import consistency_rules as rules
@@ -69,7 +69,15 @@ class ConsistencyAuditor:
 
     # 需要检查的关键事实模式（类级只读常量）
     FACT_PATTERNS: ClassVar[dict[str, str]] = {
-        "工期": r"(?:工期|周期|天数|天)\s*[:：]?\s*(\d+)\s*天",
+        # BUG-FIX 2026-10-10（P1·日历天/个日历天 全部漏抽）：原式只认 `(\d+)\s*天`，
+        # 于是「建设工期：450 日历天」「总工期 450 个日历天」这类招标文件最高频写法
+        # **一个都抽不出来**——而 `_collect_fact_instances` 的注释举的标杆例子
+        # 「建设工期：450 日历天」本身就是抽不出来的。后果：工期事实（关键事实，
+        # 一冲突即 high）在整个审计链路里静默缺席，正文写错工期也不会报冲突。
+        # 现补 `个` 量词与 日历天/自然日/工作日 三种同义单位（与
+        # `facts_service.normalize_fact_value` 的单位归一口径一致），
+        # 并允许标签词与数值之间隔「为/是/约」（「合同工期为 450 日历天」）。
+        "工期": r"(?:工期|周期|天数|天)\s*[:：]?\s*(?:为|是|约)*\s*(\d+)\s*(?:个)?\s*(?:日历天|自然日|工作日|天)",
         # BUG-FIX 2026-10-09（P1·金额单位丢失 → 误报 + 修复建议有害）：原式
         # `(?:...)\s*[:：]?\s*([\d,\.]+)\s*(?:万元|元|百万|千万)?` 只捕获**数字**、
         # 把单位留在非捕获组里统统丢弃。于是「合同价 1200 万元」与「造价 12000000 元」
@@ -86,8 +94,49 @@ class ConsistencyAuditor:
         # 2026-09-29 修复的「安全标准」正则过宽同类）。现把岗位词一并捕获为前缀，
         # 抽取时按岗位拆分事实名（见 extract_facts_from_text），只有**同岗位**数量
         # 不一致才判冲突；裸「人员」（施工/作业等未列举岗位）仍归入「人员数量」。
-        "人员数量": r"(项目经理|技术负责人|技术人员|管理人员|作业人员|施工人员|人员)\s*[:：]?\s*(\d+)\s*人",
-        "资质等级": r"(?:资质|级别|等级)\s*[:：]?\s*([甲乙丙]+[一二三级]?)",
+        "人员数量": r"(项目经理|技术负责人|技术人员|管理人员|作业人员|施工人员|人员)\s*[:：]?\s*(\d+)\s*人"
+        # BUG-FIX 2026-10-11（P2·「本项目共 N 人」整类漏抽）：原式只有「岗位词 + 数字 + 人」
+        # 一种写法，于是「本项目共 20 人参与施工」「合计 30 人到岗」这类**总括式**表述
+        # 一个都抽不出来（中文里总括词在数字前、没有岗位词）。而自动修复侧的结构校验
+        # `rules._PERSONNEL_VALUE_TAIL_RE`（取值后紧跟「人」即放行）却**认**这种写法 ——
+        # 检测路径看不见、修复路径却会改，两侧口径不一致：正文两处「共 20 人」写成
+        # 不一致也不会报冲突，用户改完再审仍会看到残留差异。现补一个总括分支，
+        # 岗位词组留空（`personnel_fact_name("")` 归到通用「人员数量」，与「裸人员」
+        # 同一桶）。
+        # 安全约束（防误抽）：
+        #  1. 必须有总括词（共/合计/共计/总计/总共）开头，且总括词与数字之间**最多**
+        #     隔一个 投入/配备/组织/动员 —— 不允许任填词，因此
+        #     「共发生 3 起事故」「累计 5 人受伤」这类安全章节表述不会被当人数；
+        #  2. 「人」之后禁止紧跟单位/事故量词 —— 排除人天/人月/人工/人次/人年，
+        #     以及事故伤亡类复合词的人受(伤)/人死(亡)/人失(踪)/人遇(难)/人被(困)。
+        #     断言只看「人」后的第一个字，故 受伤/死亡 分别以 受/死 领头被拦下。
+        # HARDEN 2026-10-11（R-1·收窄动词表）：初版动词表含 安排/参与，实测会把
+        # 「共安排 5 人值守」「共参与 12 人投标评审」这类**子集**人数抽进通用「人员
+        # 数量」桶。通用桶不与岗位桶区分（personnel_fact_name("") 归通用），于是同篇
+        # 内「共投入 30 人施工」+「共安排 5 人值守」会互判成 30 vs 5 的假冲突——
+        # 与 2026-10-04 修的「不同岗位归一桶」是同一类结构性误报。现只保留表示
+        # **项目级人力投放**的 投入/配备/组织/动员，剔除表示排班/参与子集的 安排/参与。
+        # 注意动词组是**可选**的，故「共 20 人参与施工」（总括词后无动词）不受影响。
+        # 副作用（HARDEN 2026-10-11·R-13，已知且接受）：R-1 收窄后本分支比 autofix
+        # 的取值结构校验闸门 `rules._PERSONNEL_VALUE_TAIL_RE`（唯一消费者是
+        # `rules.fact_has_keyword_nearby`，rules:431）更窄，「共安排 5 人值守」这类
+        # 写法对**抽取**不可见、对**autofix 就近校验**仍可见——即 2026-10-11 P2 修过
+        # 的「检测看不见、修复会改」在这个子集写法上部分回归。注意 AI 修复通道
+        # `consistency_repair.repair_with_ai` 已无人员数量专用分支（走通用补丁），
+        # 故该不对称只落在 autofix 一条路上。之所以不改闸门：闸门放宽是 F-2 的
+        # 刻意取舍（等宽会把措辞稍变的合法取值整批误拦，用户采纳建议后
+        # 「没有可替换的位置」），而此处触发需「子集短语 + 同值合法短语 + 另一总
+        # 人数」三者同篇共存。完整权衡见 `rules._PERSONNEL_VALUE_TAIL_RE` 的 R-13
+        # 注释；要彻底消除须同时收紧闸门并收敛这里的动词表，两侧同步。
+        r"|(?:(?:共计|总计|合计|总共|共)\s*(?:投入|配备|组织|动员)?\s*)"
+        r"(\d+)\s*人(?!\s*[天次年月工时受死失遇被])",
+        # BUG-FIX 2026-10-10（P1·「资质等级：一级」全部漏抽）：原值捕获组
+        # `([甲乙丙]+[一二三级]?)` 要求以甲/乙/丙开头，于是「资质等级：一级」
+        # 「资质等级：一级建筑业企业」「企业资质：施工总承包一级」这些最标准写法
+        # 全部抽不出 —— 资质等级是关键事实（一冲突即 high），整类事实近乎失效。
+        # 现支持 甲/乙/丙级 与 一/二/三/四级，并允许中间隔 总承包/专业/施工/工程
+        # 这类资格类型词（可多个连用）。
+        "资质等级": r"(?:资质|级别|等级)\s*[:：]?\s*(?:总承包|专业|施工|工程|承包)*\s*([甲乙丙]+级?|[一二三四]级)",
         "质量标准": r"(?:质量|标准|等级)\s*[:：]?\s*(合格|优良|优秀)",
         # BUG-FIX 2026-09-29（正则过宽 → 结构性误报）：原式
         # `(?:安全|事故|伤亡)\s*[:：]?\s*([^,\n]+?)(?:\n|$)` 把冒号做成可选、
@@ -121,6 +170,12 @@ class ConsistencyAuditor:
         """
         facts = []
 
+        # BUG-FIX 2026-10-10（中·非字符串输入直接崩溃）：`re.findall` 对 None /
+        # 数字等非字符串对象抛 TypeError。此前该异常会一路冒泡到 `run_full_audit`
+        # 的兜底 except，把整轮审计降级为 failed —— 用户看到「审计失败」，实际
+        # 只是某处正文为空或 None。这里做防御性归一：空输入一律返回空列表。
+        text = str(text or "")
+
         for fact_type, pattern in self.FACT_PATTERNS.items():
             matches = re.findall(pattern, text, re.IGNORECASE)
             for match in matches:
@@ -133,8 +188,16 @@ class ConsistencyAuditor:
                         fact_name = rules.FACT_AMOUNT
                         value = f"{str(match[0]).strip()}{str(match[1] or '').strip()}"
                     else:
-                        fact_name = rules.personnel_fact_name(str(match[0]))
-                        value = str(match[1]).strip()
+                        # 「人员数量」是两条互斥分支（岗位式 / 总括式「共 N 人」），
+                        # 各带一个数值捕获组 → match 是三元组，数值落在第一个**非空**
+                        # 组上。总括分支的岗位组是空串 → `personnel_fact_name("")` 归到
+                        # 通用「人员数量」，与裸「人员」同一桶。
+                        role = str(match[0]) if len(match) > 0 else ""
+                        fact_name = rules.personnel_fact_name(role)
+                        value = next(
+                            (str(g).strip() for g in match[1:] if str(g).strip()),
+                            "",
+                        )
                 else:
                     fact_name = f"{fact_type}"
                     value = str(match).strip()
@@ -161,32 +224,51 @@ class ConsistencyAuditor:
         前端「提取 N 个事实」恒显示 0。抽取逻辑下沉到本方法后，全量重扫只需跑一次，
         审计数直接由本方法的返回值计算。
         """
-# PERF（2026-10-08）：本方法只读不写，改 readonly 连接，不再在事件循环
+        # PERF（2026-10-08）：本方法只读不写，改 readonly 连接，不再在事件循环
         # 所在的 to_thread 里抢全局写锁。此前用无参 `get_db()`（写连接），与
         # `routers/consistency.py` 里自己写的「纯读必须 readonly」注释自相矛盾，
         # 在生成高峰期会与正文写库争锁、拉长 SSE 延迟。
         with get_db(readonly=True) as conn:
-            # 获取项目摘要（使用notes字段作为摘要）
+            # BUG-FIX 2026-10-09（P0·事实来源张冠李戴 / sqlite3.Row 惰性解引用）：
+            # `conn.execute()` 在 CPython 里**复用同一个 statement 对象**，而
+            # `row_factory=sqlite3.Row` 返回的行是**惰性解引用**的（取值时实时读
+            # statement 当前行，并不缓存列值）。因此「先 fetch 到变量、后面再取列」
+            # 在第二条 `conn.execute()` 执行后就会读到**别人的行**：
+            #   summary_row / sections / facts_row 三个变量彼此互相污染。
+            # 实测后果：`sections` 在 `facts_row = conn.execute(...)` 之后取列，
+            # `section["id"]` 会读出别的 id（本例把 id=2 读成 4）→
+            # ① 冲突 `sources` 里的 `section_<id>` 指向错误章节，前端「定位到该章节」
+            #    跳到无关内容；② `apply_autofix` 的「只改冲突来源章节」闸门用这个 id
+            #    列表 → 改到不在来源里的章节、同时漏掉真正的来源章节。
+            # 修法是**每条语句取完立刻物化为普通 Python 值**，不跨语句持有 Row。
             summary_row = conn.execute(
                 "SELECT notes, bidder_name, industry FROM projects WHERE id = ?",
                 (project_id,),
             ).fetchone()
+            summary = dict(summary_row) if summary_row is not None else None
 
-            # 组合项目信息作为上下文
             summary_text = ""
-            if summary_row:
-                if summary_row["notes"]:
-                    summary_text += f"项目备注: {summary_row['notes']}\n"
-                if summary_row["bidder_name"]:
-                    summary_text += f"投标人: {summary_row['bidder_name']}\n"
-                if summary_row["industry"]:
-                    summary_text += f"行业: {summary_row['industry']}\n"
+            if summary:
+                if summary["notes"]:
+                    summary_text += f"项目备注: {summary['notes']}\n"
+                if summary["bidder_name"]:
+                    summary_text += f"投标人: {summary['bidder_name']}\n"
+                if summary["industry"]:
+                    summary_text += f"行业: {summary['industry']}\n"
 
-            # 获取所有章节内容
-            sections = conn.execute(
-                "SELECT id, title, content FROM sections WHERE project_id = ? ORDER BY sort_order",
-                (project_id,),
-            ).fetchall()
+            # 获取所有章节内容（立即物化，避免被下一条语句污染）
+            sections = [
+                {
+                    "id": r["id"],
+                    "title": r["title"],
+                    "content": r["content"],
+                }
+                for r in conn.execute(
+                    "SELECT id, title, content FROM sections "
+                    "WHERE project_id = ? ORDER BY sort_order",
+                    (project_id,),
+                ).fetchall()
+            ]
 
             # ENHANCE 2026-09-29（双轨制）：读取已确认的全局事实基准。
             # 旧库可能没有 global_facts_json 列（由 _ensure_column 后补），故先判列名。
@@ -194,12 +276,15 @@ class ConsistencyAuditor:
                 "SELECT global_facts_json FROM analysis WHERE project_id = ?",
                 (project_id,),
             ).fetchone()
+            global_facts_json = (
+                facts_row["global_facts_json"] if facts_row is not None else ""
+            )
 
         # 提取所有事实
         all_facts = {}
 
         # 事实基准排在最前：后面生成修复建议时以它为优先目标值
-        for item in parse_stored_items(facts_row["global_facts_json"] if facts_row else ""):
+        for item in parse_stored_items(global_facts_json):
             raw_value = str(item.get("value") or "")
             if not raw_value.strip() or is_placeholder_value(raw_value):
                 continue
@@ -399,43 +484,107 @@ class ConsistencyAuditor:
         会让同一项目的旧冲突永不清除，`GET /consistency/conflicts` 结果无限膨胀，
         用户看到的是一堆已经不存在于正文中的历史冲突。
         修复：本次审计是**全量重扫**，写入前先清空该项目「未解决」的旧冲突
-        （`resolved=1` 的保留作为历史），再以 upsert 写入本次结果，保证
+        （`resolved=1` 的保留作为历史），再写入本次结果，保证
         「一次审计 = 一份当前冲突快照」，且重复执行幂等。
+
+        BUG-FIX 2026-10-09（P2·已解决历史无限膨胀 + upsert 死代码）：
+        `conflict_id` 带微秒时间戳，每次审计都产生全新 ID —— 原实现里的
+        `ON CONFLICT(conflict_id)` 分支**从未被触发过**（是死代码），而
+        「已解决」历史行因为 ID 永不重复，会随每次审计**逐轮累加**：3 轮审计 +
+        每轮手动标记已解决 → 库里留下 3 行同名同值的「已解决」冲突。
+        `GET /consistency/conflicts?state=all` 把它们全部返回，摘要卡片也会
+        重复计数，看起来像同一个问题被修了 3 次。
+
+        修复口径（不改 ID 生成规则、不需要数据库迁移）：
+          1. 先把「已解决」历史折叠为**每个 (project_id, fact_name) 一行**；
+          2. 本次审计仍检出的冲突，若存在同名已解决历史 → **复用该行**
+             （更新取值/来源/严重度并置 resolved=0，即「重新打开」），不新建行；
+          3. 仍无历史时才 INSERT 新 ID。
+        同时移除原 upsert 里的 `resolved = 0` 重置分支 —— 它是埋雷：一旦将来把
+        conflict_id 改成稳定值，用户手动标记的「已解决」会在下一次审计被静默
+        抹回「未解决」。
         """
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         with get_db() as conn:
-            # 清理未解决的旧冲突（本次全量重扫后它们已过期）
+            # 1) 清理未解决的旧冲突（本次全量重扫后它们已过期）
             conn.execute(
                 "DELETE FROM consistency_conflicts "
                 "WHERE project_id = ? AND COALESCE(resolved, 0) = 0",
                 (project_id,),
             )
+
+            # 2) 已解决历史折叠：每个 fact_name 只保留最新一行（避免历史无限累加）
+            keep_ids = [
+                row[0]
+                for row in conn.execute(
+                    """SELECT conflict_id FROM (
+                           SELECT conflict_id,
+                                  ROW_NUMBER() OVER (
+                                      PARTITION BY fact_name
+                                      ORDER BY COALESCE(resolved_at, created_at) DESC,
+                                               id DESC
+                                  ) AS rn
+                           FROM consistency_conflicts
+                           WHERE project_id = ? AND COALESCE(resolved, 0) = 1
+                       ) WHERE rn = 1""",
+                    (project_id,),
+                ).fetchall()
+            ]
+            if keep_ids:
+                placeholders = ",".join("?" for _ in keep_ids)
+                conn.execute(
+                    "DELETE FROM consistency_conflicts "
+                    "WHERE project_id = ? AND COALESCE(resolved, 0) = 1 "
+                    f"AND conflict_id NOT IN ({placeholders})",
+                    (project_id, *keep_ids),
+                )
             for conflict in conflicts:
+                # BUG-FIX 2026-10-08：写库前归一化严重度，杜绝 `severity=''`
+                # 这类脏值（`severity` 列 NOT NULL 但**空串合法**，而
+                # `ORDER BY CASE severity ... END` 若不写 ELSE，未命中 CASE
+                # 的行在 SQLite 里求值为 NULL 并排到最前 → 冲突列表顺序错乱）。
+                severity = rules.normalize_severity(conflict.severity)
+                values_json = self._json_serialize(conflict.values)
+                sources_json = self._json_serialize(conflict.sources)
+
+                # 3) 复用同事实的「已解决」历史行（重新打开），避免重复行累加
+                reused = conn.execute(
+                    "SELECT conflict_id FROM consistency_conflicts "
+                    "WHERE project_id = ? AND fact_name = ? AND COALESCE(resolved, 0) = 1 "
+                    "LIMIT 1",
+                    (project_id, conflict.fact_name),
+                ).fetchone()
+                if reused is not None:
+                    conn.execute(
+                        """UPDATE consistency_conflicts
+                           SET values_json = ?, sources_json = ?, severity = ?,
+                               description = ?, resolved = 0, resolved_value = NULL,
+                               resolved_at = NULL, created_at = ?
+                           WHERE conflict_id = ? AND project_id = ?""",
+                        (
+                            values_json,
+                            sources_json,
+                            severity,
+                            conflict.description,
+                            now_str,
+                            reused["conflict_id"],
+                            project_id,
+                        ),
+                    )
+                    continue
+
                 conn.execute(
                     """INSERT INTO consistency_conflicts
                        (project_id, conflict_id, fact_name, values_json,
                         sources_json, severity, description, created_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-ON CONFLICT(conflict_id) DO UPDATE SET
-                         values_json = excluded.values_json,
-                         sources_json = excluded.sources_json,
-                         severity = excluded.severity,
-                         description = excluded.description,
-                         resolved = 0,
-                         resolved_value = NULL,
-                         resolved_at = NULL,
-                         created_at = excluded.created_at""",
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         project_id,
                         conflict.conflict_id,
                         conflict.fact_name,
-                        self._json_serialize(conflict.values),
-                        self._json_serialize(conflict.sources),
-                        # BUG-FIX 2026-10-08：写库前归一化严重度，杜绝 `severity=''`
-                        # 这类脏值（`severity` 列 NOT NULL 但**空串合法**，而
-                        # `ORDER BY CASE severity ... END` 若不写 ELSE，未命中 CASE
-                        # 的行在 SQLite 里求值为 NULL 并排到最前 → 冲突列表顺序错乱）。
-                        rules.normalize_severity(conflict.severity),
+                        values_json,
+                        sources_json,
+                        severity,
                         conflict.description,
                         now_str,
                     ),
@@ -542,23 +691,28 @@ ON CONFLICT(conflict_id) DO UPDATE SET
                 "SELECT * FROM consistency_conflicts WHERE conflict_id = ? AND project_id = ?",
                 (conflict_id, project_id),
             ).fetchone()
-
-        if not row:
-            return None, None
+            # BUG-FIX 2026-10-09：sqlite3.Row 是**惰性解引用**（读的是连接上那个共享、
+            # 会在 with 块退出时 commit() 被 finalize 掉的预处理语句），旧实现把 Row
+            # 带回块外再取 values_json / sources_json / fact_name，有串列与读到残留内存
+            # 的风险。这里在块内立即物化。同类修复：consistency_auditor.
+            # _collect_fact_instances、consistency_repair._load_context。
+            raw_values = raw_sources = raw_fact_name = None
+            if row:
+                raw_values = row["values_json"] or "[]"
+                raw_sources = row["sources_json"] or "[]"
+                raw_fact_name = row["fact_name"] if "fact_name" in row.keys() else None
 
         import json
 
         try:
-            values = json.loads(row["values_json"])
+            values = json.loads(raw_values)
             if not isinstance(values, list):
                 return None, None
             try:
-                sources = json.loads(row["sources_json"] or "[]")
+                sources = json.loads(raw_sources)
             except (json.JSONDecodeError, TypeError):
                 sources = []
-            return self._build_suggestion(
-                values, sources, fact_name=row["fact_name"] if "fact_name" in row.keys() else None
-            )
+            return self._build_suggestion(values, sources, fact_name=raw_fact_name)
         except Exception as e:
             logger.error("生成修复建议失败: %s", e)
             return None, None
@@ -603,6 +757,7 @@ ON CONFLICT(conflict_id) DO UPDATE SET
             "changed_sections": 0,
             "total_replacements": 0,
             "skipped": [],
+            "filtered": [],
             "message": "",
         }
 
@@ -619,10 +774,16 @@ ON CONFLICT(conflict_id) DO UPDATE SET
                 report["fact_name"] = row["fact_name"] or ""
                 try:
                     values = json.loads(row["values_json"] or "[]")
+                    try:
+                        sources = json.loads(row["sources_json"] or "[]")
+                    except (json.JSONDecodeError, TypeError):
+                        sources = []
                 except (json.JSONDecodeError, TypeError):
-                    values = []
+                    values, sources = [], []
                 if not isinstance(values, list):
                     values = []
+                if not isinstance(sources, list):
+                    sources = []
 
                 # 需要被统一掉的值：与目标值不同、且非空
                 stale_values = []
@@ -636,15 +797,44 @@ ON CONFLICT(conflict_id) DO UPDATE SET
                     report["message"] = "该冲突没有需要替换的旧值（所有取值都等于目标值）"
                     return report
 
-                sections = conn.execute(
-                    "SELECT id, title, content FROM sections "
-                    "WHERE project_id = ? AND content IS NOT NULL AND content != '' "
-                    "ORDER BY sort_order, id",
-                    (project_id,),
-                ).fetchall()
+                # BUG-FIX 2026-10-09（P1·autofix 过度替换污染正文）：两道防护闸门。
+                # 闸门一 —— 章节归属：只改冲突来源章节（sources_json 里的
+                # `section_<id>`）。此前扫的是**全文所有章节**，于是「工期 45 天」
+                # 的修复会顺手把「钢筋直径 30 mm」改成 45 mm。
+                # 闸门二 —— 标签词就近：见下方 `_keep_occurrence`。
+                source_section_ids = [
+                    int(sid)
+                    for sid in rules.extract_source_section_ids(sources)
+                    if sid is not None
+                ]
+                scope_limited = bool(
+                    rules.autofix_scope_to_source_sections() and source_section_ids
+                )
+                if scope_limited:
+                    placeholders = ",".join("?" for _ in source_section_ids)
+                    sections = conn.execute(
+                        "SELECT id, title, content FROM sections "
+                        "WHERE id IN (" + placeholders + ") "
+                        "AND content IS NOT NULL AND content != '' "
+                        "ORDER BY sort_order, id",
+                        (*source_section_ids,),
+                    ).fetchall()
+                    report["scoped_section_ids"] = source_section_ids
+                else:
+                    sections = conn.execute(
+                        "SELECT id, title, content FROM sections "
+                        "WHERE project_id = ? AND content IS NOT NULL AND content != '' "
+                        "ORDER BY sort_order, id",
+                        (project_id,),
+                    ).fetchall()
+                    if not source_section_ids:
+                        # 无章节来源（旧数据只有摘要/基准来源）→ 范围无法限定
+                        report["scope_fallback_reason"] = "冲突无章节来源，已回退全文扫描"
 
                 # 逐章节计算替换；先全部算完再决定是否落库
                 planned: list[tuple[int, str, str]] = []  # (section_id, title, new_content)
+                require_keyword = rules.autofix_requires_fact_keyword()
+                fact_name = report["fact_name"]
                 for section in sections:
                     content = section["content"] or ""
                     present = {
@@ -654,13 +844,55 @@ ON CONFLICT(conflict_id) DO UPDATE SET
                     }
                     if not present:
                         continue
-                    result = text_patch.replace_values(content, present)
+                    filtered_count = 0
+
+                    # 闸门二：取值附近必须出现该事实的标签词（仅对短数字最敏感，
+                    # 但对所有取值统一执行，避免「同章内另一处无关数字」被误改）。
+                    def _keep_occurrence(
+                        start: int, end: int, _content=content
+                    ) -> bool:
+                        nonlocal filtered_count
+                        if rules.fact_has_keyword_nearby(
+                            _content, start, end, fact_name
+                        ):
+                            return True
+                        filtered_count += 1
+                        return False
+
+                    result = text_patch.replace_values(
+                        content,
+                        present,
+                        keep=_keep_occurrence if require_keyword else None,
+                    )
                     if result["errors"] or not result["changed"]:
+                        detail = "；".join(result["errors"])
+                        if not detail and filtered_count:
+                            # BUG-FIX 2026-10-10（P1·就近校验把「正确拦截」误报成
+                            # 「修复失败」）：整章取值全被就近校验拦下，说明这些取值
+                            # **不属于本事实**——例如人员数量冲突（20 vs 30）修复时，
+                            # 同章「技术人员 20 人」「钢筋直径 20 mm」里的 20 被正确
+                            # 拒绝。这是闸门正常工作，不是失败：若据此把冲突留在未解决
+                            # 态，用户会反复点「采纳修复」反复看到失败，冲突永远关不掉，
+                            # 而正文其实已经改对。单独计入 filtered 并照常关闭冲突；
+                            # 只有真正报错、或没有任何拦截却仍未改动，才算 skipped。
+                            report["filtered"].append(
+                                {
+                                    "section_id": section["id"],
+                                    "title": section["title"],
+                                    "occurrences": filtered_count,
+                                    "reason": (
+                                        f"全部 {filtered_count} 处取值附近未出现"
+                                        f"「{fact_name}」的标签词，判定为其他事实，已跳过"
+                                    ),
+                                }
+                            )
+                            continue
+                        detail = detail or "替换后内容无变化"
                         report["skipped"].append(
                             {
                                 "section_id": section["id"],
                                 "title": section["title"],
-                                "reason": "；".join(result["errors"]) or "替换后内容无变化",
+                                "reason": detail,
                             }
                         )
                         continue
@@ -725,6 +957,11 @@ ON CONFLICT(conflict_id) DO UPDATE SET
                     f"已修改 {len(planned)} 个章节、共 {report['total_replacements']} 处，"
                     f"统一为：{new_value}"
                 )
+                if report["filtered"]:
+                    report["message"] += (
+                        f"；另有 {len(report['filtered'])} 个章节的取值经就近校验"
+                        "判定为其他事实，已按设计跳过"
+                    )
                 logger.info(
                     "一致性修复落文成功: conflict=%s, 章节=%d, 替换=%d",
                     conflict_id,
@@ -756,7 +993,7 @@ ON CONFLICT(conflict_id) DO UPDATE SET
             facts_count = sum(len(instances) for instances in all_facts.values())
             conflicts = self.detect_conflicts(project_id, all_facts=all_facts)
 
-# 统计章节数（纯读 → readonly 连接，见 _collect_fact_instances 的 PERF 说明）
+            # 统计章节数（纯读 → readonly 连接，见 _collect_fact_instances 的 PERF 说明）
             with get_db(readonly=True) as conn:
                 total_sections = conn.execute(
                     "SELECT COUNT(*) as cnt FROM sections WHERE project_id = ?",

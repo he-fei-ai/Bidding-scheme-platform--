@@ -138,5 +138,5 @@ def test_fetch_raw_template_no_warning(caplog):
     with caplog.at_level(logging.WARNING):
         raw = get_prompt(key)
     assert raw.strip() == _ALL_PROMPTS[key]["content"].strip()
-    assert "__L1_TITLE__" in raw  # 未渲染的原始模板（DB 默认内容）
+    assert "{L1_TITLE}" in raw  # 未渲染的原始模板（DB 默认内容）
     assert not [r for r in caplog.records if "missing variables" in r.getMessage()]

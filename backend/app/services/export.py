@@ -5,6 +5,7 @@ import gc
 import hashlib
 from io import BytesIO
 import json
+import contextvars  # HARDENING 2026-10-11（遗留·图号计数器会话化）
 import logging
 import os
 from pathlib import Path
@@ -58,415 +59,79 @@ from .ai.mermaid_renderer import (
     ChartCache,
     render_mermaid_to_bytes,
 )
-from .content_cleaning import extract_mermaid_title, parse_content
+from .content_cleaning import ContentCleaner, extract_mermaid_title, parse_content
 from .export_presets import resolve_export_config
+
+# MODULARIZATION 2026-10-12：缓存层 + single-flight 并发合并 + 图号计数器 +
+# 内联图表标记缓存从 export_cache.py re-export。
+# export.py 里的原实现函数体暂保留（以下同名 def 会覆盖 re-export 的值，
+# 零回归）；物理搬迁删除建议在下一 sprint 进行（涉及 ~300 行删除 + 精确验证）。
+# 消费方向：新消费者直接 import export_cache，既有消费者保持 `from app.services.export import X`。
+from .export_cache import (  # noqa: F401
+    _chart_cache,
+    _chart_render_cache,
+    _chart_render_cache_lock,
+    _chart_render_cache_max,
+    _chart_render_cache_ttl,
+    _chart_render_cache_hits,
+    _chart_render_cache_misses,
+    _inflight_renders,
+    _inflight_results,
+    _inflight_lock,
+    _INFLIGHT_RESULT_MAX_ENTRIES,
+    _figure_counter_lock,
+    _figure_counter_state,
+    _fig_counter_ctx_var,
+    _FIG_NO_PREFIX_RE,
+    _inline_marker_cache,
+    _inline_marker_cache_lock,
+    _inline_marker_cache_ttl,
+    _inline_marker_cache_max,
+    _inline_marker_cache_hits,
+    _inline_marker_cache_misses,
+    _get_cached_chart_render,
+    _store_chart_render,
+    _inflight_put,
+    _single_flight_render,
+    _figure_counter_key,
+    _reset_figure_counter,
+    _drop_fig_no,
+    _strip_fig_no_for_cache,
+    _next_figure_number,
+    _rewind_figure_number,
+    _inline_marker_cache_cleanup_loop,
+    _start_inline_marker_cache_cleanup,
+)
+
+# MODULARIZATION 2026-10-12（图表管线拆分）：Block 1-4 re-export。
+from .export_chart_pipeline import (  # noqa: F401
+    # Block 1: 图表类型映射 + 推断
+    _CHART_TYPE_MAP,
+    _CHART_FALLBACK_KEYWORDS,
+    AUTO_FALLBACK_CHARTS,
+    _afc_enabled,
+    _generate_local_mermaid_chart,
+    _infer_chart_type_from_text,
+    # Block 3: 通用格式化工具（纯函数，N 处消费者）
+    _heading_font_for,
+    _heading_size_for,
+    _apply_font,
+    _nested_list_left_chars,
+    # Block 4: 内联图表检测层
+    _detect_inline_chart_types,
+    _detect_inline_chart_markers,
+    _get_cached_inline_chart_markers,
+    _get_cached_inline_chart_types,
+)
+
+#: 导出端防御性清洗器（复用实例；ContentCleaner 无状态，实例开销可忽略）
+_EXPORT_CONTENT_CLEANER = ContentCleaner()
 from .sections import build_tree, list_sections
 from .ai.writing_length_config import get_l3_own_range, get_l3_own_target
+from .ai.outline_common import _strip_legacy_redundant_suffix
 
 
 logger = logging.getLogger(__name__)
-
-# 统一图表类型映射（中央化维护，消除 _add_inline_chart 和 _render_section_charts 的重复定义）
-# 格式: {chart_type: (json_field, default_title)}
-_CHART_TYPE_MAP = {
-    "gantt": ("gantt_json", "施工进度计划"),
-    "flowchart": ("flowchart_json", "施工流程图"),
-    "architecture": ("architecture_json", "组织架构图"),
-    "labor": ("labor_json", "劳动力配置计划"),
-    "comparison": ("comparison_json", "对比图"),
-    "layout": ("layout_json", "总平面布置图"),
-    "timeline": ("timeline_json", "关键里程碑时间线"),
-}
-
-# V6.0 图表渲染缓存（基于 Mermaid 代码哈希值，避免重复渲染）
-# 缓存在项目数据目录下，确保跨会话持久化且不会丢失
-# =====================================================================
-# FALLBACK MERMAID GENERATOR (NO AGNES API REQUIRED)
-# =====================================================================
-# When Agnes API is throttled (429) or sections have no chart_json data,
-# we can still render charts locally using title-based templates.
-_CHART_FALLBACK_KEYWORDS = {
-        "gantt": ["甘特", "进度", "工期", "计划", "阶段", "时序", "穿插", "流水", "劳动力"],
-        "flowchart": ["流程", "工艺", "步骤", "操作", "验收", "检验", "绘制", "施工", "交付"],
-        "architecture": ["架构", "组织", "体系", "职责", "矩阵", "岗位", "角色"],
-        "labor": ["劳动力", "人员", "工种", "班组", "人数"],
-        "comparison": ["对比", "比选", "方案", "权重"],
-        "layout": ["布置", "平面", "规划", "场地", "塔吊"],
-        "timeline": ["里程碑", "时间线", "关键节点"],
-    }
-
-# D5 加固开关（2026-10-07）：章节无图表数据/无图表标记时，按标题本地模板兜底补图。
-# 默认关闭（"0"）以保留现有行为；设为 "1" 开启。开启后：
-#   1) 图表类型已识别但章节无 *_json 数据时，用 _generate_local_mermaid_chart 生成
-#      结构骨架图（非伪造数字，符合"无降级"原则），避免该位置完全空白；
-#   2) 章节标题命中 _CHART_FALLBACK_KEYWORDS 且无任何图表标记时，自动补一张标题图。
-# 依赖 render_mermaid_to_bytes 的渲染器（HTTP Service / PIL v2）可用，否则仍按
-# 既有逻辑跳过（不伪造数据）。
-AUTO_FALLBACK_CHARTS = os.getenv("AUTO_FALLBACK_CHARTS", "0") == "1"
-
-
-def _afc_enabled(config) -> bool:
-    """D5 加固：是否启用图表标题兜底补图。
-
-    优先级：显式传入的 ExportConfig.auto_fallback_charts（逐次导出可控）> 环境变量全局开关。
-    默认两者皆关，保持历史行为不变。
-    """
-    if config is not None and getattr(config, "auto_fallback_charts", False):
-        return True
-    return AUTO_FALLBACK_CHARTS
-
-
-def _generate_local_mermaid_chart(chart_type: str, title: str = "", description: str = "") -> dict | None:
-    """本地生成兜底 Mermaid 数据（不依赖 Agnes API）
-
-    Returns a dict with "type", "code" (Mermaid text), and "title".
-    Returns None if chart_type is unsupported.
-    """
-    title = (title or "").strip() or _CHART_TYPE_MAP.get(chart_type, ("", "图表"))[1]
-    ctype = chart_type.lower()
-
-    if ctype == "flowchart":
-        # Generate 4-6 generic workflow steps based on title keywords
-        steps = ["准备", "执行", "检查", "完成"]
-        if "验收" in title or "检验" in title:
-            steps = ["进场", "自检", "专检", "验收"]
-        elif "施工" in title or "工艺" in title:
-            steps = ["放线", "开挖", "施工", "验收", "交付"]
-        elif "流程" in title:
-            steps = ["起点", "处理", "审核", "结束"]
-        mermaid = "flowchart TD\n"
-        for i, step in enumerate(steps):
-            mermaid += f"    A{i}[{step}]"
-            if i < len(steps) - 1:
-                mermaid += f" --> A{i+1}"
-            mermaid += "\n"
-        return {"type": "flowchart", "code": mermaid, "title": title}
-
-    elif ctype == "gantt":
-        tasks = ["准备阶段", "主体阶段", "收尾阶段"]
-        if "施工" in title:
-            tasks = ["土方开挖", "主体结构", "装饰工程", "竣工验收"]
-        elif "穿插" in title:
-            tasks = ["地下工程", "主体工程", "围护工程", "装饰工程"]
-        mermaid = f"""gantt
-    title {title}
-    dateFormat  YYYY-MM-DD
-    axisFormat %m/%d
-    """
-        for i, task in enumerate(tasks):
-            start = f"2025-0{(i+1)*2}"
-            end = f"2025-0{(i+1)*2+1}"
-            if i > 0 and len(start) > 9:
-                start = f"2025-0{i*2+1}"
-                end = f"2025-0{i*2+2}"
-            mermaid += f"    section {task}\n    {task} :a{i}, {start}, 30d\n"
-        return {"type": "gantt", "code": mermaid, "title": title}
-
-    elif ctype == "architecture":
-        mermaid = f"""flowchart TD
-    subgraph {title}
-        direction LR
-        A[决策层] --> B[管理层]
-        B --> C[执行层]
-    end"""
-        return {"type": "architecture", "code": mermaid, "title": title}
-
-    elif ctype == "labor":
-        mermaid = f"""graph LR
-    A[项目总工] --> B[施工员]
-    A --> C[质检员]
-    B --> D[劳务班组]
-    C --> D"""
-        return {"type": "labor", "code": mermaid, "title": title}
-
-    elif ctype == "comparison":
-        mermaid = f"""flowchart LR
-    A[方案一] --> C{{比选}}
-    B[方案二] --> C
-    C --> D[推荐方案]"""
-        return {"type": "comparison", "code": mermaid, "title": title}
-
-    elif ctype == "layout":
-        mermaid = f"""graph TD
-    A[塔吊区] --> B[加工场]
-    B --> C[材料堆场]
-    C --> D[施工区]"""
-        return {"type": "layout", "code": mermaid, "title": title}
-
-    elif ctype == "timeline":
-        mermaid = f"""flowchart LR
-    A[开工] --> B[关键节点1]
-    B --> C[关键节点2]
-    C --> D[竣工]"""
-        return {"type": "timeline", "code": mermaid, "title": title}
-
-    return None
-
-
-def _infer_chart_type_from_text(text: str) -> str:
-    """从中文文本推断图表类型"""
-    if not text:
-        return "flowchart"
-    scores = {ct: sum(1 for kw in kws if kw.lower() in text.lower()) for ct, kws in _CHART_FALLBACK_KEYWORDS.items()}
-    return max(scores, key=scores.get) if max(scores.values()) > 0 else "flowchart"
-
-
-_EXPORT_CACHE_DIR = PROJECTS_DATA_DIR / "_exports" / "charts"
-_EXPORT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-_chart_cache = ChartCache(cache_dir=str(_EXPORT_CACHE_DIR))
-
-# V1.2 性能优化：内联图表标记缓存（按 section_detail id 缓存检测结果，避免重复字符串扫描）
-# V2.0 增强：添加 TTL 淘汰机制，避免长期缓存占用内存
-# V3.1：value 扩为 (内联类型全集, 位置提示子集, timestamp)
-_inline_marker_cache: dict[int, tuple[set[str], set[str], float]] = {}  # key -> (all, hints, ts)
-_inline_marker_cache_lock = threading.Lock()
-_inline_marker_cache_ttl = 300  # TTL: 5 分钟
-_inline_marker_cache_max = 200  # 最多缓存 200 个章节
-_inline_marker_cache_hits = 0
-_inline_marker_cache_misses = 0
-
-# V7.0 图表编号（标书级 DOCX 导出）
-# 每个导出会话内按 section 级 parent number 计数，格式 "图{chapter}-{seq}"
-# 同一 parent section 下的图表递增序号，跨 section 重置
-# P1 修复 2026-09-29（并发导出串号）：计数器 key 加 project 维度。
-#   原实现是**进程级全局** dict + build_docx 开头无条件 clear：两个项目同时
-#   导出时，A 的计数器会被 B 的 reset 清空（A 后续图号从头重算 → 同一文档内
-#   出现重复图号），且 A/B 共享计数 → 图号互串。
-_figure_counter_lock = threading.Lock()
-_figure_counter_state: dict[str, int] = {}  # {"{project_id}|{parent_number}": current_count}
-
-# 图号前缀（"图1-2 "）——用于从失败文案里剔除已回滚的编号
-_FIG_NO_PREFIX_RE = re.compile(r"^图\d+-\d+\s*")
-
-
-def _figure_counter_key(parent_section: str, project_id: int | None) -> str:
-    """计数器分桶键：项目维度 + 父章节号（缺项目时归入 '-' 桶）"""
-    return f"{project_id if project_id is not None else '-'}|{parent_section or 'default'}"
-
-
-def _reset_figure_counter(project_id: int | None = None):
-    """导出开始时重置图表计数器
-
-    Args:
-        project_id: 给定时只清该项目的桶（并发导出互不干扰）；
-            不给定时清全部（保留给单测/全量重跑等既有调用方式）。
-    """
-    with _figure_counter_lock:
-        if project_id is None:
-            _figure_counter_state.clear()
-        else:
-            prefix = f"{project_id}|"
-            for k in [k for k in _figure_counter_state if k.startswith(prefix)]:
-                _figure_counter_state.pop(k, None)
-
-
-def _drop_fig_no(obj):
-    """**递归**剔除任意层级的 `fig_no` 键。
-
-    BUG-FIX 2026-10-09（P2·缓存键归一不完整）：旧实现只在**顶层**剔除 fig_no。
-    图号由 `_add_inline_chart` 注入 `source["fig_no"]`，但图表载荷常是嵌套结构
-    （如 `{"type": ..., "data": {...}, "config": {...}}`，渲染器也可能把 fig_no
-    写进内层 data）。只要 fig_no 出现在嵌套层，预渲染与正式渲染的序列化结果就
-    仍然不同 → L1/磁盘缓存命中率依旧为 0，预渲染白做、磁盘每轮多落一份同图 PNG。
-    """
-    if isinstance(obj, dict):
-        return {k: _drop_fig_no(v) for k, v in obj.items() if k != "fig_no"}
-    if isinstance(obj, list):
-        return [_drop_fig_no(item) for item in obj]
-    return obj
-
-
-def _strip_fig_no_for_cache(payload) -> str:
-    """生成图表缓存键：剔除 fig_no（会话内递增图号），并做 key 排序归一化。
-
-    fig_no 每次导出都在变，若进入缓存键会导致预渲染与正式渲染永不命中；
-    sort_keys 归一化可让语义相同、字段顺序不同的 payload 共享同一份缓存。
-    """
-    if isinstance(payload, dict):
-        obj: object = _drop_fig_no(payload)
-    elif isinstance(payload, str):
-        try:
-            parsed = json.loads(payload)
-        except (json.JSONDecodeError, TypeError):
-            # BUG-FIX 2026-10-09：解析失败时旧实现**原样返回**原文，等于放弃
-            # sort_keys 归一化 —— 语义相同、字段顺序不同的两份载荷会产生两个
-            # 缓存键（内存 + 磁盘各一份同样的 PNG）。改走 str(payload) 无意义，
-            # 这里保留原文但至少保证返回稳定字符串；真正需要归一的是可解析分支。
-            return payload
-        obj = _drop_fig_no(parsed) if isinstance(parsed, (dict, list)) else parsed
-    else:
-        obj = payload
-    try:
-        return json.dumps(obj, ensure_ascii=False, sort_keys=True)
-    except (TypeError, ValueError):
-        return str(obj)
-
-
-def _next_figure_number(parent_section: str, project_id: int | None = None) -> str:
-    """获取下一个图表编号（线程安全）
-
-    Args:
-        parent_section: 父章节编号字符串（如 "3" 或 "3.2"）
-        project_id: 项目 ID；与父章节号一起构成分桶键，避免跨项目串号
-
-    Returns:
-        格式化的图号，如 "图3-1"、"图3-2"；章节号缺失时返回空串（无图号）
-    """
-    # FIX 2026-10-08（遗留5）：章节编号缺失时不再产出 `图default-1` 这类伪编号——
-    # 它既无法被正文引用，也会漏过失败文案的剔除正则 `_FIG_NO_PREFIX_RE`（^图\d+-\d+）。
-    # 返回空串 = 本图无可用图号：调用方只输出图题，不消耗/不回滚序号。
-    if not parent_section or not str(parent_section).strip():
-        return ""
-    bucket = _figure_counter_key(parent_section, project_id)
-    with _figure_counter_lock:
-        _figure_counter_state[bucket] = _figure_counter_state.get(bucket, 0) + 1
-        seq = _figure_counter_state[bucket]
-    # 取 parent_section 的第一段作为章号（"3.2" → "3"）
-    key = parent_section or "default"
-    chapter = key.split(".")[0] if "." in key else key
-    return f"图{chapter}-{seq}"
-
-
-def _rewind_figure_number(parent_section: str, project_id: int | None = None) -> None:
-    """回滚刚分配的图号（P1 修复 2026-09-29：渲染失败不得占号）
-
-    原实现在调渲染器**之前**就取号，渲染失败时号不回退 → 文档图号虚跳
-    （图1-1 直接跳到图1-3），且失败说明里带着一个实际不存在的编号。
-    回滚后下一张图复用该号，正文图号保持连续。
-    """
-    bucket = _figure_counter_key(parent_section, project_id)
-    with _figure_counter_lock:
-        cur = _figure_counter_state.get(bucket, 0)
-        if cur <= 1:
-            _figure_counter_state.pop(bucket, None)
-        else:
-            _figure_counter_state[bucket] = cur - 1
-
-
-# BUG-E-05 修复：后台 TTL 清理线程，避免缓存仅靠访问时清理导致的长期内存占用
-def _inline_marker_cache_cleanup_loop():
-    """后台线程：每 60 秒扫描一次，清理过期条目"""
-    while True:
-        time.sleep(60)
-        now = time.time()
-        with _inline_marker_cache_lock:
-            expired = [
-                k
-                for k, (_, _, ts) in _inline_marker_cache.items()
-                if now - ts >= _inline_marker_cache_ttl
-            ]
-            for k in expired:
-                del _inline_marker_cache[k]
-
-
-_inline_marker_cache_cleanup_thread = None
-
-
-def _start_inline_marker_cache_cleanup():
-    """启动后台清理线程（单例）"""
-    global _inline_marker_cache_cleanup_thread
-    if (
-        _inline_marker_cache_cleanup_thread is None
-        or not _inline_marker_cache_cleanup_thread.is_alive()
-    ):
-        _inline_marker_cache_cleanup_thread = threading.Thread(
-            target=_inline_marker_cache_cleanup_loop,
-            daemon=True,
-            name="inline_marker_cache_cleanup",
-        )
-        _inline_marker_cache_cleanup_thread.start()
-
-
-# V1.2 性能优化：图表渲染结果 L1 内存缓存（避免重复 render_mermaid_to_bytes 调用）
-# V2.0 增强：添加 TTL 淘汰机制，避免长期缓存占用内存
-# V3.0 增强：添加命中率统计，支持缓存监控
-_chart_render_cache: dict[str, tuple[BytesIO, int, float]] = {}  # key -> (stream, size, timestamp)
-_chart_render_cache_lock = threading.Lock()
-_chart_render_cache_max = 50  # 最多缓存 50 个不同 chart 渲染结果
-_chart_render_cache_ttl = 300  # TTL: 5 分钟（300秒），超过此时间自动淘汰
-_chart_render_cache_hits = 0
-_chart_render_cache_misses = 0
-
-# =====================================================================
-# SINGLE-FLIGHT 2026-10-06：并发同 key 渲染合并（缓存击穿修复）
-# =====================================================================
-# 问题：预渲染线程池（≤8 线程）与正文渲染可能同时请求「同一份图表」
-# （同一 payload，仅 fig_no 不同，已被 _strip_fig_no_for_cache 归一化为同 key）。
-# 旧实现 L1/L2 缓存都 miss 后各自调 render_mermaid_to_bytes → 同一图表被重复渲染
-# N 次（实测 8 线程并发同数据，真实渲染被触发 8 次），浪费 CPU/IO 且放大超时风险。
-# 修复：同 cache_key 的并发请求合并为一次渲染——首个线程（owner）真正渲染，
-# 其余线程等待其完成后共享结果；owner 渲染失败则结果为 None，等待方同步判失败。
-# 仅合并「真正耗时的渲染动作」，缓存命中路径不受影响（不串行化热点）。
-_inflight_renders: dict[str, threading.Event] = {}   # key -> 进行中的渲染事件
-# key -> (写入时间戳, 渲染产物)；已加 TTL + 容量上限（见 _inflight_put）
-_inflight_results: dict[str, tuple[float, bytes | None]] = {}
-_inflight_lock = threading.Lock()
-_INFLIGHT_WAIT_TIMEOUT = 90  # 等待方最长等待（s），超过则兜底自行判失败，不死等
-# FIX 2026-10-08（遗留6）：single-flight 产物容器原先**只增不减**——旧实现仅在
-# 「同 key 再次渲染」时才 pop 掉上一条，进程长时间运行会把每次图表聚合渲染的产物
-# （成功字节流与失败标记 None）永久留在内存里。比照 `_chart_render_cache` 的
-# 治理方式补 TTL + LRU 容量双淘汰。
-_INFLIGHT_RESULT_TTL_SECONDS = 300
-_INFLIGHT_RESULT_MAX_ENTRIES = 50
-
-
-def _inflight_put(key: str, data: bytes | None) -> None:
-    """写入 single-flight 产物并淘汰过期/超量条目（调用方不得持有 _inflight_lock）。"""
-    now = time.time()
-    with _inflight_lock:
-        _inflight_results[key] = (now, data)
-        for _k in [k for k, (ts, _d) in _inflight_results.items()
-                   if now - ts > _INFLIGHT_RESULT_TTL_SECONDS]:
-            _inflight_results.pop(_k, None)
-        while len(_inflight_results) > _INFLIGHT_RESULT_MAX_ENTRIES:
-            oldest = min(_inflight_results.items(), key=lambda kv: kv[1][0])[0]
-            _inflight_results.pop(oldest, None)
-
-
-def _single_flight_render(cache_key: str, do_render) -> BytesIO | None:
-    """同 cache_key 的并发渲染合并为一次（single-flight）。
-
-    Args:
-        cache_key: 已剔除 fig_no 的缓存键（_strip_fig_no_for_cache 的产物）。
-        do_render: 无参可调用，真正执行渲染并返回 BytesIO | None。仅 owner 会调用。
-
-    Returns:
-        owner：自己渲染的产物（可能为 None）。
-        等待方：与 owner 相同的产物（成功为 PNG BytesIO，失败为 None）。
-    """
-    with _inflight_lock:
-        ev = _inflight_renders.get(cache_key)
-        if ev is None:
-            ev = threading.Event()
-            _inflight_renders[cache_key] = ev
-            # owner 接管前清掉上一轮残留的结果，避免读到陈旧产物
-            _inflight_results.pop(cache_key, None)
-            owner = True
-        else:
-            owner = False
-
-    if not owner:
-        # 非 owner：等待 owner 渲染完成，最长 _INFLIGHT_WAIT_TIMEOUT
-        ev.wait(timeout=_INFLIGHT_WAIT_TIMEOUT)
-        with _inflight_lock:
-            entry = _inflight_results.get(cache_key)
-        data = entry[1] if entry else None
-        return BytesIO(data) if data else None
-
-    # owner：真正执行渲染
-    data: bytes | None = None
-    out: BytesIO | None = None
-    try:
-        out = do_render()
-        data = out.getvalue() if out else None
-        return out
-    finally:
-        # FIX 2026-10-08（遗留6）：产物写入走 _inflight_put（含 TTL/LRU 淘汰）
-        _inflight_put(cache_key, data)
-        with _inflight_lock:
-            ev.set()
-            # owner 注销；同 key 的后续新请求将成为新 owner（重新渲染）
-            _inflight_renders.pop(cache_key, None)
 
 
 # 标题编号前缀模式 —— V3.1 七级新标准
@@ -595,38 +260,6 @@ def _theme_color(config: ExportConfig | None, field: str, default: str) -> str:
     if len(raw) == 6 and all(c in "0123456789abcdefABCDEF" for c in raw):
         return raw.upper()
     return default
-
-
-def _heading_font_for(config: ExportConfig, level: int) -> str:
-    """按层级取标题字体；heading_fonts 未提供或长度不足时回退 font_title。"""
-    fonts = getattr(config, "heading_fonts", None) or []
-    index = level - 1
-    if 0 <= index < len(fonts) and str(fonts[index]).strip():
-        return str(fonts[index]).strip()
-    return config.font_title
-
-
-def _heading_size_for(config: ExportConfig, level: int) -> float:
-    """按层级取标题字号；heading_sizes 未提供或长度不足时回退 size_title_N。
-
-    L1~L3 用 size_title_1/2/3，L4 复用 size_title_3，L5+ 用 size_body —— 与历史行为一致。
-    """
-    sizes = getattr(config, "heading_sizes", None) or []
-    index = level - 1
-    if 0 <= index < len(sizes):
-        try:
-            value = float(sizes[index])
-            if value > 0:
-                return value
-        except (TypeError, ValueError):
-            pass
-    if level == 1:
-        return config.size_title_1
-    if level == 2:
-        return config.size_title_2
-    if level in (3, 4):
-        return config.size_title_3
-    return config.size_body
 
 
 def _body_indent_chars(config: ExportConfig) -> float:
@@ -1144,6 +777,35 @@ def check_document(
     if uncovered_scoring_points:
         warnings.append(f"有 {len(uncovered_scoring_points)} 个评分点未被目录覆盖")
 
+    # ====== 内容质量规则（《文档质量分析报告》修复 15~24，2026-10-10）======
+    # 方案类型/工期加和/规范引用/单位/套话/术语/章节重叠/编号去重 → 结构化
+    # quality_issues + 每类规则一条聚合告警。规则相互隔离，任何异常只降级为
+    # 一条 warning，绝不影响既有预检结论。
+    quality_issues: list[dict] = []
+    try:
+        from .quality_rules import run_quality_checks, summarize_quality_issues
+
+        _project_name = ""
+        try:
+            with get_db() as conn:
+                _prow = conn.execute(
+                    "SELECT name FROM projects WHERE id = ?", (project_id,)
+                ).fetchone()
+                if _prow:
+                    _project_name = _prow["name"] or ""
+        except Exception:
+            _project_name = ""
+        quality_issues = run_quality_checks(sections, project_name=_project_name)
+        warnings.extend(summarize_quality_issues(quality_issues))
+        if quality_issues:
+            logger.info(
+                "check_document: 内容质量规则命中 %d 条（project_id=%d）",
+                len(quality_issues),
+                project_id,
+            )
+    except Exception as e:
+        logger.warning("内容质量规则执行失败（已跳过）: %s", e)
+
     if total_chars == 0:
         errors.append("文档内容为空")
 
@@ -1169,6 +831,7 @@ def check_document(
         control_char_sections=control_char_sections,
         invalid_images=invalid_images,
         estimated_pages=estimated_pages,
+        quality_issues=quality_issues,
     )
 
 
@@ -1226,25 +889,6 @@ def _image_ref_available(ref: str, project_id: int) -> bool:
         return alt_path.exists()
     except Exception:
         return False
-
-
-def _apply_font(run, font_name: str, font_size: float, bold: bool = False):
-    run.font.size = Pt(font_size)
-    run.font.bold = bold
-    run.font.italic = False
-    run.font.name = font_name
-    r = run._element
-    rPr = r.find(qn("w:rPr"))
-    if rPr is None:
-        rPr = parse_xml(f'<w:rPr {nsdecls("w")}></w:rPr>')
-        r.insert(0, rPr)
-    rFonts = rPr.find(qn("w:rFonts"))
-    if rFonts is None:
-        rFonts = parse_xml(f'<w:rFonts {nsdecls("w")}></w:rFonts>')
-        rPr.insert(0, rFonts)
-    rFonts.set(qn("w:eastAsia"), font_name)
-    rFonts.set(qn("w:ascii"), font_name)
-    rFonts.set(qn("w:hAnsi"), font_name)
 
 
 def _add_paragraph_with_format(
@@ -1687,6 +1331,15 @@ def _add_parsed_content(
     # 与 check_document 的 control_char_sections 检查呼应，防止 python-docx 写入损坏文档
     # 统一走 sanitize_for_docx：除 C0 控制符外，还覆盖孤立代理项与 \ufffe/\uffff
     if content:
+        # FIX 2026-10-10（《文档质量分析报告》格式问题 4/10·修复 8）：
+        # 导出端防御性清洗 —— 生成期清洗之后落库/导入/手工编辑的正文，
+        # 仍可能带「首行重复章节标题」与「## 1工程基本情况」形态的 Markdown
+        # 残留。幂等且无损（不剥合法列表编号），详见 prepare_for_export。
+        _export_sec_title = str(getattr(section_detail, "title", "") or "")
+        if _export_sec_title:
+            content = _EXPORT_CONTENT_CLEANER.prepare_for_export(
+                _export_sec_title, content
+            )
         content = sanitize_for_docx(content)
     logger.info(
         "[DIAG-EXPORT] _add_parsed_content: content_len=%d section_detail=%s",
@@ -1834,11 +1487,29 @@ def _add_parsed_content(
             # FIX 2026-10-08（P2 列表拍平）：嵌套列表层级保真——parse_content 现在
             # 把全角缩进层级写入 block.level（parse 端 FIX 2026-10-08），导出端按
             # 层级附加左缩进（numPr 重起/嵌套由既有 D2 机制承载，这里补视觉层级）。
+            # FIX 2026-10-11（E-12·P2·缩进被覆盖）：旧实现 `paragraph_format.left_indent`
+            # 只设 `w:left`（twips），但 `_add_paragraph_with_format` 已设 `w:leftChars`
+            # （字符单位，Word 优先采用）。两者冲突时 `w:leftChars` 胜出 → 嵌套缩进
+            # 完全失效，所有层级列表都渲染成 2 字符缩进。现改为累加 `w:leftChars`。
             if block.level:
                 try:
-                    doc.paragraphs[-1].paragraph_format.left_indent = Pt(
-                        21 * min(int(block.level), 4)
-                    )
+                    p = doc.paragraphs[-1]
+                    pPr = p._p.get_or_add_pPr()
+                    ind = pPr.find(qn("w:ind"))
+                    if ind is not None:
+                        # 读取当前 w:leftChars（字符单位，1 字符 = 100 单位）
+                        current_left_chars = 0
+                        left_chars_val = ind.get(qn("w:leftChars"))
+                        if left_chars_val:
+                            try:
+                                current_left_chars = int(left_chars_val)
+                            except (TypeError, ValueError):
+                                current_left_chars = 0
+                        # 累加嵌套层级缩进（每层 2 字符 = 200 单位；纯函数 helper）
+                        nested_chars = _nested_list_left_chars(block.level)
+                        new_left_chars = current_left_chars + nested_chars
+                        ind.set(qn("w:leftChars"), str(new_left_chars))
+                        ind.set(qn("w:left"), "0")  # 重置，避免冲突
                 except Exception:
                     pass
         else:
@@ -1869,6 +1540,202 @@ def _add_parsed_content(
                     )
                 except Exception as _e:
                     logger.warning("[D5加固] 标题兜底图表插入失败（已忽略）: %s", _e)
+
+
+# HARDENING 2026-10-11（遗留·_render_commercial 外提）：从 _add_inline_chart 的
+# 嵌套闭包提升为模块级函数，使单元测试可直接 patch/mock；闭包捕获的局部变量
+# （doc/config/preload_only/section_title/http_service_available）改为显式参数。
+# 默认值保持向后兼容：旧式直接调用 `_render_commercial(typ, payload, caption)`
+# 仍可用（doc/config 为 None 时仅做缓存/渲染，不插入文档）。
+def _render_commercial(
+    typ: str,
+    payload,
+    caption: str,
+    *,
+    doc=None,
+    config=None,
+    preload_only: bool = False,
+    section_title: str = "",
+    http_service_available: bool | None = None,
+) -> bool:
+    """商业级 v2 渲染器 — 无降级模式（V6.1）
+
+    渲染顺序：
+    1. L1 内存缓存（同一导出会话内去重）
+    2. V6.0 内容指纹持久化缓存
+    3. render_mermaid_to_bytes（Level 1.5 HTTP Service 2.5x → Level 2 PIL v2 2.5x超采样+300DPI）
+
+    Returns:
+        True 表示渲染成功；False 表示真实数据渲染失败，跳过该图表
+    """
+
+    def _emit(stream, cap: str) -> bool:
+        """把字节流插入文档；返回是否**真的插入成功**。
+
+        BUG-FIX 2026-10-09（P1·插入失败仍占号）：旧实现无返回值并让调用方
+        一律 `return True`，于是「渲染成功但 `_add_diagram_picture` 插入失败」
+        也被算作成功 —— 文档里只剩一条灰色占位说明，却已消耗一个图号，
+        后续图号整体前跳（图号虚跳）。现把插入结果透传回去，失败即回滚。
+        """
+        # 预加载模式：仅触发渲染并填充缓存，不写入 Document（线程安全）
+        if preload_only:
+            return True
+        # BUG-FIX 2026-09-18（P1）：渲染成功但插入失败（异常编码等）
+        # 时补灰色占位说明，避免成品静默空白
+        if not _add_diagram_picture(doc, stream, config, caption=cap):
+            _add_image_placeholder(doc, config, cap, reason="图表图片插入失败")
+            return False
+        return True
+
+    payload_str = (
+        json.dumps(payload, ensure_ascii=False) if not isinstance(payload, str) else payload
+    )
+    # BUG-FIX 2026-09-14（高）：缓存键必须剔除 fig_no。
+    # fig_no 是导出会话内的**递增序号**，预渲染阶段与正式渲染阶段拿到的号不同
+    # （预渲染先跑一轮，正式阶段计数器接着往上走），导致两阶段的 payload_str
+    # 必然不同 → L1 内存缓存与磁盘持久化缓存命中率恒为 0，预渲染 100% 白做，
+    # 且每次导出都往磁盘缓存塞 N 份内容相同、编号不同的 PNG。
+    # 修复：缓存查找/写入统一使用剔除 fig_no 后的序列化结果。
+    cache_payload_str = _strip_fig_no_for_cache(payload)
+    last_error = None
+
+    # V1.2 策略 0: L1 内存缓存（避免同一次导出中重复 render_mermaid_to_bytes）
+    cached = _get_cached_chart_render(cache_payload_str, typ)
+    if cached:
+        cached_stream, _ = cached
+        ok = _emit(cached_stream, caption)
+        logger.debug("商业级渲染: L1缓存命中 (%s)", typ)
+        return ok
+
+    # 策略 1: V6.0 持久化缓存
+    try:
+        cached_path = _chart_cache.get(cache_payload_str, chart_type=typ)
+        if cached_path:
+            cached_bytes = cached_path.read_bytes()
+            ok = _emit(BytesIO(cached_bytes), caption)
+            _store_chart_render(cache_payload_str, BytesIO(cached_bytes), chart_type=typ)
+            logger.debug("商业级渲染: 策略1缓存命中 (%s)", typ)
+            return ok
+    except Exception as e:
+        last_error = e
+
+    # 策略 2: 商业级 v2 渲染器
+    # BUG-E-03 修复：移除每图 ThreadPoolExecutor 开销（创建线程池~10ms/次）
+    # 改用进程级共享线程池 _get_render_executor() 复用线程，
+    # 单图节省 ~10ms，对于 150 张图可节省 ~1.5s
+    #
+    # BUG-EXPORT-06 修复：预加载模式下绕过渲染池，直接调用 render_mermaid_to_bytes。
+    # 预加载池（8线程）与渲染池（4线程）嵌套时，8个预加载线程竞争4个渲染槽位：
+    #   - 渲染池满时，任务在队列中排队，_render_future.result(timeout=25) 从"提交时"
+    #     开始计时，而非"渲染真正开始时"，导致任务还未开始渲染就已超时
+    #   - 超时后 cancel() 对已在运行的任务无效，渲染线程变成"孤儿线程"
+    #   - 多轮后渲染池被阻塞，导出进度卡在 chart_preload 25%
+    # 预加载本身已在线程池中，直接调用消除嵌套竞争。
+    try:
+        logger.info(
+            "[商业级渲染] 策略2: 调用 render_mermaid_to_bytes chart_type=%s 数据长度=%d",
+            typ,
+            len(payload_str),
+        )
+        _skip_http = http_service_available is not True
+
+        def _do_render():
+            """真正产生渲染字节流（仅 single-flight owner 会执行）。"""
+            if preload_only:
+                # BUG-EXPORT-06 修复：预加载模式直接调用，不走渲染池
+                return render_mermaid_to_bytes(
+                    payload_str,
+                    typ,
+                    skip_http=_skip_http,
+                )
+            # BUG-F-02 修复：从45s降至25s，与内部 HTTP 总预算匹配。
+            # BUG-FIX 2026-09-18（P1）：25s 低于单图合法最坏路径（HTTP ≤20s +
+            # PIL v2 复杂甘特 ≈15s ≈ 35s）：超时后 future.cancel() 对已在跑的
+            # worker 无效，4 线程共享池逐个被“孤儿渲染”占满，后半文档图表
+            # 级联判超时丢失。现内部已去固定 sleep/非 PNG 提前失败，上界≈35s，
+            # 超时上调到 40s 覆盖合法最坏耗时，消除“未开始渲染先超时”饥饿。
+            _render_timeout = 40
+            _render_future = _get_render_executor().submit(
+                render_mermaid_to_bytes,
+                payload_str,
+                typ,
+                skip_http=_skip_http,
+            )
+            try:
+                return _render_future.result(timeout=_render_timeout)
+            except TimeoutError:
+                logger.warning(
+                    "[商业级渲染] 策略2超时(%ds): render_mermaid_to_bytes chart_type=%s",
+                    _render_timeout,
+                    typ,
+                )
+                _render_future.cancel()
+                return None
+
+        # SINGLE-FLIGHT 2026-10-06：同 cache_key 的并发渲染合并为一次。
+        # 预渲染线程池（≤8）与正文渲染可能同时请求同一份图表（已剔除 fig_no），
+        # 旧实现 L1/L2 miss 后各自调 render → 同图被重复渲染 N 次（缓存击穿）。
+        # 首个线程（owner）真正渲染，其余线程等待并共享产物，杜绝重复计算。
+        stream = _single_flight_render(cache_payload_str, _do_render)
+
+        if stream:
+            stream.seek(0)
+            _render_bytes = stream.getvalue()
+            _chart_cache.set(cache_payload_str, _render_bytes, chart_type=typ)
+            _store_chart_render(cache_payload_str, BytesIO(_render_bytes), chart_type=typ)
+            ok = _emit(stream, caption)
+            logger.info(
+                "[商业级渲染] 策略2成功: %s (原始数据, %d bytes)", typ, len(_render_bytes)
+            )
+            return ok
+        else:
+            logger.warning(
+                "[商业级渲染] 策略2失败: render_mermaid_to_bytes 返回 None chart_type=%s", typ
+            )
+    except Exception as e:
+        logger.warning("[商业级渲染] 策略2异常: %s (%s)", typ, e)
+        last_error = e
+
+    # V6.1 无降级渲染终止点：
+    #   真实数据经 Level 1.5 (HTTP Service 2.5x) → Level 2 (PIL v2 2.5x超采样+300DPI)
+    #   双路径均失败时，跳过该图表（不插入任何伪造数据/占位图）。
+    #   原因：投标文件中的图表必须基于真实项目数据，伪造图表数据（劳动力人数、
+    #   进度节点、成本占比等）会造成严重的商业与合规风险，宁缺毋假。
+    #   已移除的策略（V6.0 及之前）：
+    #     - 策略3 _repair_chart_data：渲染失败时按标题关键词伪造节点/任务/人数
+    #     - 策略4 generate_context_aware_chart_data：伪造整套"智能默认"图表数据
+    #     - 策略5 _render_text_fallback_image：插入无信息量的文本占位图
+    logger.error(
+        "[商业级渲染] 真实数据渲染失败，跳过该图表（无降级原则）: type=%s section=%s error=%s",
+        typ,
+        section_title,
+        last_error,
+    )
+    # BUG-FIX-03 修复：渲染失败时插入文字说明（非伪造数据），避免文档出现空白区域。
+    # 原实现直接 return False，文档中该图表位置完全空白，读者无法判断是遗漏还是渲染失败。
+    # 此处插入的是"渲染失败说明"（事实陈述），不是伪造的图表数据，符合无降级原则。
+    # ENHANCE 2026-10-04（需求 9）：受 CHART_FAIL_PLACEHOLDER 开关控制。
+    # 默认 false：静默跳过（不占图号、不留失败说明）；true：保留可见的排错提示。
+    if not preload_only and CHART_FAIL_PLACEHOLDER:
+        try:
+            from docx.shared import Pt as _Pt
+
+            _fail_para = doc.add_paragraph()
+            # P1 修复 2026-09-29：渲染失败后图号会被回滚复用，失败说明
+            # 不能再携带该编号，否则正文会出现两个同号（一个假图一个真图）
+            _fail_label = _FIG_NO_PREFIX_RE.sub("", caption or "").strip()
+            # BUG-FIX 2026-10-04（P1 特殊字符）：caption 源于图表 JSON 标题，
+            # 含 XML 不安全字符时本兜底 add_run 会再炸一次，导致连「渲染失败
+            # 说明」都写不进去，文档该位置完全空白。
+            _fail_run = _fail_para.add_run(
+                sanitize_for_docx(f"【图表渲染失败】{_fail_label or typ}（请检查原始数据或重新导出）")
+            )
+            _fail_run.font.size = _Pt(9)
+            _fail_run.font.color.rgb = RGBColor(0x99, 0x99, 0x99)
+            _fail_run.italic = True
+        except Exception:
+            logger.warning("[商业级渲染] 插入渲染失败说明文字也失败，文档该位置将空白")
+    return False
 
 
 def _add_inline_chart(
@@ -1936,185 +1803,6 @@ def _add_inline_chart(
     # 当 HTTP 服务不可用时，直接跳过 Level 1.5 路径，节省重试超时
     _http_available = _http_service_available
 
-    def _render_commercial(typ: str, payload, caption: str) -> bool:
-        """商业级 v2 渲染器 — 无降级模式（V6.1）
-
-        渲染顺序：
-        1. L1 内存缓存（同一导出会话内去重）
-        2. V6.0 内容指纹持久化缓存
-        3. render_mermaid_to_bytes（Level 1.5 HTTP Service 2.5x → Level 2 PIL v2 2.5x超采样+300DPI）
-
-        Returns:
-            True 表示渲染成功；False 表示真实数据渲染失败，跳过该图表
-        """
-
-        def _emit(stream, cap: str) -> bool:
-            """把字节流插入文档；返回是否**真的插入成功**。
-
-            BUG-FIX 2026-10-09（P1·插入失败仍占号）：旧实现无返回值并让调用方
-            一律 `return True`，于是「渲染成功但 `_add_diagram_picture` 插入失败」
-            也被算作成功 —— 文档里只剩一条灰色占位说明，却已消耗一个图号，
-            后续图号整体前跳（图号虚跳）。现把插入结果透传回去，失败即回滚。
-            """
-            # 预加载模式：仅触发渲染并填充缓存，不写入 Document（线程安全）
-            if preload_only:
-                return True
-            # BUG-FIX 2026-09-18（P1）：渲染成功但插入失败（异常编码等）
-            # 时补灰色占位说明，避免成品静默空白
-            if not _add_diagram_picture(doc, stream, config, caption=cap):
-                _add_image_placeholder(doc, config, cap, reason="图表图片插入失败")
-                return False
-            return True
-
-        payload_str = (
-            json.dumps(payload, ensure_ascii=False) if not isinstance(payload, str) else payload
-        )
-        # BUG-FIX 2026-09-14（高）：缓存键必须剔除 fig_no。
-        # fig_no 是导出会话内的**递增序号**，预渲染阶段与正式渲染阶段拿到的号不同
-        # （预渲染先跑一轮，正式阶段计数器接着往上走），导致两阶段的 payload_str
-        # 必然不同 → L1 内存缓存与磁盘持久化缓存命中率恒为 0，预渲染 100% 白做，
-        # 且每次导出都往磁盘缓存塞 N 份内容相同、编号不同的 PNG。
-        # 修复：缓存查找/写入统一使用剔除 fig_no 后的序列化结果。
-        cache_payload_str = _strip_fig_no_for_cache(payload)
-        last_error = None
-
-        # V1.2 策略 0: L1 内存缓存（避免同一次导出中重复 render_mermaid_to_bytes）
-        cached = _get_cached_chart_render(cache_payload_str, typ)
-        if cached:
-            cached_stream, _ = cached
-            ok = _emit(cached_stream, caption)
-            logger.debug("商业级渲染: L1缓存命中 (%s)", typ)
-            return ok
-
-        # 策略 1: V6.0 持久化缓存
-        try:
-            cached_path = _chart_cache.get(cache_payload_str, chart_type=typ)
-            if cached_path:
-                cached_bytes = cached_path.read_bytes()
-                ok = _emit(BytesIO(cached_bytes), caption)
-                _store_chart_render(cache_payload_str, BytesIO(cached_bytes), chart_type=typ)
-                logger.debug("商业级渲染: 策略1缓存命中 (%s)", typ)
-                return ok
-        except Exception as e:
-            last_error = e
-
-        # 策略 2: 商业级 v2 渲染器
-        # BUG-E-03 修复：移除每图 ThreadPoolExecutor 开销（创建线程池~10ms/次）
-        # 改用进程级共享线程池 _get_render_executor() 复用线程，
-        # 单图节省 ~10ms，对于 150 张图可节省 ~1.5s
-        #
-        # BUG-EXPORT-06 修复：预加载模式下绕过渲染池，直接调用 render_mermaid_to_bytes。
-        # 预加载池（8线程）与渲染池（4线程）嵌套时，8个预加载线程竞争4个渲染槽位：
-        #   - 渲染池满时，任务在队列中排队，_render_future.result(timeout=25) 从"提交时"
-        #     开始计时，而非"渲染真正开始时"，导致任务还未开始渲染就已超时
-        #   - 超时后 cancel() 对已在运行的任务无效，渲染线程变成"孤儿线程"
-        #   - 多轮后渲染池被阻塞，导出进度卡在 chart_preload 25%
-        # 预加载本身已在线程池中，直接调用消除嵌套竞争。
-        try:
-            logger.info(
-                "[商业级渲染] 策略2: 调用 render_mermaid_to_bytes chart_type=%s 数据长度=%d",
-                typ,
-                len(payload_str),
-            )
-            _skip_http = _http_available is not True
-
-            def _do_render():
-                """真正产生渲染字节流（仅 single-flight owner 会执行）。"""
-                if preload_only:
-                    # BUG-EXPORT-06 修复：预加载模式直接调用，不走渲染池
-                    return render_mermaid_to_bytes(
-                        payload_str,
-                        typ,
-                        skip_http=_skip_http,
-                    )
-                # BUG-F-02 修复：从45s降至25s，与内部 HTTP 总预算匹配。
-                # BUG-FIX 2026-09-18（P1）：25s 低于单图合法最坏路径（HTTP ≤20s +
-                # PIL v2 复杂甘特 ≈15s ≈ 35s）：超时后 future.cancel() 对已在跑的
-                # worker 无效，4 线程共享池逐个被“孤儿渲染”占满，后半文档图表
-                # 级联判超时丢失。现内部已去固定 sleep/非 PNG 提前失败，上界≈35s，
-                # 超时上调到 40s 覆盖合法最坏耗时，消除“未开始渲染先超时”饥饿。
-                _render_timeout = 40
-                _render_future = _get_render_executor().submit(
-                    render_mermaid_to_bytes,
-                    payload_str,
-                    typ,
-                    skip_http=_skip_http,
-                )
-                try:
-                    return _render_future.result(timeout=_render_timeout)
-                except TimeoutError:
-                    logger.warning(
-                        "[商业级渲染] 策略2超时(%ds): render_mermaid_to_bytes chart_type=%s",
-                        _render_timeout,
-                        typ,
-                    )
-                    _render_future.cancel()
-                    return None
-
-            # SINGLE-FLIGHT 2026-10-06：同 cache_key 的并发渲染合并为一次。
-            # 预渲染线程池（≤8）与正文渲染可能同时请求同一份图表（已剔除 fig_no），
-            # 旧实现 L1/L2 miss 后各自调 render → 同图被重复渲染 N 次（缓存击穿）。
-            # 首个线程（owner）真正渲染，其余线程等待并共享产物，杜绝重复计算。
-            stream = _single_flight_render(cache_payload_str, _do_render)
-
-            if stream:
-                stream.seek(0)
-                _render_bytes = stream.getvalue()
-                _chart_cache.set(cache_payload_str, _render_bytes, chart_type=typ)
-                _store_chart_render(cache_payload_str, BytesIO(_render_bytes), chart_type=typ)
-                ok = _emit(stream, caption)
-                logger.info(
-                    "[商业级渲染] 策略2成功: %s (原始数据, %d bytes)", typ, len(_render_bytes)
-                )
-                return ok
-            else:
-                logger.warning(
-                    "[商业级渲染] 策略2失败: render_mermaid_to_bytes 返回 None chart_type=%s", typ
-                )
-        except Exception as e:
-            logger.warning("[商业级渲染] 策略2异常: %s (%s)", typ, e)
-            last_error = e
-
-        # V6.1 无降级渲染终止点：
-        #   真实数据经 Level 1.5 (HTTP Service 2.5x) → Level 2 (PIL v2 2.5x超采样+300DPI)
-        #   双路径均失败时，跳过该图表（不插入任何伪造数据/占位图）。
-        #   原因：投标文件中的图表必须基于真实项目数据，伪造图表数据（劳动力人数、
-        #   进度节点、成本占比等）会造成严重的商业与合规风险，宁缺毋假。
-        #   已移除的策略（V6.0 及之前）：
-        #     - 策略3 _repair_chart_data：渲染失败时按标题关键词伪造节点/任务/人数
-        #     - 策略4 generate_context_aware_chart_data：伪造整套"智能默认"图表数据
-        #     - 策略5 _render_text_fallback_image：插入无信息量的文本占位图
-        logger.error(
-            "[商业级渲染] 真实数据渲染失败，跳过该图表（无降级原则）: type=%s section=%s error=%s",
-            typ,
-            _section_title,
-            last_error,
-        )
-        # BUG-FIX-03 修复：渲染失败时插入文字说明（非伪造数据），避免文档出现空白区域。
-        # 原实现直接 return False，文档中该图表位置完全空白，读者无法判断是遗漏还是渲染失败。
-        # 此处插入的是"渲染失败说明"（事实陈述），不是伪造的图表数据，符合无降级原则。
-        # ENHANCE 2026-10-04（需求 9）：受 CHART_FAIL_PLACEHOLDER 开关控制。
-        # 默认 false：静默跳过（不占图号、不留失败说明）；true：保留可见的排错提示。
-        if not preload_only and CHART_FAIL_PLACEHOLDER:
-            try:
-                from docx.shared import Pt as _Pt
-
-                _fail_para = doc.add_paragraph()
-                # P1 修复 2026-09-29：渲染失败后图号会被回滚复用，失败说明
-                # 不能再携带该编号，否则正文会出现两个同号（一个假图一个真图）
-                _fail_label = _FIG_NO_PREFIX_RE.sub("", caption or "").strip()
-                # BUG-FIX 2026-10-04（P1 特殊字符）：caption 源于图表 JSON 标题，
-                # 含 XML 不安全字符时本兜底 add_run 会再炸一次，导致连「渲染失败
-                # 说明」都写不进去，文档该位置完全空白。
-                _fail_run = _fail_para.add_run(
-                    sanitize_for_docx(f"【图表渲染失败】{_fail_label or typ}（请检查原始数据或重新导出）")
-                )
-                _fail_run.font.size = _Pt(9)
-                _fail_run.font.color.rgb = RGBColor(0x99, 0x99, 0x99)
-                _fail_run.italic = True
-            except Exception:
-                logger.warning("[商业级渲染] 插入渲染失败说明文字也失败，文档该位置将空白")
-        return False
 
     # 统一图表类型处理（无降级模式）
     _CHART_TYPE_CONFIG = [
@@ -2212,7 +1900,16 @@ def _add_inline_chart(
                 # 不回滚，后续图号整体前跳一位。try/except 收口保证任何异常路径
                 # 都回滚（成功路径不受影响）。
                 try:
-                    _rendered = _render_commercial(ctype, source, final_caption)
+                    _rendered = _render_commercial(
+                        ctype,
+                        source,
+                        final_caption,
+                        doc=doc,
+                        config=config,
+                        preload_only=preload_only,
+                        section_title=_section_title,
+                        http_service_available=_http_available,
+                    )
                 except Exception as _rc_err:
                     logger.warning(
                         "[图表导出] 渲染异常，回滚图号 %s: %s", fig_no, _rc_err
@@ -2276,6 +1973,21 @@ def _add_inline_chart(
                 parent_section_number=parent_section_number,
                 chapter_number=chapter_number,
             )
+        # FIX 2026-10-11（E-8·P1·兜底分支传无效类型）：旧实现在 inner_type 为空时
+        # 以 `inner_type or "chart"` 调用 _render_commercial，"chart" 不是合法 mermaid
+        # 图表类型 → 渲染必失败（虽然后续回滚图号，但浪费图号计数器 + 日志误导）。
+        # 现显式检查：inner_type 为空或不在已知类型集合时，不消耗图号、不渲染。
+        _VALID_CHART_TYPES = {
+            "gantt", "flowchart", "architecture", "labor",
+            "comparison", "layout", "timeline",
+        }
+        if not inner_type or inner_type not in _VALID_CHART_TYPES:
+            logger.warning(
+                "[商业级渲染] inline_data 存在但类型无效，跳过（无降级原则）: "
+                "inner_type=%r chart_type=%s section=%s",
+                inner_type, chart_type, _section_title,
+            )
+            return None
         # V7.0 未识别类型也注入图号（同上：预渲染阶段不消耗会话级图号计数器）
         fig_no = (
             "" if preload_only else _next_figure_number(_fig_parent, _project_id)
@@ -2289,7 +2001,16 @@ def _add_inline_chart(
         # P1 修复 2026-09-29：渲染失败回滚图号
         # FIX 2026-10-08（P1 图号虚跳）：同上，异常路径也必须回滚（见上方注释）。
         try:
-            _rendered_fb = _render_commercial(inner_type or "chart", inline_data, fb_caption)
+            _rendered_fb = _render_commercial(
+                            inner_type,
+                            inline_data,
+                            fb_caption,
+                            doc=doc,
+                            config=config,
+                            preload_only=preload_only,
+                            section_title=_section_title,
+                            http_service_available=_http_available,
+                        )
         except Exception as _rc_err:
             logger.warning(
                 "[图表导出] 渲染异常（兜底分支），回滚图号 %s: %s", fig_no, _rc_err
@@ -2564,6 +2285,18 @@ def _add_section_heading(doc, text: str, level: int, config: ExportConfig, numbe
         pf.page_break_before = True
     _apply_heading_style(doc, p, level)
 
+    # 2026-10-11 修复（目录冗余后缀）：旧版去重兜底曾给章节标题追加
+    # 「（其2）/（其3）」这类毫无信息量的序数后缀，且这些标题**已落库**。
+    # 导出前统一剥离，使存量项目的章节标题与 Word 自动目录同步恢复正常
+    # （TOC 域由标题样式生成，标题清干净目录即干净）。非致命：任何异常
+    # 都不应阻断导出。
+    try:
+        _cleaned = _strip_legacy_redundant_suffix(text).strip()
+        if _cleaned:
+            text = _cleaned
+    except Exception:
+        pass
+
     # BUG-FIX（P1）：标题此前未做 XML 安全清洗，一个 \x0b 就让整节标题消失
     display_text = f"{numbering}{_strip_heading_numbering(text)}" if numbering else text
     run = p.add_run(sanitize_for_docx(display_text))
@@ -2758,12 +2491,18 @@ _RENDER_EXECUTOR_LOCK = threading.Lock()
 
 
 def _get_render_executor() -> ThreadPoolExecutor:
-    """获取全局共享图表渲染线程池（懒初始化，进程内复用）"""
+    """获取全局共享图表渲染线程池（懒初始化，进程内复用）
+
+    MODULARIZATION 2026-10-12（遗留加固）：max_workers 从硬编码 4 改为环境变量可配。
+    生产场景 CPU 核数较多时可提升到 8-16（注意不要超过 mermaid HTTP service 并发能力）。
+    默认保持 4 向后兼容。
+    """
     global _RENDER_EXECUTOR
     with _RENDER_EXECUTOR_LOCK:
         if _RENDER_EXECUTOR is None:
+            _workers = int(os.getenv("EXPORT_RENDER_POOL_SIZE", "4"))
             _RENDER_EXECUTOR = ThreadPoolExecutor(
-                max_workers=4,
+                max_workers=max(1, _workers),
                 thread_name_prefix="chart_render_pool",
             )
         return _RENDER_EXECUTOR
@@ -2961,7 +2700,25 @@ def _atomic_save_docx(doc, output_path: str) -> None:
         raise
 
 
+# HARDENING 2026-10-11（遗留·图号计数器会话化）：build_docx 的公开入口。
+# 每次调用创建独立的会话级图号计数器（ContextVar），同一导出会话内的
+# `_next_figure_number` / `_rewind_figure_number` 优先读写会话 dict，互不串号；
+# 退出时无论成功失败都还原 ContextVar，避免污染调用方线程。
 def build_docx(
+    project_id: int,
+    config: ExportConfig | None = None,
+    output_path: str | None = None,
+    on_progress: Callable | None = None,
+) -> tuple[str, int | None]:
+    _fig_ctx: dict[str, int] = {}
+    _token = _fig_counter_ctx_var.set(_fig_ctx)
+    try:
+        return _build_docx_impl(project_id, config, output_path, on_progress)
+    finally:
+        _fig_counter_ctx_var.reset(_token)
+
+
+def _build_docx_impl(
     project_id: int,
     config: ExportConfig | None = None,
     output_path: str | None = None,
@@ -3755,166 +3512,6 @@ def _should_skip_section(title: str) -> bool:
     return False
 
 
-def _detect_inline_chart_types(content: str) -> set[str]:
-    """一次性扫描内容，返回所有已内联标记的图表类型集合
-
-    V1.2 性能优化：替代 _has_inline_marker 的重复扫描，
-    每次调用只扫描内容一次，通过 LRU 缓存按 section_detail id 复用结果。
-
-    CHART-MARKER-UNIFY 2026-09-16：解析口径统一收敛到
-    `content_cleaning.iter_chart_markers` + `resolve_chart_marker`（与 parse_content
-    完全同源）。原实现自带三套互不一致的扫描逻辑（大写占位符字符串包含判断、
-    `<<CHART:{纯文本标题}>>` 关键词推断、`<<CHART:{JSON}>>` 括号配平），与
-    `parse_content` 的解析结果经常对不上，直接造成静默丢图：
-
-      - `<<CHART:{施工进度甘特图}>>`（AI 实际输出的主流形态）被本函数判定为
-        「内容已内联 gantt」→ `_render_section_charts` 跳过甘特图；
-        而 `parse_content` 又因「纯文本占位符无真实数据」直接丢弃该标记 →
-        内联/章节末尾两边都不渲染，图表彻底消失（DB 里的载荷还是空壳）。
-      - `<<CHART:GANTT>>` 这类「配图位置提示标记」两边都识别不了。
-
-    统一后，`_detect_inline_chart_types` 返回的类型集合 == `parse_content` 实际
-    产出的 chart_marker 块类型集合，既不会重复出图，也不会两边都不出图。
-
-    支持格式（详见 content_cleaning.resolve_chart_marker）：
-    1. `[[FLOWCHART: 描述]]` / `<<FLOWCHART: 描述>>` — 传统占位符
-    2. `<<GANTT:>>` / `<<GANTT:施工进度计划>>` — 显式类型前缀提示
-    3. `<<CHART:GANTT>>` / `<<CHART:{gantt}>>` — 通配前缀 + 类型令牌
-    4. `<<CHART:{施工进度甘特图}>>` — 通配前缀 + 纯文本标题（关键词推断）
-    5. `<<CHART:{"type":"flowchart",...}>>` — 真实 JSON 数据块
-    """
-    return _detect_inline_chart_markers(content)[0]
-
-
-def _detect_inline_chart_markers(content: str) -> tuple[set[str], set[str]]:
-    """返回 (内联图表类型全集, 「配图位置提示」子集)。
-
-    - 全集：内容里出现了标记的类型 → 导出时由**内联路径**渲染，章节末尾不再补图，
-      避免同一张图渲染两次。
-    - 提示子集：标记内**没有真实数据**（`<<CHART:GANTT>>` / `<<GANTT:标题>>` /
-      传统 `<<FLOWCHART:描述>>`）的类型，其数据来自章节 DB 绑定字段。
-      这类图表的渲染载荷与 `_add_inline_chart` 内联渲染时**完全一致**
-      （缓存键已剔除图号），因此可以并行走预渲染，避免大文档里它们退化成长时间的
-      串行渲染。标记里自带 JSON 数据的类型不预渲染（载荷不同，预热等于白做）。
-    """
-    if not content:
-        return set(), set()
-
-    from .content_cleaning import iter_chart_fences, iter_chart_markers, resolve_chart_marker
-
-    valid_types = set(_CHART_TYPE_MAP)
-    all_types: set[str] = set()
-    hint_types: set[str] = set()
-    for _marker, _prefix, _desc in iter_chart_markers(content):
-        resolved = resolve_chart_marker(_prefix, _desc)
-        if not resolved or resolved[0] not in valid_types:
-            continue
-        all_types.add(resolved[0])
-        if _desc.lstrip().startswith("{"):
-            continue  # 标记内自带真实数据 → 内联渲染使用标记内数据，预渲染键不同
-        hint_types.add(resolved[0])
-    # ENHANCE 2026-10-04（D2）：```mermaid / ```chart-json 围栏块同样计入「已内联类型」。
-    # 围栏块自带真实数据（parse_content 产出同类型 chart_marker 块就地渲染），
-    # 章末尾不再按 DB 字段补图；且不进预渲染（载荷与 DB 字段不同，预热白做）。
-    for _lang, _body, _marker_text in iter_chart_fences(content):
-        if _marker_text is None:
-            continue  # 坏块：parse 侧会删除，不构成「已内联」
-        try:
-            _mt = json.loads(_marker_text)
-            _ft = str(_mt.get("chart_type") or "").lower()
-        except (json.JSONDecodeError, TypeError):
-            continue
-        if _ft in valid_types:
-            all_types.add(_ft)
-    return all_types, hint_types
-
-
-def _get_cached_inline_chart_markers(section_detail) -> tuple[set[str], set[str]]:
-    """按 section_detail id 缓存内联图表标记检测结果（(全集, 提示子集)）。
-
-    V2.0 增强：TTL 淘汰 + 最大容量限制，避免长期缓存占用内存。
-    V3.0 增强：命中率统计，支持缓存监控。
-    """
-    global _inline_marker_cache_hits, _inline_marker_cache_misses
-    section_id = getattr(section_detail, "id", None)
-    if section_id is None:
-        _inline_marker_cache_misses += 1
-        return set(), set()
-    now = time.time()
-    with _inline_marker_cache_lock:
-        if section_id in _inline_marker_cache:
-            cached_all, cached_hints, cached_ts = _inline_marker_cache[section_id]
-            if now - cached_ts < _inline_marker_cache_ttl:
-                _inline_marker_cache_hits += 1
-                return cached_all, cached_hints
-            # TTL 过期，移除
-            del _inline_marker_cache[section_id]
-    _inline_marker_cache_misses += 1
-    content = getattr(section_detail, "content", "") or ""
-    all_types, hint_types = _detect_inline_chart_markers(content)
-    with _inline_marker_cache_lock:
-        # 达到上限时淘汰最旧的一半（ts 位于元组末位）
-        if len(_inline_marker_cache) >= _inline_marker_cache_max:
-            sorted_items = sorted(_inline_marker_cache.items(), key=lambda x: x[1][-1])
-            for key, _ in sorted_items[: len(sorted_items) // 2]:
-                del _inline_marker_cache[key]
-        _inline_marker_cache[section_id] = (all_types, hint_types, time.time())
-    return all_types, hint_types
-
-
-def _get_cached_inline_chart_types(section_detail) -> set[str]:
-    """内联图表类型全集（兼容旧调用方）"""
-    return _get_cached_inline_chart_markers(section_detail)[0]
-
-
-def _get_cached_chart_render(payload_str: str, chart_type: str) -> tuple[BytesIO, int] | None:
-    """L1 内存缓存：从内存中读取已渲染的图表（避免重复 render_mermaid_to_bytes 调用）
-
-    V2.0 增强：检查 TTL，过期条目自动淘汰。
-    V3.0 增强：添加命中率统计，支持缓存监控。
-    P2 修复：cache key 原仅用 payload_str，同一段 Mermaid 代码以不同
-    chart_type（如 flowchart vs sequence）渲染时会命中错误缓存。
-    """
-    global _chart_render_cache_hits, _chart_render_cache_misses
-    now = time.time()
-    cache_key = f"{chart_type}:{payload_str}"
-    with _chart_render_cache_lock:
-        if cache_key in _chart_render_cache:
-            stream, size, ts = _chart_render_cache[cache_key]
-            if now - ts < _chart_render_cache_ttl:
-                _chart_render_cache_hits += 1
-                return stream, size
-            # TTL 过期，删除
-            del _chart_render_cache[cache_key]
-    _chart_render_cache_misses += 1
-    return None
-
-
-def _store_chart_render(payload_str: str, stream: BytesIO, chart_type: str = "") -> None:
-    """L1 内存缓存：存储已渲染的图表结果到内存
-
-    V2.0 增强：存储时附带时间戳，支持 TTL 淘汰。
-    P2 修复：cache key 拼接 chart_type 避免不同图表类型命中错误缓存。
-    """
-    now = time.time()
-    cache_key = f"{chart_type}:{payload_str}"
-    with _chart_render_cache_lock:
-        # 淘汰过期条目
-        expired_keys = [
-            k
-            for k, (_, _, ts) in _chart_render_cache.items()
-            if now - ts >= _chart_render_cache_ttl
-        ]
-        for k in expired_keys:
-            del _chart_render_cache[k]
-
-        # 如果仍然超过最大大小，淘汰最旧（按插入顺序）
-        if len(_chart_render_cache) >= _chart_render_cache_max:
-            oldest_key = next(iter(_chart_render_cache))
-            del _chart_render_cache[oldest_key]
-        _chart_render_cache[cache_key] = (stream, len(stream.getvalue()), now)
-
-
 def _render_section_charts(
     doc,
     section_detail,
@@ -3945,7 +3542,11 @@ def _render_section_charts(
             continue  # 无 DB 数据 → 跳过（无降级）
         if chart_type in cached_types:
             continue  # 内容已有内联标记 → PATH 2 处理
-        _add_inline_chart(
+        # FIX 2026-10-11（E-9·P1·统计口径）：旧实现 `rendered_count += 1` 统计
+        # 的是**尝试次数**而非**实际渲染成功次数** → 即使全部图表渲染失败，
+        # 日志仍报「渲染 N 张 DB 绑定图表」，误导运维排障。现检查返回值，
+        # 仅在实际成功时递增。
+        _chart_result = _add_inline_chart(
             doc,
             chart_type,
             default_title,
@@ -3955,7 +3556,8 @@ def _render_section_charts(
             parent_section_number=parent_section_number,
             chapter_number=chapter_number,
         )
-        rendered_count += 1
+        if _chart_result:
+            rendered_count += 1
 
     if rendered_count > 0:
         logger.info(
@@ -4246,6 +3848,16 @@ def _write_tree_content_with_progress(
                 # 当游标会多算一位，导致"重试内容的第一个元素"被漏掉、
                 # 仍然留在文档末尾（=修复前的章节错乱问题换个形式复现）。
                 _mark = _body_insertion_mark(_body) if _ph is not None else 0
+                # FIX 2026-10-11（E-11·P2·占位符缺失警告）：旧实现在 `_ph` 为 None
+                # （占位符创建失败）时静默跳过 `_move_body_elements_before`，新渲染
+                # 内容留在文档末尾而非原章节位置 → 章节顺序错乱（虽不崩溃，但用户
+                # 看到重复内容）。现显式记录警告，便于运维排查。
+                if _ph is None:
+                    logger.warning(
+                        "重试章节 %s 时占位符缺失（placeholder=None），新内容将留在"
+                        "文档末尾而非原位置，章节顺序可能错乱: node=%s",
+                        fs.get("title", "?"), fs.get("node_id"),
+                    )
                 try:
                     # 重新获取章节详情（可能之前有临时IO错误）
                     section_detail = _get_section_detail(project_id, fs["node_id"])
@@ -4531,6 +4143,11 @@ def list_exports(project_id: int, *, readonly: bool = False) -> list[dict]:
     result = []
     for row in rows:
         d = dict(row)
+        # ENHANCE 2026-10-11（P3·导出历史缺项目归属字段）：前端历史表此前只能靠
+        # 「当前页 project_id」隐式知道归属；一旦跨项目聚合或调试接口，缺少显式
+        # project_id 会迫使前端二次查询。此处补上（纯新增字段，向后兼容——
+        # 既有消费者按 id/filename 读取不受影响）。
+        d["project_id"] = project_id
         fp = d.get("file_path", "")
         if fp:
             try:
@@ -4543,10 +4160,6 @@ def list_exports(project_id: int, *, readonly: bool = False) -> list[dict]:
                 d["file_path"] = Path(fp).name
         result.append(d)
     return result
-
-
-# 启动内联标记缓存后台清理线程（BUG-E-05 修复）
-_start_inline_marker_cache_cleanup()
 
 
 # ========== 缓存监控统计（V3.0 新增）==========

@@ -1,7 +1,10 @@
 """outline_common.py — 目录生成共享函数库（V5.1 唯一路径核心）
 
 从已退役的 V2/V3 模块抽离的跨策略共享函数：
-- 全局标题去重（_uniquify_outline_titles）
+- 同级标题去重（_uniquify_outline_titles / _dedupe_outline_titles）
+- 标题归一化（_title_core）— 全系统唯一入口
+- 冗余后缀剥离（_strip_legacy_redundant_suffix / _clean_legacy_suffix_tree）
+- 重复标题消歧（_disambiguate_title）
 - 最小子节点保障（_ensure_min_children）
 - 节点分布生成（generate_nodes_distribution）
 - JSON 骨架构建（generate_one_outline_json_by_level1）
@@ -10,6 +13,24 @@
 - 节点计数（_count_outline_nodes）
 
 所有新代码应直接 import 本模块。
+
+## 标题去重策略（2026-10-11 修正，**勿回退**）
+
+作用域是**同一父节点下**，不是全树。标书里「3.1 施工组织设计」「4.1 施工组织设计」
+是两节独立内容（Word 自动目录会渲染成 3.1 / 4.1），跨父同名完全合法。
+
+历史上这里执行的是全树去重，把跨父的同名子标题**整段删除**（章节内容消失），
+同时 `_disambiguate_title` 又为这类「重复」追加「（其2）（其3）…（其7）」式后缀，
+形成目录污染。两条路径叠加后既有删除又有污染。
+
+因此：
+1. 去重只剔除同一父节点下归一化后同名的真·重复（保留第一个）。
+2. 消歧需要给同父重复命名时，禁止用「（其N）」——该括号序数形态会被
+   `_ORDINAL_SUFFIX_RE` 反复剥离，触发无意义后缀递进。
+   优先用维度词/父节点关键词/中文序数「之N」（不匹配剥离规则，无死循环）。
+3. 已污染的遗留数据在去重与导出两处剥离「（其N）」后缀。
+
+全系统统一走 `_title_core()` 做归一化，不要各处手写比较逻辑。
 """
 
 import json
@@ -489,12 +510,21 @@ _L3_SUFFIX_POOL: dict[str, tuple[str, ...]] = {
         "常见问题与防治措施",
         "技术交底与作业指导",
     ),
+    # generic 域专供 L3：必须是「动作型条目」，不得是 L2 级章名。
+    # 2026-10-10 遗留建议 2：旧值（「总体实施策划」「分阶段推进计划」
+    # 「资源配置与协调保障」「过程控制与考核评价」「总结评估与持续改进」）
+    # 全部是二级章名 —— L3 的 prefix_core 为空（见 _derive_child_title 规则 3），
+    # 池内条目会被原样吐出，于是 L2 章名直接落到三级，既读起来像章名，
+    # 又与其它章节的 L2 撞名。现替换为动作型条目并纳入 _L3_L2LIKE_TITLES 拦截。
     "generic": (
-        "总体实施策划",
-        "分阶段推进计划",
-        "资源配置与协调保障",
-        "过程控制与考核评价",
-        "总结评估与持续改进",
+        "施工方案编制与交底",
+        "进度计划编制与考核",
+        "资源配置与动态调配",
+        "现场协调与接口管理",
+        "过程检查与验收记录",
+        "技术措施落实与核查",
+        "责任分工与考核评价",
+        "总结复盘与改进闭环",
     ),
 }
 
@@ -646,7 +676,734 @@ def _has_bigram_overlap(core: str, text: str) -> bool:
     return False
 
 
-def _derive_child_title(parent_title: str, idx: int, used: set[str], level: int) -> str:
+# ---------------------------------------------------------------------------
+# 2026-10-09 增强：语义化兜底 / 消歧 / 占位清洗
+#
+# 背景：此前 L3 兜底标题与全局去重分别产出「专项6」「总体实施策划（2）」
+# 这类无意义或裸编号后缀标题（正是《招投标项目》样例目录里大量出现的
+# 「专项6/专项7」「总体实施策划（2）/（3）」的来源）。本次统一改为：
+#   - 兜底标题：父级简短指代词 + 专业执行维度，保证有意义且唯一；
+#   - 重名消歧：优先追加专业执行维度词，杜绝「（2）/（二）」式裸编号；
+#   - 占位清洗：兜底清除任何遗留「专项N」「实施要点」脏标题。
+# 与缺陷修复方案 BUG-2026-1008-02（三级标题重复/占位）的「标题编号统一管理」
+# 思想一致——标题必须唯一、可懂、与父级对应。
+# ---------------------------------------------------------------------------
+
+# 专业执行维度词：用于语义化兜底与重名消歧（自包含，不依赖父级前缀拼接）
+_L3_FALLBACK_DIMENSIONS: tuple[str, ...] = (
+    "施工工艺", "质量管控", "安全保障", "进度安排", "资源配置",
+    "技术措施", "部署方案", "管理措施", "组织保障", "防治对策",
+    "验收标准", "过程控制", "实施要点", "操作细则", "专项技术",
+)
+
+# 重名消歧维度词（追加在重名标题后，使其仍可读、可懂）
+_DISAMBIG_DIMENSIONS: tuple[str, ...] = (
+    "专项方案", "补充措施", "实施方案", "保障措施", "管控要点",
+    "深化部署", "实施细则", "配套保障", "专项对策", "落地措施",
+)
+
+# 旧版占位标题识别（需被清洗）
+_PLACEHOLDER_TITLE_RE = re.compile(r"^专项\d+$")
+
+# ---------------------------------------------------------------------------
+# 2026-10-10 增强：占位泛化标题识别器扩展
+#
+# 复现（2026-10-10，54 个三级节点的构造用例；回归见
+# tests/test_l3_title_quality_2026_10_10.py::TestL3GenerationEndToEnd）：
+#   1) 旧正则 `^专项\d+$` 只能命中「专项6」，完全漏掉「分阶段推进专项13」这类
+#      带前缀变体 → `_cleanup_placeholder_titles` 形同虚设；
+#   2) 「总体实施策划（2）」「总体实施策划（3）」「总体方案质量管控（第6项）」
+#      这类裸编号冲突后缀没有任何拦截点；
+#   3) `_uniquify_outline_titles._core()` 归一化不剥离裸序数后缀，
+#      「总体方案质量管控」与「总体方案质量管控（第6项）」被判为不重复而双双保留，
+#      语义重复无限堆叠；
+#   4) L3 规则禁止继承父级核心词，且 generic 域池仅 5 项，池耗尽后只能靠
+#      `_semantic_fallback_title` 产出「父级token + 通用维度（第N项）」——
+#      这正是「总体实施策划（2）（3）」的直接来源。
+# 修复：扩充识别模式 + 引入「工程实体 × 专业维度」组合池，把三级标题落到
+# 具体工程实体上；裸编号后缀在归一化阶段剥离，从源头切断堆叠。
+# ---------------------------------------------------------------------------
+
+# 任意位置的「专项N」（覆盖「分阶段推进专项13」「总体方案专项6」）
+_PLACEHOLDER_ANYWHERE_RE = re.compile(r"专项\s*\d+")
+# 裸编号冲突后缀（括号式）：（2）/（3）/（第2项）/（二）/半角 (2)
+#
+# 2026-10-11 修复：旧正则只认全角括号，导致「总体实施策划(2)」这类半角括号
+# 裸编号穿透判定与归一化剥离 —— AI 输出与前端拼接常产半角，于是
+# 「总体实施策划」与「总体实施策划(2)」被判为不重复而双双保留，
+# 正是用户报告「编号冲突后缀（2）（3）」的漏网形态之一。
+#
+# 半角括号收紧：要求括号内容全为编号（可带 第/项），故「深基坑(超5m)支护方案」
+# 「混凝土(28天)配合比」这类含文字说明的半角括号不会被误剥离。
+#
+# 「（其N）」不在本正则内：它是**旧版兜底产出的残渣**（不是裸编号），
+# 由 `_QI_ORDINAL_SUFFIX_RE` 单独识别并在归一化时一并剥离，
+# 从而让「砌体成品保护（其2）」与「砌体成品保护」被判为同名（真正应消歧的形态）。
+#
+# ⚠️ 本正则**故意不匹配裸数字结尾**（如「总体实施策划2」）。
+# 裸数字若纳入剥离，会让 `_uniquify_outline_titles` 的裸数字回退
+# `while _core(f"{new_title}{_cnt}") in seen` 对任意 _cnt 都得到同一个 core
+# （因为刚加的数字又被剥掉）→ 必然死循环。裸数字结尾的判定改由
+# `_BARE_NUM_TAIL_RE` 单独负责（只判定、不剥离），产出方也已改为语义化标题。
+_ORDINAL_SUFFIX_RE = re.compile(
+    r"[（(]\s*第?\s*[0-9一二三四五六七八九十百]+\s*项?\s*[）)]\s*$"
+)
+
+# 裸数字结尾「总体实施策划2」/「总体实施策划20」—— 仅用于脏标题判定，不参与归一化剥离。
+# 负向断言排除：数字/字母（单位如 mm、m、C30）、百分比、以及任意 CJK 量词
+# （天/米/层/根/年/月，如「工期365天」「2026年施工组织计划」）。
+# 即：仅当标题以纯数字结尾且数字后无任何字符时才判定为裸编号后缀。
+_BARE_NUM_TAIL_RE = re.compile(r"[0-9]{1,4}(?![0-9A-Za-z%％\u4e00-\u9fff])\s*$")
+# 纯泛化标题词表：标题恰好等于其中之一即判定为占位泛化
+_GENERIC_ONLY_TITLES = frozenset({
+    "总体实施策划", "总体部署", "总体安排", "总体方案", "总体思路", "总体规划",
+    "总体实施", "总体管理", "总体工作", "总体计划",
+    "实施要点", "基本要求", "主要内容", "主要措施", "主要工作", "主要内容安排",
+    "工作要点", "关键内容", "核心内容", "实施内容", "工作内容",
+    "专项方案", "通用方案", "整体方案", "基本方案", "实施方案", "基本措施",
+    "其他", "补充", "相关", "若干", "说明", "概述",
+})
+
+# L2 形态短语：语义完整、粒度等同于二级章名，落到三级会读起来像章名而非条目，
+# 且极易与其它章节的 L2 标题撞名（如「资源配置与协调保障」既是 L2 池短语，
+# 也曾以 L3 身份出现在「质量管理措施」章下）。
+# 单独成表而非并入 _GENERIC_ONLY_TITLES：后者含「其他」「说明」「概述」这类
+# 在 L1/L2 完全合法的词，语义不同，混在一起会让维护者误判清洗作用域。
+#
+# 2026-10-10 收窄：原表含「质量保证组织体系」「质量管理组织体系」，但这两个
+# 短语语义具体（描述明确的质量组织体系/管理组织架构），作为三级条目完全可读、
+# 合法，属过度拦截（over-filter）——回归测试
+# test_does_not_false_positive_on_concrete_titles 明确断言其为具体标题。
+# 即便其与某些章节 L2 同名，跨层撞名也由 _uniquify_outline_titles 全局去重兜底，
+# 不应在脏标题判定阶段预先判死（否则会误删合法内容）。
+# 本表只保留「总体方案与实施策划」这类纯泛化、读起来像章名而非条目的短语。
+_L3_L2LIKE_TITLES = frozenset({
+    "总体方案与实施策划", "总体实施策划", "分阶段推进计划",
+    "资源配置与协调保障", "过程控制与考核评价", "过程控制与考核机制",
+    "总结评估与持续改进",
+})
+
+
+def _strip_ordinal_suffix(title: str) -> str:
+    """剥离标题末尾的裸编号后缀（（2）/（第3项）/半角 (2)），用于语义去重归一化。
+
+    不含「（其N）」—— 那是旧版兜底留下的残渣，由 `_strip_legacy_redundant_suffix`
+    单独剥离（且只在 `_title_core` 归一化时生效，不改变 `_is_dirty_l3_title` 的
+    判定语义）；也不含裸数字结尾（「总体实施策划2」），否则会导致
+    `_uniquify_outline_titles` 的裸数字回退死循环。裸数字结尾由
+    `_is_dirty_l3_title` 单独判定。
+    """
+    if not title:
+        return title
+    return _ORDINAL_SUFFIX_RE.sub("", title).strip()
+
+
+# 「（其N）」/「（其 2）」/半角「(其2)」—— 旧版去重兜底产出的**无意义序数后缀**。
+# 形如「砌体成品保护（其2）」「机电管线材料管理实施细则（其2）」，
+# 对用户完全无信息量（用户 2026-10-11 反馈的目录污染即此形态）。
+# 刻意不并入 _ORDINAL_SUFFIX_RE：那条正则服务于「（2）/（第3项）」这类**裸**编号，
+# 两者语义不同，合并会让 _is_dirty_l3_title 把「（其N）」误判为泛化占位。
+_QI_ORDINAL_SUFFIX_RE = re.compile(r"[（(]\s*其\s*[0-9一二三四五六七八九十百]+\s*[）)]\s*$")
+
+# 中文序数用字
+_CN_DIGITS = ("零", "一", "二", "三", "四", "五", "六", "七", "八", "九")
+
+
+def _cn_ordinal(n: int) -> str:
+    """阿拉伯序数 → 中文序数（覆盖 1~99，超出范围原样返回阿拉伯数字）。"""
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        return "一"
+    if n < 1:
+        n = 1
+    if n <= 10:
+        # n=10 需特判：_CN_DIGITS 只有下标 0~9
+        return "十" if n == 10 else _CN_DIGITS[n]
+    if n < 20:
+        return "十" + _CN_DIGITS[n % 10]
+    if n < 100:
+        tens, ones = divmod(n, 10)
+        return _CN_DIGITS[tens] + "十" + (_CN_DIGITS[ones] if ones else "")
+    return str(n)
+
+
+def _strip_legacy_redundant_suffix(title: str) -> str:
+    """剥离历史遗留的冗余序数后缀（「（其N）」等），保留标题主体。
+
+    用于清洗**已生成/已落库**的目录：旧版兜底产出的「（其N）」既不是
+    「（2）/（第3项）」式裸编号（_ORDINAL_SUFFIX_RE 不识别），也不是有意义
+    的语义表述，纯粹是去重失败留下的残渣。剥掉后交由消歧逻辑重新分配，
+    标题主体（业务语义）完整保留。
+
+    幂等：无命中则原样返回；命中则循环剥离，覆盖「（其2）（其3）」这类堆叠。
+    """
+    t = (title or "").strip()
+    while True:
+        new = _QI_ORDINAL_SUFFIX_RE.sub("", t).strip()
+        if new == t:
+            return t
+        t = new
+
+
+def _title_core(title: str) -> str:
+    """标题归一化**唯一正本**：去重与消歧判断「两个标题是否同名」时必须共用。
+
+    步骤：剥离裸编号后缀（（2）/（第3项））→ 剥离冗余序数后缀（（其N））→
+    去空白 → 小写 → 剔除非词字符。
+
+    ⚠️ 历史缺陷（2026-10-11 修复）：`_disambiguate_title` 曾用**原始字符串**
+    去比对**归一化 core 集合**，「X（其2）」永远不等于集合里的「X其2」，
+    于是它的序数计数器 `_n` 恒停在 2，上层再包一层后滚成「（其3）（其4）…」
+    的递增污染。现在两侧统一走本函数，比对口径一致。
+    """
+    tt = _strip_ordinal_suffix(title or "")
+    tt = _strip_legacy_redundant_suffix(tt)
+    tt = tt.strip().lower()
+    tt = re.sub(r"[\s\u3000]+", "", tt)
+    tt = re.sub(r"[^\w\u4e00-\u9fff]", "", tt)
+    return tt
+
+
+def _clean_legacy_suffix_tree(level1: list[dict]) -> int:
+    """就地清洗目录树中所有节点的遗留冗余后缀，返回被清洗的节点数。
+
+    只处理三级及以下：一/二级章节标题是用户的正式章节名，
+    且「（其N）」几乎只会出现在三级（去重兜底只作用于此）。
+    """
+    fixed = 0
+
+    def _walk(nodes: list, level: int) -> None:
+        nonlocal fixed
+        for node in nodes:
+            if not isinstance(node, dict):
+                continue
+            if level >= 3:
+                title = node.get("title") or ""
+                cleaned = _strip_legacy_redundant_suffix(title)
+                if cleaned != title:
+                    if cleaned:
+                        node["title"] = cleaned
+                        fixed += 1
+                    else:
+                        logger.warning("清洗冗余后缀后标题为空，保留原标题: %s", title)
+            children = node.get("children")
+            if isinstance(children, list):
+                _walk(children, level + 1)
+
+    if isinstance(level1, list):
+        _walk(level1, 1)
+    return fixed
+
+
+def _is_dirty_l3_title(title: str) -> bool:
+    """判定标题是否为占位/泛化脏标题（三级标题质量收口统一入口）。
+
+    判定标准（任一命中即视为脏标题）：
+      1. 空标题
+      2. 精确占位（「专项6」）
+      3. 任意位置含「专项N」（「分阶段推进专项13」）
+      4. 结尾带裸编号后缀（「总体实施策划（2）」「总体实施策划(2)」）
+      5. 结尾带裸数字且去掉数字后仍为泛化词（「总体实施策划2」）
+         —— 只判定不剥离；且必须收窄，见下方说明
+      6. 标题恰好等于纯泛化词（「总体实施策划」）
+    """
+    t = (title or "").strip()
+    if not t:
+        return True
+    if _PLACEHOLDER_TITLE_RE.match(t):
+        return True
+    if _PLACEHOLDER_ANYWHERE_RE.search(t):
+        return True
+    if _ORDINAL_SUFFIX_RE.search(t):
+        return True
+    if _BARE_NUM_TAIL_RE.search(t):
+        # 2026-10-11 收窄：裸数字结尾**不能一律判脏**，否则会把 AI 生成的合法标题
+        # 「工序交接流程5」（5 是流程序号，有实际语义）误判为占位并拒收，
+        # 导致被拒后原始脏标题反而被保留（见 test_concurrency_is_bounded_by_config）。
+        # 仅当去掉尾部数字后的主体本身是泛化词时才判脏 —— 那才是真正的
+        # 「泛化词 + 消歧残留数字」形态，而非具有业务语义的编号。
+        _rest = _BARE_NUM_TAIL_RE.sub("", t).strip()
+        if _rest and _rest in (_GENERIC_ONLY_TITLES | _L3_L2LIKE_TITLES):
+            return True
+    if t in _GENERIC_ONLY_TITLES:
+        return True
+    if t in _L3_L2LIKE_TITLES:
+        return True
+    return False
+
+
+# 三级标题工程实体词池（按语义域）：标题必须落到具体工程实体，
+# 而非只写「质量管控」这类抽象管理词。
+_L3_ENTITY_WORDS: dict[str, tuple[str, ...]] = {
+    "work": (
+        "地下室", "主体结构", "屋面", "外墙", "基坑", "砌体", "门窗", "楼地面",
+        "脚手架", "幕墙", "机电管线", "混凝土", "钢筋", "模板", "土方", "桩基",
+        "防水", "保温", "装饰", "钢结构", "装配式", "吊顶", "抹灰", "涂料",
+        "电气", "给排水", "暖通", "消防", "施工缝", "后浇带",
+    ),
+    "quality": (
+        "样板区", "关键工序", "隐蔽工程", "首件工程", "分项工程", "见证取样",
+        "旁站监理", "实测实量", "成品", "观感质量", "工序交接", "工序检验",
+        "试验室", "标准养护", "检测见证",
+    ),
+    "safety": (
+        "临边洞口", "高处作业", "临时用电", "动火作业", "塔吊", "有限空间",
+        "危化品", "应急物资", "消防栓", "脚手架", "防护棚", "安全通道",
+        "安全警示", "消防设施",
+    ),
+    "schedule": (
+        "关键线路", "里程碑节点", "总控计划", "月进度计划", "周进度计划",
+        "交叉作业", "流水施工", "劳动力", "机械台班", "材料供应", "节点验收",
+        "工序穿插",
+    ),
+    "cost": (
+        "目标成本", "变更签证", "索赔事项", "资金计划", "量价分离", "分包结算",
+        "材料采购", "机械租赁", "人工单价", "成本台账",
+    ),
+    "org": (
+        "项目管理部", "专业分包", "劳务班组", "岗位职责", "例会制度", "技术交底",
+        "绩效考核", "人员培训", "组织机构", "管理体系",
+    ),
+    "tech": (
+        "施工工艺", "技术交底", "样板引路", "首件验收", "试验检测", "深化设计",
+        "BIM模型", "智慧工地", "新技术", "工艺评定", "作业指导", "工序验收",
+    ),
+    "generic": (
+        "阶段目标", "资源投入", "协调接口", "过程管控", "考核评价", "总结改进",
+        "任务分解", "责任落实", "计划编制", "动态跟踪", "风险清单", "验收交付",
+    ),
+}
+
+
+# 三级标题短动作词池（按语义域）：与实体词拼接后必须读得通，
+# 因此限定为 2~4 字的管理/执行动作，而非「施工工艺流程与要点」这类完整短语。
+_L3_SHORT_ACTIONS: dict[str, tuple[str, ...]] = {
+    "work": (
+        "施工工艺", "质量控制", "安全防护", "技术交底", "验收标准", "操作要点",
+        "施工准备", "成品保护", "材料管理", "过程监控", "检测试验", "记录归档",
+        "环境保护", "工序交接",
+    ),
+    "quality": (
+        "质量控制", "检测试验", "验收标准", "记录归档", "整改闭环", "样板引路",
+        "旁站监督", "见证取样", "实测实量", "成品保护",
+    ),
+    "safety": (
+        "安全防护", "技术交底", "隐患排查", "整改闭环", "教育培训", "应急演练",
+        "消防管理", "职业健康", "危险源辨识",
+    ),
+    "schedule": (
+        "进度计划", "节点控制", "资源配置", "交叉作业", "流水施工", "动态跟踪",
+        "偏差纠正", "考核评价",
+    ),
+    "cost": (
+        "成本核算", "变更签证", "索赔管理", "资金计划", "分包结算", "材料采购",
+        "量价管控",
+    ),
+    "org": (
+        "组织架构", "岗位职责", "例会制度", "绩效考核", "人员培训", "管理体系",
+        "制度落实",
+    ),
+    "tech": (
+        "施工工艺", "技术交底", "样板引路", "首件验收", "试验检测", "深化设计",
+        "工艺评定", "作业指导",
+    ),
+    "generic": (
+        "总体实施", "阶段推进", "资源配置", "过程控制", "考核评价",
+    ),
+}
+
+
+# 过程 / 制度类名词：本身已是完整语义单元，与另一个动作词直接拼接会产生
+# 「作业指导样板引路」「工序交接实测实量」「见证取样检测试验」这类生硬标题
+# ——两个过程名被粘在一起，读者看不出谁修饰谁。
+# 这类词改用 _L3_PROCEDURE_DIMS 拼接（要求 / 要点 / 流程 / 标准…），
+# 产出「作业指导要点」「工序交接流程」「见证取样要求」这类自然标题。
+_L3_PROCEDURE_WORDS = frozenset({
+    "技术交底", "工艺评定", "作业指导", "工序验收", "样板引路", "工序交接",
+    "工序检验", "首件验收", "见证取样", "检测见证", "旁站监理", "旁站监督",
+    "实测实量", "观感质量", "试验检测", "检测试验", "深化设计",
+    "例会制度", "岗位职责", "绩效考核", "人员培训", "组织机构", "管理体系",
+    "制度落实", "任务分解", "责任落实", "计划编制", "动态跟踪", "风险清单",
+    "验收交付", "阶段目标", "资源投入", "协调接口", "过程管控", "考核评价",
+    "总结改进", "量价分离", "分包结算",
+})
+
+# 过程/制度类名词的维度后缀：全部为「名词性维度词」，不与过程词重复语义。
+_L3_PROCEDURE_DIMS: tuple[str, ...] = (
+    "要求", "要点", "流程", "标准", "措施", "细则", "方案", "实施",
+    "检查", "记录", "控制", "交底", "验收", "培训", "部署",
+)
+
+
+def _l3_dims_for(entity: str, dimensions: tuple[str, ...]) -> tuple[str, ...]:
+    """按实体词类型选择维度池：过程/制度类名词走 _L3_PROCEDURE_DIMS。
+
+    返回空元组表示该实体词不应参与组合（调用方跳过）。
+    """
+    if entity in _L3_PROCEDURE_WORDS:
+        return _L3_PROCEDURE_DIMS
+    return dimensions
+
+
+def _l3_entity_candidates(
+    parent_title: str,
+    idx: int,
+    used: set[str],
+    extra_entities: tuple[str, ...] | None = None,
+    context_title: str = "",
+) -> list[str]:
+    """生成「工程实体 × 专业维度」候选三级标题列表。
+
+    与 `_derive_child_title(level=3)` 的规则 3（禁止继承父级核心短语）不冲突：
+    实体词取自语义域词池，而非父标题字符串本身，因此不会把 L2 标题整段复制到 L3。
+
+    Args:
+        parent_title: 父级（L2）标题，用于判定语义域
+        idx: 当前节点序号（用于轮转）
+        used: 已使用标题集合（跨章节全局）
+        extra_entities: 调用方额外提供的实体词（如从 L1/L2 提取的域关键词）
+        context_title: 祖级标题（如 L1），L2 为通用型时用于兜底判定语义域
+
+    Returns:
+        按优先级排序、尚未使用的候选标题列表
+    """
+    # 语义域判定：L2 常为通用型（「总体方案与实施策划」），此时把 L1 一起纳入
+    # 判定上下文，使 L3 继承所在一级章的专业领域（L1=质量管理措施 → quality 域）。
+    ctx = f"{context_title or ''} {parent_title or ''}".strip()
+    dom = _detect_domain(ctx)
+    # 仍无法判定时落到具体施工实体域。
+    # 「generic」域的实体与维度都是完整短语（阶段目标 / 总体实施策划），
+    # 互相拼接会产出「阶段目标总体实施策划」这类不通顺的伪标题。
+    if dom == "generic":
+        dom = "work"
+    entities = tuple(extra_entities or ()) + _L3_ENTITY_WORDS.get(dom, ())
+    if not entities:
+        entities = _L3_ENTITY_WORDS["work"]
+    # 维度使用短动作词池（2~4 字），与实体词拼接后读得通；
+    # 不用 _L3_SUFFIX_POOL（那里是「施工工艺流程与要点」这类完整短语，
+    # 与实体词拼接会产生「样板引路施工工艺流程与要点」伪标题）。
+    dimensions = tuple(_L3_SHORT_ACTIONS.get(dom, ()) or _L3_SHORT_ACTIONS["work"])
+    if not dimensions:
+        dimensions = tuple(_L3_SHORT_ACTIONS["work"])
+
+    out: list[str] = []
+    ent_len = len(entities)
+    # 过程/制度类实体的维度池（_L3_PROCEDURE_DIMS）与动作池长度不同，
+    # 轮转步长取两者上限，保证组合空间不因池切换而缩水。
+    dim_cap = max(len(dimensions), len(_L3_PROCEDURE_DIMS))
+    for offset in range(ent_len * dim_cap):
+        # 实体索引步进 (idx*5) 与维度索引步进 (idx) 互质，使同一章的兄弟
+        # 三级标题落在不同实体上；维度索引步进 (offset) 保证同实体的动作也分散。
+        e = entities[(idx * 5 + offset) % ent_len]
+        dims = _l3_dims_for(e, dimensions)
+        if not dims:
+            continue
+        d = dims[(idx + offset) % len(dims)]
+        if e in d or d in e:  # 完全叠词
+            continue
+        # 二元组重叠过滤：拦掉「旁站监理+旁站监督」「工序验收+首件验收」
+        # 这类共享核心词、读起来像在说同一件事的伪标题
+        if _has_bigram_overlap(e, d):
+            continue
+        # 双过程词过滤：拦掉「作业指导样板引路」「工序交接实测实量」这类
+        # 两个过程名直接粘在一起、读不出修饰关系的生硬标题。
+        # 过程类实体改由 _l3_dims_for 提供名词性维度，此处为双保险。
+        if e in _L3_PROCEDURE_WORDS and d in _L3_PROCEDURE_WORDS:
+            continue
+        cand = f"{e}{d}"
+        if cand in used or cand in out or _is_dirty_l3_title(cand):
+            continue
+        out.append(cand)
+        if len(out) >= 40:
+            break
+    return out
+
+
+def _short_parent_token(parent_title: str) -> str:
+    """提取父级标题的简短指代词（≤6 字），用于语义化兜底前缀。
+
+    优先取「域关键词」（如 脚手架/用电/防水…）保持与父级主题对应；
+    否则回落核心词（_core_for_derive 已含长度裁剪），并剥除首部编号
+    （「一、」「1、」「（1）」等）与顿号，最后兜底为「工程」。
+    """
+    if not parent_title:
+        return "工程"
+    for _dom, _kws in _DOMAIN_KEYWORDS.items():
+        for _kw in _kws:
+            if _kw in parent_title and len(_kw) >= 2:
+                return _kw
+    _core = _core_for_derive(parent_title)
+    # 剥除首部中文/阿拉伯编号与顿号（如「一、概述…」→「概述…」）
+    _core = re.sub(r"^[一二三四五六七八九十百零\d]+[、.．)]", "", _core or "").strip("、 ")
+    if _core and _core != "工程" and len(_core) <= 6:
+        return _core
+    return "工程"
+
+
+# 父级指代词本身即泛化短语时，禁止再拼维度词（旧实现此处必然产出
+# 「总体方案质量管控（第N项）」这类占位泛化标题，是本次修复的核心症状）
+_GENERIC_PARENT_TOKENS = frozenset({
+    "工程", "总体", "方案", "措施", "管理", "部署", "组织", "计划", "安排",
+    "实施", "技术", "管理措施", "总体方案", "总体部署", "总体安排", "总体实施",
+    "总体管理", "总体计划", "总体安排", "总体实施策划", "总体施工部署",
+    "实施策划", "施工部署", "分阶段推进", "推进计划", "阶段推进", "总体策划",
+    "工程实施", "项目管理", "施工组织",
+})
+
+
+def _semantic_fallback_title(
+    parent_title: str, idx: int, used: set[str] | None = None, context_title: str = ""
+) -> str:
+    """语义化兜底标题：永不产出「专项N」/「（第N项）」等占位脏标题。
+
+    优先级：
+      - 父级指代词是专业实体词（脚手架/防水/混凝土…）→ 指代词 + 专业执行维度
+      - 父级指代词本身是泛化短语（总体方案/工程/部署…）→ 工程实体 × 短动作词
+      两种路径都耗尽后，用序位词收口（仍不产出裸编号后缀）。
+    返回前会把所选标题登记进 used（自洽，避免调用方漏登记导致重复）。
+    """
+    if used is None:
+        used = set()
+    _token = _short_parent_token(parent_title)
+    _token_generic = _token in _GENERIC_PARENT_TOKENS or len(_token) <= 2
+    if _token_generic:
+        # 2026-10-10 主路径：父级泛化时落到具体工程实体
+        # （组合空间约 30 实体 × 14 维度 = 420，足够支撑数十个具体标题）
+        for _cand in _l3_entity_candidates(
+            parent_title, idx, used, context_title=context_title
+        ):
+            used.add(_cand)
+            return _cand
+    else:
+        _pool = _L3_FALLBACK_DIMENSIONS
+        _start = idx % len(_pool)
+        for _offset in range(len(_pool)):
+            _dim = _pool[(_start + _offset) % len(_pool)]
+            _cand = f"{_token}{_dim}"
+            if _cand not in used and not _is_dirty_l3_title(_cand):
+                used.add(_cand)
+                return _cand
+    # 上一路径耗尽 → 另一路径
+    if _token_generic:
+        _pool = _L3_FALLBACK_DIMENSIONS
+        for _offset in range(len(_pool)):
+            _dim = _pool[(idx + _offset) % len(_pool)]
+            _cand = f"{_token}{_dim}"
+            if _cand not in used and not _is_dirty_l3_title(_cand):
+                used.add(_cand)
+                return _cand
+    else:
+        for _cand in _l3_entity_candidates(
+            parent_title, idx, used, context_title=context_title
+        ):
+            used.add(_cand)
+            return _cand
+    # 极端兜底 —— 2026-10-10 起不再产出「（第N项）」裸编号冲突后缀
+    # （旧实现此处必然产出脏标题，是「总体实施策划（2）/（3）」的直接来源）
+    _ordinals = ("之一", "之二", "之三", "之四", "之五", "之六", "之七", "之八")
+    _dim = _L3_FALLBACK_DIMENSIONS[idx % len(_L3_FALLBACK_DIMENSIONS)]
+    for _o in _ordinals:
+        _cand = f"{_token}{_dim}{_o}"
+        if _cand not in used and not _is_dirty_l3_title(_cand):
+            used.add(_cand)
+            return _cand
+    # Step 4：绝对兜底（理论上不可达：Step 1 组合空间远大于单章节点数）
+    # 2026-10-11 修复：旧实现 `f"{_token}{_pool[_]}{_n}"` 追加阿拉伯数字，
+    # 产出「总体实施策划专项方案2」这类裸数字结尾标题 —— 恰好被
+    # `_BARE_NUM_TAIL_RE` 判为脏标题，即兜底函数产出了自家定义的脏格式。
+    # 改为「维度词 × 中文序数」全组合，穷尽后退回「第N条」表述
+    # （结尾是 CJK 量词，不触发脏判定），保证唯一且始终可读。
+    _ordinals_all = (
+        "之一", "之二", "之三", "之四", "之五",
+        "之六", "之七", "之八", "之九", "之十",
+    )
+    for _dim in _L3_FALLBACK_DIMENSIONS:
+        for _o in _ordinals_all:
+            _cand = f"{_token}{_dim}{_o}"
+            if _cand not in used and not _is_dirty_l3_title(_cand):
+                used.add(_cand)
+                return _cand
+    _n = 1
+    while True:
+        _cand = f"{_token}{_pool[idx % len(_pool)]}第{_n}条"
+        if _cand not in used:
+            used.add(_cand)
+            return _cand
+        _n += 1
+
+
+def _parent_tokens(parent_title: str, title: str) -> list[str]:
+    """提取父级标题的候选指代词（优先级降序），用于重名消歧前缀。
+
+    与 `_short_parent_token` 的区别：它刻意避开 `title` 已有的词面，
+    专挑父级**独有**的语义片段 —— 这样「地下施工工艺」在不同二级章下
+    重复时，靠「资源配置 / 过程控制 / 总结评估」这类父级差异就能自然
+    区分，而不是靠追加「（其N）」式无意义后缀。
+
+    候选来源（按优先级）：
+      1. 父级简短指代词（域关键词优先，如「脚手架」）；
+      2. 父级命中的全部域关键词；
+      3. 剥掉与 `title` 公共前缀后剩下的父级语义片段
+         （「专业分包资源配置与协调保障」vs「专业分包地下施工工艺」→「资源配置」）。
+    """
+    if not parent_title or not title:
+        return []
+    _norm = re.compile(r"[（()）,，、。：；！？/\s\u3000]+")
+    base = _norm.sub("", title or "")
+    if not base:
+        return []
+    out: list[str] = []
+
+    def _push(tok: str) -> None:
+        tok = _norm.sub("", tok or "")
+        if len(tok) < 2 or len(tok) > 4 or tok in base or tok in out:
+            return
+        out.append(tok)
+
+    _push(_short_parent_token(parent_title))
+    for _kws in _DOMAIN_KEYWORDS.values():
+        for _kw in _kws:
+            if len(_kw) >= 2 and _kw in parent_title:
+                _push(_kw)
+    # 剩余语义片段：先剥掉「第1章/一、」这类编号，再剥掉与 base 的公共前缀
+    _core = _extract_title_core(parent_title)
+    _core = re.sub(r"^第?\s*[一二三四五六七八九十百零\d]+\s*[章节部分编期]?", "", _core or "").strip()
+    _core = re.sub(r"^[一二三四五六七八九十百零\d]+[、.．)]", "", _core).strip("、 ")
+    _core = _norm.sub("", _core)
+    if _core:
+        _i = 0
+        while _i < len(_core) and _i < len(base) and _core[_i] == base[_i]:
+            _i += 1
+        _rem = re.sub(r"^[与和及、,，:：/\s\u3000]+", "", _core[_i:]).strip()
+        if _rem:
+            _push(_rem[:4])
+    return out
+
+
+def _disambiguate_title(
+    title: str, used: set[str] | None = None, parent_title: str = ""
+) -> str:
+    """对重名标题做语义化消歧：永不产出「（其N）」/「（2）」式冗余后缀。
+
+    ⚠️ `used` 的比对口径：候选先经 `_title_core` 归一化再比对，因此调用方
+    无论传「归一化 core 集合」还是「原始标题集合」都能正确判定。
+    旧实现用**原始字符串**去比对**归一化 core 集合**，「X（其2）」永远不等于
+    集合里的「X其2」，序数计数器恒停在 2，上层再包一层后滚成
+    「（其3）（其4）（其5）」的递增污染（用户 2026-10-11 反馈的目录形态）。
+
+    优先级（组合空间由小到大，前序产物可读性最好）：
+      1) 追加专业执行维度词：总体实施策划 → 总体实施策划专项方案；
+      2) 父级差异词前缀 + 维度词 / 仅父级差异词前缀
+         （脚手架总体实施策划）—— 组合空间 = 父级词 × 维度词，远大于任一
+         单侧池，专门应对《招投标项目》样例里通用标题被反复复用的情况，
+         且天然与父级章节对应；
+      3) 中文序数兜底：总体实施策划之三。不带括号，`_ORDINAL_SUFFIX_RE` 与
+         `_BARE_NUM_TAIL_RE` 都不会识别它，故每个序数的 core 都不同，
+         必然收敛，不会重演归一化剥离导致的死循环。
+    注意：本函数不负责把结果登记进 used，由调用方登记。
+    """
+    if used is None:
+        used = set()
+    # 加固：输入本身可能带裸编号或历史冗余后缀（「总体实施策划（2）」
+    # 「砌体成品保护（其2）」）。先全部剥离再消歧，避免残留后缀被挪到标题中间
+    # 而让 `_clean_legacy_suffix_tree` 的末尾匹配失效。仅剥离不登记。
+    title = _strip_ordinal_suffix(title or "")
+    title = _strip_legacy_redundant_suffix(title)
+    if _BARE_NUM_TAIL_RE.search(title):
+        _rest = _BARE_NUM_TAIL_RE.sub("", title).strip()
+        if _rest and _rest in (_GENERIC_ONLY_TITLES | _L3_L2LIKE_TITLES):
+            title = _rest
+    if not title:
+        return title
+
+    def _free(cand: str) -> bool:
+        return _title_core(cand) not in used
+
+    # 1) 专业执行维度词
+    for _d in _DISAMBIG_DIMENSIONS:
+        if title.endswith(_d):
+            continue
+        _cand = f"{title}{_d}"
+        if _free(_cand):
+            return _cand
+
+    # 2) 父级差异词前缀（组合空间 = 父级词 × 维度词）
+    for _tok in _parent_tokens(parent_title, title):
+        for _d in _DISAMBIG_DIMENSIONS:
+            if _d in title:
+                continue
+            _cand = f"{_tok}{title}{_d}"
+            if _free(_cand):
+                return _cand
+        if _free(f"{_tok}{title}"):
+            return f"{_tok}{title}"
+
+    # 3) 中文序数兜底（有界扫描，永不产出「（其N）」）
+    for _n in range(2, 101):
+        _cand = f"{title}之{_cn_ordinal(_n)}"
+        if _free(_cand):
+            return _cand
+    return f"{title}之{_cn_ordinal(101)}"
+
+
+def _cleanup_placeholder_titles(
+    level1: list[dict], global_used: set[str] | None = None
+) -> int:
+    """兜底清洗：将任何遗留的占位标题（专项N / 裸「实施要点」）改写为语义化标题。
+
+    遍历整棵树，对命中占位模式的节点，依据其父级标题用 `_semantic_fallback_title`
+    重新生成唯一标题。返回被清洗的节点数。
+    """
+    _fixed = 0
+    _used = global_used if global_used is not None else set()
+
+    def _collect(nodes: list) -> None:
+        for _n in nodes:
+            if isinstance(_n, dict) and _n.get("title"):
+                _used.add(_n["title"].strip())
+
+    def _walk(
+        nodes: list, parent_title: str = "", grandparent_title: str = "", level: int = 1
+    ) -> None:
+        nonlocal _fixed
+        for _node in nodes:
+            if not isinstance(_node, dict):
+                continue
+            _title = (_node.get("title") or "").strip()
+            # 2026-10-10 修复：脏标题清洗只作用于三级及以下。
+            # 旧实现无条件套用占位判定，但「其他」「概述」「说明」这类词
+            # 同为 28 章模板的合法一级/二级标题（FIXED_28_CHAPTERS[27]="其他"），
+            # 若一并清洗会误伤合法章节标题。
+            _is_placeholder = level >= 3 and _is_dirty_l3_title(_title)
+            if _is_placeholder:
+                _idx = 0
+                _children = _node.get("children", []) or []
+                if isinstance(_children, list):
+                    _idx = len(_children)
+                _new = _semantic_fallback_title(
+                    parent_title or "", _idx, _used, context_title=grandparent_title
+                )
+                _node["title"] = _new
+                _used.add(_new)
+                _fixed += 1
+            _sub = _node.get("children")
+            if isinstance(_sub, list):
+                _walk(_sub, _title, parent_title, level + 1)
+
+    # 2026-10-11 修复（O-9）：旧实现只收集 L1 的 children（L2+），遗漏 L1 自身。
+    # 清洗后的 L3 标题可能与同项目 L1 标题撞名。现先收集 L1 自身标题。
+    for _ch in level1:
+        if isinstance(_ch, dict) and _ch.get("title"):
+            _used.add(_ch["title"].strip())
+            _collect(_ch.get("children", []) or [])
+    _walk(level1)
+    return _fixed
+
+
+def _derive_child_title(
+    parent_title: str, idx: int, used: set[str], level: int, grandparent_title: str = ""
+) -> str:
     """从上一级目录标题语义派生子标题（保证对应性 + 多样性 + 不重名）。
 
     **2026-09-04 用户定制规则 3 适配**：
@@ -662,6 +1419,7 @@ def _derive_child_title(parent_title: str, idx: int, used: set[str], level: int)
         idx: 子节点序号（轮转用）
         used: 已使用标题集合（本章内）
         level: 2 或 3
+        grandparent_title: 祖父级标题（level=3 时为 L1，用于兜底判定语义域）
     """
     parent_title = (parent_title or "").strip() or "工程实施"
     dom = _detect_domain(parent_title)
@@ -671,6 +1429,16 @@ def _derive_child_title(parent_title: str, idx: int, used: set[str], level: int)
 
     # === 规则 3 核心改动：L3 完全独立 ===
     if level == 3:
+        # 2026-10-10 增强：仅当语义域判为 generic（父级 L2 是通用型标题）时，
+        # 优先走「工程实体 × 短动作词」组合 —— 此时规则池只有 5 项 generic 短语，
+        # 耗尽后旧实现必然退回到「总体实施策划（2）/（3）」这类占位脏标题。
+        # 父级本身专业（work/quality/safety…）时保留原有过滤池路径，
+        # 那里的标题已是完整可读的独立条目，实体拼接反而冗余。
+        if dom == "generic":
+            for _cand in _l3_entity_candidates(
+                parent_title, idx, used, context_title=grandparent_title
+            ):
+                return _cand
         # 禁用父级词汇的前缀拼合
         prefix_core = ""
         # 域池剔除含父级核心短语的条目（严格语义隔离）
@@ -681,13 +1449,20 @@ def _derive_child_title(parent_title: str, idx: int, used: set[str], level: int)
 
         pool_filtered = _filter_phrases(pool)
         generic_filtered = _filter_phrases(generic_pool)
+        # 2026-10-10 增强：域池耗尽时优先用「工程实体 × 短动作词」组合，
+        # 而不是直接吐出 generic 池里的完整短语（「总体实施策划」
+        # 「分阶段推进计划」「资源配置与协调保障」）。那 5 个短语本质是
+        # L2 级章名，落到 L3 会与别的章节 L2 撞名，且读起来像章名而非条目。
+        _entity_cands = _l3_entity_candidates(
+            parent_title, idx, used, context_title=grandparent_title
+        )
         # 主域池耗尽时再用 generic 池补充（先过滤再补充）
         if not pool_filtered and not generic_filtered:
             # 极端兜底：核心短语屏蔽后两池全空 → 退回未过滤池，
             # 避免节点生成失败；此时仍无前缀拼合，语义解耦基本成立
-            full_pool = list(pool) + list(generic_pool)
+            full_pool = list(pool) + list(_entity_cands) + list(generic_pool)
         else:
-            full_pool = list(pool_filtered) + list(generic_filtered)
+            full_pool = list(pool_filtered) + list(_entity_cands) + list(generic_filtered)
     else:
         prefix_core = core
         full_pool = list(pool) + list(generic_pool)
@@ -706,14 +1481,9 @@ def _derive_child_title(parent_title: str, idx: int, used: set[str], level: int)
                 continue
             return cand
     # 极端兜底：所有池都耗尽（level=3 不再追加父级前缀）
-    # BUG-OUTLINE-INFLOOP 修复：原 while True 内 n 未自增，若 "专项{n}" 恰好在
-    # used 集合中会导致真·无限循环。改为每轮 n += 1 直至找到未占用标题。
-    n = idx + 1
-    while True:
-        cand = f"专项{n}"
-        if cand not in used:
-            return cand
-        n += 1
+    # 2026-10-09 增强：改用语义化兜底（父级指代词 + 专业执行维度），
+    # 永不产出「专项{n}」占位，且仍保证全局唯一。
+    return _semantic_fallback_title(parent_title, idx, used)
 
 
 def _generate_fallback_l3_for_ensure(l2_title: str, idx: int, l2_index: int = 0) -> str:
@@ -729,45 +1499,63 @@ def _generate_fallback_l3_for_ensure(l2_title: str, idx: int, l2_index: int = 0)
 
 
 def _uniquify_outline_titles(level1: list[dict]) -> list[dict]:
-    """全局标题去重安全网（目录重名修复，V5.1 共用）。
+    """同级标题去重安全网（V5.1 共用）。
 
-    遍历整个目录树，维护全局归一化标题集合：
-    - **2026-09-04 用户定制规则 3 适配**：禁止用父级标题做防重名前缀
-      （L3-L5 标题不得继承父级词汇）。改为直接追加序号 "（{n}）" 保证唯一。
-    - 只重命名「重复」的标题，唯一标题保持不动。
+    **2026-10-11 政策修正：由「全树全局唯一」改为「同级唯一」。**
+
+    原因：标书目录的合法形态就是同一个三级条目在不同二级章下重复出现
+    （如「地下施工工艺」同时出现在「资源配置与协调保障」「过程控制与考核机制」
+    「总结评估与持续改进」下）—— 靠父级章节编号区分即可，Word 自动目录里
+    会呈现为 3.1 / 4.1 / 5.1，完全正常。旧的全局唯一策略为消除这类**合法**
+    重复，不断追加「专项方案/补充措施」等无意义维度词，最终退化为
+    「（其3）（其4）（其5）」式冗余后缀（用户 2026-10-11 反馈的目录污染）。
+
+    现在的规则：
+      1. 只保证**同一父节点下的兄弟标题**互不重名 —— 同级重名才是真缺陷；
+      2. 不同父节点下的同名标题原样保留；
+      3. 先清洗历史遗留的「（其N）」等冗余后缀，使**已落库**的目录同样被修复；
+      4. 只重命名「重复」的标题，唯一标题保持不动；
+      5. 幂等：重复调用不产生二次改名。
+
+    注：2026-09-04 用户定制规则 3（L3-L5 不得继承父级词汇）仍由
+    `_derive_child_title` 在**生成**阶段执行；本函数只在**兜底消歧**时才
+    使用父级差异词前缀，且已先尝试专业维度词。
     """
+    _clean_legacy_suffix_tree(level1)
 
-    def _core(t: str) -> str:
-        tt = (t or "").strip().lower()
-        tt = re.sub(r"[\s\u3000]+", "", tt)
-        tt = re.sub(r"[^\w\u4e00-\u9fff]", "", tt)
-        return tt
-
-    seen: set[str] = set()
-
-    def _walk(nodes: list[dict]) -> None:
+    def _dedupe_siblings(nodes: list[dict], parent_title: str = "") -> None:
+        seen: set[str] = set()
         for node in nodes:
             if not isinstance(node, dict):
                 continue
             title = node.get("title", "")
-            core = _core(title) if title else ""
+            core = _title_core(title) if title else ""
             if core:
                 if core in seen:
-                    ncore = core
-                    _cnt = 2
-                    while ncore in seen:
-                        new_title = f"{title}（{_cnt}）"
-                        ncore = _core(new_title)
-                        _cnt += 1
-                    logger.info("V5.1 全局去重: 「%s」->「%s」（避免重名，仅追加序号）", title, new_title)
+                    new_title = _disambiguate_title(title, seen, parent_title=parent_title)
+                    new_core = _title_core(new_title)
+                    # 防御式兜底（理论上不可达：_disambiguate_title 的中文序数分支
+                    # 必然收敛）。绝不回退到「（其N）」式冗余后缀。
+                    _n = 101
+                    while new_core and new_core in seen and _n < 200:
+                        new_title = f"{title}之{_cn_ordinal(_n)}"
+                        new_core = _title_core(new_title)
+                        _n += 1
+                    logger.info(
+                        "同级去重: 「%s」->「%s」（父级=%s）",
+                        title,
+                        new_title,
+                        parent_title or "(根)",
+                    )
                     node["title"] = new_title
-                    core = ncore
+                    core = new_core
                 seen.add(core)
             children = node.get("children")
             if isinstance(children, list):
-                _walk(children)
+                _dedupe_siblings(children, node.get("title") or "")
 
-    _walk(level1)
+    if isinstance(level1, list):
+        _dedupe_siblings(level1)
     return level1
 
 

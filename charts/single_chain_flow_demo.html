@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>单链流程图统一样式 - 竖向 + 横向</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    font-family: "Microsoft YaHei", "PingFang SC", Arial, sans-serif;
+    background: #f5f7fa;
+    margin: 0;
+    padding: 40px 20px;
+    color: #333;
+  }
+  h1 {
+    text-align: center;
+    color: #1f3a63;
+    margin-bottom: 4px;
+  }
+  .subtitle {
+    text-align: center;
+    color: #666;
+    margin-bottom: 40px;
+    font-size: 14px;
+  }
+  section {
+    margin: 32px auto;
+    max-width: 1200px;
+    background: #fff;
+    padding: 24px;
+    border-radius: 8px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.05);
+  }
+  section h2 {
+    color: #1f3a63;
+    margin: 0 0 16px;
+    border-left: 4px solid #a89aff;
+    padding-left: 12px;
+  }
+  .v-flow, .h-flow {
+    display: inline-flex;
+    align-items: center;
+    padding: 20px;
+  }
+  .v-flow { flex-direction: column; }
+  .h-flow { flex-direction: row; }
+  .v-flow .node { width: 280px; }
+  .h-flow .node { width: 200px; }
+  .node {
+    box-sizing: border-box;
+    min-height: 80px;
+    background: #f0edff;
+    border: 1px solid #a89aff;
+    border-radius: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 16px 24px;
+    font-size: 15px;
+    color: #333333;
+    letter-spacing: 0.5px;
+    text-align: center;
+    line-height: 1.4;
+    transition: box-shadow 0.2s;
+    flex-shrink: 0;
+  }
+  .node:hover { box-shadow: 0 2px 8px rgba(168, 154, 255, 0.3); }
+  .v-flow .arrow { width: 100%; height: 40px; display: flex; align-items: center; justify-content: center; }
+  .h-flow .arrow { width: 40px; height: 100%; display: flex; align-items: center; justify-content: center; }
+  .arrow svg { overflow: visible; }
+  .arrow line { stroke: #333333; stroke-width: 1.5; stroke-linecap: round; }
+  .arrow polygon { fill: #333333; }
+  .palette {
+    display: flex;
+    gap: 12px;
+    justify-content: center;
+    margin: 16px 0;
+    flex-wrap: wrap;
+  }
+  .swatch {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 10px;
+    background: #fafafa;
+    border-radius: 4px;
+    font-family: Consolas, monospace;
+    font-size: 13px;
+  }
+  .swatch .box { width: 18px; height: 18px; border: 1px solid #ddd; }
+  .note {
+    max-width: 1200px;
+    margin: 24px auto;
+    padding: 16px 20px;
+    background: #fff8e1;
+    border-left: 4px solid #f0c000;
+    border-radius: 4px;
+    font-size: 14px;
+    color: #444;
+  }
+</style>
+</head>
+<body>
+
+<h1>单链流程图统一样式规范</h1>
+<div class="subtitle">浅紫底 <code>#f0edff</code> · 紫边框 <code>#a89aff</code> · 深灰字 <code>#333</code> · 深灰箭头 <code>#333</code></div>
+
+<div class="palette">
+  <div class="swatch"><div class="box" style="background:#f0edff"></div>节点背景 #f0edff</div>
+  <div class="swatch"><div class="box" style="background:#a89aff"></div>节点边框 #a89aff</div>
+  <div class="swatch"><div class="box" style="background:#333333"></div>文字/箭头 #333333</div>
+</div>
+
+<section>
+  <h2>① 竖向单链（节点 &gt; 8） · 拆除工艺流程</h2>
+  <div class="v-flow" id="vChart"></div>
+</section>
+
+<section>
+  <h2>② 横向单链（节点 ≤ 8） · 防水施工工艺流程</h2>
+  <div class="h-flow" id="hChart"></div>
+</section>
+
+<div class="note">
+  <strong>方向自动选择规则</strong>：节点数 ≤ 8 → 横向；节点数 &gt; 8 → 竖向。<br>
+  实现入口：backend <code>/api/v1/charts/single-chain-flow/render</code>（direction 支持
+  <code>vertical</code> / <code>horizontal</code> / <code>auto</code>）。
+</div>
+
+<script>
+const vSteps = [
+  '拆除技术交底与保护标记','吊顶拆除','隔墙拆除','墙面面层铲除','地面面层拆除',
+  '垃圾分类与密闭收集','临时贮存与封闭锁闭','装车与洒水降尘','车辆冲洗',
+  '密闭运输至消纳点','台账记录与闭环管理',
+];
+const hSteps = ['基层处理','防水施工','蓄水试验','保护层施工','验收交付'];
+
+function makeNode(text) {
+  const n = document.createElement('div');
+  n.className = 'node';
+  n.textContent = text;
+  return n;
+}
+
+function renderV(id, steps) {
+  const c = document.getElementById(id);
+  steps.forEach((t, i) => {
+    c.appendChild(makeNode(t));
+    if (i < steps.length - 1) {
+      const a = document.createElement('div');
+      a.className = 'arrow';
+      a.innerHTML =
+        '<svg xmlns="http://www.w3.org/2000/svg">' +
+        '<line x1="0" y1="0" x2="0" y2="30" />' +
+        '<polygon points="0,40 -5,30 5,30" />' +
+        '</svg>';
+      c.appendChild(a);
+    }
+  });
+}
+
+function renderH(id, steps) {
+  const c = document.getElementById(id);
+  steps.forEach((t, i) => {
+    c.appendChild(makeNode(t));
+    if (i < steps.length - 1) {
+      const a = document.createElement('div');
+      a.className = 'arrow';
+      a.innerHTML =
+        '<svg xmlns="http://www.w3.org/2000/svg">' +
+        '<line x1="0" y1="0" x2="30" y2="0" />' +
+        '<polygon points="40,0 30,-5 30,5" />' +
+        '</svg>';
+      c.appendChild(a);
+    }
+  });
+}
+
+renderV('vChart', vSteps);
+renderH('hChart', hSteps);
+</script>
+
+</body>
+</html>

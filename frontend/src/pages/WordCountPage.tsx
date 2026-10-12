@@ -8,7 +8,7 @@ import {
 } from "@ant-design/icons";
 import { getWordCountOverview, getWordCountSections, setSectionTargetWords } from "../api";
 import type { WordCountOverview, WordCountItem } from "../api";
-import { extractApiError, getLevelColor, getLevelLabel } from "../utils";
+import { extractApiError, getLevelColor, getLevelLabel, resolveProgressLowerBound } from "../utils";
 
 const { Text } = Typography;
 
@@ -134,8 +134,25 @@ export default function WordCountPage() {
       key: "progress",
       width: 180,
       render: (progress: number, record: WordCountItem) => {
-        const below = record.target_words != null && record.target_words > 0 && record.word_count < record.target_words;
-        const done = record.target_words != null && record.target_words > 0 && record.word_count >= record.target_words;
+        // BUG-FIX 2026-10-09（前后端判定不一致）：本列此前用
+        // `word_count < target_words` / `>= target_words` 判定，即**零容差**，
+        // 完全忽略后端 `GET /word-count/sections` 已经算好的容差区间。
+        // 于是同一个 300 字目标、实际 280 字的 L3 章节，后端 `on_target`
+        // 判定为「在 240~360 内 = 达标」，本列却渲染成「缺 20 字」+ 红色进度条
+        // —— 用户看到的画面与导出预检（services/export.py 走同一套区间）
+        // 直接矛盾，且无法自查原因。
+        // 现统一以服务端给出的 `on_target` 为准（它是唯一事实来源，
+        // 已包含 L3 自身 300±20% 与四档档位各自 tolerance_ratio 的判定），
+        // 「缺多少字」也改为相对**区间下界**计算，与红色进度条语义对齐。
+        const onTarget = record.on_target === true;
+        const unknown = record.on_target === "unknown";
+        // 缺字数以达标区间下界为基准；后端未直接给区间时用 target - tolerance
+        // 估算，tolerance 取自档位配置（tier_target 与 target_words 的关系由
+        // 后端口径保证，前端仅在缺少 tier 信息时按 ±10% 保守估算）。
+        const lowerBound = resolveProgressLowerBound(record);
+        const hasTarget = record.target_words != null && record.target_words > 0;
+        const below = !onTarget && !unknown && hasTarget && record.word_count < lowerBound;
+        const done = onTarget;
         return (
           <Space direction="vertical" size={2} style={{ width: "100%" }}>
             <Progress
@@ -145,10 +162,13 @@ export default function WordCountPage() {
             />
             {below && (
               <Text type="warning" style={{ fontSize: 12 }}>
-                缺 {((record.target_words || 0) - record.word_count).toLocaleString()} 字
+                缺 {(lowerBound - record.word_count).toLocaleString()} 字
               </Text>
             )}
             {done && <Text type="success" style={{ fontSize: 12 }}>已达标</Text>}
+            {!done && !below && unknown && (
+              <Text type="secondary" style={{ fontSize: 12 }}>待生成</Text>
+            )}
           </Space>
         );
       },

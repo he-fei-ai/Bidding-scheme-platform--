@@ -323,12 +323,39 @@ async def test_s3_save_image_model_masked_key_preserves_ciphertext(restore_image
 # B-1 / P-1：源码级自证（项目既有 F-4 同款手法）
 # ---------------------------------------------------------------------------
 def test_b1_fetch_model_info_logs_probe_failure():
-    """元数据探测失败必须有日志，禁止回归为静默 except pass。"""
+    """元数据探测失败必须有日志，禁止回归为静默 except pass。
+
+    B-1 加固（2026-10-11）：源码级断言改用**直读源文件**提取函数体，
+    替代 `inspect.getsource`。原因：全量套件跑时 `inspect.getsource` 偶发
+    拿到错位的 `__code__.co_firstlineno`（表现为 src 片段来自其他函数），
+    导致本用例在全量下报「logger.warning not in src」的假失败。
+    直读源文件 + 精确边界切分（下一个 top-level `@router.`/`def`/`class`）
+    稳定可复现，且与原有语义完全等价。
+    """
+    from pathlib import Path
+
     import app.routers.ai_config as m
 
-    src = inspect.getsource(m.fetch_model_info)
-    assert "pass" not in src.split("except Exception")[-1]
-    assert "logger.warning" in src
+    src_path = Path(m.__file__).with_suffix(".py")
+    full_src = src_path.read_text(encoding="utf-8")
+    anchor = "async def fetch_model_info("
+    pos = full_src.find(anchor)
+    assert pos >= 0, "无法在源文件中定位 fetch_model_info 定义（签名变更？）"
+    # 向上定位到该行起始（多行 def 签名不影响，因为 anchor 是完整子串）
+    line_start = full_src.rfind("\n", 0, pos) + 1
+    # 向下定位到下一个 top-level 元素
+    tail = full_src[pos:]
+    ends = []
+    for marker in ("\n@router.", "\nasync def ", "\ndef ", "\nclass "):
+        i = tail.find(marker, 1)
+        if i >= 0:
+            ends.append(i)
+    func_end = pos + (min(ends) if ends else len(tail))
+    func_src = full_src[line_start:func_end]
+
+    assert "except Exception" in func_src, "fetch_model_info 应存在 except Exception 分支"
+    assert "pass" not in func_src.split("except Exception")[-1]
+    assert "logger.warning" in func_src
 
 
 def test_p1_fallback_health_check_off_event_loop():

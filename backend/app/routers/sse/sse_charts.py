@@ -304,7 +304,93 @@ async def _auto_generate_charts_for_section(
         # 其次用章节标题 —— 保证 DOCX 图题与正文语义一致。
         _chart_title = str(arrange.get("hintTitle") or title or "").strip()
 
+        # ---------- ENHANCE 2026-10-11: 校验 + AI 修复统一钩子 ----------
+        # 7 类图表分两条校验轨道：
+        #   ① architecture / labor（结构化 JSON）→ validate_chart_payload（chart_validators v3.1）
+        #   ② flowchart / gantt / comparison / layout / timeline（Mermaid 代码）→ repair_mermaid + validate_mermaid
+        # 校验失败 → chart_data_fix() AI 修复重试 → 再校验 → 仍失败则跳过（不写入坏数据到 DB）。
+        # 这是 validate_chart_payload 首次进入生产链路——拦截 AI 生成的残缺数据。
+        _MERMAID_CODE_TYPES = {"flowchart", "gantt", "comparison", "layout", "timeline"}
+        _STRUCTURED_TYPES = {"architecture", "labor"}
 
+        async def _validate_and_fix(chart_type: str, chart_data: dict) -> dict | None:
+            """校验图表数据，失败时 AI 修复重试，返回修复后数据或 None（跳过）。"""
+            nonlocal provider, title, content
+
+            # --- Step 1: 首轮校验 ---
+            # 调用 image_engine.validate_chart_for_ai_pipeline 统一入口——
+            # 已封装 repair_mermaid + validate_mermaid + 结构化解析 + chart_validators。
+            # 这里只有异常兜底逻辑，核心校验逻辑抽到了 image_engine.py 方便单元测试。
+            try:
+                from ...services.ai.image_engine import validate_chart_for_ai_pipeline as _vfp
+                # verbose=True 让 Mermaid 代码型返回完整 repair_context（repair_mermaid diff +
+                # 结构化解析结果），chart_data_fix AI 修复时能拿到机械化修复的精确上下文
+                _ok, _errors, chart_data, _mutated, _repair_ctx = _vfp(
+                    chart_type, chart_data, verbose=True, section_title=_chart_title
+                )
+                if _mutated and _ok:
+                    logger.info(
+                        "[图表校验] 首轮校验通过且 chart_data 被机械化修复/注入结构化字段: type=%s title=%s",
+                        chart_type, _chart_title,
+                    )
+            except Exception as _ve:
+                logger.debug("图表校验管线不可用（跳过）: %s", _ve)
+                _ok, _errors, _repair_ctx = True, [], None
+
+            if not _errors:
+                return chart_data  # 校验通过（或校验器不可用时放行）
+
+            # --- Step 2: AI 修复重试 ---
+            logger.warning(
+                "[图表校验] 首轮校验未通过，触发 AI 修复重试: type=%s errors=%s",
+                chart_type, _errors[:3],
+            )
+            try:
+                from ...services.ai.image_engine import chart_data_fix as _fix
+                _fixed = await _fix(
+                    provider,
+                    chart_type=chart_type,
+                    section_title=title,
+                    section_content=content,
+                    error_message="; ".join(_errors[:5]),
+                    original_data=json.dumps(chart_data, ensure_ascii=False),
+                    repair_context=_repair_ctx,  # ENHANCE 2026-10-11: 注入机械化修复上下文
+                )
+                if isinstance(_fixed, dict):
+                    # 修复成功：合并 type/title，保留修复内容
+                    _fixed["type"] = chart_type
+                    if not _fixed.get("title"):
+                        _fixed["title"] = _chart_title
+                    # --- Step 2: 二轮校验（同样走 validate_chart_for_ai_pipeline + verbose=True）---
+                    # ENHANCE 2026-10-11: 二轮校验也走统一入口，拿到修复后完整 repair_context，
+                    # 可对比首轮 vs 修复后哪些问题解决了、哪些还存在、repair_mermaid 步骤触发情况。
+                    _fixed_ok, _fixed_errors, _fixed, _fixed_mutated, _fixed_ctx = _vfp(
+                        chart_type, _fixed, verbose=True, section_title=_chart_title
+                    )
+                    if _fixed_ok:
+                        chart_data = _fixed
+                        # 结构化日志：首轮 vs 修复后 diff 对比
+                        _first_steps = (_repair_ctx or {}).get("repair_mermaid", {}).get("steps", [])
+                        _second_steps = (_fixed_ctx or {}).get("repair_mermaid", {}).get("steps", [])
+                        _json = json.dumps(chart_data, ensure_ascii=False)[:2000]
+                        logger.info(
+                            "[图表校验] AI 修复成功: type=%s title=%s errors_resolved=%d "
+                            "首轮repair_steps=%s 二轮repair_steps=%s fixed_data=%s",
+                            chart_type, _chart_title, len(_errors),
+                            _first_steps, _second_steps, _json,
+                        )
+                        return chart_data
+                    else:
+                        logger.warning(
+                            "[图表校验] AI 修复后仍未通过校验，跳过: type=%s errors=%s",
+                            chart_type, _fixed_errors[:3],
+                        )
+                else:
+                    logger.warning("[图表校验] AI 修复未返回 dict，跳过: type=%s", chart_type)
+            except Exception as _fe:
+                logger.warning("[图表校验] AI 修复调用异常，跳过: type=%s error=%s", chart_type, _fe)
+
+            return None  # 校验失败且修复无效 → 跳过，不写入坏数据
 
         try:
 
@@ -362,6 +448,11 @@ async def _auto_generate_charts_for_section(
 
                     chart_data = {"type": "flowchart", "code": mermaid_code, "title": _chart_title}
 
+                    chart_data = await _validate_and_fix(chart_type, chart_data)
+                    if chart_data is None:
+
+                        return None
+
                     await _save_section_field(
 
                         section_id,
@@ -403,6 +494,11 @@ async def _auto_generate_charts_for_section(
                 if mermaid_code:
 
                     chart_data = {"type": "gantt", "code": mermaid_code, "title": _chart_title}
+
+                    chart_data = await _validate_and_fix(chart_type, chart_data)
+                    if chart_data is None:
+
+                        return None
 
                     await _save_section_field(
 
@@ -446,6 +542,11 @@ async def _auto_generate_charts_for_section(
 
                     chart_data = {"type": "architecture", "tree": arch_tree, "title": _chart_title}
 
+                    chart_data = await _validate_and_fix(chart_type, chart_data)
+                    if chart_data is None:
+
+                        return None
+
                     await _save_section_field(
 
                         section_id,
@@ -488,6 +589,11 @@ async def _auto_generate_charts_for_section(
 
                     chart_data = {"type": "labor", **labor_data, "title": _chart_title}
 
+                    chart_data = await _validate_and_fix(chart_type, chart_data)
+                    if chart_data is None:
+
+                        return None
+
                     await _save_section_field(
 
                         section_id,
@@ -525,6 +631,11 @@ async def _auto_generate_charts_for_section(
                 if mermaid_code:
 
                     chart_data = {"type": "comparison", "code": mermaid_code, "title": _chart_title}
+
+                    chart_data = await _validate_and_fix(chart_type, chart_data)
+                    if chart_data is None:
+
+                        return None
 
                     await _save_section_field(
 
@@ -564,6 +675,11 @@ async def _auto_generate_charts_for_section(
 
                     chart_data = {"type": "layout", "code": mermaid_code, "title": _chart_title}
 
+                    chart_data = await _validate_and_fix(chart_type, chart_data)
+                    if chart_data is None:
+
+                        return None
+
                     await _save_section_field(
 
                         section_id,
@@ -601,6 +717,11 @@ async def _auto_generate_charts_for_section(
                 if mermaid_code:
 
                     chart_data = {"type": "timeline", "code": mermaid_code, "title": _chart_title}
+
+                    chart_data = await _validate_and_fix(chart_type, chart_data)
+                    if chart_data is None:
+
+                        return None
 
                     await _save_section_field(
 

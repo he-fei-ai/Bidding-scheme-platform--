@@ -893,6 +893,12 @@ class TestExtractGlobalFactsPolicyPropagation:
         async def _fake_collect(_provider, messages, **_kwargs):
             captured["system"] = str(getattr(messages[0], "content", ""))
             captured["user"] = str(getattr(messages[1], "content", ""))
+            # 缓存优化（文档四）后消息为 4 条：通用 system / 上下文块 /
+            # 策略专属指令 / 补充来源。保留整个列表供断言按角色定位。
+            captured["messages"] = [
+                (str(getattr(m, "role", "")), str(getattr(m, "content", "")))
+                for m in messages
+            ]
             return [{"key": "projectName", "label": "项目名称", "value": "示范工程"}]
 
         monkeypatch.setattr(wa, "collect_json_response", _fake_collect)
@@ -904,24 +910,35 @@ class TestExtractGlobalFactsPolicyPropagation:
 
     @pytest.mark.parametrize("policy", ["fabricate", "omit", "placeholder"])
     def test_system_prompt_follows_policy(self, monkeypatch, policy):
-        """提示词正本共用：Step02 不得再写死「可模拟生成」一档。"""
+        """提示词正本共用：Step02 不得再写死「可模拟生成」一档。
+
+        ENHANCE 2026-10-09（文档四·缓存前缀）：system 改为所有解析任务共享的
+        通用前缀，策略专属提示词下移到任务消息。断言相应调整为「策略提示词
+        必须出现在发给模型的消息中」——策略传播这一核心契约不变。
+        """
         from app.services import facts_service
+        from app.services.ai import workflows_analysis as wa
 
         captured, _result = self._run(monkeypatch, {"policy": policy})
-        assert captured["system"] == facts_service.fact_extract_system_prompt(policy)
+        policy_prompt = facts_service.fact_extract_system_prompt(policy)
+        bodies = [c for _role, c in captured["messages"]]
+
+        assert captured["system"] == wa.ANALYSIS_SYSTEM, "system 应为解析类共享前缀"
+        assert policy_prompt in bodies, "策略专属提示词必须发给模型（策略传播不得丢）"
         if policy == "omit":
-            assert "一致性优先于具体性" in captured["system"]
+            assert "一致性优先于具体性" in policy_prompt
         elif policy == "placeholder":
-            assert "占位要集中" in captured["system"]
+            assert "占位要集中" in policy_prompt
         else:
-            assert "一致性优先于具体性" not in captured["system"]
+            assert "一致性优先于具体性" not in policy_prompt
 
     def test_missing_policy_argument_keeps_legacy_behaviour(self, monkeypatch):
         """向后兼容：旧调用方不传 policy 时行为与 fabricate 完全一致。"""
         from app.services import facts_service
 
         captured, _result = self._run(monkeypatch, {})
-        assert captured["system"] == facts_service.fact_extract_system_prompt("fabricate")
+        bodies = [c for _role, c in captured["messages"]]
+        assert facts_service.fact_extract_system_prompt("fabricate") in bodies
 
     @pytest.mark.parametrize(
         ("policy", "expect_value", "expect_flag"),

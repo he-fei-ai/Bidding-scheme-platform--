@@ -7,6 +7,9 @@ import type { ConsistencyRules } from "../api";
 import { applyConsistencySeverityMeta } from "../utils";
 import ConflictListTab from "../components/consistency/ConflictListTab";
 import ScoringComplianceTab from "../components/consistency/ScoringComplianceTab";
+import AgentRepairTab from "../components/consistency/AgentRepairTab";
+import FactBackflowTab from "../components/consistency/FactBackflowTab";
+import RejectionCoverageTab from "../components/consistency/RejectionCoverageTab";
 
 const { Text } = Typography;
 
@@ -87,6 +90,21 @@ export default function ConsistencyPage() {
             key: "scoring",
             label: "评分标准达标",
             children: <ScoringComplianceTab projectId={projectId} />,
+          },
+          {
+            key: "agent",
+            label: "Agent 多轮修复",
+            children: <AgentRepairTab projectId={projectId} />,
+          },
+          {
+            key: "facts",
+            label: "事实回流",
+            children: <FactBackflowTab projectId={projectId} />,
+          },
+          {
+            key: "coverage",
+            label: "废标覆盖率",
+            children: <RejectionCoverageTab projectId={projectId} />,
           },
         ]}
       />

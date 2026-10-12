@@ -116,6 +116,27 @@ def find_known_provider(provider_name: str) -> dict | None:
     return None
 
 
+def find_default_base_url_for_provider(provider_name: str) -> str:
+    """按厂商名（或 type 名）反查默认 base_url。
+
+    G-2 修复配套（2026-10-11）：`POST /ai/test` 允许省略 base_url，此时回落到
+    厂商目录里的默认 base_url；未收录则返回空串，由调用方决定是否报错。
+    查找顺序：精确匹配 name → 精确匹配 type → 大小写宽松匹配。
+    """
+    if not provider_name:
+        return ""
+    target = provider_name.strip().lower()
+    if not target:
+        return ""
+    for p in KNOWN_PROVIDERS:
+        if str(p.get("name", "")).strip().lower() == target:
+            return p.get("base_url", "")
+    for p in KNOWN_PROVIDERS:
+        if str(p.get("type", "")).strip().lower() == target:
+            return p.get("base_url", "")
+    return ""
+
+
 # ──────────────────────────────────────────────────────────────────────
 # 国内可访问推荐厂商（WAF 拦截/超时时的建议列表）
 # ──────────────────────────────────────────────────────────────────────

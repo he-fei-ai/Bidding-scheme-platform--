@@ -107,6 +107,25 @@ async def get_file_text(project_id: int, file_id: int, current_user: Annotated[o
     text = await asyncio.to_thread(file_service.get_file_text, project_id, file_id)
     return {'text': text}
 
+@router.delete('/texts')
+async def clear_project_texts_endpoint(project_id: int, current_user: Annotated[object, Depends(get_current_user)]=None):
+    """清空项目所有文件的已提取文本并重置状态（Gap-1 2026-10-11 新增）
+
+    ⚠️ 不删除已上传的原始文件，只清空：
+      - texts/ 目录下的所有提取文本文件
+      - uploaded_files 表中所有记录的 status → 'pending'、message → ''、extracted_text_path → ''
+      - file_parse_tasks 表中该项目的 completed/failed 终态行（processing 在途行保留）
+      - 合并文本缓存（_text_cache_clear）
+
+    响应体：{status: 'cleared', files_reset: N, tasks_cleared: M}
+    """
+    await enforce_project_access(project_id, current_user)
+    try:
+        return await asyncio.to_thread(file_service.clear_project_texts, project_id)
+    except Exception as e:
+        logger.error('清空项目文本失败 [project=%d]: %s', project_id, e, exc_info=True)
+        raise HTTPException(status_code=500, detail='清空项目文本失败，请检查日志') from e
+
 @router.delete('/{file_id}')
 async def delete_uploaded_file(project_id: int, file_id: int, current_user: Annotated[object, Depends(get_current_user)]=None):
     """删除上传文件"""
@@ -171,10 +190,20 @@ async def async_reparse_file(project_id: int, file_id: int, current_user: Annota
             raise HTTPException(status_code=400, detail='原始文件已不存在，请重新上传')
 
         # 任务行由本端点创建（任务内部已改为「有则更新」，这里先建是为了让
-        # 状态端点立刻可见 processing，而不是等 worker 接单后才出现）。
+# 状态端点立刻可见 processing，而不是等 worker 接单后才出现）。
         # BUG-FIX 2026-10-06（R3）：派发时显式 create_task_row=False，
         # 否则任务内再建一行，同一次解析会在任务表留下两行（重复计数 + 孤儿行）
-        _create_parse_task(project_id, filename, Path(filename).suffix.lower())
+
+        # BUG-FIX 2026-10-09（事件循环阻塞）：`_create_parse_task` 内部走
+        # `get_db()` —— 那是**获取全局写锁**的连接入口（非 readonly）。
+        # 它被直接写在 `async def` 里，会阻塞事件循环，而本函数上方 14 行
+        # 的 PERF 注释恰好就是为了消除同一类问题才把读操作包进
+        # `asyncio.to_thread` 的，这里是那次修复的漏网之鱼。
+        # 大项目并发上传时会拖慢所有 SSE 心跳（正文/大纲生成共用同一事件循环）。
+        # 现把写操作同样移入线程池。
+        await asyncio.to_thread(
+            _create_parse_task, project_id, filename, Path(filename).suffix.lower()
+        )
 
         dispatched = await asyncio.to_thread(
             dispatch_task,

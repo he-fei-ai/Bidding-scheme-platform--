@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, useCallback } from "react";
+import { useEffect, useRef, useState, useCallback, useMemo } from "react";
 import { Alert, Button, Space, Typography, Tag, Spin } from "antd";
 import {
   ReloadOutlined,
@@ -8,6 +8,8 @@ import {
   WarningOutlined,
   FileTextOutlined,
 } from "@ant-design/icons";
+import ArchitectureChart from "./ArchitectureChart";
+import type { ArchNodeData } from "./ArchitectureChart";
 
 const { Text, Paragraph } = Typography;
 
@@ -301,6 +303,49 @@ function extractChartData(code: string, type: string): any {
   return null;
 }
 
+/** 从架构图中提取 L3 叶子节点数，用于判断是否启用竖排 */
+function countL3Leaves(node: any): number {
+  if (!node.children || node.children.length === 0) return 1;
+  return node.children.reduce((sum: number, c: any) => sum + countL3Leaves(c), 0);
+}
+
+/** 尝试将 JSON 转换为 ArchitectureChart 所需的数据结构 */
+function tryParseArchitectureData(code: string): { root: ArchNodeData; title: string } | null {
+  if (!code || !code.trim().startsWith("{")) return null;
+  try {
+    const data = JSON.parse(code.trim());
+    // 后端契约：{type:"architecture", title, root:{label, children}} 或顶层树格式
+    const rawRoot = (data.root && typeof data.root === "object") ? data.root : data;
+    if (!rawRoot || (!rawRoot.label && !rawRoot.name)) return null;
+
+    function toArchNode(n: any, depth: number, idx: number): ArchNodeData {
+      const hasChildren = Array.isArray(n?.children) && n.children.length > 0;
+      // 优先使用数据自带的 variant 字段，否则按深度推断
+      // （收窄为 ArchNodeData["variant"] 联合类型，避免赋值时 string → 联合类型报 TS2322）
+      const variant: ArchNodeData["variant"] =
+        (n.variant as ArchNodeData["variant"]) ||
+        (depth === 0 ? "root" : depth === 1 ? "level2" : "level3");
+      const isLeaf = !hasChildren;
+      const highlight = !!n.highlight || (isLeaf && /highlight/i.test(n.variant || ""));
+
+      const result: ArchNodeData = {
+        id: n.id || `n${idx}`,
+        label: String(n?.label || n?.name || ""),
+        variant: isLeaf ? (highlight ? "level3 highlight" : "level3") : variant,
+      };
+      if (hasChildren) {
+        result.children = n.children.map((c: any, i: number) => toArchNode(c, depth + 1, idx + i));
+      }
+      return result;
+    }
+
+    const root = toArchNode(rawRoot, 0, 0);
+    return { root, title: data.title || "" };
+  } catch {
+    return null;
+  }
+}
+
 /** 降级时使用原生 React/SVG 图表组件（不做文本表格降级） */
 function renderNativeChartFallback(type: string, code: string) {
   const data = extractChartData(code, type);
@@ -319,26 +364,23 @@ function renderNativeChartFallback(type: string, code: string) {
       const totalW = Math.max(chartW, n * (nodeW + gap));
       const totalH = n * (nodeH + gap);
       return (
-        <div style={{ margin: "12px 0", padding: 16, background: "#fff", border: "1px solid #d6e4ff", borderRadius: 8 }}>
-          <div style={{ fontWeight: 700, fontSize: 15, marginBottom: 12, color: "#1a3a8a", textAlign: "center", borderBottom: "1px solid #e6f0ff", paddingBottom: 10 }}>
+        <div style={{ margin: "12px 0", padding: 16, background: "#fff", border: "1px solid #D8D0F5", borderRadius: 8 }}>
+          <div style={{ fontWeight: 700, fontSize: 15, marginBottom: 12, color: "#2D2D3A", textAlign: "center", borderBottom: "1px solid #EDE9FE", paddingBottom: 10 }}>
             {data.title || "流程图"}
           </div>
           <svg width="100%" viewBox={`0 0 ${totalW} ${totalH}`} style={{ display: "block", margin: "0 auto" }}>
             {nodes.map((node: string, i: number) => {
               const y = pad + i * (nodeH + gap);
               const x = (totalW - nodeW) / 2;
-              const isStart = i === 0;
-              const isEnd = i === n - 1;
               return (
                 <g key={i}>
                   {i > 0 && (
-                    <line x1={totalW / 2} y1={y - gap} x2={totalW / 2} y2={y} stroke="#1677ff" strokeWidth={2} markerEnd="url(#arr)" />
+                    <line x1={totalW / 2} y1={y - gap} x2={totalW / 2} y2={y} stroke="#333333" strokeWidth={1.5} markerEnd="url(#arr)" />
                   )}
-                  <rect x={x} y={y} width={nodeW} height={nodeH} rx={8}
-                    fill={isStart ? "#52c41a" : isEnd ? "#f5222d" : "#e8f0fe"}
-                    stroke={isStart ? "#389e0d" : isEnd ? "#cf1322" : "#1677ff"} strokeWidth={2} />
-                  <text x={totalW / 2} y={y + nodeH / 2 + 5} textAnchor="middle" fontSize={13} fontWeight={600}
-                    fill={isStart || isEnd ? "#fff" : "#1a3a8a"} style={{ fontFamily: "'Microsoft YaHei', sans-serif" }}>
+                  <rect x={x} y={y} width={nodeW} height={nodeH} rx={0}
+                    fill="#EDE9FE" stroke="#9B8BE0" strokeWidth={1} />
+                  <text x={totalW / 2} y={y + nodeH / 2 + 5} textAnchor="middle" fontSize={14} fontWeight={400}
+                    fill="#2D2D3A" style={{ fontFamily: "'Microsoft YaHei', sans-serif" }}>
                     {(node as string).length > 12 ? (node as string).slice(0, 12) + "…" : node}
                   </text>
                 </g>
@@ -346,12 +388,12 @@ function renderNativeChartFallback(type: string, code: string) {
             })}
             <defs>
               <marker id="arr" markerWidth="8" markerHeight="8" refX="7" refY="3" orient="auto">
-                <path d="M0,0 L0,6 L8,3 z" fill="#1677ff" />
+                <path d="M0,0 L0,6 L8,3 z" fill="#333333" />
               </marker>
             </defs>
           </svg>
           <div style={{ marginTop: 8, fontSize: 11, color: "#999", textAlign: "center" }}>
-            {n} 个步骤 &nbsp;·&nbsp; 绿色=开始 / 蓝色=过程 / 红色=结束
+            {n} 个步骤
           </div>
         </div>
       );
@@ -699,12 +741,13 @@ async function doRender(
         securityLevel: "strict",
         fontFamily: "'Microsoft YaHei', sans-serif",
         themeVariables: {
-          primaryColor: "#1677ff",
-          primaryTextColor: "#333",
-          primaryBorderColor: "#1677ff",
-          lineColor: "#666",
-          secondaryColor: "#e6f4ff",
-          tertiaryColor: "#f5f5f5",
+          primaryColor: "#EDE9FE",
+          primaryTextColor: "#2D2D3A",
+          primaryBorderColor: "#9B8BE0",
+          lineColor: "#333333",
+          secondaryColor: "#EDE9FE",
+          tertiaryColor: "#F5F5F5",
+          fontSize: "14px",
         },
       });
       mermaidInitialized = true;
@@ -735,6 +778,26 @@ export default function DiagramPreview({ code, type, onRefresh, onInsert, showIn
   const codeRef = useRef(code);
   const abortRef = useRef<AbortController | null>(null);
 
+  // ====== 架构图专用：检测是否启用自定义竖排渲染 ======
+  const [useCustomArch, setUseCustomArch] = useState(false);
+  const [archData, setArchData] = useState<{ root: ArchNodeData; title: string } | null>(null);
+
+  // 当 code 或 type 变化时，重新评估架构图渲染策略
+  useEffect(() => {
+    if (type === "architecture" && code && code.trim().startsWith("{")) {
+      const parsed = tryParseArchitectureData(code);
+      if (parsed) {
+        setArchData(parsed);
+        // L3 叶子节点 > 6 时启用竖排自定义渲染
+        const l3Count = countL3Leaves(parsed.root);
+        setUseCustomArch(l3Count > 6);
+        return;
+      }
+    }
+    setUseCustomArch(false);
+    setArchData(null);
+  }, [code, type]);
+
   useEffect(() => {
     codeRef.current = code;
   }, [code]);
@@ -745,6 +808,14 @@ export default function DiagramPreview({ code, type, onRefresh, onInsert, showIn
   }, [code]);
 
   const renderDiagram = useCallback(() => {
+    // 架构图自定义渲染路径：跳过 Mermaid，直接使用 React 组件
+    if (type === "architecture" && useCustomArch && archData) {
+      setLoading(false);
+      setError(null);
+      setMermaidFailed(false);
+      return;
+    }
+
     let resolvedCode = codeRef.current;
     
     // 尝试将 JSON 转换为 Mermaid 代码
@@ -802,12 +873,12 @@ export default function DiagramPreview({ code, type, onRefresh, onInsert, showIn
     return () => {
       controller.abort();
     };
-  }, [type, retryCount]);
+  }, [type, retryCount, useCustomArch, archData]);
 
   useEffect(() => {
     const cleanup = renderDiagram();
     return cleanup;
-  }, [code, type, retryCount, renderDiagram]);
+  }, [code, type, retryCount, renderDiagram, useCustomArch, archData]);
 
   // 重试处理
   const handleRetry = useCallback(() => {
@@ -832,7 +903,7 @@ export default function DiagramPreview({ code, type, onRefresh, onInsert, showIn
     flowchart: { icon: <BarChartOutlined />, label: "流程图", color: "#1677ff" },
     gantt: { icon: <LineChartOutlined />, label: "甘特图", color: "#52c41a" },
     comparison: { icon: <PieChartOutlined />, label: "对比图", color: "#faad14" },
-    architecture: { icon: <BarChartOutlined />, label: "架构图", color: "#722ed1" },
+    architecture: { icon: <BarChartOutlined />, label: useCustomArch ? "架构图（竖排）" : "架构图", color: "#722ed1" },
     labor: { icon: <LineChartOutlined />, label: "劳动力图", color: "#13c2c2" },
     layout: { icon: <BarChartOutlined />, label: "布局图", color: "#eb2f96" },
     timeline: { icon: <LineChartOutlined />, label: "时间线", color: "#fa8c16" },
@@ -860,7 +931,7 @@ export default function DiagramPreview({ code, type, onRefresh, onInsert, showIn
       </div>
 
       {/* 加载指示器 */}
-      {loading && (
+      {loading && !useCustomArch && (
         <div
           style={{
             textAlign: "center",
@@ -877,7 +948,7 @@ export default function DiagramPreview({ code, type, onRefresh, onInsert, showIn
           <div style={{ marginTop: 8, color: "#ccc", fontSize: 11 }}>
             {type === "flowchart" && "正在渲染流程图节点和连线"}
             {type === "gantt" && "正在渲染甘特图时间轴和任务条"}
-            {type === "architecture" && "正在渲染架构层级结构"}
+            {type === "architecture" && (useCustomArch ? "正在渲染竖排架构图（L3 节点较多，已自动切换竖排布局）" : "正在渲染架构层级结构")}
             {type === "comparison" && "正在渲染对比数据"}
             {type === "layout" && "正在渲染布局图"}
             {type === "timeline" && "正在渲染时间线"}
@@ -978,11 +1049,13 @@ export default function DiagramPreview({ code, type, onRefresh, onInsert, showIn
         />
       )}
       
-      {/* 渲染成功 - 显示图表 */}
-      {/* BUG 修复：容器必须常驻 DOM（原先受 !loading 条件渲染，doRender 执行时
-          containerRef.current 必为 null，导致 Mermaid 渲染永远失败并走原生降级）。
-          改为常驻挂载 + CSS 隐藏，加载/出错时不可见但 ref 始终有效。 */}
-      {!mermaidFailed && (
+      {/* ====== 架构图自定义渲染（L3 竖排） ====== */}
+      {useCustomArch && archData && !loading && (
+        <ArchitectureChart data={archData.root} title={archData.title} />
+      )}
+
+      {/* 渲染成功 - 显示 Mermaid 图表（非自定义架构图时使用） */}
+      {!mermaidFailed && !useCustomArch && (
         <div
           ref={containerRef}
           style={{

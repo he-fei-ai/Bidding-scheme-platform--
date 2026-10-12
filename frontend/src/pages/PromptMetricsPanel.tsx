@@ -10,7 +10,7 @@ import {
 import {
   fetchPromptMetrics, fetchPromptAlerts, syncHardcodePrompts,
   fetchMetricsHistory, fetchMetricsByCategory,
-  type PromptMetrics, type PromptAlert,
+  type PromptMetrics, type PromptAlert, type CategoryStats,
 } from "../api";
 
 const { Title, Text } = Typography;
@@ -34,7 +34,8 @@ export default function PromptMetricsPanel() {
   const [alerts, setAlerts] = useState<PromptAlert[]>([]);
   const [history, setHistory] = useState<Array<{ timestamp: number; total_tokens: number; total_calls: number }>>([]);
   const [dbHitRatio, setDbHitRatio] = useState(0);
-  const [categoryStats, setCategoryStats] = useState<Array<{ category: string; calls: number; total_tokens: number }>>([]);
+  // 后端 /prompts/metrics/categories 返回 CategoryStats[]（含 prompt_count 字段）
+  const [categoryStats, setCategoryStats] = useState<CategoryStats[]>([]);
 
   const loadData = async () => {
     setLoading(true);

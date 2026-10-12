@@ -9,8 +9,32 @@ import os
 import re
 from typing import Any
 
-from .prompts import get_prompt, render_prompt
+from .prompts import (
+    assemble_prompt_context,
+    get_prompt,
+    render_prompt,
+    sanitize_prompt_value,
+)
+
+# L3 标题修复的项目上下文 Token 预算上限（BUG-FIX-PROMPT-C5）。
+# 修复任务经信号量限流为 OUTLINE_L3_REPAIR_CONCURRENCY 并发（默认 5），
+# 统一预算避免上下文负载被放大。旧注释写的「最多并行 10 次」实际是
+# `warnings[:10]` 条数截断的副产品，并非真实的并发上限。
+L3_REPAIR_CONTEXT_TOKEN_CAP = 6000
 from .providers.base import AIMessage
+
+# 2026-10-10：三级标题 AI 修复的条数上限改为可配置。
+# 旧实现硬编码 `warnings[:10]` —— 大目录（数百三级节点）必然残留未修复脏标题，
+# 而该上限此前既无法调、也无法观测。
+from app.config import OUTLINE_L3_REPAIR_CONCURRENCY, OUTLINE_L3_REPAIR_MAX  # noqa: E402
+
+# 2026-10-10：AI 修复结果需经统一脏标题判定，避免把占位标题写回去。
+# outline_common 无任何本包内导入，不会形成循环。
+from .outline_common import (  # noqa: E402
+    _L3_ENTITY_WORDS,
+    _is_dirty_l3_title,
+    _title_core,
+)
 
 
 # BUG 修复（循环导入）：_L3_GENERIC_PATTERNS 和 _L3_PROJECT_SPECIFIC_KEYWORDS
@@ -269,40 +293,6 @@ def _flatten_outline_tree(
     return flat
 
 
-def _renumber_items(items: list[dict], parent_number: str = "") -> list[dict]:
-    """为目录项附加 number 字段（用于前端展示和导出），**绝不修改纯文本 title**
-
-    关键设计（依据 V2.1/V3.0 文档）：
-      - title 保持纯文本（与 28 章模板格式完全一致），不附加"1."、"1.1."等数字前缀
-      - 仅在 number 字段中保存路径式编号（如 "1"、"1.2"、"1.2.3"），供前端按需展示
-      - 前端展示时由展示层根据层级 + number 渲染"第一章/1.1/a"等格式
-      - DOCX 导出时由导出器统一根据层级 + 路径重新生成 V2.1 标准编号
-    """
-    result = []
-    for i, item in enumerate(items):
-        # BUG 修复：若 item 不是 dict，dict(item) 会 TypeError
-        if not isinstance(item, dict):
-            continue
-        num = f"{parent_number}{i + 1}" if parent_number else str(i + 1)
-        new_item = dict(item)  # 不修改原对象
-        new_item["number"] = num
-        # 保持 title 纯文本，不附加"1."、"1.1."、"1.2.3."等数字前缀
-        # BUG-FIX 2026-10-08（编号冲突/目录树错误）：同 _flatten_outline_tree，
-        # children 为 dict（真值）时原实现递归后被 isinstance 守卫全量跳过，
-        # 子树连同其编号一起消失；现严格要求 list 并对异常形态留痕。
-        children = new_item.get("children")
-        if children and not isinstance(children, list):
-            logger.warning(
-                "目录节点 children 类型非法（期望 list，实际 %s），其子树编号已跳过: %s",
-                type(children).__name__,
-                new_item.get("title", ""),
-            )
-        if isinstance(children, list) and children:
-            new_item["children"] = _renumber_items(children, f"{num}.")
-        result.append(new_item)
-    return result
-
-
 def normalize_outline_items(items: list[dict], default_level: int = 1) -> list[dict]:
     """归一化目录项字段：AI 可能返回 name/heading 等字段名，统一为 title
 
@@ -456,13 +446,18 @@ def _strip_title_number_prefix(title: str) -> str:
 
 
 def _dedupe_outline_titles(outline: list[dict]) -> list[dict]:
-    """全树标题去重（V3.8 修复）：确保整个目录树中不存在完全相同的标题。
+    """同级标题去重（V3.8 修复 / 2026-10-11 作用域修正）。
 
     normalize_outline_items 仅做「同父去重」，无法消除不同父节点下的重复标题，
     例如两个三级节点下各有一个「多栋楼同时施工平面协调」四级节点，
     导出后会出现「1、多栋楼同时施工平面协调」「1、多栋楼同时施工平面协调」的重复条目。
 
-    本函数维护全局已见标题集合（归一化后），重复的后续节点直接丢弃。
+    **2026-10-11 修正：判定作用域由「全树」收窄为「同级」。**
+    旧实现用全局 `seen` 集合，会把**不同父节点下合法重复**的章节**整段删除**
+    （标书目录里「地下施工工艺」分属不同二级章是正常形态，Word 目录里呈现为
+    3.1 / 4.1 / 5.1），造成落库后正文章节直接缺失。现在只在同一父节点的
+    兄弟范围内判定重复，跨章节同名一律保留。
+
     建议在 normalize_outline_items 之后、_ensure_min_children 之前调用，
     若因此导致某父节点子节点数不足，_ensure_min_children 会用模板标题兜底补全。
 
@@ -471,21 +466,22 @@ def _dedupe_outline_titles(outline: list[dict]) -> list[dict]:
     Returns:
         去重后的目录树
     """
-    seen: set[str] = set()
-
     def _walk(nodes: list[dict]) -> list[dict]:
+        seen: set[str] = set()
         result = []
         for node in nodes:
             if not isinstance(node, dict):
                 continue
             title = node.get("title", "")
-            key = _normalize_title_core(title)
-            if key and key in seen:
-                logger.warning(
-                    "V3.8 全树去重: 跳过重复标题「%s」（level=%s）", title, node.get("level", "")
-                )
-                continue
+            key = _title_core(title)
             if key:
+                if key in seen:
+                    logger.warning(
+                        "同级去重: 跳过同级重复标题「%s」（level=%s）",
+                        title,
+                        node.get("level", ""),
+                    )
+                    continue
                 seen.add(key)
             children = node.get("children")
             if isinstance(children, list):
@@ -516,21 +512,23 @@ def validate_outline_business(outline: list[dict]) -> tuple[bool, str]:
     if not isinstance(outline, list) or len(outline) == 0:
         return False, "目录为空"
 
-    seen_titles: set[str] = set()  # V4.0 全局标题去重
-
-    def _check_node(node: dict, path: str) -> str | None:
-        """校验单个节点，返回错误信息或 None"""
+    # 2026-10-11 修正：重复判定作用域由「全树」收窄为「同级」。
+    # 旧实现用一个全局集合，会把不同章节下**合法**的同名条目判为错误并
+    # return False 拒绝整个目录（标书里「地下施工工艺」分属不同二级章是
+    # 正常形态）。现在每层兄弟各自维护 seen 集合。
+    def _check_node(node: dict, path: str, seen_titles: set[str]) -> str | None:
+        """校验单个节点，返回错误信息或 None；seen_titles 为同级已见标题集合"""
         title = str(node.get("title", "") or "").strip()
         if not title:
             return f"{path} 标题为空"
-        # V4.0 数字前缀残留检测
+        # 数字前缀残留检测
         stripped = _strip_title_number_prefix(title)
         if stripped != title:
             return f"{path} 标题含编号前缀「{title}」，编号应由系统自动生成"
-        # V4.0 全局重复标题检测（剥离编号后比较，避免误报）
-        core = _normalize_title_core(stripped)
+        # 同级重复标题检测（剥离编号与遗留冗余后缀后比较，避免误报）
+        core = _title_core(stripped)
         if core in seen_titles:
-            return f"{path} 标题与目录中其他章节重复: {title}"
+            return f"{path} 标题与同级其他章节重复: {title}"
         seen_titles.add(core)
         return None
 
@@ -543,6 +541,7 @@ def validate_outline_business(outline: list[dict]) -> tuple[bool, str]:
             return f"{path} 显式 level={explicit} 与树深度推导 level={derived_level} 不一致"
         return None
 
+    seen_l1: set[str] = set()  # 同级（一级章之间）已见标题
     for i, item in enumerate(outline):
         # BUG 修复：若 item 不是 dict，item.get() 会 AttributeError
         if not isinstance(item, dict):
@@ -556,8 +555,8 @@ def validate_outline_business(outline: list[dict]) -> tuple[bool, str]:
         if err:
             logger.warning("[目录校验] %s（非致命，继续校验）", err)
 
-        # V4.0 一级标题校验（前缀/全局重复）
-        err = _check_node(item, f"第 {i + 1} 项")
+        # 一级标题校验（前缀/同级重复）
+        err = _check_node(item, f"第 {i + 1} 项", seen_l1)
         if err:
             return False, err
 
@@ -569,6 +568,7 @@ def validate_outline_business(outline: list[dict]) -> tuple[bool, str]:
         if len(children) < 2:
             return False, f"第 {i + 1} 项二级目录不足 2 个（实际 {len(children)} 个）"
 
+        seen_l2: set[str] = set()  # 同级（该一级章下的二级之间）已见标题
         for j, child in enumerate(children):
             # BUG 修复：若 child 不是 dict，跳过避免 AttributeError
             if not isinstance(child, dict):
@@ -579,8 +579,8 @@ def validate_outline_business(outline: list[dict]) -> tuple[bool, str]:
             if err:
                 logger.warning("[目录校验] %s（非致命，继续校验）", err)
 
-            # V4.0 二级标题校验
-            err = _check_node(child, f"第 {i + 1}.{j + 1} 项")
+            # 二级标题校验（同级作用域）
+            err = _check_node(child, f"第 {i + 1}.{j + 1} 项", seen_l2)
             if err:
                 return False, err
 
@@ -595,6 +595,7 @@ def validate_outline_business(outline: list[dict]) -> tuple[bool, str]:
                     f"（实际 {len(grandchildren)} 个）"
                 )
 
+            seen_l3: set[str] = set()  # 同级（该二级章下的三级之间）已见标题
             for k, gc in enumerate(grandchildren):
                 # BUG 修复：若 gc 不是 dict，跳过
                 if not isinstance(gc, dict):
@@ -605,8 +606,8 @@ def validate_outline_business(outline: list[dict]) -> tuple[bool, str]:
                 if err:
                     logger.warning("[目录校验] %s（非致命，继续校验）", err)
 
-                # V4.0 三级标题校验
-                err = _check_node(gc, f"第 {i + 1}.{j + 1}.{k + 1} 项")
+                # 三级标题校验（同级作用域）
+                err = _check_node(gc, f"第 {i + 1}.{j + 1}.{k + 1} 项", seen_l3)
                 if err:
                     return False, err
 
@@ -764,14 +765,33 @@ def validate_outline_with_semantic(
 
 
 def _is_l3_title_project_specific(title: str, l2_title: str = "") -> bool:
-    """判断三级标题是否结合了项目具体内容。"""
+    """判断三级标题是否结合了项目具体内容。
+
+    2026-10-10 增强：结构化具体标题（工程实体 + 动作维度，如「样板区质量控制」
+    「关键线路进度计划」）应直接判为通过。旧实现只看 `_L3_GENERIC_PATTERNS`，
+    而「质量控制」「施工工艺」本身就在通用词表里 —— 会把新链路生成的**结构化
+    具体标题**也误判为泛化，导致每章都触发一轮无谓的 AI 修复调用。
+    """
     if not title or len(title) < 5:
+        return False
+
+    # 2026-10-10：占位泛化标题（「专项6」「总体实施策划（2）」「总体实施策划」）
+    # 必须先于一切正向判定直接否决 —— 否则「总体实施策划（2）」会因长度 ≥7
+    # 且不在通用词表中被误判为具体标题，导致整个 L3 具体性校验再次空跑。
+    if _is_dirty_l3_title(title):
         return False
 
     # 检查是否含项目特异性关键词
     for kw in _L3_PROJECT_SPECIFIC_KEYWORDS:
         if kw in title:
             return True
+
+    # 2026-10-10：含工程实体词的标题属于结构化具体标题（实体+动作），
+    # 已满足三级标题应有的落地粒度，无需再走 AI 修复。
+    for _ent_words in _L3_ENTITY_WORDS.values():
+        for ent in _ent_words:
+            if len(ent) >= 2 and ent in title:
+                return True
 
     # 检查是否含通用占位词
     for pat in _L3_GENERIC_PATTERNS:
@@ -787,17 +807,28 @@ def validate_l3_specificity(outline: list[dict]) -> tuple[bool, list[dict]]:
 
     返回:
         (passed, warnings) — warnings 为 [{"path": "...", "title": "...", "reason": "..."}]
+
+    2026-10-10 修复：旧实现用 `node.get("level", 0) != 3` 判定层级，但
+    V5.1 分步生成链路（`_generate_level3_v51`）产出的三级节点**不带 level 字段**，
+    导致默认值 0 ≠ 3 → 整个校验静默空跑、永远 passed=True。这是本函数长期处于
+    死代码状态、脏标题无人拦截的关键原因。现改为按树深度判定，level 字段仅作
+    显式覆盖。
     """
     warnings: list[dict] = []
 
-    def _check_l3(node: dict, path: str, l2_title: str = ""):
+    def _actual_level(node: dict, depth: int) -> int:
+        lv = node.get("level")
+        if isinstance(lv, int) and lv > 0:
+            return lv
+        return depth
+
+    def _check_l3(node: dict, path: str, depth: int, l2_title: str = ""):
         # BUG 修复：若 node 不是 dict，node.get() 会 AttributeError
         if not isinstance(node, dict):
             return
-        title = str(node.get("title", "") or "").strip()
-        level = node.get("level", 0)
-        if level != 3:
+        if _actual_level(node, depth) != 3:
             return
+        title = str(node.get("title", "") or "").strip()
         if not _is_l3_title_project_specific(title, l2_title):
             reason = "含通用占位词，缺乏项目针对性"
             for pat in _L3_GENERIC_PATTERNS:
@@ -814,24 +845,82 @@ def validate_l3_specificity(outline: list[dict]) -> tuple[bool, list[dict]]:
                 }
             )
         # 递归检查子节点
-        for child in node.get("children", []):
-            # BUG 修复：若 child 不是 dict，跳过避免 AttributeError
-            if isinstance(child, dict):
-                _check_l3(child, f"{path}.{child.get('level', 0)}", title)
+        children = node.get("children")
+        if isinstance(children, list):
+            for idx, child in enumerate(children, 1):
+                if isinstance(child, dict):
+                    _check_l3(child, f"{path}.{idx}", depth + 1, title)
+
+    if not isinstance(outline, list):
+        return True, warnings
 
     for i, item in enumerate(outline, 1):
         # BUG 修复：若 item 不是 dict，跳过
         if not isinstance(item, dict):
             continue
-        for j, child in enumerate(item.get("children", []), 1):
-            # BUG 修复：若 child 不是 dict，跳过
+        l2_children = item.get("children")
+        if not isinstance(l2_children, list):
+            continue
+        for j, child in enumerate(l2_children, 1):
             if not isinstance(child, dict):
                 continue
             l2_title = child.get("title", "")
-            for k, gc in enumerate(child.get("children", []), 1):
-                _check_l3(gc, f"{i}.{j}.{k}", l2_title)
+            l3_children = child.get("children")
+            if not isinstance(l3_children, list):
+                continue
+            for k, gc in enumerate(l3_children, 1):
+                _check_l3(gc, f"{i}.{j}.{k}", 3, l2_title)
 
     return len(warnings) == 0, warnings
+
+
+def _locate_by_path(tree: list, path: str, ancestors: list | None = None):
+    """按 `validate_l3_specificity` 产出的 1-based 点分路径定位节点。
+
+    返回 ``(node, parent_title, ancestor_titles)``：
+      - ``parent_title``：节点的**直接父节点**标题（path 倒数第二段对应的节点）；
+      - ``ancestor_titles``：节点的**完整祖先链**（最外层 L1 标题在前，
+        依次向内；不含节点自身）。3 段路径 "1.1.1" → ``[L1标题, L2标题]``。
+    路径非法/越界返回 ``(None, "", [])``。支持任意深度（"1.2" 至 "1.2.3.4.5.6"）。
+
+    2026-10-11 修复（O-5）：旧实现硬编码 `len(parts) != 3` 才处理，而
+    `validate_l3_specificity._check_l3` 会递归进 L3 的子节点，一旦深层节点
+    带 `level=3` 显式标记（AI 直出路径常见），warning 的 path 就是
+    "1.2.3.4" 这类 4 段路径 → 被 repair 的 `continue` 静默跳过。
+    结果：AI 自检报出问题、日志显示"已修复"，实际脏标题原样保留。
+    """
+    if ancestors is None:
+        ancestors = []
+    if not path or not isinstance(tree, list):
+        return None, "", []
+    parts = str(path).split(".")
+    if len(parts) == 1:
+        # 叶子段：直接定位节点，祖先链即已累积的全部外层标题。
+        try:
+            idx = int(parts[0])
+        except ValueError:
+            return None, "", []
+        if 1 <= idx <= len(tree):
+            node = tree[idx - 1]
+            if isinstance(node, dict):
+                return node, (ancestors[-1] if ancestors else ""), list(ancestors)
+        return None, "", []
+    # 前缀段：进入下一层 children，累积当前节点标题为子层的祖先。
+    try:
+        idx = int(parts[0])
+    except ValueError:
+        return None, "", []
+    if not (1 <= idx <= len(tree)):
+        return None, "", []
+    node = tree[idx - 1]
+    if not isinstance(node, dict):
+        return None, "", []
+    parent_path = ".".join(parts[1:])
+    return _locate_by_path(
+        node.get("children") or [],
+        parent_path,
+        ancestors=ancestors + [str(node.get("title", "") or "")],
+    )
 
 
 async def repair_l3_generic_titles(
@@ -843,12 +932,18 @@ async def repair_l3_generic_titles(
     work_interface_json: str,
     construction_method_json: str,
     project_scope: str = "",
+    max_repair: int | None = None,
 ) -> list[dict]:
     """修复含通用占位词的三级目录标题。
 
     策略：对每个含通用词的L3标题，收集其L1/L2上下文+项目信息，
     调用AI重新生成一个具体的三级标题。
+
+    Args:
+        max_repair: 单次最多修复条数。None 时取配置 OUTLINE_L3_REPAIR_MAX。
     """
+    if max_repair is None:
+        max_repair = OUTLINE_L3_REPAIR_MAX
 
     repaired = copy.deepcopy(outline)
     _, warnings = validate_l3_specificity(repaired)
@@ -858,15 +953,35 @@ async def repair_l3_generic_titles(
     logger.info("[L3修复] 检测到 %d 个通用三级标题，开始修复", len(warnings))
 
     # 构建项目上下文
-    project_context = f"【项目概述】\n{summary[:3000]}\n"
-    if tender_context:
-        project_context += f"【招标文件关键信息】\n{tender_context[:5000]}\n"
-    if boq_json:
-        project_context += f"【清单工程量】\n{boq_json[:2000]}\n"
-    if construction_method_json:
-        project_context += f"【工程作法】\n{construction_method_json[:2000]}\n"
-    if project_scope:
-        project_context += f"【承包范围】\n{project_scope[:1000]}\n"
+    #
+    # BUG-FIX-PROMPT-C5（未脱敏的招标原文注入 + 预算失控）：
+    # 原实现用 f-string 裸拼 tender_context/summary/boq/... 后交给
+    # render_prompt 注入 __PROJECT_CONTEXT__，存在两个问题：
+    #   1) 未做元标记中和/敏感信息脱敏 —— 本文件其它注入点（如
+    #      workflows_analysis 的 SCORING_* 链路）都传了 sanitize=True，
+    #      此处独缺，口径不一致；招标原文属用户/外部内容，应同等防御。
+    #   2) 逐段 [:5000]/[:3000] 硬切片，未纳入统一 Token 预算 —— 5 段相加
+    #      约 13k 字符，且该函数最多并行 10 次（见下方 asyncio.gather），
+    #      聚合上下文负载被放大 10 倍。
+    # 修复：改用提示词模块统一的 assemble_prompt_context 组装（按优先级排序 +
+    # 总预算内截断），并对每段做元标记中和。
+    project_context = assemble_prompt_context(
+        {
+            "SUMMARY": sanitize_prompt_value((summary or "")[:3000]),
+            "TENDER_CONTEXT": sanitize_prompt_value((tender_context or "")[:5000]),
+            "BOQ": sanitize_prompt_value((boq_json or "")[:2000]),
+            "CONSTRUCTION_METHOD": sanitize_prompt_value((construction_method_json or "")[:2000]),
+            "PROJECT_SCOPE": sanitize_prompt_value((project_scope or "")[:1000]),
+        },
+        max_tokens=L3_REPAIR_CONTEXT_TOKEN_CAP,
+        priorities={
+            "SUMMARY": 100,
+            "TENDER_CONTEXT": 95,
+            "PROJECT_SCOPE": 80,
+            "CONSTRUCTION_METHOD": 70,
+            "BOQ": 65,
+        },
+    )
 
     # BUG-FIX-PROMPT-B2 2026-10-04：取**未渲染的模板**（命中 DB 覆盖），变量注入
     # 交由统一渲染函数 render_prompt（下方 _repair_one 内逐任务完成）。旧实现用
@@ -875,35 +990,34 @@ async def repair_l3_generic_titles(
     repair_template = get_prompt("L3_TITLE_REPAIR_PROMPT")
 
     # 预构建所有待修复任务（并行执行）
-    repair_tasks: list[tuple[int, int, int, str, str, str]] = []
-    for w in warnings[:10]:  # 最多修复10个，避免过多AI调用
-        path = w["path"]
-        parts = path.split(".")
-        if len(parts) != 3:
+    #
+    # ★ 2026-10-10 修复（O-5）：原实现硬编码 `len(parts) != 3: continue` 跳过 L4+，
+    # 并用 `repaired[i]["children"][j]["children"][k]` 三层下标直写。一旦 AI 在
+    # L3 下挂了 L4 子节点并显式标记 `level=3`，`validate_l3_specificity` 会产出
+    # 4 段 path（如 `1.1.2.1`），原实现必漏修 —— 脏标题原样流出。
+    # 现改为路径递归定位 `_locate_by_path`：任意深度均支持，写入直接改节点引用，
+    # 无需再算 i/j/k（`repaired` 在本函数内已 deepcopy，持引用直改安全）。
+    repair_tasks: list[tuple] = []
+    for w in warnings[:max_repair]:  # 最多修复 max_repair 个，避免过多 AI 调用
+        path = w.get("path", "")
+        if not path:
             continue
-        try:
-            i, j, k = int(parts[0]) - 1, int(parts[1]) - 1, int(parts[2]) - 1
-            l1_title = repaired[i].get("title", "")
-            l2_title = (
-                repaired[i].get("children", [{}])[j].get("title", "")
-                if j < len(repaired[i].get("children", []))
-                else ""
+        node, parent_title, ancestors = _locate_by_path(repaired, path)
+        if not node:
+            logger.warning(
+                "[L3修复] path 无法定位，跳过: %s（树结构可能已变）", path,
             )
-            l3_title = (
-                repaired[i].get("children", [{}])[j].get("children", [{}])[k].get("title", "")
-                if k < len(repaired[i].get("children", [{}])[j].get("children", []))
-                else ""
-            )
-            if not l3_title:
-                continue
-            repair_tasks.append((i, j, k, l1_title, l2_title, l3_title))
-        except (IndexError, ValueError):
             continue
+        l1_title = ancestors[0] if ancestors else ""
+        l3_title = node.get("title", "")
+        if not l3_title:
+            continue
+        repair_tasks.append((path, node, l1_title, parent_title, l3_title))
 
     async def _repair_one(
-        i: int, j: int, k: int, l1_title: str, l2_title: str, l3_title: str
+        path: str, node: dict, l1_title: str, l2_title: str, l3_title: str
     ) -> None:
-        """并行修复单个L3标题"""
+        """并行修复单个 L3 标题（按路径定位节点，支持任意深度）。"""
         repair_msg = render_prompt(
             repair_template,
             L1_TITLE=l1_title,
@@ -925,14 +1039,34 @@ async def repair_l3_generic_titles(
             )
             # 清理可能的markdown围栏
             new_title = new_title.strip().strip("`").strip("json").strip()
-            if new_title and len(new_title) >= 5 and new_title != l3_title:
-                repaired[i]["children"][j]["children"][k]["title"] = new_title
+            # 2026-10-10 增强：AI 可能返回另一个占位标题（或原样复读），
+            # 必须用统一脏标题判定拦截，否则等于白调一次 AI。
+            if new_title and len(new_title) >= 5 and new_title != l3_title and not _is_dirty_l3_title(new_title):
+                node["title"] = new_title
                 logger.info("[L3修复] %s → %s", l3_title[:30], new_title[:30])
+            elif new_title:
+                logger.info(
+                    "[L3修复] 拒绝 AI 返回的占位/重复标题（保留原标题）: %s",
+                    new_title[:30],
+                )
         except Exception as e:
             logger.warning("[L3修复] AI调用失败 (%s): %s", l3_title[:20], e)
 
     if repair_tasks:
-        await asyncio.gather(*[_repair_one(*t) for t in repair_tasks], return_exceptions=True)
+        # 2026-10-10 加固：旧实现直接 asyncio.gather 全量并发，实际并发数等于
+        # 待修复条数（上限 OUTLINE_L3_REPAIR_MAX=24）。每条任务都携带 ≤6000 token
+        # 的项目上下文，24 路并发会瞬时打出 24 个长上下文请求，既撞 provider 的
+        # 速率限制，也会在超时重试时把负载成倍放大。改为信号量限流：任一时刻
+        # 最多 OUTLINE_L3_REPAIR_CONCURRENCY 路在飞，其余排队。
+        _sem = asyncio.Semaphore(max(1, OUTLINE_L3_REPAIR_CONCURRENCY))
+
+        async def _guarded(task: tuple) -> None:
+            async with _sem:
+                await _repair_one(*task)
+
+        await asyncio.gather(
+            *[_guarded(t) for t in repair_tasks], return_exceptions=True
+        )
 
     return repaired
 

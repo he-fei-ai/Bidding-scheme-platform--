@@ -81,8 +81,11 @@ def _register_stream_journal(journal: _StreamJournal) -> None:
         ]
         for sid in expired:
             _STREAM_JOURNALS.pop(sid, None)
+        # MODULARIZATION 2026-10-12（遗留加固）：超量淘汰补充日志，便于生产观察
+        # 高频导出是否触发 journal 容量上限。
         while len(_STREAM_JOURNALS) > _STREAM_JOURNAL_MAX:
-            _STREAM_JOURNALS.popitem(last=False)
+            evicted_key, evicted_journal = _STREAM_JOURNALS.popitem(last=False)
+            logger.info("SSE journal 超量淘汰流 %s（容量上限 %d）", evicted_key, _STREAM_JOURNAL_MAX)
 
 
 def _drain_queue_to_journal(journal: _StreamJournal) -> None:
@@ -277,6 +280,30 @@ async def export_docx(project_id: int, config: ExportConfig=Body(default_factory
     finally:
         _stop_keepalive()
         await _release_export_lock(lock_key, owner_id, why=f'同步导出 project={project_id}')
+
+@router.post('/html', dependencies=[limit_per_endpoint])
+async def export_html(project_id: int, config: ExportConfig=Body(default_factory=ExportConfig), identity=Depends(verify_auth)):
+    """ENHANCE 2026-10-12：HTML 导出格式（新增第二交付通道）。
+
+    复用同一套章节树 + parse_content 内容组装链，渲染端换成简洁 HTML。
+    图表标记按「无降级」原则输出占位符 div（不伪造 Mermaid 图，真实图表需
+    DOCX/PDF 格式）。支持 LibreOffice headless 自动转换 HTML → PDF。
+
+    与 DOCX/PDF 并立，不替代任何既有端点；前端可在导出配置页选择格式。
+    """
+    if config is None:
+        config = ExportConfig()
+    await enforce_project_access(project_id, identity)
+    from ..services.html_export import build_html
+
+    path, _fingerprint = await asyncio.to_thread(build_html, project_id, config)
+
+    from pathlib import Path as _Path
+    _p = _Path(path)
+    if not _p.exists():
+        raise HTTPException(status_code=500, detail="HTML 导出产物落盘失败")
+    from fastapi.responses import FileResponse as _FileResponse
+    return _FileResponse(path=str(_p), filename=_p.name, media_type="text/html; charset=utf-8")
 
 @router.post('/docx-stream', dependencies=[limit_per_endpoint])
 async def export_docx_stream(request: Request, project_id: int, config: ExportConfig=Body(default_factory=ExportConfig), identity=Depends(verify_auth)):
@@ -502,7 +529,12 @@ async def export_docx_stream_resume(request: Request, project_id: int, stream_id
     因此 id 序列只覆盖有业务价值的事件。
     """
     await enforce_project_access(project_id, identity)
-    journal = _STREAM_JOURNALS.get(stream_id)
+    # FIX 2026-10-11（E-10·P1·锁一致性）：旧实现直接 `_STREAM_JOURNALS.get(stream_id)`
+    # 未持锁，与 `_register_stream_journal` 的写操作存在理论竞态（虽 CPython GIL
+    # 保证 dict 原子性，但代码一致性缺失，多解释器如 PyPy/Jython 下不安全）。
+    # 现统一持锁读取，与 `_register_stream_journal` / 淘汰逻辑同口径。
+    with _STREAM_JOURNAL_LOCK:
+        journal = _STREAM_JOURNALS.get(stream_id)
     if journal is None or journal.project_id != project_id:
         raise HTTPException(status_code=404, detail='导出流不存在或已过期，请在导出历史中查看结果')
 
@@ -683,13 +715,19 @@ _presets_router = APIRouter(prefix='/export', tags=['export_presets'])
 
 
 @_presets_router.get('/presets')
-async def list_export_presets():
+async def list_export_presets(identity=Depends(verify_auth)):
     """列出全部导出格式预设（版式 + 主题）。
 
     ENHANCE 2026-09-14：新增端点，移植自易标 `EXPORT_LAYOUT_PRESETS` /
     `EXPORT_THEME_PRESETS`。预设为全局静态数据、不含任何项目敏感信息，
     因此不需要鉴权；前端据此渲染「一键套用」选择器，开放 API 调用方也可
     只传 `{"preset_id": "formal-binding", "theme_id": "blue"}` 直接得到成品排版。
+
+    SECURITY 2026-10-12（GAP-T04·遗留加固）：原端点无鉴权暴露。虽然预设不含
+    敏感数据，但信息暴露面本身属于安全加固范畴——任何匿名请求都能枚举出
+    系统已安装的版式/主题预设（可用于探测系统功能边界）。现与同模块其他端点
+    统一应用 `Depends(verify_auth)`，前端 `getExportPresets()` 已带 auth header，
+    向后完全兼容。
     """
     from ..services.export_presets import list_presets
 

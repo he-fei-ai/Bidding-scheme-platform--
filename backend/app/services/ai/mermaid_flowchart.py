@@ -180,6 +180,10 @@ def _register_node_if_match(line: str, nodes_map: dict) -> None:
     label = _extract_mermaid_node_label(line)
     if not label:
         return
+    # 连线语法残留（如 `N1["CheckBIM -- \"通过\""]`）不是节点定义，跳过注册，
+    # 否则会渲染出 `CheckBIM -- "通过"` 这样的垃圾节点。
+    if _looks_like_edge_artifact(label):
+        return
 
     plain_id = _strip_mermaid_node_brackets(line)
     if not plain_id:
@@ -220,6 +224,57 @@ def _strip_mermaid_node_brackets(nid: str) -> str:
         return m.group(1)
     return nid
 
+def _brackets_balanced(text: str) -> bool:
+    """判断字符串中的 `[`/`{`/`(` 是否与 `]`/`}`/`)` 一一配对且顺序合法。
+
+    用于区分「真正的节点定义」与「被括号包裹的边文本残留」。
+    例：`A[工期 2026-09-22` 不平衡（左侧被切断的节点标签），
+    `A[工期 2026-09-22 -- 2026-12-15]` 平衡（完整节点）。
+    """
+    depth = 0
+    for ch in text:
+        if ch in "[({":
+            depth += 1
+        elif ch in "])}":
+            depth -= 1
+            if depth < 0:
+                return False
+    return depth == 0
+
+
+def _clean_edge_label(label: str | None) -> str | None:
+    """清理边标签文本：修正 JSON 风格转义、去除成对的包裹引号。
+
+    AI 常把边标签写成 `-->|"通过"|` 或 `-- \"通过\" -->`，
+    直接渲染会把引号/反斜杠一并画出来（图中显示为 `"通过"`）。
+    空白结果返回 None（表示无边标签）。
+    """
+    if not label:
+        return None
+    text = label.strip().replace('\\"', '"')
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in ('"', "'"):
+        text = text[1:-1].strip()
+    return text or None
+
+
+# 明显的连线语法残留（不是节点标签）：
+#   - `CheckBIM -- "通过"`   （legacy 边文本写法被误当节点）
+#   - `D1 -- 通过`           （同上，无引号）
+#   - `A ==> 通过` / `A -.- 通过`
+# 注意：`工期 2026-09-22 -- 2026-12-15` 这类以「中文/日期」开头的
+# 合法节点标签不会被命中（可选前缀仅允许 ASCII/中文单词，其后必须紧跟连接符）。
+_EDGE_ARTIFACT_RE = re.compile(
+    r"^(?:[A-Za-z0-9_\u4e00-\u9fff]+\s+)?(?:-->|===?->|==+>|-\.->)\s+\S"
+)
+
+
+def _looks_like_edge_artifact(label: str | None) -> bool:
+    """判断标签文本是否是连线语法残留（不应被当作节点渲染）。"""
+    if not label:
+        return True
+    return bool(_EDGE_ARTIFACT_RE.match(label.strip()))
+
+
 def _split_mermaid_edge(line: str) -> tuple[str, str | None, str] | None:
     """解析 Mermaid 边定义：from --[|label|]--> to（支持带中英文标签和方括号节点 ID）
 
@@ -244,27 +299,42 @@ def _split_mermaid_edge(line: str) -> tuple[str, str | None, str] | None:
     # 标签在右侧首部:  -->|label| B
     label_m = re.match(r"^\s*\|([^|]*)\|\s*(.*)$", right)
     if label_m:
-        edge_label = label_m.group(1).strip() or None
+        edge_label = _clean_edge_label(label_m.group(1))
         right = label_m.group(2).strip()
     else:
         # 兼容 A -->|label| 之后直接接节点（label 在右半部分首部）
         label_m = re.match(r"^\s*\|([^|]*)\|\s*$", right)
         if label_m:
-            edge_label = label_m.group(1).strip() or None
+            edge_label = _clean_edge_label(label_m.group(1))
             right = ""
         # 清理左侧可能存在的连线样式后缀
         left = re.sub(r"\s+---\s*$", "", left)
+
+    # 兼容 legacy 边文本残留：`A -- "通过" --> B`（未先经过 Sanitizer 时的兜底）。
+    # 要求 src 括号平衡，避免把 `A[工期 2026-09-22 -- 2026-12-15]` 这类
+    # 完整节点标签误拆成「节点 + 边标签」。
+    left_legacy = re.match(r"^(?P<src>.+?)\s+(?:--|==>|-\.-)\s+(?P<label>\S.*)$", left)
+    if left_legacy and _brackets_balanced(left_legacy.group("src")):
+        legacy_label = _clean_edge_label(left_legacy.group("label"))
+        if legacy_label and not edge_label:
+            edge_label = legacy_label
+        left = left_legacy.group("src").strip()
 
     # 清理左侧可能存在的 |...| 形式的标签（少数语法）
     label_m_left = re.match(r"^(.*?)\s*\|([^|]*)\|\s*$", left)
     if label_m_left and not edge_label:
         left = label_m_left.group(1).strip()
-        edge_label = label_m_left.group(2).strip() or None
+        edge_label = _clean_edge_label(label_m_left.group(2))
 
     from_id = left
     to_id = right
 
     if not from_id or not to_id:
+        return None
+
+    # 兜底：端点如果仍是连线语法残留（如 `CheckBIM -- "通过"`），说明该行无法
+    # 安全解析——放弃该条连线，避免注册出垃圾节点把整张图的拓扑带偏。
+    if _looks_like_edge_artifact(from_id) or _looks_like_edge_artifact(to_id):
         return None
 
     return from_id, edge_label, to_id
@@ -354,6 +424,8 @@ def _parse_flowchart_structure(mermaid_code: str) -> dict:
         for nid in (from_id, to_id):
             if nid not in nodes_map:
                 label = _extract_mermaid_node_label(nid)
+                if label and _looks_like_edge_artifact(label):
+                    continue  # 连线语法残留（如 `A -- "通过"`）不注册为节点
                 if label:
                     nodes_map[nid] = {
                         "id": nid,
@@ -368,10 +440,38 @@ def _parse_flowchart_structure(mermaid_code: str) -> dict:
 
         edges.append({"from": from_id, "to": to_id, "label": edge_label})
 
+    # ENHANCE 2026-10-11: 纯 ID 规范化（chart_validators 兼容）
+    #
+    # _resolve_id / _register_node_if_match 用带方括号的完整 Mermaid 字符串
+    # （如 "A[施工准备]"）作为 nodes_map 的 key——这是渲染链路的设计：渲染器
+    # 需要用完整 Mermaid 语句来匹配和查找节点。但 chart_validators
+    # validate_flowchart_structure 期望：
+    #   - nodes[].id = 纯 ASCII（"A"）
+    #   - nodes[].label = 中文标签（"施工准备"）
+    #   - edges[].from/to = 纯 ASCII，与 nodes[].id 对齐
+    #
+    # 渲染链路（_render_flowchart_image_v2）和校验链路（chart_validators）
+    # 在返回格式上各有偏好，所以在函数末尾统一做一次规范化：
+    # nodes[].id / edges[].from / edges[].to 全部 strip 成纯 ID，
+    # nodes[].label 保持中文不变。
+    plain_nodes: list[dict] = []
+    for n in nodes_map.values():
+        plain_nodes.append({
+            **n,
+            "id": _strip_mermaid_node_brackets(n["id"]),
+        })
+    plain_edges = []
+    for e in edges:
+        plain_edges.append({
+            **e,
+            "from": _strip_mermaid_node_brackets(e["from"]),
+            "to": _strip_mermaid_node_brackets(e["to"]),
+        })
+
     return {
         "direction": direction,
-        "nodes": list(nodes_map.values()),
-        "edges": edges,
+        "nodes": plain_nodes,
+        "edges": plain_edges,
     }
 
 @_render_hq
@@ -382,7 +482,7 @@ def _render_flowchart_image_v2(mermaid_code: str) -> BytesIO | None:
     - 严格区分决策菱形与流程矩形
     - 自动判断 TD / LR 布局
     - 带标签的分支连线（-->|label|）
-    - 专业配色：决策节点 = 黄色警示 / 流程节点 = 蓝色主调 / 开始结束 = 绿色起点
+    - 扁平化配色：所有节点统一使用淡紫填充 #EDE9FE、丁香紫边框 #9B8BE0、深炭灰文字 #2D2D3A，直角矩形无阴影
     - 自动避让连线，箭头清晰
     - 增强 v3.0: 使用 @_render_hq 实现 2.5x 超采样抗锯齿，300 DPI 输出
     """
@@ -403,18 +503,42 @@ def _render_flowchart_image_v2(mermaid_code: str) -> BytesIO | None:
 
     direction = parsed["direction"]
     decision_ids = {n["id"] for n in nodes if n["type"] == "decision"}
-    [n["id"] for n in nodes if n["type"] != "decision"]
 
     # ---- 尺寸参数 ----
     padding = 40
     node_w = 180
     node_h = 56
     diamond_w = 200
-    diamond_h = 80
+    diamond_h = 200          # 菱形取正方形：文字可用区 = min(w, h)/2
     row_gap = 32
     col_gap = 60
     title_h = 60
     caption_h = 32
+
+    # ---- 决策菱形自适应尺寸（BUG-2026-1011-02）----
+    # 菱形是正方形旋转 45°，文字实际可用区域只有内接矩形（宽 = 高 = min(w, h)/2）。
+    # 原来 diamond_h=80 远小于 diamond_w=200，"BIM管线综合碰撞检查" 这类标签
+    # 必然溢出斜边被裁切。这里按最长决策标签反推所需边长；col_w/row_h 由
+    # max(node_w, diamond_w) 推导，边长增大时布局会自动让位，不会压到相邻节点。
+    scale = 2.5  # 与下方 _render_hq 超采样倍率保持一致
+    decision_labels = [str(n.get("label", "")) for n in nodes if n["id"] in decision_ids]
+    if decision_labels:
+        probe_draw = ImageDraw.Draw(Image.new("RGB", (8, 8), "white"))
+        probe_font = _image_font(int(15 * scale))          # 与 font_node 同字号
+        cjk_w = max(1.0, _text_width(probe_draw, "国", probe_font))
+        line_h = max(16.0, _text_height(probe_draw, "国", probe_font) + 4)
+        pad = 20.0 * scale                                  # 文字与斜边的留白
+        longest = max(len(l) for l in decision_labels)
+        best_side = None
+        for n_lines in range(1, 5):
+            chars = max(1, -(-longest // n_lines))          # 向上取整
+            side = 2 * max(chars * cjk_w, n_lines * line_h) + 2 * pad
+            if best_side is None or side < best_side:
+                best_side = side
+        if best_side is not None:
+            need = best_side / scale
+            if need > diamond_w or need > diamond_h:
+                diamond_w = diamond_h = max(diamond_w, diamond_h, need)
 
     # ---- 自动布局（基于 BFS 层级）----
     # 构建邻接表
@@ -465,27 +589,23 @@ def _render_flowchart_image_v2(mermaid_code: str) -> BytesIO | None:
         # 横向布局：层级 = 列
         max_cols = max_level + 1
         max_rows = max(len(g) for g in level_groups.values())
-        col_w = max(node_w, diamond_w) + col_gap
-        row_h = max(node_h, diamond_h) + row_gap
-        total_w = padding * 2 + max_cols * col_w - col_gap
-        total_h = title_h + padding * 2 + max_rows * row_h + caption_h
     else:
         # 纵向布局：层级 = 行
         max_rows = max_level + 1
         max_cols = max(len(g) for g in level_groups.values())
-        col_w = max(node_w, diamond_w) + col_gap
-        row_h = max(node_h, diamond_h) + row_gap
-        total_w = padding * 2 + max_cols * col_w - col_gap
-        total_h = title_h + padding * 2 + max_rows * row_h + caption_h
+    # 无决策节点时不占位，保持原有行/列步距
+    col_w = max(node_w, diamond_w if decision_ids else node_w) + col_gap
+    row_h = max(node_h, diamond_h if decision_ids else node_h) + row_gap
+    total_w = padding * 2 + max_cols * col_w - col_gap
+    total_h = title_h + padding * 2 + max_rows * row_h + caption_h
 
-    # 使用 2.5x 缩放渲染 + @_render_hq 保持原分辨率并添加 300 DPI 元数据
+    # 2.5x 缩放渲染 + @_render_hq 保持原分辨率并添加 300 DPI 元数据
     # 2.5x 渲染 + 不降采样 = 真实超采样抗锯齿，最终 DOCX 插入时 DPI 感知缩放到合适尺寸
-    scale = 2.5
 
     img = Image.new("RGB", (int(total_w * scale), int(total_h * scale)), "white")
     draw = ImageDraw.Draw(img)
     font_title = _image_font(int(20 * scale), bold=True)
-    font_node = _image_font(int(16 * scale), bold=True)
+    font_node = _image_font(int(15 * scale))
     font_edge = _image_font(int(13 * scale))
     font_caption = _image_font(int(13 * scale))
 
@@ -497,7 +617,7 @@ def _render_flowchart_image_v2(mermaid_code: str) -> BytesIO | None:
             title = raw.strip()[5:].strip()
             break
 
-    draw.text((int(padding * scale), int(18 * scale)), title, fill="#1E3A5F", font=font_title)
+    draw.text((int(padding * scale), int(18 * scale)), title, fill="#2D2D3A", font=font_title)
 
     # ---- 计算节点位置 ----
     positions: dict[str, tuple[float, float, float, float]] = {}
@@ -534,7 +654,7 @@ def _render_flowchart_image_v2(mermaid_code: str) -> BytesIO | None:
     node_lookup = {n["id"]: n for n in nodes}
 
     # ---- 绘制连线（先画线，再画节点，确保节点覆盖在连线上方）----
-    arrow_color = "#475569"
+    arrow_color = "#333333"
     edge_label_bg = "#FFFFFF"
     for e in edges:
         if e["from"] not in positions or e["to"] not in positions:
@@ -567,11 +687,8 @@ def _render_flowchart_image_v2(mermaid_code: str) -> BytesIO | None:
         else:
             path[-1] = (ex, ey - 8)
 
-        # 连线阴影效果
-        shadow_offset = 2
-        shadow_path = [(p[0] + shadow_offset, p[1] + shadow_offset) for p in path]
-        draw.line(shadow_path, fill="#E5E7EB", width=int(3 * scale))
-        draw.line(path, fill=arrow_color, width=int(2 * scale))
+        # 扁平化直线连线（无阴影）
+        draw.line(path, fill=arrow_color, width=int(1.5 * scale))
 
         # 绘制箭头（使用实心三角形）
         if direction == "LR":
@@ -598,94 +715,87 @@ def _render_flowchart_image_v2(mermaid_code: str) -> BytesIO | None:
             draw.rectangle(
                 [label_x - 2, label_y - 2, label_x + tw_l, label_y + th_l],
                 fill=edge_label_bg,
-                outline="#CBD5E0",
+                outline="#9B8BE0",
                 width=1,
             )
-            draw.text((label_x + 2, label_y), e["label"], fill="#1E3A5F", font=font_edge)
+            draw.text((label_x + 2, label_y), e["label"], fill="#2D2D3A", font=font_edge)
 
     # ---- 绘制节点（最后画，置于最上层）----
     for nid, (x, y, w, h) in positions.items():
         node = node_lookup[nid]
         label = node["label"]
-        # 阴影偏移
-        shadow_offset = 4
         if nid in decision_ids:
-            # 菱形（决策）带阴影
+            # 菱形（决策）扁平化，无阴影
             cx = x + w / 2
             cy = y + h / 2
             d = min(w, h) / 2 - 2
-            # 阴影
-            draw.polygon(
-                [
-                    (cx + shadow_offset, cy - d + shadow_offset),
-                    (cx + d + shadow_offset, cy + shadow_offset),
-                    (cx + shadow_offset, cy + d + shadow_offset),
-                    (cx - d + shadow_offset, cy + shadow_offset),
-                ],
-                fill="#D1D5DB",
-                outline=None,
-            )
             # 主体
             draw.polygon(
                 [(cx, cy - d), (cx + d, cy), (cx, cy + d), (cx - d, cy)],
-                fill="#FFF7E6",
-                outline="#D97706",
-                width=3,
+                fill="#EDE9FE",
+                outline="#9B8BE0",
+                width=int(1.5 * scale),
             )
+            # 文字必须约束在菱形内接矩形内（宽 = 高 = min(w, h)），
+            # 否则会被菱形斜边裁切（BUG-2026-1011-02）。
+            inscribed = min(w, h)
+            inner_w = max(int(24 * scale), int(inscribed - 24 * scale))
             _draw_text_center(
-                draw, (x + 4, y + 4, x + w - 4, y + h - 4), label, font_node, "#7C2D12", max_lines=2
+                draw,
+                (cx - inner_w / 2, y, cx + inner_w / 2, y + h),
+                label,
+                font_node,
+                "#2D2D3A",
+                max_lines=4,
             )
         else:
-            # 圆角矩形带阴影
-            draw.rounded_rectangle(
-                [
-                    x + shadow_offset,
-                    y + shadow_offset,
-                    x + w + shadow_offset,
-                    y + h + shadow_offset,
-                ],
-                radius=10,
-                fill="#D1D5DB",
-                outline=None,
-            )
-            # 渐变效果：使用两层颜色（从浅蓝到深蓝过渡）
-            draw.rounded_rectangle(
+            # 扁平化直角矩形（无圆角、无阴影）
+            draw.rectangle(
                 [x, y, x + w, y + h],
-                radius=10,
-                fill="#EAF2F8",
-                outline="#2B579A",
-                width=3,
+                fill="#EDE9FE",
+                outline="#9B8BE0",
+                width=int(1.5 * scale),
             )
-            # 高光效果：顶部浅色线条
-            highlight_y = y + 4
-            draw.line([(x + 8, highlight_y), (x + w - 8, highlight_y)], fill="#FFFFFF", width=2)
             _draw_text_center(
-                draw, (x + 4, y + 4, x + w - 4, y + h - 4), label, font_node, "#1E3A5F", max_lines=2
+                draw, (x + 4, y + 4, x + w - 4, y + h - 4), label, font_node, "#2D2D3A", max_lines=2
             )
 
-    # ---- 图例 ----
-    legend_y = int(total_h * scale) - 24
+    # ---- 图例（扁平化淡紫色系）----
+    # 注意：图例几何必须与 scale 同步缩放——字体已按 scale 放大，
+    # 但旧的色块/间距仍是原始像素，2.5x 渲染下两个图例项会挤在一起
+    # （图上显示成 "流程节点决策判定" 连成一片），且贴近底边被裁切。
+    label1, label2 = "流程节点", "决策判定"
+    box_w = int(24 * scale)
+    box_h = int(16 * scale)
+    text_off = int(8 * scale)      # 色块与文字之间的间距
+    item_gap = int(28 * scale)     # 两个图例项之间的间距
+    bbox1 = draw.textbbox((0, 0), label1, font=font_caption)
+    bbox2 = draw.textbbox((0, 0), label2, font=font_caption)
+    text_w1 = bbox1[2] - bbox1[0]
+    text_h = max(bbox1[3] - bbox1[1], bbox2[3] - bbox2[1])
+    legend_bottom = int(total_h * scale) - int(caption_h * scale / 2)
+    legend_top = legend_bottom - max(box_h, text_h)
     legend_x = int(padding * scale)
-    # 流程节点
-    draw.rounded_rectangle(
-        [legend_x, legend_y - 14, legend_x + 24, legend_y + 2],
-        radius=4,
-        fill="#EAF2F8",
-        outline="#2B579A",
-        width=1,
+    # 流程节点（矩形）
+    draw.rectangle(
+        [legend_x, legend_top, legend_x + box_w, legend_top + box_h],
+        fill="#EDE9FE",
+        outline="#9B8BE0",
+        width=int(1 * scale),
     )
-    draw.text((legend_x + 30, legend_y - 13), "流程节点", fill="#1E3A5F", font=font_caption)
-    legend_x += 100
-    # 决策节点
-    cx = legend_x + 12
-    cy = legend_y - 6
+    draw.text((legend_x + box_w + text_off, legend_top), label1, fill="#2D2D3A", font=font_caption)
+    legend_x += box_w + text_off + text_w1 + item_gap
+    # 决策节点（菱形）
+    cx = legend_x + box_w / 2
+    cy = legend_top + box_h / 2
+    d = min(box_w, box_h) / 2
     draw.polygon(
-        [(cx, cy - 10), (cx + 10, cy), (cx, cy + 10), (cx - 10, cy)],
-        fill="#FFF7E6",
-        outline="#D97706",
-        width=1,
+        [(cx, cy - d), (cx + d, cy), (cx, cy + d), (cx - d, cy)],
+        fill="#EDE9FE",
+        outline="#9B8BE0",
+        width=int(1 * scale),
     )
-    draw.text((legend_x + 30, legend_y - 13), "决策判定", fill="#1E3A5F", font=font_caption)
+    draw.text((legend_x + box_w + text_off, legend_top), label2, fill="#2D2D3A", font=font_caption)
 
     result_stream = _image_to_stream(img)
     size_kb = len(result_stream.getvalue()) // 1024
@@ -846,10 +956,10 @@ def _render_flowchart_with_edges(data: dict) -> BytesIO | None:
            "edges": [{"from":"A","to":"B","label":"合格"},...]}
     支持简化格式：nodes 可以是字符串列表，edges 缺失时自动生成顺序连线。
 
-    支持3种节点类型:
-    - start: 圆角矩形, 绿色 (#D5F5E3)
-    - process: 矩形, 浅蓝 (#EAF2F8)
-    - end: 圆角矩形, 红色 (#FADBD8)
+    支持3种节点类型（统一扁平化淡紫色样式）:
+    - start: 直角矩形, 淡紫 (#EDE9FE)
+    - process: 直角矩形, 淡紫 (#EDE9FE)
+    - end: 直角矩形, 淡紫 (#EDE9FE)
 
     自动布局：按 edges 拓扑排序确定节点位置
     箭头绘制：使用 PIL.ImageDraw 的 line + polygon 绘制方向箭头
@@ -924,9 +1034,9 @@ def _render_flowchart_with_edges(data: dict) -> BytesIO | None:
 
         # 节点类型配色
         type_styles = {
-            "start": {"fill": "#D5F5E3", "outline": "#27AE60", "shape": "rounded"},
-            "process": {"fill": "#EAF2F8", "outline": "#2B579A", "shape": "rect"},
-            "end": {"fill": "#FADBD8", "outline": "#E74C3C", "shape": "rounded"},
+            "start": {"fill": "#EDE9FE", "outline": "#9B8BE0", "shape": "rect"},
+            "process": {"fill": "#EDE9FE", "outline": "#9B8BE0", "shape": "rect"},
+            "end": {"fill": "#EDE9FE", "outline": "#9B8BE0", "shape": "rect"},
         }
 
         # 构建邻接表 & 入度
@@ -988,13 +1098,13 @@ def _render_flowchart_with_edges(data: dict) -> BytesIO | None:
         img = Image.new("RGB", (int(total_w), int(total_h)), "white")
         draw = ImageDraw.Draw(img)
         font_title = _image_font(int(20 * scale), bold=True)
-        font_node = _image_font(int(16 * scale), bold=True)
+        font_node = _image_font(int(15 * scale))
         font_edge = _image_font(int(13 * scale))
         font_caption = _image_font(int(13 * scale))
 
         # 标题
         title = str(data.get("title", "流程图"))
-        draw.text((padding, int(18 * scale)), title, fill="#1E3A5F", font=font_title)
+        draw.text((padding, int(18 * scale)), title, fill="#2D2D3A", font=font_title)
 
         # 计算节点位置
         node_lookup = {n["id"]: n for n in nodes}
@@ -1010,7 +1120,7 @@ def _render_flowchart_with_edges(data: dict) -> BytesIO | None:
                 positions[nid] = (x, y, node_w, node_h)
 
         # ---- 先画连线（确保节点覆盖在连线上方）----
-        arrow_color = "#475569"
+        arrow_color = "#333333"
         edge_label_bg = "#FFFFFF"
         for e in edges:
             f, t = e.get("from", ""), e.get("to", "")
@@ -1048,10 +1158,10 @@ def _render_flowchart_with_edges(data: dict) -> BytesIO | None:
                 draw.rectangle(
                     [label_x - 2, label_y - 2, label_x + tw_l, label_y + th_l],
                     fill=edge_label_bg,
-                    outline="#CBD5E0",
+                    outline="#9B8BE0",
                     width=1,
                 )
-                draw.text((label_x + 2, label_y), label, fill="#1E3A5F", font=font_edge)
+                draw.text((label_x + 2, label_y), label, fill="#2D2D3A", font=font_edge)
 
         # ---- 再画节点（置于最上层）----
         for nid, (x, y, w, h) in positions.items():
@@ -1060,42 +1170,31 @@ def _render_flowchart_with_edges(data: dict) -> BytesIO | None:
             ntype = node.get("type", "process")
             style = type_styles.get(ntype, type_styles["process"])
 
-            if style["shape"] == "rounded":
-                draw.rounded_rectangle(
-                    [x, y, x + w, y + h],
-                    radius=int(12 * scale),
-                    fill=style["fill"],
-                    outline=style["outline"],
-                    width=int(2 * scale),
-                )
-            else:
-                draw.rectangle(
-                    [x, y, x + w, y + h],
-                    fill=style["fill"],
-                    outline=style["outline"],
-                    width=int(2 * scale),
-                )
+            # 扁平化直角矩形（无圆角、无阴影）
+            draw.rectangle(
+                [x, y, x + w, y + h],
+                fill=style["fill"],
+                outline=style["outline"],
+                width=int(1.5 * scale),
+            )
             _draw_text_center(
-                draw, (x + 4, y + 4, x + w - 4, y + h - 4), label, font_node, "#1E3A5F", max_lines=2
+                draw, (x + 4, y + 4, x + w - 4, y + h - 4), label, font_node, "#2D2D3A", max_lines=2
             )
 
-        # ---- 图例 ----
+        # ---- 图例（扁平化淡紫色系）----
         legend_y = total_h - 24
         legend_x = padding
         legend_items = [
-            ("#D5F5E3", "#27AE60", "开始"),
-            ("#EAF2F8", "#2B579A", "过程"),
-            ("#FADBD8", "#E74C3C", "结束"),
+            ("#EDE9FE", "#9B8BE0", "流程节点"),
         ]
         for fill, outline, ltext in legend_items:
-            draw.rounded_rectangle(
+            draw.rectangle(
                 [
                     legend_x,
                     legend_y - int(14 * scale),
                     legend_x + int(24 * scale),
                     legend_y + int(2 * scale),
                 ],
-                radius=int(4 * scale),
                 fill=fill,
                 outline=outline,
                 width=int(1 * scale),
@@ -1103,7 +1202,7 @@ def _render_flowchart_with_edges(data: dict) -> BytesIO | None:
             draw.text(
                 (legend_x + int(30 * scale), legend_y - int(13 * scale)),
                 ltext,
-                fill="#1E3A5F",
+                fill="#2D2D3A",
                 font=font_caption,
             )
             legend_x += int(90 * scale)

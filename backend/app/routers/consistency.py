@@ -370,6 +370,103 @@ async def repair_with_ai(
     return {'status': 'ok' if report.get('success') else 'no_change', **report}
 
 
+@router.post('/agent/{project_id}')
+async def agent_mode_repair(
+    project_id: int,
+    dry_run: bool = Query(False, description='只跑 Agent 会话与预览，不写库'),
+    max_turns: int = Query(8, ge=1, le=20, description='Agent 最大往返轮数（防失控烧 token）'),
+    user=Depends(get_current_user),
+):
+    """Agent 模式全文一致性修复（E-1，对标易标 D1「Agent修复」）。
+
+    差异点 vs 既有 `POST /consistency/repair/{project_id}`（AI 补丁路径）：
+
+    - 本模式让 AI 以「多轮往返」方式工作（search / read / replace），长文
+      不会一次塞进单请求 —— 几十万字标书不再受 batch/token 限制；
+    - 安全模型与 AI 补丁路径一致：AI 只提修改意图，宿主唯一命中校验后执行，
+      Agent 编造的 old_text / 越界 section_id 一律拒绝，幻觉 0 落库。
+
+    Args:
+        project_id: 项目ID
+        dry_run: 预览模式
+        max_turns: Agent 最大往返轮数
+    """
+    await enforce_project_access(project_id, user)
+    from ..services.agent_repair import run_agent_repair
+
+    # ENHANCE 2026-10-09：与 audit/autofix/repair 共享同一项目级写锁，避免
+    # 并发写正文/冲突状态互相踩踏（见模块头 _CONSISTENCY_OP_LOCKS 说明）。
+    try:
+        async with _LockManager(project_id):
+            report = await run_agent_repair(
+                project_id, dry_run=dry_run, max_turns=max_turns
+            )
+    except Exception as e:
+        logger.error('Agent 一致性修复失败 project=%s: %s', project_id, e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f'Agent 修复失败: {e!s}') from e
+
+    return {'status': 'ok' if report.get('success') else 'partial', **report}
+
+
+@router.get('/facts/proposals/{project_id}')
+async def facts_backflow_proposals(
+    project_id: int,
+    min_occurrences: int = Query(3, ge=1, le=50, description='候选值在正文至少出现次数'),
+    user=Depends(get_current_user),
+):
+    """审计结果 → 全局事实 反向回流候选（E-5）。
+
+    扫描未解决冲突，把「正文里占多数的取值」沉淀成候选事实（占位值剔除、
+    与既有事实去重）。用户确认后走 `POST /facts/proposals/{id}/accept`。
+    """
+    await enforce_project_access(project_id, user)
+    from ..services.consistency_backflow import propose_facts
+
+    result = await asyncio.to_thread(propose_facts, project_id, min_occurrences=min_occurrences)
+    return {'status': 'ok', **result}
+
+
+@router.post('/facts/proposals/{project_id}/accept')
+async def facts_backflow_accept(
+    project_id: int,
+    body: dict,
+    user=Depends(get_current_user),
+):
+    """采纳事实回流候选，合并进全局事实清单（E-5）。
+
+    走与手工保存一致的 upsert + 三层缓存失效；采纳后同一类冲突在下次
+    审计时即为「有基准」，不再因缺失口径而复现。
+    """
+    await enforce_project_access(project_id, user)
+    proposals = body.get('proposals') if isinstance(body, dict) else None
+    if not isinstance(proposals, list):
+        raise HTTPException(status_code=400, detail='body.proposals 必须是列表')
+    from ..services.consistency_backflow import accept_fact_proposals
+
+    async with _LockManager(project_id):
+        result = await asyncio.to_thread(accept_fact_proposals, project_id, proposals)
+    return {'status': 'ok', **result}
+
+
+@router.get('/rejection-coverage/{project_id}')
+async def rejection_answer_coverage_endpoint(
+    project_id: int,
+    user=Depends(get_current_user),
+):
+    """废标条款应答覆盖率（E-6）。
+
+    基于最新一次废标检查任务，对每个检查条款与全项目正文做字符 bigram
+    重合度，量化「条款要求是否被投标正文正面回应」。确定性实现、无 AI、
+    结果可复现；配合废标项检查的问题点使用，避免「查出了风险却没在方案里
+    补答」的断层。
+    """
+    await enforce_project_access(project_id, user)
+    from ..services.rejection_coverage import rejection_answer_coverage
+
+    report = await asyncio.to_thread(rejection_answer_coverage, project_id)
+    return {'status': 'ok', **report}
+
+
 @router.get('/summary/{project_id}')
 async def get_audit_summary(project_id: int, user=Depends(get_current_user)):
     """获取审计摘要

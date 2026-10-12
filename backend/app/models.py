@@ -288,6 +288,12 @@ class DocumentCheckResult(BaseModel):
     control_char_sections: list[EmptySection] = []  # 含 Word 不兼容控制字符的章节
     invalid_images: list[str] = []  # 无法访问的图片引用（本地路径/URL）
     estimated_pages: int = 0  # 预估总页数（按字数与图片密度）
+    # ====== 内容质量规则（《文档质量分析报告》修复 15~24，2026-10-10）======
+    # 结构化问题清单，每项含 rule_id/severity/title/message/suggestion/
+    # section_id/section_title（与 chart_validators CMP-07 同形）。
+    # 同类问题已聚合成 warnings 中的「[内容质量] …」条目；本字段供前端
+    # 渲染可定位到章节的问题列表。向后兼容：默认空列表，旧调用方不受影响。
+    quality_issues: list[dict] = []
 
 
 # ========== 废标检查模块 ==========

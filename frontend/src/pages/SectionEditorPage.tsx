@@ -27,7 +27,8 @@ import ContentPreview from "../components/ContentPreview";
 import RichTextEditor from "../components/RichTextEditor";
 import RecoveryBanner from "../components/RecoveryBanner";
 import VersionHistory from "../components/VersionHistory";
-import { extractApiError, annotateOutlineWithNumbers, getLevelColor, getLevelLabel, findNodeInTree, updateNodeInTree, collectLeafIds, countSubtreeLeaves, getLeafCount, getPendingFailedLeafCount, getWordDeficientStats, upsertSectionProgressItem, resolveTargetForNode, resolveToleranceForNode, getWordCountRange } from "../utils";
+import { taskStore } from "../services/taskStore";
+import { extractApiError, annotateOutlineWithNumbers, getLevelColor, getLevelLabel, findNodeInTree, updateNodeInTree, collectLeafIds, countSubtreeLeaves, getLeafCount, getPendingFailedLeafCount, getWordDeficientStats, upsertSectionProgressItem, resolveTargetForNode, resolveToleranceForNode, getWordCountRange, WORD_COUNT_TIERS } from "../utils";
 const { Text } = Typography;
 
 /** 兜底扩写的平铺阈值下限（2026-10-08：按三级目录档位控制） */
@@ -43,6 +44,10 @@ const EXPAND_FLAT_MINIMUM: Record<string, number> = {
 
 const getExpandFlatMinimum = (writingLength: string): number =>
   EXPAND_FLAT_MINIMUM[writingLength] ?? 2000;
+
+/** 档位 key → 中文名（简短/标准/详细/超长）；未知 key 原样返回 */
+const tierLabelOf = (key?: string | null): string =>
+  WORD_COUNT_TIERS.find((t) => t.key === key)?.label ?? key ?? "标准";
 
 /** 目录树批量更新：合并窗口与「最大等待」——避免高频 SSE 事件把 debounce 饿死 */
 const TREE_BATCH_DEBOUNCE_MS = 50;
@@ -76,9 +81,21 @@ function getWordCountStatus(
 interface WordBudgetInfo {
   level1_count: number;
   level2_count: number;
+  level3_count: number;
   level1_min: number;
   level2_default: number;
   total_estimate: number;
+  tier_key?: string;
+  tier_label?: string;
+  tier_target?: number;
+  tier_tolerance?: number;
+  level3_default?: number;
+  l3_own_target?: number;
+  l3_own_tolerance?: number;
+  l3_own_lo?: number;
+  l3_own_hi?: number;
+  leaf_l3_count?: number;
+  subtree_l3_count?: number;
 }
 
 export default React.memo(function SectionEditorPage() {
@@ -161,6 +178,49 @@ const [progressTotal, setProgressTotal] = useState(0);
     }
     return { success, failed, cancelled };
   }, [progressItems, isGenerating, progressSuccess, progressFailed, progressCancelled]);
+
+  // 2026-10-12：把正文生成任务实时同步到全局 taskStore，供顶栏「后台任务实时显示栏」跨页面展示。
+  // 单一出口，按页面既有 isGenerating/isPaused + progressTotal/derivedProgress 派生，不侵入 SSE 状态机；
+  // 结束（完成 / 停止 / 出错）时以完成态收尾，taskStore.getActiveTasks 会即时把它移出活跃列表。
+  const contentTaskIdRef = useRef<string>("");
+  useEffect(() => {
+    const active = isGenerating || isPaused;
+    if (active) {
+      const total = progressTotal || 0;
+      const done = derivedProgress.success + derivedProgress.failed + derivedProgress.cancelled;
+      const progress = total > 0 ? Math.min(100, Math.round((done / total) * 100)) : 0;
+      const text = isPaused
+        ? `正文生成已暂停（${done}${total ? "/" + total : ""} 章）`
+        : total > 0
+          ? `正文生成中 ${done}/${total} 章`
+          : "正文生成中…";
+      if (!contentTaskIdRef.current) {
+        const tid = `content_${projectId}_${Date.now()}`;
+        contentTaskIdRef.current = tid;
+        taskStore.startTask({
+          taskId: tid,
+          projectId,
+          taskType: "content",
+          status: isPaused ? "paused" : "running",
+          progress,
+          message: text,
+          startedAt: Date.now(),
+          lastUpdated: Date.now(),
+        });
+      } else {
+        taskStore.updateTask(contentTaskIdRef.current, {
+          status: isPaused ? "paused" : "running",
+          progress,
+          message: text,
+        });
+      }
+    } else if (contentTaskIdRef.current) {
+      const tid = contentTaskIdRef.current;
+      contentTaskIdRef.current = "";
+      taskStore.completeTask(tid, "completed");
+    }
+  }, [isGenerating, isPaused, progressTotal, derivedProgress, projectId]);
+
   // 用户主动停止生成时标记，防止 onerror 触发错误弹窗
   const userStoppedRef = useRef(false);
   // 修复：树更新批处理——累积 pending updates，在微任务结束时批量应用一次 setTree
@@ -172,6 +232,15 @@ const [progressTotal, setProgressTotal] = useState(0);
   // BUG-FIX 2026-09-16（低）：「已自动保存」提示的收起定时器需可撤销，
   // 否则多章节连续完成时会互相干扰，且卸载后仍 setState。
   const autoSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // HARDEN 2026-10-12：overall_progress 事件已下发 chart_enqueued/processed/
+  // queue_size 三个字段，但前端未落地消费；用户在长批次生成期看不到配图收尾
+  // 状态，误以为"卡住"。用一个 ref 缓存最新三个数字，供 chart_draining 与
+  // 后续扩展 UI 引用；不引入新 state 避免额外渲染。
+  const lastOverallProgressChartRef = useRef<{
+    enqueued: number;
+    processed: number;
+    queueSize: number;
+  } | null>(null);
   // BUG-F-02 修复：存储 expandContent 的 abort 函数，组件卸载时调用防止泄漏
   const expandAbortRef = useRef<(() => void) | null>(null);
   // BUG-F-04 修复：防止 startGeneration 并发调用导致重复 SSE 连接
@@ -757,13 +826,54 @@ if (d.status === "failed") {
         } else if (d.status === "cache_stats") {
           // 修复：后端 get_stats() 返回 cache_size/hits/misses，前端原来读 size/hit_count/miss_count 恒为 0
           console.info(`[缓存统计] 命中=${d.hits || 0}, 未命中=${d.misses || 0}, 大小=${d.cache_size || 0}, 命中率=${d.hit_rate || "-"}`);
+        } else if (d.status === "overall_progress") {
+          // BUG-FIX 2026-10-12（P2 SSE 进度不准 / 日志延迟错位）：
+          // 后端 sse_content.py 每个章节终态都会推送节流 2s 的 overall_progress，
+          // 携带 {saved, failed, cancelled, chart_enqueued, chart_processed,
+          // chart_queue_size, total, done, percent}。此前前端完全忽略，
+          // ProgressPanel 只能靠"下一个 completed 事件"跳一次，用户体感为
+          // "日志延迟错位"。改为直接映射三个计数器 + total，无需等待下节完成。
+          if (typeof d.total === "number") setProgressTotal(d.total);
+          if (typeof d.saved === "number") setProgressSuccess(d.saved);
+          if (typeof d.failed === "number") setProgressFailed(d.failed);
+          if (typeof d.cancelled === "number") setProgressCancelled(d.cancelled);
+          // HARDEN 2026-10-12：缓存配图收尾计数，供 chart_draining 展示真实进度。
+          if (typeof d.chart_enqueued === "number") {
+            lastOverallProgressChartRef.current = {
+              enqueued: d.chart_enqueued,
+              processed: typeof d.chart_processed === "number" ? d.chart_processed : 0,
+              queueSize: typeof d.chart_queue_size === "number" ? d.chart_queue_size : 0,
+            };
+          }
+        } else if (d.status === "word_count_condense") {
+          // BUG-FIX 2026-10-12（P2 超长内容处理无反馈）：
+          // 后端字数偏差控制完成时推送本事件，此前前端无分支处理，
+          // 压缩结果（例如"15 章节压缩到目标区间"）用户完全看不到。
+          // 现已同步在 BUG-3 修复中把压缩结果批量落库 + 三层缓存失效。
+          if ((d.condensed_count ?? 0) > 0) {
+            message.info(
+              d.message ||
+                `字数偏差控制完成：${d.condensed_count} 章节已压缩${d.fail_count ? `，${d.fail_count} 章节失败` : ""}`,
+              4,
+            );
+          }
         } else if (d.status === "retry_round") {
           // ENHANCE 2026-09-16：后端失败章节的指数退避重试此前**完全没有前端反馈**
           // （事件已下发但无分支处理），大项目重试期间界面体感为"卡住"。
           message.info(d.message || `失败章节重试中（第 ${d.round ?? 1}/${d.total_rounds ?? 1} 轮）`, 3);
         } else if (d.status === "chart_draining") {
           // ENHANCE 2026-09-16：配图流水线收尾（最长 60s）同样无反馈，现补上。
-          message.loading({ content: d.message || "配图收尾中...", key: "chartDraining", duration: 2 });
+          // HARDEN 2026-10-12：把 overall_progress 缓存的真实配图计数拼进提示文案，
+          // 让用户看到"已处理 X/Y（队列中 Z）"，替代此前的黑盒 loading。
+          const c = lastOverallProgressChartRef.current;
+          const suffix = c && c.enqueued > 0
+            ? `（已处理 ${c.processed}/${c.enqueued}${c.queueSize > 0 ? `，队列中 ${c.queueSize}` : ""}）`
+            : "";
+          message.loading({
+            content: (d.message || "配图收尾中...") + suffix,
+            key: "chartDraining",
+            duration: 2,
+          });
         } else if (d.status === "slow_warning") {
           // ENHANCE 2026-09-16：软告警（超过估算 1.5x）只提醒不熔断，让用户知道"慢但没死"。
           message.warning(d.message || "AI 响应较慢，生成仍在继续", 4);
@@ -1190,11 +1300,13 @@ globalCompletedReceivedRef.current = true;
   const handleWritingLengthChange = (value: string) => {
     setWritingLength(value);
     setUseCustomWords(false);
+    // 2026-10-12：字数控制下沉到 L3，档位 key 对齐后端（brief/standard/detailed/long）。
+    // level2DefaultWords 仅作已废弃的 level2_default 兼容参数下发，取 >=1000 满足后端校验。
     const wordMap: Record<string, number> = {
-      short: 1800,
-      standard: 3500,
-      detailed: 5500,
-      extra_long: 7000,
+      brief: 1000,
+      standard: 1200,
+      detailed: 2000,
+      long: 2500,
     };
     if (wordMap[value]) {
       setLevel2DefaultWords(wordMap[value]);
@@ -1340,8 +1452,8 @@ globalCompletedReceivedRef.current = true;
                       if (target && target > 0) {
                         const dev = Math.round((node.word_count - target) / target * 100);
                         const source = node.target_words && node.target_words > 0 ? "自定义"
-                          : (node.word_count_tier ? `档位：${node.word_count_tier}`
-                            : node.level === 3 ? `L3 自身正文 300 字` : `档位：${writingLength || "standard"}`);
+                          : (node.word_count_tier ? `档位：${tierLabelOf(node.word_count_tier)}`
+                            : node.level === 3 ? `L3 自身正文 300 字` : `档位：${tierLabelOf(writingLength)}`);
                         return `当前 ${node.word_count} 字 / 目标 ${target} 字（区间 ${lo}~${hi} 字）· 偏差 ${dev >= 0 ? "+" : ""}${dev}% · 来源：${source}`;
                       }
                       return `${node.word_count} 字`;
@@ -1619,6 +1731,17 @@ globalCompletedReceivedRef.current = true;
   const wordDeficient = getWordDeficientStats(tree, getExpandFlatMinimum(writingLength), level2DefaultWords);
   const annotatedTree = useMemo(() => annotateOutlineWithNumbers(tree), [tree]);
 
+  // 2026-10-12：字数控制已下沉到三级目录（L3）。当前档位与达标区间从 WORD_COUNT_TIERS 派生，
+  // 供「字数预算」卡片展示，避免再写死旧的二级（L2）字数区间。
+  const currentTier =
+    WORD_COUNT_TIERS.find((t) => t.key === writingLength) ??
+    WORD_COUNT_TIERS.find((t) => t.isDefault) ??
+    WORD_COUNT_TIERS[0];
+  const [l3RangeLo, l3RangeHi] = getWordCountRange(
+    currentTier.targetWords,
+    currentTier.toleranceRatio,
+  );
+
   if (loading) {
     return <Skeleton active paragraph={{ rows: 12 }} />;
   }
@@ -1670,43 +1793,54 @@ globalCompletedReceivedRef.current = true;
           <Card
             size="small"
             title={<span style={{ fontSize: 12 }}><CalculatorOutlined /> 字数预算</span>}
-            style={{ flex: "0 0 25%", minWidth: 0 }}
+            style={{ flex: 1, minWidth: 0 }}
             styles={{ body: { padding: "4px 10px" } }}
           >
             <div style={{ fontSize: 12 }}>
+              {/* L1/L2：父节点不单独生成正文，仅作结构统计（2026-10-08 起字数控制下沉到 L3） */}
               <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 2 }}>
                 <Text type="secondary">一级章节 ({wordBudget.level1_count} 个)</Text>
-                <Text>≥{wordBudget.level1_min} 字/章</Text>
+                <Text type="secondary">不单独生成</Text>
               </div>
-              <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 2 }}>
                 <Text type="secondary">二级章节 ({wordBudget.level2_count} 个)</Text>
+                <Text type="secondary">不单独生成</Text>
+              </div>
+              {/* L3：字数控制核心。方案三混合口径——叶子 L3 自身正文固定 300±20%；
+                  下方四档下拉为「子树总字数」，仅对含下级目录(L4+)的 L3 生效。 */}
+              <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 2 }}>
+                <Text type="secondary">三级章节 ({wordBudget.level3_count} 个)</Text>
                 <Text style={{ color: "#1677ff" }}>
-                  {useCustomWords ? `${level2DefaultWords} 字/章` :
-                   writingLength === "short" ? "1000~1800字" :
-                   writingLength === "standard" ? "1800~3500字" :
-                   writingLength === "detailed" ? "3500~5500字" :
-                   "5500~7000字"}
+                  {useCustomWords
+                    ? `${level2DefaultWords} 字/章`
+                    : `${wordBudget.l3_own_lo ?? 240}~${wordBudget.l3_own_hi ?? 360} 字/章`}
                 </Text>
               </div>
+              {(wordBudget.subtree_l3_count ?? 0) > 0 && (
+                <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 2 }}>
+                  <Text type="secondary">含下级子树 ({wordBudget.subtree_l3_count} 个)</Text>
+                  <Text style={{ color: "#1677ff" }}>{l3RangeLo}~{l3RangeHi}字</Text>
+                </div>
+              )}
               <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
-                <Select
-                  value={writingLength}
-                  onChange={handleWritingLengthChange}
-                  size="small"
-                  style={{ flex: 1 }}
-                  disabled={useCustomWords}
-                  options={[
-                    { value: "short", label: "简短（1000~1800字）" },
-                    { value: "standard", label: "标准（1800~3500字）" },
-                    { value: "detailed", label: "详细（3500~5500字）" },
-                    { value: "extra_long", label: "超长（5500~7000字）" },
-                  ]}
-                  onMouseDown={(e) => { e.preventDefault(); }}
-                />
+                <Tooltip title="档位＝子树总字数，仅对含下级目录的章节生效；叶子章节固定 240~360 字">
+                  <Select
+                    value={writingLength}
+                    onChange={handleWritingLengthChange}
+                    size="small"
+                    style={{ flex: 1 }}
+                    disabled={useCustomWords}
+                    options={WORD_COUNT_TIERS.map((t) => {
+                      const [lo, hi] = getWordCountRange(t.targetWords, t.toleranceRatio);
+                      return { value: t.key, label: `${t.label}（${lo}~${hi}字）` };
+                    })}
+                    onMouseDown={(e) => { e.preventDefault(); }}
+                  />
+                </Tooltip>
                 {useCustomWords && (
                   <Space.Compact size="small">
                     <InputNumber
-                      min={3000} max={10000} step={500}
+                      min={1000} max={10000} step={100}
                       value={level2DefaultWords}
                       onChange={(v) => v && setLevel2DefaultWords(v)}
                       style={{ width: 60 }}
@@ -1737,7 +1871,7 @@ globalCompletedReceivedRef.current = true;
             <Card
               size="small"
               title={<span style={{ fontSize: 12 }}>生成进度</span>}
-              style={{ flex: 1, minWidth: 0 }}
+              style={{ flex: "0 0 56.25%", minWidth: 0 }}
               styles={{ body: { padding: "4px 10px" } }}
               extra={
                 <Space size={4}>
@@ -1768,7 +1902,7 @@ globalCompletedReceivedRef.current = true;
             <Card
               size="small"
               title={<span style={{ fontSize: 12 }}>生成进度</span>}
-              style={{ flex: 1, minWidth: 0 }}
+              style={{ flex: "0 0 56.25%", minWidth: 0 }}
               styles={{ body: { padding: "4px 10px" } }}
             >
               <div style={{ textAlign: "center", color: "#999", fontSize: 12, padding: "4px 0" }}>

@@ -594,6 +594,17 @@ export async function updateFileRole(projectId: number, fileId: number, fileRole
   return res.data;
 }
 
+// Gap-1 2026-10-11：清空项目所有文件的已提取文本并重置状态
+// ⚠️ 不删除已上传的原始文件，只清空提取文本 + 重置文件状态为 pending + 清理解析任务终态行
+export async function clearProjectTexts(projectId: number): Promise<{
+  status: "cleared";
+  files_reset: number;
+  tasks_cleared: number;
+}> {
+  const res = await http.delete(`/projects/${projectId}/files/texts`);
+  return res.data;
+}
+
 // AI Analysis
 export async function getAnalysis(projectId: number): Promise<AnalysisResult> {
   const res = await http.get<AnalysisResult>(`/projects/${projectId}/ai/analysis`);
@@ -1839,9 +1850,21 @@ export async function getApiKeyUsage(keyId: number, days: number = 7): Promise<{
 export async function getWordBudget(projectId: number, level2Default: number = 3500): Promise<{
   level1_count: number;
   level2_count: number;
+  level3_count: number;
   level1_min: number;
   level2_default: number;
   total_estimate: number;
+  tier_key?: string;
+  tier_label?: string;
+  tier_target?: number;
+  tier_tolerance?: number;
+  level3_default?: number;
+  l3_own_target?: number;
+  l3_own_tolerance?: number;
+  l3_own_lo?: number;
+  l3_own_hi?: number;
+  leaf_l3_count?: number;
+  subtree_l3_count?: number;
 }> {
   const res = await http.get(`/projects/${projectId}/sections/word-budget`, {
     params: { level2_default: level2Default },
@@ -1963,10 +1986,10 @@ export async function getExportPresets(): Promise<ExportPresetCatalog> {
   return res.data;
 }
 
-export async function exportDocx(projectId: number, config?: ExportConfig): Promise<{  filename: string; file_path: string; file_size: number; export_id?: number; check: DocumentCheckResult;
+export async function exportDocx(projectId: number, config?: ExportConfig): Promise<{  filename: string; file_path: string; file_size: number; export_id?: number; check: DocumentCheckResult; download_url?: string | null; relative_path?: string;
 }> {
   const res = await httpPostLong<{
-    filename: string; file_path: string; file_size: number; export_id?: number; check: DocumentCheckResult;
+    filename: string; file_path: string; file_size: number; export_id?: number; check: DocumentCheckResult; download_url?: string | null; relative_path?: string;
   }>(`/projects/${projectId}/export/docx`, config || {});
   return res.data;
 }
@@ -2004,7 +2027,7 @@ export function exportDocxStream(
   onProgress: (event: ExportProgressEvent) => void,
 ): {
   promise: Promise<{
-    filename: string; file_path: string; file_size: number; export_id?: number; record_failed?: boolean; check: DocumentCheckResult;
+    filename: string; file_path: string; file_size: number; export_id?: number; record_failed?: boolean; check: DocumentCheckResult; download_url?: string | null; relative_path?: string;
   }>;
   abort: () => void;
 } {
@@ -2030,7 +2053,7 @@ export function exportDocxStream(
 
   return {
     promise: new Promise<{
-      filename: string; file_path: string; file_size: number; export_id?: number; record_failed?: boolean; check: DocumentCheckResult;
+      filename: string; file_path: string; file_size: number; export_id?: number; record_failed?: boolean; check: DocumentCheckResult; download_url?: string | null; relative_path?: string;
     }>((res, rej) => {
       resolve = res;
       reject = rej;
@@ -2091,6 +2114,10 @@ export function exportDocxStream(
                     export_id: parsed.export_id,
                     // 后端 completed 事件新增 record_failed：导出记录写库失败时为 true
                     record_failed: parsed.record_failed,
+                    // ENHANCE 2026-10-11（P3）：透传 SSE completed 携带的下载 URL 与磁盘
+                    // 相对路径，令 SSE 路径与同步 /export/docx 路径的 ExportResult 字段对齐。
+                    download_url: parsed.download_url,
+                    relative_path: parsed.relative_path,
                     check: parsed.check || {} as any,
                   });
                 } else if (parsed.event === "error") {
@@ -2458,6 +2485,22 @@ export async function testAIConnection(config: {
   max_tokens?: number; temperature?: number;
 }): Promise<{ status: string; message: string }> {
   const res = await http.post("/ai/test", config);
+  return res.data;
+}
+
+// HARDENING 2026-10-11（G-6 前端集成）：显式清空主 AI 配置的已保存 API Key
+export async function clearAiConfigApiKey(): Promise<{ status: string }> {
+  const res = await http.post("/ai/config/clear-api-key");
+  return res.data;
+}
+
+// HARDENING 2026-10-11（G-5 前端集成）：查询配置变更审计日志（支持 action/target 过滤）
+export async function getConfigAudit(params?: {
+  limit?: number;
+  action?: string;
+  target?: string;
+}): Promise<Array<{ actor: string; action: string; target: string; detail: string; created_at: string }>> {
+  const res = await http.get("/ai/config-audit", { params });
   return res.data;
 }
 
@@ -3265,6 +3308,115 @@ export async function getAuditSummary(projectId: number): Promise<{
   return res.data;
 }
 
+// ---------------------------------------------------------------------------
+// Agent 模式全文一致性修复（E-1，后端 POST /consistency/agent/{projectId}）
+// ---------------------------------------------------------------------------
+
+export interface AgentRepairReport {
+  status: string;
+  success: boolean;
+  dry_run: boolean;
+  project_id: number;
+  turns: number;
+  max_turns: number;
+  conflict_states: { resolved: number; still_open: number } | null;
+  changed_sections: { id: number; title: string }[];
+  applied: unknown[];
+  rejected: unknown[];
+  unresolved: { section_id: string; reason: string }[];
+  errors: string[];
+  message: string;
+}
+
+export async function repairConsistencyWithAgent(
+  projectId: number,
+  opts: { dryRun?: boolean; maxTurns?: number } = {},
+): Promise<AgentRepairReport> {
+  const res = await http.post<AgentRepairReport>(`/consistency/agent/${projectId}`, null, {
+    params: {
+      dry_run: opts.dryRun ?? false,
+      max_turns: opts.maxTurns ?? 8,
+    },
+    timeout: 600000, // Agent 多轮往返可能耗时较长
+  });
+  return res.data;
+}
+
+// ---------------------------------------------------------------------------
+// 事实回流（E-5，审计结果 → 全局事实候选）
+// ---------------------------------------------------------------------------
+
+export interface FactProposal {
+  conflict_id: string;
+  fact_name: string;
+  value: string;
+  occurrences: number;
+  category: string;
+  suggested_key: string;
+  occurrences_map: { value: string; count: number }[];
+}
+
+export async function proposeFactsFromConflicts(
+  projectId: number,
+  opts: { minOccurrences?: number } = {},
+): Promise<{
+  status: string;
+  proposals: FactProposal[];
+  skipped: number;
+  conflicts_scanned: number;
+}> {
+  const res = await http.get<{
+    status: string;
+    proposals: FactProposal[];
+    skipped: number;
+    conflicts_scanned: number;
+  }>(`/consistency/facts/proposals/${projectId}`, {
+    params: { min_occurrences: opts.minOccurrences ?? 3 },
+  });
+  return res.data;
+}
+
+export async function acceptFactProposals(
+  projectId: number,
+  proposals: FactProposal[],
+): Promise<{ status: string; added: number; merged_total: number }> {
+  const res = await http.post<{ status: string; added: number; merged_total: number }>(
+    `/consistency/facts/proposals/${projectId}/accept`,
+    { proposals },
+  );
+  return res.data;
+}
+
+// ---------------------------------------------------------------------------
+// 废标条款应答覆盖率（E-6，后端 GET /consistency/rejection-coverage/{id}）
+// ---------------------------------------------------------------------------
+
+export interface RejectionCoverageItem {
+  clause_id: string;
+  name: string;
+  text: string;
+  status: "covered" | "weak" | "empty";
+  coverage: number;
+  section_hits: string[];
+}
+
+export interface RejectionCoverageResult {
+  status: string;
+  scanned_clauses: number;
+  full_chars: number;
+  threshold: number;
+  weak_count: number;
+  empty_count: number;
+  items: RejectionCoverageItem[];
+}
+
+export async function getRejectionCoverage(projectId: number): Promise<RejectionCoverageResult> {
+  const res = await http.get<RejectionCoverageResult>(
+    `/consistency/rejection-coverage/${projectId}`,
+  );
+  return res.data;
+}
+
 // ========== 协作功能 ==========
 
 export interface Comment {
@@ -3755,6 +3907,181 @@ export async function getWordCountSections(projectId: number): Promise<{
   const res = await http.get<{ status: string; project_id: number; total: number; items: WordCountItem[] }>(
     `/word-count/sections/${projectId}`,
   );
+  return res.data;
+}
+
+// =============================================================================
+// 易标（OpenBidKit）字数控制（ENHANCE 2026-10-12 移植）
+// -----------------------------------------------------------------------------
+// 与上方「档位（tier）」API 并列、互不覆盖：
+//   updateWordCountTier  —— 全局档位字典（简短/标准/详细/超长），管理员维护；
+//   updateWordControlSettings —— 本项目一次正文任务的绝对字数目标
+//                                （最少/最多/每节 + 强控），作者填写。
+//
+// 所有派生指标（页数预估 / 小节 ±20% 区间 / 目标小节数 / 初稿目标 /
+// 可扩缩容量 / 叶子数可行性）都由后端纯函数计算，前端只做展示，
+// 避免「前端一套公式、后端一套公式」的口径分叉。
+// =============================================================================
+
+/** 字数控制配置（后端 WordControlSettingsInput 的 wire 形态）。 */
+export interface WordControlSettings {
+  minimum_words: number;
+  maximum_words: number;
+  section_words: number;
+  strict_section_words: boolean;
+}
+
+/** 字数控制派生指标（后端 _options_payload 的返回）。 */
+export interface WordControlDerived {
+  status?: "ok";
+  valid: boolean;
+  errors: string[];
+  /** 强控小节区间 [ceil(0.8S), floor(1.2S)] */
+  section_bounds: [number, number];
+  /** 目标小节数区间 [ceil(min/S), floor(max/S)]（max 未设时为 null） */
+  leaf_count_range: [number, number | null];
+  target_leaf_count: number | null;
+  /** 目录二审容差区间 [target-2, target+2] */
+  outline_review_bounds: [number, number] | null;
+  /** 初稿目标字数（强控 + 设了全文上限时才有值） */
+  generation_word_target: number | null;
+  /** 页数预估（每页 650 字） */
+  estimated_pages: number | null;
+  /** 可行性提示文案；null 表示可行 */
+  word_capacity: string | null;
+  /** 仅在传 project_id 时返回 */
+  project_id?: number;
+  current_leaf_count?: number;
+  leaf_outside_range?: boolean;
+  leaf_count_warning?: WordControlLeafWarning | null;
+}
+
+/** 目录阶段叶子数偏差警告（R12 leaf-count 分支）。 */
+export interface WordControlLeafWarning {
+  kind: "leaf-count";
+  message: string;
+  expected: number;
+  actual: number;
+  review_bounds: [number, number] | null;
+}
+
+/** 正文收尾字数警告（R12）。 */
+export interface WordControlWarning {
+  kind: string;
+  message: string;
+  [key: string]: unknown;
+}
+
+/** 字数控制配置 + 快照 + 派生指标（GET 返回）。 */
+export interface WordControlSettingsResponse {
+  status: string;
+  project_id: number;
+  settings: WordControlSettings;
+  snapshot: WordControlSettings | null;
+  snapshot_at: string | null;
+  last_warning: string | null;
+  derived: WordControlDerived;
+}
+
+/** 读取项目的字数控制配置。 */
+export async function getWordControlSettings(
+  projectId: number,
+): Promise<WordControlSettingsResponse> {
+  const res = await http.get<WordControlSettingsResponse>(
+    `/word-count/word-control-settings/${projectId}`,
+  );
+  return res.data;
+}
+
+/** 写入字数控制配置；配置不合理时后端 422 拒绝。 */
+export async function updateWordControlSettings(
+  projectId: number,
+  settings: WordControlSettings,
+): Promise<WordControlSettingsResponse & { snapshot_invalidated: boolean }> {
+  const res = await http.put<WordControlSettingsResponse & { snapshot_invalidated: boolean }>(
+    `/word-count/word-control-settings/${projectId}`,
+    settings,
+  );
+  return res.data;
+}
+
+/**
+ * 字数控制派生指标（即改即算，不落库）。
+ *
+ * @param body 预览用的配置；带 project_id 时会附带当前目录叶子数与可行性。
+ */
+export async function computeWordControlDerived(
+  body: WordControlSettings & { project_id?: number },
+): Promise<WordControlDerived> {
+  const res = await http.post<WordControlDerived>(
+    "/word-count/word-control-derived",
+    body,
+  );
+  return res.data;
+}
+
+/** 把当前配置固化为生效快照（生成前的必经闸门）。 */
+export async function snapshotWordControlSettings(
+  projectId: number,
+): Promise<{
+  status: string;
+  project_id: number;
+  snapshot: WordControlSettings & { snapshot_at: string; section_count: number };
+  valid: boolean;
+  has_valid_snapshot: boolean;
+  snapshot_bounds: Record<string, unknown>;
+}> {
+  const res = await http.post<{
+    status: string;
+    project_id: number;
+    snapshot: WordControlSettings & { snapshot_at: string; section_count: number };
+    valid: boolean;
+    has_valid_snapshot: boolean;
+    snapshot_bounds: Record<string, unknown>;
+  }>(`/word-count/word-control-snapshot/${projectId}`);
+  return res.data;
+}
+
+/** 字数偏差审计（章节级明细 + R12 结构化警告）。 */
+export async function getWordCountAudit(
+  projectId: number,
+): Promise<{
+  status: string;
+  project_id: number;
+  total_l3_sections: number;
+  total_target: number;
+  total_actual: number;
+  target_coverage: number;
+  /** 易标 R1 口径的目标覆盖率 */
+  readable_coverage: number;
+  avg_deviation_rate: number;
+  std_deviation_rate: number;
+  category_counts: Record<string, number>;
+  on_target_rate: number;
+  tier_breakdown: Record<string, unknown>;
+  items: Array<Record<string, unknown>>;
+  /** 易标 R1 口径的全文可读字数合计 */
+  readable_words_total: number;
+  /** 未配置字数控制时为 null */
+  word_control_warning: WordControlWarning | null;
+}> {
+  const res = await http.get<{
+    status: string;
+    project_id: number;
+    total_l3_sections: number;
+    total_target: number;
+    total_actual: number;
+    target_coverage: number;
+    readable_coverage: number;
+    avg_deviation_rate: number;
+    std_deviation_rate: number;
+    category_counts: Record<string, number>;
+    on_target_rate: number;
+    tier_breakdown: Record<string, unknown>;
+    items: Array<Record<string, unknown>>;
+    readable_words_total: number;
+    word_control_warning: WordControlWarning | null;
+  }>(`/word-count/audit/${projectId}`);
   return res.data;
 }
 

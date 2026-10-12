@@ -37,6 +37,74 @@ from .mermaid_service import MermaidRenderError, get_mermaid_service_client
 logger = logging.getLogger(__name__)
 
 
+# =========================================================================
+# P0-5 加固：里程碑时间线自动识别
+# -------------------------------------------------------------------------
+# 部分 AI 把「里程碑时间线」以 flowchart 形式输出（含日期节点的有向图），
+# 此时应识别为时间线并以 timeline 渲染器输出，而非普通流程图。
+# 判定：≥3 个含 YYYY-MM-DD 日期的节点 + 至少一个里程碑关键词。
+# =========================================================================
+_MILESTONE_KEYWORDS = ("开工", "竣工", "封顶", "里程碑", "关键节点", "主体", "完工", "交付")
+_DATE_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
+def _extract_flowchart_node_labels(mermaid_code: str) -> list[str]:
+    """从 flowchart Mermaid 代码中提取所有节点标签（去重相邻重复）。
+
+    优先识别 `id["label"]`（sanitizer 输出），其次 `id[label]`；
+    同一节点若连续出现两次（如 `A --> B` 中 A 是上一行终点），只保留一次。
+    """
+    if not mermaid_code:
+        return []
+    # 先尝试带双引号的标准形式
+    labels = re.findall(r'\w+\s*\["([^"]+)"\]', mermaid_code)
+    if not labels:
+        labels = re.findall(r'\w+\s*\[([^\]]+)\]', mermaid_code)
+    out: list[str] = []
+    for label in labels:
+        if not out or label != out[-1]:
+            out.append(label)
+    return out
+
+
+def _is_milestone_timeline(mermaid_code: str) -> bool:
+    """判断一段 flowchart Mermaid 代码是否实为里程碑时间线。"""
+    nodes = _extract_flowchart_node_labels(mermaid_code)
+    if len(nodes) < 3:
+        return False
+    date_nodes = [n for n in nodes if _DATE_RE.search(n)]
+    if len(date_nodes) < 3:
+        return False
+    return any(kw in mermaid_code for kw in _MILESTONE_KEYWORDS)
+
+
+def _flowchart_to_timeline_plan(mermaid_code: str) -> dict | None:
+    """将含日期节点的 flowchart 转换为 TimelinePlan JSON（供 timeline 渲染器）。
+
+    节点标签形如 `开工: 2026-09-22` 或 `2026-09-22 开工`，提取日期与名称，
+    按日期升序排列为里程碑。解析失败返回 None（调用方回落普通流程图渲染）。
+    """
+    nodes = _extract_flowchart_node_labels(mermaid_code)
+    if len(nodes) < 3:
+        return None
+    milestones: list[dict] = []
+    for label in nodes:
+        m = _DATE_RE.search(label)
+        if not m:
+            return None
+        date = m.group(0)
+        raw = label.strip().strip('"').strip("'")
+        name = _DATE_RE.sub("", raw).strip(" :：").strip()
+        if not name:
+            name = raw
+        milestones.append({"name": name, "date": date, "status": "pending"})
+    milestones.sort(key=lambda x: x["date"])
+    # 让首个为已完成、其余待定，避免全部同态（与 timeline 兜底规范一致）
+    if milestones:
+        milestones[0]["status"] = "completed"
+    return {"type": "timeline", "title": "项目关键里程碑节点", "milestones": milestones}
+
+
 def render_mermaid_to_bytes(
     mermaid_code: str,
     chart_type: str = "flowchart",
@@ -165,6 +233,32 @@ def render_mermaid_to_bytes(
                     len(_sanitized),
                 )
                 code = _sanitized
+
+    # ---------- P0-5 加固：里程碑时间线自动识别与路由 ----------
+    # 若 chart_type 为 flowchart，但代码实为里程碑时间线（含多个日期节点 +
+    # 里程碑关键词），则转「垂直里程碑流程图」渲染器，输出与参考图一致的
+    # 浅紫色圆角矩形 + 黑色向下箭头样式；失败时静默回落普通流程图渲染。
+    if chart_type == "flowchart" and not code.lstrip().startswith("{"):
+        try:
+            if _is_milestone_timeline(code):
+                _tl_plan = _flowchart_to_timeline_plan(code)
+                if _tl_plan:
+                    _tl_img = _render_milestone_flowchart_image_v2(_tl_plan)
+                    if _tl_img is not None:
+                        elapsed = _time.perf_counter() - _t0
+                        logger.info(
+                            "[渲染] 里程碑时间线自动路由成功 chart_type=%s 耗时=%.2fs",
+                            chart_type,
+                            elapsed,
+                        )
+                        return _tl_img
+        except Exception as _e:
+            # ENHANCE 2026-10-11（渲染策略可观测性）：里程碑时间线路由失败
+            # 意味着本该用专用渲染器输出更好的样式，却回落到普通流程图渲染。
+            # 这是可观测的渲染质量降级，debug 级别运维感知不到，升级为 info。
+            logger.info(
+                "[渲染] 里程碑时间线自动路由失败，回落普通流程图: %s", _e
+            )
 
     # =========================================================
     # 渲染管道优先级（商业级最优策略 — 无降级 V5.0）
@@ -839,10 +933,22 @@ class ChartCache:
         return count
 
 def render_mermaid(mermaid_code: str, chart_type: str = "flowchart") -> str:
-    """兼容接口：返回 Mermaid 源码（不实际渲染）。
-    
-    完整渲染请使用 render_mermaid_to_bytes()。该函数保留仅为向后兼容。
+    """[DEPRECATED] 兼容接口：返回 Mermaid 源码（不实际渲染）。
+
+    完整渲染请使用 render_mermaid_to_bytes()。
+    本函数于 2026-10-11 标记为 deprecated，从未被生产代码调用——仅为
+    向后兼容预留。保留到后续版本确认无外部调用者后移除。
     """
+    import warnings
+    warnings.warn(
+        "render_mermaid() 已弃用（仅返回源码不做渲染），"
+        "请使用 render_mermaid_to_bytes() 替代。",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    logger.warning(
+        "[DEPRECATED] render_mermaid() 被调用——返回源码而非图片，调用方可能无法正常渲染图表"
+    )
     return mermaid_code
 
 
@@ -897,6 +1003,7 @@ from .mermaid_layout import (  # noqa: F401
     _repair_layout_data,
 )
 from .mermaid_timeline import (  # noqa: F401
+    _render_milestone_flowchart_image_v2,
     _render_timeline_image_v2,
     _repair_timeline_data,
 )

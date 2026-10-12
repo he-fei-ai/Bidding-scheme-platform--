@@ -191,6 +191,19 @@ def make_celery(app_name: str = "bid_assistant"):
                 "task": "app.celery_app.run_scheduled_reports",
                 "schedule": timedelta(hours=1),
             },
+            # ENHANCE 2026-10-11: repair_mermaid 步骤统计定时汇总
+            # 每小时打印一次累计的 {chart_type: {step_name: count}} 并 reset，
+            # 供运维洞察「哪些 chart_type 高频触发哪些修复步骤」。
+            # 无数据时静默跳过（不会产生空日志）。
+            "flush-repair-stats": {
+                "task": "app.celery_app.flush_repair_stats_task",
+                "schedule": timedelta(hours=1),
+            },
+            # ENHANCE 2026-10-11: repair_stats_snapshots 清理（每周一次，保留最近 720 行 = 30 天）
+            "cleanup-repair-stats-snapshots": {
+                "task": "app.celery_app.cleanup_repair_stats_snapshots_task",
+                "schedule": timedelta(days=7),
+            },
         },
         # 重试配置
         task_retry_backoff_max=600,
@@ -347,6 +360,35 @@ class _InlineTaskSelf:
     """bind=True 任务的 `self` 替身。"""
 
     request = _InlineTaskRequest()
+
+
+@celery_app.task(name="app.celery_app.flush_repair_stats_task")
+def flush_repair_stats_task() -> dict[str, Any]:
+    """每小时汇总 repair_mermaid 步骤统计（ENHANCE 2026-10-11）
+
+    委托给 image_engine.flush_repair_stats() 做实际的快照 + reset。
+    无数据时 flush_repair_stats 内部静默（不产生空日志）。
+    """
+    try:
+        from .services.ai.image_engine import flush_repair_stats as _flush
+        return _flush()
+    except Exception as e:
+        import logging as _logging
+        _logging.getLogger(__name__).warning("flush_repair_stats_task 异常: %s", e)
+        return {"total": 0, "error": str(e)}
+
+
+@celery_app.task(name="app.celery_app.cleanup_repair_stats_snapshots_task")
+def cleanup_repair_stats_snapshots_task() -> dict[str, Any]:
+    """每周清理 repair_stats_snapshots 表（保留最近 720 行 = 30 天）"""
+    try:
+        from .services.ai.image_engine import cleanup_repair_stats_snapshots as _cleanup
+        _deleted = _cleanup()
+        return {"deleted": _deleted, "kept": 720}
+    except Exception as e:
+        import logging as _logging
+        _logging.getLogger(__name__).warning("cleanup_repair_stats_snapshots_task 异常: %s", e)
+        return {"deleted": 0, "error": str(e)}
 
 
 def list_registered_tasks() -> list[str]:

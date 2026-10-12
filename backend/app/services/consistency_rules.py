@@ -240,7 +240,7 @@ def assess_severity(
         return SEVERITY_HIGH
     if (
         section_count is not None
-        and len(values) <= SEVERITY_HIGH_DISTINCT_THRESHOLD
+        and len(values) == SEVERITY_HIGH_DISTINCT_THRESHOLD
         and section_count <= SEVERITY_LOW_MAX_SECTIONS
     ):
         return SEVERITY_LOW
@@ -258,6 +258,285 @@ def personnel_fact_name(role: str) -> str:
     if not text or text == FACT_PERSONNEL:
         return FACT_PERSONNEL
     return f"{text}数量"
+
+
+# ============================================================================
+# 事实标签词 —— 自动修复（autofix）的「就近定位」唯一来源
+# ============================================================================
+
+#: 事实名 → 抽取正则前缀里的「标签词」集合。
+#: 与 `consistency_auditor.FACT_PATTERNS` 的标签组保持同一口径；
+#: `人员数量` 的岗位前缀单独由 `personnel_fact_keywords` 动态推导。
+FACT_KEYWORDS: dict[str, frozenset[str]] = {
+    FACT_DURATION: frozenset({"工期", "周期", "天数"}),
+    FACT_AMOUNT: frozenset({"金额", "造价", "预算", "报价", "合同价"}),
+    FACT_QUALIFICATION: frozenset({"资质", "级别"}),
+    FACT_QUALITY: frozenset({"质量"}),
+    FACT_SAFETY: frozenset({"安全生产目标", "安全管理目标", "事故控制", "事故发生率", "伤亡控制"}),
+}
+
+#: 「人员数量」及其岗位变体额外可匹配的通用标签词
+PERSONNEL_GENERIC_KEYWORDS: frozenset[str] = frozenset({"人员", "人"})
+
+#: 岗位前缀 → 通用人员标签词（与 :data:`PERSONNEL_GENERIC_KEYWORDS` 并集使用）
+PERSONNEL_ROLE_PREFIXES: tuple[str, ...] = (
+    "项目经理",
+    "技术负责人",
+    "技术人员",
+    "管理人员",
+    "作业人员",
+    "施工人员",
+)
+
+#: 标签词长度下限：比它短的标签词（如「人」「天」「级」）**不参与**就近判定。
+#: 这类字在中文正文里几乎无处不在，拿它们做窗口校验只会产生假阴性
+#: （把合法取值过滤掉 → 用户明明采纳了建议却「没有可替换的位置」）。
+KEYWORD_MATCH_MIN_LEN = 2
+
+#: autofix 就近校验的搜索半径（历史对称口径，保留以兼容 rules_meta 消费者）。
+AUTOFIX_KEYWORD_WINDOW = 40
+
+#: autofix 就近校验的**非对称**默认半径（BUG-FIX 2026-10-09·P1 续）：
+#: 中文习惯是标签词在数值**之前**（「工期 30 天」），故前向窗口收紧到 12；
+#: 后向窗口更窄（6），只覆盖「30 天工期」这种倒装。对称 40 会把
+#: 「总工期 30 天，其中钢筋进场 30 批」里的第二个 30 误判为工期取值。
+AUTOFIX_KEYWORD_WINDOW_BEFORE = 12
+AUTOFIX_KEYWORD_WINDOW_AFTER = 6
+
+
+#: 人员类事实的取值单位校验：取值之后必须出现人数单位「人」，中间允许隔
+#: 「名/位」量词或「施工人员/作业人员」这类岗位词（至多 4 个汉字）。
+#: 是比「附近出现标签词」更强的**结构约束**。
+#: BUG-FIX 2026-10-10（P1·人数类自动修复零闸门）：裸「人员数量」此前
+#: `personnel_fact_keywords` 返回空集 → `fact_has_keyword_nearby` 直接放行，
+#: 自动修复对人数取值完全绕过标签词校验，「钢筋直径 20 mm」「构件编号 20 号」
+#: 会被当成「共 20 人」改写。改用结构校验后这类无关数字一律拦下；上限 4 个汉字
+#: 保证「钢筋直径 20 mm，共 20 人到场」里的钢筋 20 仍被拦（其后 4 字内无「人」）。
+#:
+#: ⚠️ 口径**有意宽于**抽取正则（HARDEN 2026-10-11·R-13，勿按「对齐」收紧）：
+#: 抽取侧 `consistency_auditor.FACT_PATTERNS["人员数量"]` 需要「岗位词 + 数字 + 人」
+#: 或「总括词 + 数字 + 人」；本闸门只认「数字 + （≤4 汉字）+ 人」，因此会放行
+#: 抽取侧看不见的写法，例如「共安排 5 人值守」（总括词后接非岗位词 + 数字）。
+#: 这是**故意的**：闸门若与抽取完全等宽，则「抽取时合法、措辞稍变即被拦」的取值
+#: 会被整批误拦，用户明明采纳了建议却「没有可替换的位置」（F-2 修复前正是这个
+#: 失败模式）。代价是：若正文里另有一个合法的「人员数量」冲突值恰好等于某个子集
+#: 短语里的数字，修复时可能把该子集短语一并改掉——触发需「子集短语 + 同值合法
+#: 短语 + 另一总人数」三者同篇共存，概率低。要收紧请同时评估误拦代价，并同步
+#: 收敛抽取侧总括分支的动词表（见 `consistency_auditor` 的 R-1 注释）。
+_PERSONNEL_VALUE_TAIL_RE = re.compile(r"\s*[一-鿿]{0,4}?\s*人")
+
+#: 取值前紧邻岗位词的判定（捕获组 1 = 具体岗位名）。
+#: BUG-FIX 2026-10-10（P1·跨岗位串改）：「人员」是「技术人员 / 管理人员 /
+#: 作业人员 / 施工人员」的**子串**，「人」又被 `KEYWORD_MATCH_MIN_LEN=2` 过滤，
+#: 于是人员数量类事实的所有闸门（标签词就近 + 取值后紧跟「人」）都区分不了
+#: 「本项目人员 20 人」和「技术人员 20 人」。实测：把人员数量 20 改成 30，
+#: 同章「技术人员 20 人」被一起改写成「技术人员 30 人」——不同岗位的编制被
+#: 静默串改，而冲突因「替换成功」被标为已解决。
+#: 同理，「技术人员数量」的标签词「人员」也会命中「管理人员 5 人」，所以本
+#: 校验对**所有**人员类事实生效：取值前紧邻的岗位必须与该事实声明的岗位一致。
+#: 允许岗位词与数值之间隔至多 4 个非数字字符（「技术人员约 20 人」「管理人员：5 人」）。
+_PERSONNEL_ROLE_PREFIX_RE = re.compile(
+    r"(" + "|".join(re.escape(role) for role in PERSONNEL_ROLE_PREFIXES) + r")[^0-9]{0,4}$"
+)
+
+#: 岗位词回看半径（字符）。与 `autofix_keyword_window_before` 同口径，
+#: 取同一量级即可覆盖「岗位词—数值」的常态间距，同时避免把更远处的
+#: 另一句岗位描述误判为当前取值的归属。
+_PERSONNEL_ROLE_LOOKBACK = 12
+
+
+def is_personnel_fact_name(fact_name: Any) -> bool:
+    """是否属于人员数量类事实（通用「人员数量」或「<岗位>数量」变体）。
+
+    只把**确实带人数单位「人」**的事实判为人员类，避免「设备数量」「工程量」
+    这类同名后缀的非人员事实被误套人数结构校验。
+    """
+    text = str(fact_name or "").strip()
+    if not text.endswith("数量"):
+        return False
+    role = "" if text == FACT_PERSONNEL else text[: -len("数量")]
+    if not role:
+        return True  # 通用「人员数量」
+    for prefix in PERSONNEL_ROLE_PREFIXES:
+        if role == prefix or role.startswith(prefix):
+            return True
+    return role.endswith(("人员", "人"))
+
+
+def personnel_fact_keywords(fact_name: Any) -> frozenset[str]:
+    """取事实名的标签词集合（唯一实现，供 autofix 就近校验使用）。
+
+    返回空集表示该事实名**无标签词定义**：调用方必须回退到既有行为
+    （只靠数字边界保护），不得因此拒绝替换。
+
+    BUG-FIX 2026-10-10（P1·裸「人员数量」无标签词）：原实现对
+    `FACT_PERSONNEL` 本身返回空集（条件 `text != FACT_PERSONNEL` 把它排除在
+    岗位分支之外，又不在 `FACT_KEYWORDS` 里）→ 该事实名没有任何标签词 →
+    标签词闸门对它**完全不生效**。现在裸「人员数量」返回通用人员标签词，
+    保证未列举岗位（如「后勤人员」）的人数取值也能被就近校验拦住。
+    """
+    text = str(fact_name or "").strip()
+    if text in FACT_KEYWORDS:
+        return FACT_KEYWORDS[text]
+    if text.endswith("数量"):
+        role = "" if text == FACT_PERSONNEL else text[: -len("数量")]
+        for prefix in PERSONNEL_ROLE_PREFIXES:
+            if role and (role == prefix or role.startswith(prefix)):
+                return frozenset({role}) | PERSONNEL_GENERIC_KEYWORDS
+        if role:
+            return frozenset({role})
+        # 裸「人员数量」：返回通用标签词，使闸门对未列举岗位生效
+        return frozenset(PERSONNEL_GENERIC_KEYWORDS)
+    return frozenset()
+
+
+def fact_has_keyword_nearby(
+    content: str,
+    occurrence_start: int,
+    occurrence_end: int,
+    fact_name: Any,
+    *,
+    window: int | None = None,
+) -> bool:
+    """判定取值的某处出现位置附近是否出现该事实的标签词。
+
+    BUG-FIX 2026-10-09（P1·autofix 过度替换污染正文）：`apply_autofix` 此前把
+    待统一值在**全文所有章节**里的所有出现位置一律替换。事实取值多为「30」「1」
+    这类极短串，数字边界保护挡不住「钢筋直径 30 mm」「本项目划分为 1 个标段」
+    这些与事实无关的数字 —— 实测一次 autofix 会在无关章节改出 4 处错误（把
+    钢筋直径、构件数量、批次号统统改成工期/人数），而冲突却因「替换成功」
+    被标为已解决，正文被静默污染。
+
+    本函数提供第二道闸门：要求取值附近出现该事实的标签词。两道闸门的分工——
+
+      - **章节归属**（`apply_autofix` 侧）：只扫冲突来源章节，管「在哪个章节」；
+      - **标签词就近**（本函数）：要求取值与标签词同现，管「是不是这个事实的值」。
+
+    Returns:
+        True 表示允许替换。空正文、无标签词定义的事实名一律返回 True（不阻断）。
+        人员数量类事实不看标签词窗口，改用「取值是否紧跟人数单位『人』」的结构
+        校验（详见函数体 BUG-FIX 2026-10-10 注释）。
+    """
+    text = str(content or "")
+    if not text:
+        return True
+
+    # BUG-FIX 2026-10-10（P1·人数类事实零闸门）：人员数量类事实改用**结构校验**——
+    # 取值之后必须紧跟人数单位「人」（可隔「名/位」量词），与抽取正则
+    # `(\d+)\s*人` 的口径一致。原走标签词窗口会两头落空：通用标签词只有
+    # 「人员/人」，「人」长度 1 被 KEYWORD_MATCH_MIN_LEN=2 过滤掉，「人员」又不会
+    # 出现在「共 20 人」里 → 合法取值被整批误拦；而放宽长度下限到 1 又会因
+    # 「钢筋直径 20 mm」邻近「…共 20 人参与施工」而被放行。结构校验同时满足两侧。
+    if is_personnel_fact_name(fact_name):
+        if not bool(_PERSONNEL_VALUE_TAIL_RE.match(text, int(occurrence_end))):
+            return False
+        # BUG-FIX 2026-10-10（P1·跨岗位串改）：取值前紧邻岗位词时，该取值属于
+        # 对应的「<岗位>数量」事实，只有岗位一致才放行。裸「人员数量」不认领
+        # 任何具体岗位；「技术人员数量」也不能认领「管理人员 5 人」。
+        head = text[
+            max(0, int(occurrence_start) - _PERSONNEL_ROLE_LOOKBACK)
+            : int(occurrence_start)
+        ]
+        matched = _PERSONNEL_ROLE_PREFIX_RE.search(head)
+        if not matched:
+            return True
+        fact_name_text = str(fact_name or "").strip()
+        fact_role = "" if fact_name_text == FACT_PERSONNEL else fact_name_text[: -len("数量")]
+        return matched.group(1) == fact_role
+
+    keywords = personnel_fact_keywords(fact_name)
+    if not keywords:
+        # 该事实名无标签词定义：回退既有行为（只靠数字边界保护），不阻断替换。
+        return True
+
+    # 非对称窗口：前向（标签词在数值之前，中文常态）比后向（倒装）宽。
+    # BUG-FIX 2026-10-09（P1 续）：对称 ±40 会把「总工期 30 天，其中钢筋进场
+    # 30 批」的第二个 30 误判成工期取值并改掉。前向收紧 + 后向更窄后拦掉该误改。
+    # BUG-FIX 2026-10-10（P1·非对称窗口是死代码）：原默认
+    # `window=AUTOFIX_KEYWORD_WINDOW`（40，真值）使
+    # `window if window else autofix_keyword_window_before()` 永远走 40 分支，
+    # 12/6 的非对称口径与 CONSISTENCY_AUTOFIX_KEYWORD_WINDOW_BEFORE/AFTER 两个
+    # 配置项**从未生效**。默认改为 None = 用非对称口径；显式传 window 才表示
+    # 「前后都用同一半径」的对称覆盖（保留既有调用契约）。
+    if window:
+        before_win, after_win = int(window), int(window)
+    else:
+        before_win = autofix_keyword_window_before()
+        after_win = autofix_keyword_window_after()
+    start = max(0, int(occurrence_start) - before_win)
+    neighborhood = text[start:int(occurrence_start)]
+    tail = text[
+        int(occurrence_end) : min(len(text), int(occurrence_end) + after_win)
+    ]
+    return any(
+        kw in neighborhood or kw in tail
+        for kw in keywords
+        if len(kw) >= KEYWORD_MATCH_MIN_LEN
+    )
+
+
+_SOURCE_SECTION_RE = re.compile(r"section_(\d+)")
+
+
+def extract_source_section_ids(sources: Any) -> list[int | None]:
+    """从冲突的 `sources_json` 内容里提取章节 ID 列表（去重、保序）。
+
+    `consistency_auditor` 的 sources 形如
+    ``["section_12 (施工组织方案)", "summary (摘要)", "global_facts (已确认事实基准)"]``；
+    摘要与基准来源没有 section_id，本方法只返回能定位到章节的 ID。
+
+    返回空列表表示**该冲突没有任何章节来源**（例如旧数据只写了摘要来源），
+    调用方必须回退到全文扫描并说明原因，不能因此静默跳过修复。
+    """
+    seen: list[int | None] = []
+    for source in sources or []:
+        match = _SOURCE_SECTION_RE.search(str(source or ""))
+        if not match:
+            continue
+        section_id = int(match.group(1))
+        if section_id not in seen:
+            seen.append(section_id)
+    return seen
+
+
+def autofix_scope_to_source_sections() -> bool:
+    """是否把替换范围限定在冲突来源章节内（见 config 同名开关）。"""
+    try:
+        from ..config import CONSISTENCY_AUTOFIX_SCOPE_TO_SOURCE_SECTIONS
+
+        return bool(CONSISTENCY_AUTOFIX_SCOPE_TO_SOURCE_SECTIONS)
+    except Exception:  # pragma: no cover - 配置不可用时保持默认（限定）
+        return True
+
+
+def autofix_requires_fact_keyword() -> bool:
+    """是否启用标签词就近校验（见 config 同名开关）。"""
+    try:
+        from ..config import CONSISTENCY_AUTOFIX_REQUIRE_FACT_KEYWORD
+
+        return bool(CONSISTENCY_AUTOFIX_REQUIRE_FACT_KEYWORD)
+    except Exception:  # pragma: no cover - 配置不可用时保持默认（启用）
+        return True
+
+
+def autofix_keyword_window_before() -> int:
+    """标签词在数值**之前**的搜索半径（见 config 同名开关）。"""
+    try:
+        from ..config import CONSISTENCY_AUTOFIX_KEYWORD_WINDOW_BEFORE
+
+        return max(0, int(CONSISTENCY_AUTOFIX_KEYWORD_WINDOW_BEFORE))
+    except Exception:  # pragma: no cover - 配置不可用时用模块默认值
+        return AUTOFIX_KEYWORD_WINDOW_BEFORE
+
+
+def autofix_keyword_window_after() -> int:
+    """标签词在数值**之后**的搜索半径（见 config 同名开关）。"""
+    try:
+        from ..config import CONSISTENCY_AUTOFIX_KEYWORD_WINDOW_AFTER
+
+        return max(0, int(CONSISTENCY_AUTOFIX_KEYWORD_WINDOW_AFTER))
+    except Exception:  # pragma: no cover - 配置不可用时用模块默认值
+        return AUTOFIX_KEYWORD_WINDOW_AFTER
 
 
 # ============================================================================
@@ -350,6 +629,17 @@ def rules_payload() -> dict[str, Any]:
             "high_distinct_threshold": SEVERITY_HIGH_DISTINCT_THRESHOLD,
             "low_max_sections": SEVERITY_LOW_MAX_SECTIONS,
             "amount_units": sorted(AMOUNT_UNIT_TO_YUAN),
+            # 自动修复防护口径（2026-10-09 深度审计加固）：前端可据此向用户说明
+            # 「为什么有些位置没改」——替换只在冲突来源章节内进行，且值附近必须
+            # 出现事实标签词。挂在 facts 之下而非新增顶层键，以保持
+            # test_rules_payload_shape 对顶层键集合的既有断言成立。
+            "autofix_keywords": {
+                name: sorted(keywords) for name, keywords in FACT_KEYWORDS.items()
+            },
+            "autofix_keyword_window_before": AUTOFIX_KEYWORD_WINDOW_BEFORE,
+            "autofix_keyword_window_after": AUTOFIX_KEYWORD_WINDOW_AFTER,
+            "autofix_keyword_min_len": KEYWORD_MATCH_MIN_LEN,
+            "autofix_scope": "source_sections",
         },
         "audit_status": {
             "success": sorted(AUDIT_SUCCESS_STATUSES),

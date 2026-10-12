@@ -9,6 +9,18 @@ from typing import Any
 # SSE 超时本地常量（秒）—— 目录生成 V5.1 三级流水线需更长时间
 SSE_TOTAL_TIMEOUT_DEFAULT = 1800  # 30分钟
 
+# BUG-FIX 2026-10-09（跨模块协议统一）：SSE 终态集合此前在两处各写一份字面量，
+# 且**目录流少了 "cancelled"**：
+#   · sse_outline.py  ("completed", "error", "stopped")
+#   · sse_content.py  ("completed", "error", "stopped")
+# 而前端 OutlineEditorPage.tsx:299 与 SectionEditorPage.tsx:727 都实现了
+# `status === "cancelled"` 分支 —— 前端认它、后端不认它：一旦上游推来 cancelled，
+# 目录流的消费循环不会 break，连接会一直挂到 1800s 总超时才释放。
+# 现收敛为唯一一份定义，两条流共用；新增终态只需改这里。
+SSE_TERMINAL_STATUSES: frozenset[str] = frozenset(
+    {"completed", "error", "stopped", "cancelled"}
+)
+
 logger = logging.getLogger(__name__)
 
 # 保存后台任务引用，防止被 GC 回收

@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { Button, Card, List, Space, Spin, Statistic, Tabs, Tag, Typography, message, Progress, Alert, Empty, Input } from "antd";
-import { CopyOutlined, FileTextOutlined, ImportOutlined, FileExcelOutlined } from "@ant-design/icons";
+import { CopyOutlined, FileTextOutlined, DownloadOutlined, FileExcelOutlined } from "@ant-design/icons";
 import { startDuplicateCheck, getDuplicateStatus, getDuplicateResult, listDuplicateTasks, getDuplicateReportUrl } from "../api";
 import { extractApiError } from "../utils";
 import type { DuplicateCheckTask } from "../types";
@@ -459,7 +459,7 @@ export default function DuplicateCheckPage() {
           <Space wrap>
             <Text type="secondary">导出查重报告：</Text>
             <a href={getDuplicateReportUrl(task.id, "docx")} target="_blank" rel="noopener noreferrer">
-              <Button icon={ImportOutlined as any}>Word 报告</Button>
+              <Button icon={<DownloadOutlined />}>Word 报告</Button>
             </a>
             <a href={getDuplicateReportUrl(task.id, "xlsx")} target="_blank" rel="noopener noreferrer">
               <Button icon={<FileExcelOutlined />}>Excel 报告（六表）</Button>

@@ -268,7 +268,12 @@ class OpenAICompatibleProvider:
                         _usage_meta = {'prompt_tokens': 0, 'completion_tokens': 0, 'total_tokens': 0}
                         if data.get('usage'):
                             u = data['usage']
-                            self._last_usage = {'prompt_tokens': u.get('prompt_tokens', 0), 'completion_tokens': u.get('completion_tokens', 0), 'total_tokens': u.get('total_tokens', 0)}
+                            # ENHANCE 2026-10-09（E-3）：透传 prompt_tokens_details
+                            # （OpenAI 兼容链路的缓存命中计量，DeepSeek/OpenRouter 等
+                            # 普遍透出 cached_tokens）。workflows 侧
+                            # record_prompt_cache 依赖该字段计算缓存命中率。
+                            _details = u.get('prompt_tokens_details') or {}
+                            self._last_usage = {'prompt_tokens': u.get('prompt_tokens', 0), 'completion_tokens': u.get('completion_tokens', 0), 'total_tokens': u.get('total_tokens', 0), 'prompt_tokens_details': _details if isinstance(_details, dict) else {}}
                             _usage_meta = dict(self._last_usage)
                         if return_meta:
                             return {'content': content, 'finish_reason': finish_reason, 'usage': _usage_meta}

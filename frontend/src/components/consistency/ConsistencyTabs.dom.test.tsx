@@ -80,7 +80,7 @@ const runAuditMock = vi.fn(async () => ({
   audit_time: "2026-10-08 10:00:00",
 }));
 
-const getScoringMock = vi.fn(async () => ({
+const getScoringMock = vi.fn(async (_pid: number, _opts?: { persist?: boolean }) => ({
   status: "ok",
   project_id: 1,
   audit_time: "2026-10-08 10:00:00",
@@ -230,7 +230,8 @@ describe.skipIf(!hasDom)("一致性校核 —— Tab 级与组件级交互", () 
 
     await waitFor(() => expect(getScoringMock).toHaveBeenCalled(), { timeout: 30_000 });
     // 必须以 persist=false 调用：反复切 Tab 不该往审计历史灌记录
-    expect(getScoringMock.mock.calls[0]?.[1]).toMatchObject({ persist: false });
+    // TS2493：vi.fn 在 mock 工厂包裹下 calls 类型退化为空元组，显式断言避免访问越界
+    expect((getScoringMock.mock.calls as unknown[][])[0]?.[1]).toMatchObject({ persist: false });
 
     expect(await screen.findByText("施工组织设计", undefined, { timeout: 30_000 })).toBeTruthy();
     // 「未挂载章节」既是统计卡标题也是表格状态标签，故用 findAllByText

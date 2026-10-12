@@ -50,6 +50,7 @@ from .routers import (
     auth,
     batch,
     cache,
+    charts,
     consistency,
     content_version,
     duplicate,
@@ -532,6 +533,7 @@ v1_router.include_router(websocket.router, prefix="", tags=["collaboration"])
 v1_router.include_router(images.router, prefix="", tags=["images"])
 v1_router.include_router(content_version.router, prefix="", tags=["content_version"])
 v1_router.include_router(tasks.router, prefix="", tags=["tasks"])
+v1_router.include_router(charts.router, prefix="", tags=["charts"])
 v1_router.include_router(auth.router, prefix="/auth", tags=["auth"])
 
 # 调试接口：发射一条带 request_id/project/section/task 的示例日志（F-P0-1 验证用）
@@ -694,6 +696,16 @@ async def _startup():
     except Exception as e:
         logger.warning("协作功能初始化失败（不影响核心功能）: %s", e)
 
+    # ENHANCE 2026-10-11: repair_stats 启动回填（跨重启保留历史高频规则）
+    try:
+        from .services.ai.image_engine import restore_repair_stats_from_db as _restore
+        _restored = _restore()
+        if _restored.get("restored", 0) > 0:
+            logger.info("repair_stats 启动回填: 注入 %d 条 mismatch 历史（来自 %d 条快照）",
+                        _restored["restored"], _restored["snapshots_used"])
+    except Exception as e:
+        logger.debug("repair_stats 启动回填跳过（表不存在？）: %s", e)
+
     # 初始化 AI 配置服务（配置缓存预热 + 历史记录清理定时任务）
     try:
         from .services.ai.ai_config_service import startup as _ai_config_startup
@@ -763,6 +775,34 @@ async def _startup():
     except Exception as e:
         logger.warning("后台任务对账失败（不影响核心功能）: %s", e)
 
+    # HARDENING 2026-10-11（遗留·审计日志无 retention）：配置审计表 ai_config_audit
+    # 会长期累积。启动后注册每日清理后台任务（默认保留 90 天，
+    # 环境变量 CONFIG_AUDIT_RETENTION_DAYS 可配）。清理失败不阻断主流程。
+    try:
+        _audit_retention_days = int(
+            os.environ.get("CONFIG_AUDIT_RETENTION_DAYS", "90")
+        )
+        _audit_retention_days = max(1, _audit_retention_days)
+
+        async def _audit_cleanup_loop():
+            while True:
+                try:
+                    from .services.ai.provider_factory import cleanup_old_config_audit
+
+                    _deleted = cleanup_old_config_audit(retention_days=_audit_retention_days)
+                    if _deleted:
+                        logger.info("配置审计日志清理完成，删除 %d 条过期记录", _deleted)
+                except Exception as _e:
+                    logger.warning("配置审计日志清理异常（忽略）: %s", _e)
+                await asyncio.sleep(86400)
+
+        _task = asyncio.create_task(_audit_cleanup_loop())
+        _background_tasks.add(_task)
+        _task.add_done_callback(_background_tasks.discard)
+        logger.info("配置审计日志清理任务已注册（保留 %d 天）", _audit_retention_days)
+    except Exception as e:
+        logger.warning("配置审计日志清理任务注册失败（不影响核心功能）: %s", e)
+
     logger.info("应用启动完成，耗时 %.1fs", time.monotonic() - _start_time)
 
 
@@ -775,6 +815,12 @@ async def _shutdown():
         _ai_config_shutdown()
     except Exception as e:
         logger.warning("AI 配置服务关闭失败: %s", e)
+
+    # HARDENING 2026-10-11：取消所有注册的后台循环任务（含审计日志每日清理），
+    # 避免事件循环关闭时留下未 await 的 while-True 协程。
+    for _t in list(_background_tasks):
+        _t.cancel()
+    _background_tasks.clear()
 
 
 # ENHANCE 2026-09-29（on_event 弃用迁移）：以 lifespan context manager 注册

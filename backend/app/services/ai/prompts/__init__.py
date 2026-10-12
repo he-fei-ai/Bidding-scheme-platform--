@@ -29,6 +29,7 @@ from __future__ import annotations
 # 注册共享规则到管理界面（只读展示，内容锁定于 _shared.py）
 from . import (
     _context,
+    _integrate,  # ENHANCE 2026-10-12：整合调用方散落的存量硬编码提示词
     _security,
     _shared,
     analysis,

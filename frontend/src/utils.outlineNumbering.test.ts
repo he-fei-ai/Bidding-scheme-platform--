@@ -21,6 +21,9 @@ import {
   nextFreeSortOrder,
   allocTempNodeId,
   formatV21Heading,
+  normalizeSectionStatus,
+  collectLeafIds,
+  getPendingFailedLeafCount,
 } from "./utils";
 import type { SectionTreeNode } from "./types";
 
@@ -339,5 +342,81 @@ describe("超深层级不爆栈（BUG-08 回归）", () => {
     const tree = outlineDictToTreeNodes([root]);
     expect(() => annotateOutlineWithNumbers(tree)).not.toThrow();
     expect(collectIds(tree)).toHaveLength(2000);
+  });
+});
+/* ==========================================================================
+ * 章节状态机归一化（BUG-FIX 2026-10-09 · 跨模块数据链回归）
+ *
+ * 背景：`outlineDictToTreeNodes` 此前把每个节点的状态硬编码为 `"active"`。
+ * 后端 sections 表的真实状态机只有五个取值：
+ *   pending → generating → completed | failed | cancelled
+ * （写入方：sse_db_ops 的 _save_section_to_db / _mark_sections_generating /
+ *   _rollback_dirty_sections，task_control 的 stop_generation）
+ * `'active'` 全仓库无人写入、也不被任何消费者识别，后果是：
+ *   · `collectLeafIds(tree, /* filterPendingFailed *\/ true)` 只收 pending/failed
+ *     → 大纲刚生成、尚未写正文的章节在「补全生成」里永远选不中；
+ *   · SectionEditorPage.getStatusIcon 无 'active' 分支，一律落到默认灰色时钟。
+ * 后端写入侧已改为 'pending' 并提供一次性迁移（db_migrations 的 active→pending），
+ * 前端此处做兜底归一化，保证新旧数据都能被正确渲染与选取。
+ * ========================================================================== */
+
+describe("normalizeSectionStatus：章节状态归一化（BUG-FIX 2026-10-09 回归）", () => {
+  it("已知状态原样透传", () => {
+    for (const s of ["pending", "generating", "completed", "failed", "cancelled"]) {
+      expect(normalizeSectionStatus(s, false)).toBe(s);
+    }
+  });
+
+  it("历史脏数据 'active' 按有无正文归一，重新进入可补全集合", () => {
+    // 无正文 → pending：能被 collectLeafIds(filterPendingFailed) 选中
+    expect(normalizeSectionStatus("active", false)).toBe("pending");
+    // 有正文 → completed：不应被重复生成
+    expect(normalizeSectionStatus("active", true)).toBe("completed");
+  });
+
+  it("未知值 / 非字符串同样归一，不产生 undefined", () => {
+    expect(normalizeSectionStatus(undefined, false)).toBe("pending");
+    expect(normalizeSectionStatus(null, false)).toBe("pending");
+    expect(normalizeSectionStatus(123, false)).toBe("pending");
+    expect(normalizeSectionStatus("weird", true)).toBe("completed");
+  });
+
+  it("outlineDictToTreeNodes 不再产出 'active'（核心回归）", () => {
+    const tree = outlineDictToTreeNodes([
+      { title: "A", children: [{ title: "A1" }] },
+      { title: "B" },
+    ]);
+    const statuses: string[] = [];
+    const stack: SectionTreeNode[][] = [tree];
+    while (stack.length) {
+      const cur = stack.pop()!;
+      for (const n of cur) {
+        statuses.push(String(n.status));
+        if (n.children?.length) stack.push(n.children);
+      }
+    }
+    expect(statuses).toHaveLength(3);
+    expect(statuses.every((s) => s !== "active")).toBe(true);
+    // 目录刚生成、全部无正文 → 全部 pending，因此都应进入「补全生成」候选
+    expect(statuses.every((s) => s === "pending")).toBe(true);
+  });
+
+  it("「补全生成」能选中刚生成的大纲章节（端到端契约）", () => {
+    // 复现原故障：outlineDictToTreeNodes 产出 active 的节点，
+    // collectLeafIds(..., true) 一个都选不中 → 补全生成对整棵新大纲失效。
+    const tree = outlineDictToTreeNodes([
+      { title: "A", children: [{ title: "A1" }, { title: "A2" }] },
+      { title: "B" },
+    ]);
+    expect(collectLeafIds(tree, true).length).toBe(3);
+    expect(getPendingFailedLeafCount(tree)).toBe(3);
+  });
+
+  it("已生成正文的章节不会被重复选中", () => {
+    const tree = outlineDictToTreeNodes([
+      { title: "A", has_content: true, status: "completed" },
+      { title: "B", has_content: true, status: "active" },
+    ]);
+    expect(collectLeafIds(tree, true)).toHaveLength(0);
   });
 });

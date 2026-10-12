@@ -34,6 +34,28 @@ from app.services.ai.workflows import (
 
 
 # ===========================================================================
+# 多样性阈值单一真源（Single Source of Truth）
+# ===========================================================================
+# 2026-10-09 加固：把散落各断言中的硬编码阈值收敛到本字典，避免「注释 vs
+# 断言 vs 文档」三处口径漂移（历史上 .trae/documents/next_optimization_plan.md
+# P1 就因 28% / 55% 不一致产生维护混乱）。修改阈值只需改这一处，
+# 所有断言消息与文档引用均可从 THRESHOLDS 派生。
+#
+# 来源：V5.2 跨章节全局去重 + V5.3 语义化兜底后，纯兜底场景 28 章 L3 唯一率
+#       实测 ≥ 100%（参见 tests/test_diversity.py 输出与
+#       .trae/documents/next_optimization_plan.md P0 修复说明）。
+#       这里保留 0.55 作为安全下限，防止未来模板池缩小后无声退化。
+THRESHOLDS = {
+    # 章节内 L3 唯一率（28 章跨章节全局去重后的最小要求）
+    "L3_UNIQUENESS_CHAPTERS": 0.55,
+    # 端到端 Mock 场景的 L2 唯一率
+    "L2_UNIQUENESS_E2E": 0.60,
+    # 端到端 Mock 场景的 L3 唯一率
+    "L3_UNIQUENESS_E2E": 0.25,
+}
+
+
+# ===========================================================================
 # 1. 章节分类测试
 # ===========================================================================
 
@@ -356,11 +378,16 @@ class TestCrossChapterUniqueness:
         )
 
     def test_l3_uniqueness_28_chapters(self):
-        """28 章兜底场景：L3 唯一率应 >= 55%。
+        """28 章兜底场景：L3 唯一率应 >= THRESHOLDS["L3_UNIQUENESS_CHAPTERS"] (55%)。
 
         V5.2 跨章节全局去重后，所有章节共用同一个 global_pool，
         防止各章独立兜底时产出相同的套话标题。
+
+        阈值来源：本文件顶部 THRESHOLDS 字典（单一真源）。
+        历史上（2026-09-10 前）注释与断言存在 28% vs 55% 的漂移，
+        本次加固后注释与断言均引用 THRESHOLDS，彻底消除不一致。
         """
+        threshold = THRESHOLDS["L3_UNIQUENESS_CHAPTERS"]
         all_l3 = []
         global_pool: set = set()  # ← V5.2 新增：跨章节共享去重池
         for idx in range(28):
@@ -380,8 +407,8 @@ class TestCrossChapterUniqueness:
         unique = len(set(all_l3))
         total = len(all_l3)
         uniqueness_rate = unique / total if total > 0 else 0
-        assert uniqueness_rate >= 0.55, (
-            f"L3 唯一率 {uniqueness_rate:.1%} < 55% 阈值\n"
+        assert uniqueness_rate >= threshold, (
+            f"L3 唯一率 {uniqueness_rate:.1%} < {threshold:.0%} 阈值\n"
             f"总数={total}, 唯一数={unique}"
         )
 

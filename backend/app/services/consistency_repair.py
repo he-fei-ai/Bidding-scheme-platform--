@@ -41,7 +41,8 @@ from .ai.prompts import get_prompt
 from .ai.provider_factory import create_provider, get_ai_config
 from .ai.providers.base import AIMessage
 from .ai.workflows import collect_json_response
-from .facts_service import facts_for_generation
+from .consistency_auditor import ConsistencyAuditor
+from .facts_service import facts_for_generation, is_placeholder_value, parse_stored_items
 
 
 logger = logging.getLogger(__name__)
@@ -212,16 +213,38 @@ def _load_context(project_id: int, section_ids: list[int] | None) -> dict:
         sql += " ORDER BY sort_order, id"
         section_rows = conn.execute(sql, params).fetchall()
 
+        # BUG-FIX 2026-10-09：sqlite3.Row 不是快照，而是**惰性解引用**——它读的是连接上
+        # 那个共享、会被下一次 execute 重新 prepare、并在 with 块退出时 commit() 被
+        # finalize 掉的预处理语句的当前行/列。上面三次 conn.execute 依次覆盖了同一语句
+        # 的列布局，所以一旦把 Row 带到块外再取值：facts_row["global_facts_json"] 可能
+        # 读到 sections 语句那一列（AI 修复因此拿不到事实基准、只能凭语义猜目标值），
+        # conflict_rows 各项也会串列。这里立即物化成 dict。
+        # 同类修复：consistency_auditor._collect_fact_instances。
+        facts_json: str | None = facts_row["global_facts_json"] if facts_row else None
+        conflicts_raw: list[dict] = [
+            {
+                "conflict_id": r["conflict_id"],
+                "fact_name": r["fact_name"],
+                "values_json": r["values_json"],
+                "description": r["description"],
+            }
+            for r in conflict_rows
+        ]
+        sections_raw: list[dict] = [
+            {"id": r["id"], "title": r["title"], "content": r["content"]}
+            for r in section_rows
+        ]
+
     # ENHANCE 2026-09-29（facts-ns + 占位泄漏）：原先自己 `json.loads` 且只认顶层
     # list，与正文生成链路不同口径：{"items": [...]} 包装形态在这里会被静默
     # 当作“无事实”→ AI 修复拿不到事实基准，只能凭语义猜目标值；而 placeholder
     # 档的【待填写】占位项又会被当成真实事实写回正文。现统一走服务层正本。
     facts: list[dict] = []
-    if facts_row and facts_row["global_facts_json"]:
-        facts = facts_for_generation(facts_row["global_facts_json"])
+    if facts_json:
+        facts = facts_for_generation(facts_json)
 
     conflicts = []
-    for row in conflict_rows:
+    for row in conflicts_raw:
         try:
             values = json.loads(row["values_json"] or "[]")
         except (json.JSONDecodeError, TypeError):
@@ -237,21 +260,122 @@ def _load_context(project_id: int, section_ids: list[int] | None) -> dict:
 
     sections = [
         {"node_id": row["id"], "id": row["id"], "title": row["title"], "content": row["content"] or ""}
-        for row in section_rows
+        for row in sections_raw
     ]
     return {"facts": facts, "conflicts": conflicts, "sections": sections}
 
 
-def refresh_conflict_states(conn, project_id: int, sections: dict[int, str]) -> dict:
-    """按可验证判据收敛冲突状态：正文里还能找到 ≥2 个取值 → 保持未解决。
+def _load_all_project_content(conn, project_id: int) -> dict[int, str]:
+    """载入项目**全量**小节正文，供 `refresh_conflict_states` 做收敛判定。
+
+    BUG-FIX 2026-10-09：见 `repair_with_ai` 落文处的说明 —— 冲突状态判定
+    必须基于全项目正文，否则带 `section_ids` 的局部修复会把「旧取值仍在
+    其它小节」的冲突误标为已解决。
+
+    复用调用方已持有的 conn（同一事务内可读到刚落库的补丁结果），
+    不额外开连接、不占用全局写锁。读取失败时返回空 dict：
+    此时 `refresh_conflict_states` 的判据会退化为「全都不存在 → 全标已解决」，
+    因此调用方必须在 update 之后、读失败时可感知 —— 故此处抛出而非静默吞掉，
+    由外层 except 统一转成 report['message']。
+    """
+    rows = conn.execute(
+        "SELECT id, content FROM sections WHERE project_id = ? ORDER BY sort_order, id",
+        (project_id,),
+    ).fetchall()
+    return {int(r["id"]): (r["content"] or "") for r in rows}
+
+
+def _load_project_summary_and_baseline(conn, project_id: int) -> dict[str, str]:
+    """载入项目**摘要文本**与**已确认事实基准**，供 `refresh_conflict_states` 做收敛判定。
+
+    BUG-FIX 2026-10-11（正确性 / 误标已解决）：`refresh_conflict_states` 的判据是
+    「全文还能找到 ≥2 个冲突取值 → 仍算冲突」，因此**扫描宇宙必须与审计器的事实
+    来源宇宙一致**。审计器（`ConsistencyAuditor._collect_fact_instances`）除章节
+    正文外还抽 `projects.notes/bidder_name/industry`（摘要）与
+    `analysis.global_facts_json`（已确认事实基准），所以冲突的两个取值可能
+    **都落在正文之外**：例如摘要写「工期 45 天」而基准写「450 日历天」，正文只写
+    其中一个；或 AI 补丁把正文里那个值改掉后，正文只剩一个取值。此时只扫
+    `sections` 会把「正文里只剩 1 个取值」误判成「全文统一」→ 冲突被**错误标记为
+    已解决**，而正文与摘要/基准之间的不一致仍真实存在。这与 2026-10-09 修的
+    「局部修复洗白其它小节」同源，只是发生在摘要/基准维度。
+
+    基准只纳入 `FACT_BASELINE_CATEGORIES` 声明的三类：那是审计器**真正会拿去比**的
+    基准范围，照抄它才能与审计口径对齐 —— 纳入未映射的类别会让无关基准值
+    （如付款金额）误压住工期冲突、使其永久判为未解决。
+
+    基准值按**原始 value 文本**整条给出，而不是先做正则抽取：
+    `refresh_conflict_states` 的查找走 `text_patch.find_value_occurrences`
+    （带数字边界保护），把「建设工期450天」整句交给它查「450」与抽出的「450」
+    结果一致；查「45」时因数字边界保护不会误命中「450」里的「45」。
+
+    复用调用方已持有的 conn：与同一事务内的章节读取保持一致视图，
+    不额外开连接、不占用全局写锁。失败向上抛，由外层 except 统一转成
+    report['message']（与 `_load_all_project_content` 同口径）。
+    """
+    texts: dict[str, str] = {}
+
+    summary_row = conn.execute(
+        "SELECT notes, bidder_name, industry FROM projects WHERE id = ?",
+        (project_id,),
+    ).fetchone()
+    summary = dict(summary_row) if summary_row is not None else None
+    if summary:
+        summary_text = ""
+        if summary.get("notes"):
+            summary_text += f"项目备注: {summary['notes']}\n"
+        if summary.get("bidder_name"):
+            summary_text += f"投标人: {summary['bidder_name']}\n"
+        if summary.get("industry"):
+            summary_text += f"行业: {summary['industry']}\n"
+        if summary_text.strip():
+            texts["summary"] = summary_text
+
+    facts_row = conn.execute(
+        "SELECT global_facts_json FROM analysis WHERE project_id = ?",
+        (project_id,),
+    ).fetchone()
+    raw_json = facts_row["global_facts_json"] if facts_row is not None else ""
+    mapped_categories = set(ConsistencyAuditor.FACT_BASELINE_CATEGORIES.keys())
+    baseline_values = [
+        str(item.get("value") or "").strip()
+        for item in parse_stored_items(raw_json)
+        if str(item.get("value") or "").strip()
+        and not is_placeholder_value(str(item.get("value") or ""))
+        and str(item.get("category") or "") in mapped_categories
+    ]
+    if baseline_values:
+        texts["global_facts"] = "\n".join(baseline_values)
+
+    return texts
+
+
+def refresh_conflict_states(
+    conn,
+    project_id: int,
+    sections: dict[int, str],
+    *,
+    extra_texts: dict[str, str] | None = None,
+) -> dict:
+    """按可验证判据收敛冲突状态：全文里还能找到 ≥2 个取值 → 保持未解决。
 
     不做「补丁跑过就标已解决」这种谎报。返回 `{resolved, still_open}`。
+
+    `sections` 是章节正文（`{section_id: content}`）；`extra_texts` 是章节正文
+    **之外**的事实来源文本（`{来源标签: 文本}`，如摘要与已确认事实基准，
+    见 `_load_project_summary_and_baseline`）。判据是「全文还能找到 ≥2 个取值」，
+    故两处都必须纳入扫描 —— 否则只在摘要/基准里存在旧取值的冲突会被误标已解决。
+    向后兼容：`extra_texts` 缺省为 None 时，行为与「只扫章节正文」完全一致。
     """
     rows = conn.execute(
         "SELECT conflict_id, values_json FROM consistency_conflicts "
         "WHERE project_id = ? AND resolved = 0",
         (project_id,),
     ).fetchall()
+    # 扫描宇宙 = 全量章节正文 + 章节之外的来源文本（摘要 / 已确认事实基准）。
+    scan_texts = list(sections.values())
+    if extra_texts:
+        scan_texts.extend(extra_texts.values())
+
     resolved = 0
     still_open = 0
     for row in rows:
@@ -275,7 +399,7 @@ def refresh_conflict_states(conn, project_id: int, sections: dict[int, str]) -> 
                 # 其实已经把该值统一掉了。反向亦然（子串漏判可致误标已解决）。
                 # 现统一到 `text_patch` 的同一套定位口径。
                 text_patch.find_value_occurrences(content, str(value))
-                for content in sections.values()
+                for content in scan_texts
             )
         ]
         unique_present = list(dict.fromkeys(present))
@@ -435,8 +559,28 @@ async def repair_with_ai(
                     (new_content, now, section_id, project_id),
                 )
             content_by_id.update({section_id: content for section_id, _k, content in planned})
+            # BUG-FIX 2026-10-09（正确性 / 误标已解决）：此前把「本次载入的
+            # 小节」content_by_id 直接交给 refresh_conflict_states。该函数以
+            # 「全项目正文里还能找到 ≥2 个冲突取值 → 仍算冲突」为判据，因此
+            # **扫描范围必须覆盖整个项目**。而 `sections` 来自 `_load_context`，
+            # 当调用方带 `section_ids` 参数（POST /consistency/repair/{id}?section_ids=…）
+            # 时它只包含被点名的那些小节 —— 于是仍残留在「未参与修复的小节」
+            # 里的旧取值根本扫不到，`len(unique_present) <= 1` 成立，
+            # 冲突被**错误标记为已解决**。人工点几个小节修复，反而会把
+            # 其它小节里真实存在的不一致「洗白」，且没有任何提示。
+            # 现改为：落文后按 project_id 重新加载**全量**正文，
+            # 再用本次已写入的 planned 内容覆盖对应条目后做收敛判定。
+            verify_scope = _load_all_project_content(conn, project_id)
+            verify_scope.update(content_by_id)
+            # BUG-FIX 2026-10-11（正确性 / 误标已解决）：收敛判据的扫描宇宙必须
+            # 与审计器一致 —— 除全量章节正文外还要纳入摘要与已确认事实基准。
+            # 否则「旧取值只存在于摘要/基准」的冲突会被「正文里只剩 1 个取值」
+            # 误判为全文统一。见 `_load_project_summary_and_baseline` 的说明。
             report["conflict_states"] = refresh_conflict_states(
-                conn, project_id, dict(content_by_id)
+                conn,
+                project_id,
+                verify_scope,
+                extra_texts=_load_project_summary_and_baseline(conn, project_id),
             )
     except Exception as exc:
         logger.error("一致性 AI 修复落文失败: %s", exc, exc_info=True)

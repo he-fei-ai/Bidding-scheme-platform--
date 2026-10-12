@@ -1,0 +1,5 @@
+⚠️  认证机制已关闭（AUTH_ENABLED=false），所有 API 请求无需登录即可访问！
+   生产部署请设置环境变量 AUTH_ENABLED=true 启用 JWT 认证。
+提示词硬编码与DB内容存在差异（共 2 个）：MERMAID_FLOWCHART_SYSTEM, MERMAID_GANTT_SYSTEM
+如需同步硬编码新版本到DB，请在提示词管理页点击「同步硬编码」（POST /prompts/sync-hardcode），或对对应提示词执行「重置为默认」。
+同级去重: 跳过同级重复标题「Y」（level=）

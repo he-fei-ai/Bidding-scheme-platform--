@@ -13,6 +13,7 @@ from ...config import CONCUR_INITIAL, CONCUR_MAX, CONCUR_MIN, GLOBAL_AI_CONCURRE
 from ...utils.json_parser import extract_json_from_text
 from .heading_standard import HeadingNumberingGenerator, build_heading_spec_prompt
 from .prompts import get_prompt
+from .prompts._output_repair import extract_json_body, try_parse_json
 from .prompts._registry import _resolve_shared
 from .providers.base import AIMessage
 
@@ -1175,6 +1176,33 @@ async def collect_json_response(
                         _err_str[:200],
                     )
                     continue
+                # ENHANCE 2026-10-11（遗留项1：激活 _output_repair 统一入口）：
+                # 在调用 AI 修复之前，先尝试「静态修复」——用 extract_json_body（围栏剥离 +
+                # JSON 主体提取）+ try_parse_json 处理 AI 常见的「合法 JSON 被代码围栏包裹」
+                # 或「JSON 前后有解释文字」场景。静态修复成功则直接返回，省去一次 AI 调用
+                # （节省成本 + 降低延迟）；失败则继续走既有 AI 修复链路（行为完全不变）。
+                _static_json_text = extract_json_body(raw_content or "")
+                _static_parsed, _static_err = try_parse_json(_static_json_text)
+                if (
+                    _static_parsed is not None
+                    and not isinstance(_static_parsed, str)
+                ):
+                    _static_ok = True
+                    if schema:
+                        try:
+                            _static_parsed = schema.model_validate(_static_parsed)
+                        except Exception:
+                            _static_ok = False
+                    if _static_ok and validator:
+                        _sv_valid, _sv_err = validator(_static_parsed)
+                        _static_ok = _sv_valid
+                    if _static_ok:
+                        logger.info(
+                            "JSON 静态修复成功（跳过 AI 修复调用），attempt=%d/%d",
+                            attempt + 1,
+                            max_retries,
+                        )
+                        return _static_parsed
                 # JSON 自修复：把原始（非法/不合规）输出连同错误原因回喂给模型，
                 # 要求其输出严格合法的 JSON。这是弱模型稳定产出 JSON 的关键（设计文档五）。
                 # 注意：provider.chat 要求 AIMessage 对象（按属性访问 .role/.content），

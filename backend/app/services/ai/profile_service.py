@@ -25,6 +25,61 @@ logger = logging.getLogger(__name__)
 # 读接口统一使用的脱敏占位符（与 routers/ai_config.API_KEY_MASK 保持一致）
 KEY_MASK = "***已配置***"
 
+# ──────────────────────────────────────────────────────────────────────
+# G-1（2026-10-11）：Profile 数值参数范围钳制
+# ──────────────────────────────────────────────────────────────────────
+# 现状：ProfileCreateRequest/ProfileUpdateRequest 直接落库，未对 temperature /
+# max_tokens / concurrency / timeout / rate_limit_per_min / token_budget_daily
+# 做任何范围校验 —— 与 save_ai_config / save_text_provider_config 的口径不一致。
+# 传入 -1（temperature）或 0（concurrency）会在 apply_profile_to_config 覆盖
+# 主配置后导致模型产出乱码/并发挂死；负数 token_budget_daily 会被
+# get_token_budget_status 直接判为超限。
+# 钳制口径与 save_ai_config 对齐：temperature [0, 2.0]、max_tokens [256, 65536]、
+# concurrency [1, 64]；Profile 特有字段的边界见常量。
+
+_PROFILE_RANGE = {
+    "temperature": (0.0, 2.0),
+    "max_tokens": (256, 65536),
+    "concurrency": (1, 64),
+    "timeout": (5, 600),
+    "rate_limit_per_min": (0, 10000),
+    "token_budget_daily": (0, 10_000_000),
+}
+
+_PROFILE_DEFAULTS = {
+    "temperature": 0.7,
+    "max_tokens": 16384,
+    "concurrency": 4,
+    "timeout": 120,
+    "rate_limit_per_min": 0,
+    "token_budget_daily": 0,
+}
+
+
+def _clamp_profile_params(data: dict) -> dict:
+    """把 Profile 数值字段钳制到合法区间；非法/缺失字段回填默认值。
+
+    幂等：调用方传入 int/float/None/str，都会输出可写库的 int/float。
+    未出现的键不动，供 update_profile 与 COALESCE 语义共存。
+    """
+    out = dict(data) if data else {}
+    for key, (lo, hi) in _PROFILE_RANGE.items():
+        raw = out.get(key, _PROFILE_DEFAULTS[key])
+        try:
+            if raw is None:
+                out[key] = _PROFILE_DEFAULTS[key]
+                continue
+            if isinstance(raw, str):
+                if raw.strip() == "":
+                    out[key] = _PROFILE_DEFAULTS[key]
+                    continue
+                raw = float(raw) if "." in raw else int(raw)
+            value = float(raw) if key == "temperature" else int(raw)
+            out[key] = min(max(value, lo), hi)
+        except (TypeError, ValueError):
+            out[key] = _PROFILE_DEFAULTS[key]
+    return out
+
 
 def _profile_row_to_dict(row, include_key: bool = False) -> dict:
     """把 ai_profiles 的一行转换为对外字典。
@@ -111,6 +166,9 @@ def create_profile(data: dict) -> dict:
     if not all(c.isalnum() or c in ("_", "-") for c in name):
         raise ValueError("Profile 名称只能包含字母、数字、下划线和连字符")
 
+    # G-1（2026-10-11）：数值参数钳制到合法区间（口径与 save_ai_config 一致）
+    data = _clamp_profile_params(data)
+
     try:
         with get_db() as conn:
             # 检查是否已存在
@@ -182,6 +240,16 @@ def create_profile(data: dict) -> dict:
 
 def update_profile(name: str, data: dict) -> dict:
     """更新 Profile"""
+    # G-1（2026-10-11）：只钳制 data 中实际提供的数值字段；未提供的保持
+    # None（COALESCE 会保留库内原值），不覆盖用户「仅改一个字段」的意图。
+    clamped = _clamp_profile_params(data)
+    out: dict = {}
+    for key, (lo, hi) in _PROFILE_RANGE.items():
+        if data.get(key) is None:
+            # 未提供 → 保持 COALESCE 原值（不写死默认值）
+            continue
+        out[key] = clamped[key]
+    data = {**data, **out}
     try:
         with get_db() as conn:
             existing = conn.execute("SELECT id FROM ai_profiles WHERE name = ?", (name,)).fetchone()

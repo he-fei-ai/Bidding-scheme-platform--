@@ -144,7 +144,7 @@ function TableBlock({ text }: { text: string }) {
 }
 
 // =============================================================
-// 1. 流程图（商业级：菱形决策 + 圆角矩形 + 折线 + 箭头）
+// 1. 流程图（扁平化：直角矩形 + 淡紫色系 + 深灰箭头）
 // =============================================================
 function FlowchartBlock({ data }: { data: any }) {
   const nodes: string[] = data?.nodes || [];
@@ -155,8 +155,8 @@ function FlowchartBlock({ data }: { data: any }) {
   }
 
   return (
-    <div style={{ margin: "12px 0", padding: 16, background: "linear-gradient(135deg, #f8faff 0%, #ffffff 100%)", border: "1px solid #d6e4ff", borderRadius: 8 }}>
-      <div style={{ fontWeight: 700, fontSize: 15, marginBottom: 14, color: "#1a3a8a", textAlign: "center", borderBottom: "1px solid #e6f0ff", paddingBottom: 10 }}>
+    <div style={{ margin: "12px 0", padding: 16, background: "#ffffff", border: "1px solid #D8D0F5", borderRadius: 8 }}>
+      <div style={{ fontWeight: 700, fontSize: 15, marginBottom: 14, color: "#2D2D3A", textAlign: "center", borderBottom: "1px solid #EDE9FE", paddingBottom: 10 }}>
         {title}
       </div>
       <div style={{ display: "flex", flexWrap: "wrap", justifyContent: "center", gap: 0 }}>
@@ -172,25 +172,17 @@ function FlowchartBlock({ data }: { data: any }) {
             >
               <div
                 style={{
-                  background: idx === 0
-                    ? "linear-gradient(135deg, #52c41a 0%, #73d13d 100%)"
-                    : idx === nodes.length - 1
-                    ? "linear-gradient(135deg, #f5222d 0%, #ff4d4f 100%)"
-                    : "linear-gradient(135deg, #e8f0fe 0%, #d2e3fc 100%)",
-                  border: idx === 0
-                    ? "2px solid #389e0d"
-                    : idx === nodes.length - 1
-                    ? "2px solid #cf1322"
-                    : "2px solid #1a73e8",
-                  borderRadius: 8,
+                  background: "#EDE9FE",
+                  border: "1px solid #9B8BE0",
+                  borderRadius: 0,
                   padding: "12px 18px",
                   minWidth: 110,
                   maxWidth: 180,
                   textAlign: "center",
-                  fontSize: 13,
-                  fontWeight: 600,
-                  color: idx === 0 || idx === nodes.length - 1 ? "#fff" : "#1a3a8a",
-                  boxShadow: "0 3px 8px rgba(26,115,232,0.15)",
+                  fontSize: 14,
+                  fontWeight: 400,
+                  color: "#2D2D3A",
+                  boxShadow: "none",
                 }}
               >
                 {node}
@@ -205,7 +197,7 @@ function FlowchartBlock({ data }: { data: any }) {
                   display: "flex",
                   alignItems: "center",
                   padding: "0 4px",
-                  color: "#1a73e8",
+                  color: "#333333",
                   fontSize: 22,
                   fontWeight: "bold",
                   marginTop: -10,
@@ -1280,12 +1272,13 @@ async function renderMermaidInto(container: HTMLDivElement, code: string): Promi
         securityLevel: "strict",
         fontFamily: "'Microsoft YaHei', sans-serif",
         themeVariables: {
-          primaryColor: "#1677ff",
-          primaryTextColor: "#333",
-          primaryBorderColor: "#1677ff",
-          lineColor: "#666",
-          secondaryColor: "#e6f4ff",
-          tertiaryColor: "#f5f5f5",
+          primaryColor: "#EDE9FE",
+          primaryTextColor: "#2D2D3A",
+          primaryBorderColor: "#9B8BE0",
+          lineColor: "#333333",
+          secondaryColor: "#EDE9FE",
+          tertiaryColor: "#F5F5F5",
+          fontSize: "14px",
         },
       });
       _mermaidInitialized = true;
@@ -1299,7 +1292,7 @@ async function renderMermaidInto(container: HTMLDivElement, code: string): Promi
 }
 
 /** Mermaid 内联渲染（懒加载 mermaid.js，与图表 Tab 使用同一渲染引擎） */
-function MermaidInlineBlock({ code, title }: { code: string; title: string }) {
+function MermaidInlineBlock({ code, title }: { code: string; title?: string }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [error, setError] = useState<string | null>(null);
   const renderIdRef = useRef(0);
@@ -1319,11 +1312,11 @@ function MermaidInlineBlock({ code, title }: { code: string; title: string }) {
     };
   }, [code]);
 
-  if (error) return <ChartPendingNotice title={title} message="图表渲染失败，请重新生成或查看导出文档" />;
+  if (error) return <ChartPendingNotice title={title || "图表"} message="图表渲染失败，请重新生成或查看导出文档" />;
 
   return (
     <div style={{ margin: "12px 0", textAlign: "center" }}>
-      <div style={{ fontWeight: 600, fontSize: 14, marginBottom: 8, color: "#1a3a8a" }}>{title}</div>
+      {title ? <div style={{ fontWeight: 600, fontSize: 14, marginBottom: 8, color: "#1a3a8a" }}>{title}</div> : null}
       <div ref={containerRef} style={{ overflowX: "auto" }} />
     </div>
   );
@@ -1613,7 +1606,7 @@ export default React.memo(function ContentPreview({ content, sectionCharts }: Co
           if (block.type === "mermaid") {
             // BUG-FIX 2026-10-08（P0）：正文围栏里的 mermaid 源码直接出图，
             // 不再以 pre-wrap 文本显示给用户。
-            return <MermaidInlineBlock key={idx} code={block.value} />;
+            return <MermaidInlineBlock key={idx} code={block.value} title="" />;
           }
           return (
             <p key={idx} style={{ margin: "6px 0", whiteSpace: "pre-wrap", textAlign: "justify" }}>

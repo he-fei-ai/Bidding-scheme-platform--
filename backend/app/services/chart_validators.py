@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-import asyncio
 
 
 """图表数据校验模块 - 遵循 v3.1 规范
@@ -994,15 +993,6 @@ def detect_chart_with_metadata(text: str) -> dict:
         "top_score": top_score,
         "patterns_matched": patterns_matched,
     }
-
-
-# AI调用超时装饰器
-async def with_timeout(coro, timeout: int = 30, error_msg: str = "AI调用超时"):
-    """带超时的AI调用装饰器"""
-    try:
-        return await asyncio.wait_for(coro, timeout=timeout)
-    except TimeoutError:
-        raise TimeoutError(f"{error_msg}（{timeout}秒）")
 
 
 # ===========================================================================

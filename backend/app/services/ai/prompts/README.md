@@ -179,7 +179,7 @@ grep -rn 'get_prompt("KEY_NAME")' app/
 - [ ] **破折号归一化**：`—` `–` 统一为 `--`
 - [ ] **运行测试**：`pytest tests/test_prompts_module_2026_10_04.py` 必须全绿
 - [ ] **拆分一致性**：拆分前请确认 prompts.py.legacy.bak 中存在该提示词
-- [ ] **DB 覆盖**：若修改硬编码，需要重新执行 `init_prompt_templates.py` 同步到 DB
+- [ ] **DB 覆盖**：若修改硬编码，需要同步到 DB——在提示词管理页点「同步硬编码」（`POST /prompts/sync-hardcode`），或对对应提示词执行「重置为默认」；首次初始化由启动期 `app/db.py::seed_prompt_templates()` 负责
 
 ---
 

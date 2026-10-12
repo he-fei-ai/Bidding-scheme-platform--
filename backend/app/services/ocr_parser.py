@@ -80,16 +80,38 @@ class MinerUParser:
         return self._stats.copy()
 
     def _get_cache_key(self, pdf_path: str) -> str:
-        """生成缓存 key（基于文件路径 + 修改时间）"""
+        """生成缓存 key（基于文件路径 + 修改时间 + 前 4KB 内容）。
+
+        BUG-FIX 2026-10-11（P3·OCR 缓存键亚秒碰撞）：原实现用
+        ``f'{pdf_path}:{mtime:.0f}'`` 把 mtime **截断到整秒**后求 MD5，存在与
+        ``pdf_export`` 缓存复用同源的亚秒缺陷——同一 PDF 在同一秒内被替换/重解析
+        时，新旧内容算出同一个 key，MinerU 缓存会把旧解析文本错配给新文件，用户
+        换正文后拿到的仍是旧摘要。现对齐 ``files._get_file_hash``（CF-03）的加固
+        口径，三步消除碰撞：
+          1. mtime 用 ``st_mtime_ns``（纳秒，亚秒精度），不再截断到秒；
+          2. 叠加文件大小，覆盖「纳秒刻度恰好相同的粗粒度文件系统」；
+          3. 无条件叠加前 4KB 内容哈希，从根上消除任何粒度碰撞（同 key 后果仅
+             缓存一次性失效→重解析一次，该哈希不落库、无兼容性影响）。
+        TOCTOU race 保留：stat() 期间文件被删则回退返回原路径（与旧行为一致）。
+        """
         path = Path(pdf_path)
         try:
-            mtime = path.stat().st_mtime
+            stat = path.stat()
         except (OSError, FileNotFoundError):
             # BUG-FIX 2026-10-08：TOCTOU race — exists() 检查与 stat() 之间
             # 文件可能被删除，导致 FileNotFoundError 未捕获
             return pdf_path
-        content_hash = hashlib.md5(f'{pdf_path}:{mtime:.0f}'.encode()).hexdigest()
-        return content_hash
+        digest = hashlib.md5(
+            f'{pdf_path}:{stat.st_size}:{stat.st_mtime_ns}'.encode()
+        ).hexdigest()
+        try:
+            with open(pdf_path, 'rb') as fh:
+                head = fh.read(4096)
+        except OSError:
+            # stat() 成功但 open() 失败（竞态删除/权限）：退回纯 mtime+size 键，
+            # 仍远优于原整秒截断键，且不抛异常打断解析链。
+            return digest
+        return hashlib.md5(digest.encode() + head).hexdigest()
 
     def _get_from_cache(self, cache_key: str) -> dict | None:
         """从缓存获取结果"""

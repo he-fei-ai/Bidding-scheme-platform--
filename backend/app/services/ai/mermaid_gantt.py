@@ -209,9 +209,6 @@ def _render_gantt_image_v2(plan: dict, highlight_critical_path: bool = False) ->
     if total_days <= 0:
         total_days = max_end or 90
 
-    # 阶段分组（如果有 section）
-    any("section" in (str(t.get("remark") or "").lower()) for t in tasks)
-
     # ---- 尺寸 ----
     scale = 2.5
     table_left = int(50 * scale)

@@ -262,6 +262,10 @@ def renumber_outline_ids(outline: list[dict]) -> tuple[list[dict], int]:
 
     只在门禁判定 id 缺失/非法/重复后调用。按位置重排能同时修好三种问题，
     且保证 L1/L2/L3 编号严格连续（1 / 1.1 / 1.1.1）。
+
+    ENHANCE 2026-10-12（P0-1）：如果 config.OUTLINE_NUMBERING_ENABLED=true，
+    同时用 outline_numbering 引擎计算 `number` 字段（模板化编号），
+    原 id 字段保持不变以维持向后兼容。
     """
     changed = 0
 
@@ -279,6 +283,17 @@ def renumber_outline_ids(outline: list[dict]) -> tuple[list[dict], int]:
             _walk(node.get("children"), new_id, level + 1)
 
     _walk(outline, "", 1)
+
+    # ENHANCE 2026-10-12（P0-1）：可选的模板化编号
+    try:
+        from ...config import OUTLINE_NUMBERING_ENABLED, OUTLINE_NUMBERING_TEMPLATE
+        if OUTLINE_NUMBERING_ENABLED:
+            from .outline_numbering import renumber_outline_with_template
+            renumber_outline_with_template(outline, mutate=True)
+    except Exception:
+        # 静默失败，不阻断主流程
+        pass
+
     return outline, changed
 
 
@@ -753,13 +768,19 @@ def compute_outline_facts(
                 )
 
     # 完全重复标题（归一化后相等）
-    exact_groups: dict[str, list[dict]] = {}
+    # 作用域：**同一父节点下**。跨父同名是标书合法形态（3.1 / 4.1 各自一节），
+    # 报成 error 会误伤正常目录；只有同父下的真·重复才需要限定语。
+    # 归一化用 `_title_core`（剥离「（其N）」等冗余后缀），否则遗留数据里
+    # 「X」与「X（其2）」会被当成两个不同标题而漏检。
+    from .outline_common import _title_core
+
+    exact_groups: dict[tuple[str, str], list[dict]] = {}
     for record in records:
         if not record["title"]:
             continue
-        key = _normalize_title_core(record["title"])
+        key = _title_core(record["title"])
         if key:
-            exact_groups.setdefault(key, []).append(
+            exact_groups.setdefault((record["parent_path"], key), []).append(
                 {"path": record["path"], "id": record["node_id"], "title": record["title"]}
             )
     duplicate_titles = [
@@ -768,7 +789,7 @@ def compute_outline_facts(
         if len(group) > 1
     ]
 
-    # 近义重复标题（同层级两两比对，规模过大时跳过，见 _NEAR_DUP_NODE_LIMIT）
+    # 近义重复标题（同父节点下同层级两两比对，规模过大时跳过，见 _NEAR_DUP_NODE_LIMIT）
     near_duplicates: list[dict] = []
     near_dup_skipped = False
     titled = [r for r in records if r["title"]]
@@ -777,8 +798,11 @@ def compute_outline_facts(
             for right in titled[i + 1 :]:
                 if left["level"] != right["level"]:
                     continue
+                # 跨父节点的同层标题是合法的（不同章节各一节），不参与重复判定
+                if left["parent_path"] != right["parent_path"]:
+                    continue
                 # 已被完全重复覆盖的组不再重复报近义
-                if _normalize_title_core(left["title"]) == _normalize_title_core(right["title"]):
+                if _title_core(left["title"]) == _title_core(right["title"]):
                     continue
                 is_dup, score = _is_title_duplicate(left["title"], right["title"])
                 if is_dup:

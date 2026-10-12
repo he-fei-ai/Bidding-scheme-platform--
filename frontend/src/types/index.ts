@@ -254,6 +254,20 @@ export interface DocumentCheckResult {
   control_char_sections?: { id: number; title: string; level: number }[];
   invalid_images?: string[];
   estimated_pages?: number;
+  // 内容质量规则（《文档质量分析报告》修复 15~24，2026-10-10）：
+  // 结构化问题清单，同类问题已聚合成 warnings 中的「[内容质量] …」条目
+  quality_issues?: QualityIssue[];
+}
+
+/** 内容质量规则 Issue（后端 quality_rules / chart_validators CMP-07 同形） */
+export interface QualityIssue {
+  rule_id: string;
+  severity: "high" | "medium" | "low";
+  title: string;
+  message: string;
+  suggestion?: string;
+  section_id?: number | null;
+  section_title?: string | null;
 }
 
 export interface ExportRecord {
@@ -273,6 +287,14 @@ export interface ExportResult {
   file_size: number;
   export_id?: number;
   check: DocumentCheckResult;
+  // ENHANCE 2026-10-11（P3·同步/SSE 导出响应类型对齐后端契约）：
+  // 后端同步 POST /export/docx（export.py）与 SSE completed 事件自 2026-10-04 起
+  // 除 file_path（已统一为下载 URL 口径）外还返回下列两字段；此前前端类型未声明，
+  // 消费者无法类型安全地读取，存在隐性数据丢失。纯新增可选字段，向后兼容。
+  /** 下载 API URL（export_id 缺失时为 null；与 file_path 同值，便于语义明确的消费） */
+  download_url?: string | null;
+  /** 磁盘相对路径（相对 PROJECTS_DATA_DIR，供运维排查与日志定位） */
+  relative_path?: string;
 }
 
 export interface AIConfig {
@@ -314,6 +336,7 @@ export interface TextProviderConfig {
   temperature: number;
   document_profile: string;
   is_active: boolean;
+  api_key_set?: boolean;
   updated_at?: string;
 }
 
@@ -331,6 +354,7 @@ export interface ImageProviderConfig {
   default_ratio: string;
   price_per_image: number;
   is_active: boolean;
+  api_key_set?: boolean;
   updated_at?: string;
 }
 

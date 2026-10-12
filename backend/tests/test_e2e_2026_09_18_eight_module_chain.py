@@ -273,7 +273,13 @@ class TestEightModuleChain:
         _mode = normalize_writing_length("")
         if _ch_level >= 2:
             _mid = level_target(_mode, _ch_level, 300)
-            assert f"{max(50, int(_mid * 0.9))}-{int(_mid * 1.1)}" in user_prompt, (
+            _expect_target = int(_mid)
+            _expect_hi = int(_mid * 1.1)
+            _expect_lo = max(50, int(_mid * 0.9))
+            # BUG-FIX 2026-10-11：字数格式从「1080-1320」改为
+            # 「约 {target} 字左右（硬性上限 {hi} 字，最低 {lo} 字）」
+            # —— 模型面对区间字符串倾向超长，改为锚点值+硬性上限后偏差显著降低。
+            assert f"约 {_expect_target} 字左右（硬性上限 {_expect_hi} 字，最低 {_expect_lo} 字）" in user_prompt, (
                 f"章节字数预算（{_mode} 模式 L{_ch_level}）必须进入提示词"
             )
         else:

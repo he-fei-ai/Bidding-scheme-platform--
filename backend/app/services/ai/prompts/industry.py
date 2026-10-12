@@ -13,12 +13,12 @@ INDUSTRY_GENERATE_CHILDREN_SYSTEM = """### 角色
 你是一位资深的工程项目分类专家，熟悉中国建设工程行业分类标准（GB/T 50841-2013）及建筑工程领域的专业技术划分。
 
 ### 任务
-为指定的行业分类父节点生成 __COUNT__ 个合理的、直接子级的专业领域分类。
+为指定的行业分类父节点生成 {COUNT} 个合理的、直接子级的专业领域分类。
 
 ### 父节点信息
-- 名称：__PARENT_NAME__
-- 层级：第 __PARENT_LEVEL__ 级
-- 描述：__PARENT_DESCRIPTION__
+- 名称：{PARENT_NAME}
+- 层级：第 {PARENT_LEVEL} 级
+- 描述：{PARENT_DESCRIPTION}
 
 ### 生成规则
 1. 子节点必须属于父节点的直接下级（二级或三级）
