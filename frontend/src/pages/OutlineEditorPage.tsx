@@ -8,20 +8,20 @@ import {
   ArrowLeftOutlined, ArrowRightOutlined, ThunderboltOutlined, EditOutlined, DeleteOutlined,
   PlusOutlined, ReloadOutlined, CloseCircleOutlined, CheckCircleOutlined, LoadingOutlined, MenuOutlined, UpOutlined,
   DownOutlined, DragOutlined, AuditOutlined, RobotOutlined, FolderOutlined,
-  RightOutlined,
+  RightOutlined, QuestionCircleOutlined,
 } from "@ant-design/icons";
 import { taskStore } from "@/services/taskStore";
 import {
   getProject, fetchSections, updateSection, deleteSection, createSection,
   moveSection, reorderSections, createOutlineEventSource, type OutlineEventSource,
   reviewOutline, reviewOutlineWithAutofix, clearSections, stopGeneration,
-  v51Confirm, fetchPendingV51Task, clearV51PendingTask,
+  v51Confirm, fetchPendingV51Task, clearV51PendingTask, getWordControlSettings,
+  type WordControlDerived,
   type OutlineMode, getStoredOutlineMode, storeOutlineMode,
 } from "../api";
 import type { SectionTreeNode } from "../types";
 import { extractApiError, annotateOutlineWithNumbers, getLevelColor, getLevelLabel, findNodeInTree, updateNodeInTree, OUTLINE_STEPS_V51, reduceOutlineGeneratingEvent, outlineDictToTreeNodes, nextFreeSortOrder, allocTempNodeId, normalizeNodeTitle } from "../utils";
 import RecoveryBanner from "../components/RecoveryBanner";
-import VersionHistory from "../components/VersionHistory";
 
 const { Text, Title } = Typography;
 
@@ -110,6 +110,44 @@ export default React.memo(function OutlineEditorPage() {
   // CROSS-FIX 2026-10-04（前后端同步）：目录生成模式（易标规格二.2 直出/分步）。
   // 默认 auto，与后端未传 outline_mode 时的旧行为一致；选择持久化 localStorage。
   const [outlineMode, setOutlineMode] = useState<OutlineMode>(getStoredOutlineMode());
+
+  // 易标 R6/R7 引用：字数控制配置下，当前目录叶子数是否落在允许区间。
+  // getWordControlSettings 的 derived 已含 current_leaf_count / leaf_outside_range / leaf_count_range。
+  const [leafWarn, setLeafWarn] = useState<{
+    configured: boolean;
+    outside: boolean;
+    current: number;
+    range: [number, number | null];
+  } | null>(null);
+
+  // 叶子数越界预警刷新：页面加载与每次目录落库变更后调用。
+  const refreshLeafWarn = useCallback(async () => {
+    if (!isProjectIdValid) return;
+    try {
+      const res = await getWordControlSettings(projectId);
+      const s = res?.settings;
+      const d: WordControlDerived | undefined = res?.derived;
+      const configured =
+        !!s && (s.minimum_words > 0 || s.maximum_words > 0 || s.section_words > 0);
+      if (configured && d) {
+        setLeafWarn({
+          configured: true,
+          outside: Boolean(d.leaf_outside_range),
+          current: typeof d.current_leaf_count === "number" ? d.current_leaf_count : 0,
+          range: d.leaf_count_range || [0, 0],
+        });
+      } else {
+        setLeafWarn({ configured: false, outside: false, current: 0, range: [0, 0] });
+      }
+    } catch {
+      // 配置缺失/接口异常时不阻塞目录编辑
+      setLeafWarn(null);
+    }
+  }, [projectId, isProjectIdValid]);
+
+  useEffect(() => {
+    void refreshLeafWarn();
+  }, [refreshLeafWarn]);
 
   const toggleCollapse = useCallback((nodeId: number, e: React.MouseEvent) => {
     e.stopPropagation();
@@ -450,9 +488,23 @@ export default React.memo(function OutlineEditorPage() {
         return;
       }
       try {
-        await updateSection(projectId, node.id, { title: newTitle });
-        setTree((prev) => updateNodeInTree(prev, node.id, { title: newTitle }));
-        message.success("标题已更新");
+        // BUG-FIX 2026-10-12（前后端标题分歧 / 双重编号）：
+        // 后端 `services.sections._strip_title_numbering` 会把用户输入的编号
+        // 前缀剥掉再入库（「1.1 施工部署」→ 存「施工部署」），但本处此前
+        // 丢弃服务端返回值、直接用原始 newTitle 更新本地树。于是：
+        //   界面显示「一、1.1 施工部署」（展示编号 + 标题内嵌编号），
+        //   DB 实际是「施工部署」，导出又是「一、施工部署」—— 三处对不上，
+        //   且只有手动刷新页面才会纠正。
+        // 改为以**服务端返回的规范标题**为准回写本地树；若后端剥过前缀，
+        // 额外提示一次，避免用户误以为保存失败。
+        const saved = await updateSection(projectId, node.id, { title: newTitle });
+        const canonicalTitle = typeof saved?.title === "string" ? saved.title : newTitle;
+        setTree((prev) => updateNodeInTree(prev, node.id, { title: canonicalTitle }));
+        if (canonicalTitle.trim() !== newTitle) {
+          message.info(`编号前缀已自动移除，保存为「${canonicalTitle}」`);
+        } else {
+          message.success("标题已更新");
+        }
       } catch {
         message.error("更新失败");
       }
@@ -487,6 +539,8 @@ export default React.memo(function OutlineEditorPage() {
       await deleteSection(projectId, node.id);
       setTree((prev) => removeNodeFromTree(prev, node.id));
       message.success("已删除");
+      // 易标 R6/R7：删除节点会改变叶子数，刷新越界预警
+      void refreshLeafWarn();
     } catch {
       message.error("删除失败");
     }
@@ -535,6 +589,8 @@ export default React.memo(function OutlineEditorPage() {
         };
         setTree((prev) => addChildToTree(prev, parentId, newNode));
         message.success("已添加");
+        // 易标 R6/R7：新增节点会改变叶子数，刷新越界预警
+        void refreshLeafWarn();
       } catch {
         message.error("添加失败");
       }
@@ -621,6 +677,8 @@ export default React.memo(function OutlineEditorPage() {
       } else {
         message.warning(`自动修复后仍有问题：${result.issues.slice(0, 3).join("；")}`);
       }
+      // 易标 R6/R7：目录结构变化后刷新叶子数越界预警
+      void refreshLeafWarn();
     } catch (e: any) {
       message.error(extractApiError(e));
     }
@@ -755,6 +813,17 @@ export default React.memo(function OutlineEditorPage() {
 
   const totalNodes = countTotalNodes(tree);
   const annotatedTree = useMemo(() => annotateOutlineWithNumbers(tree), [tree]);
+  // ENHANCE 2026-10-12（编号命名空间统一）：V5.1 审核弹窗此前自己用
+  // `index+1` / `index+1.ci+1` / `index+1.ci+1.gi+1` 现算了一套**独立**编号，
+  // 与主目录树（第一节、/ 一、/ 1、，来自 utils.formatV21Heading）、后端
+  // 落库口径（1 / 1.2 / 1.2.3）三套并存 —— 同一页面内两处显示不同编号，
+  // 用户在审核阶段看到的序号与最终目录/导出完全对不上。
+  // 现复用主树同一份 annotateOutlineWithNumbers，审核弹窗与主树、后端
+  // 「层级由树位置派生」这一条不变量对齐。
+  const annotatedReviewTree = useMemo(
+    () => (pendingReviewTree ? annotateOutlineWithNumbers(pendingReviewTree) : null),
+    [pendingReviewTree],
+  );
 
   // ===== V5.1 人工审核处理函数 =====
   const handleReviewEditTitle = (nodeId: number, value: string) => {
@@ -851,6 +920,8 @@ const applyTitles = (nodes: SectionTreeNode[]): SectionTreeNode[] =>
       }
       setReviewModalVisible(false);
       setReviewConfirmed(true);
+      // 易标 R6/R7：最终目录保存后刷新叶子数越界预警
+      void refreshLeafWarn();
     } catch (e: any) {
       message.destroy("v51_review");
       message.error("审核确认失败: " + (extractApiError(e) || "未知错误"));
@@ -1159,7 +1230,20 @@ const applyTitles = (nodes: SectionTreeNode[]): SectionTreeNode[] =>
       {tree.length > 0 && (
         <Card
           size="small"
-          title={<span><FolderOutlined /> 目录结构</span>}
+          title={
+            <Space>
+              <FolderOutlined />
+              <span>目录结构</span>
+              <Tooltip title="查看字数控制标准（易标 R1–R15）">
+                <Button
+                  type="text"
+                  size="small"
+                  icon={<QuestionCircleOutlined />}
+                  onClick={() => navigate("/word-control-standard")}
+                />
+              </Tooltip>
+            </Space>
+          }
           extra={
             <Space>
               <Button
@@ -1189,6 +1273,30 @@ const applyTitles = (nodes: SectionTreeNode[]): SectionTreeNode[] =>
             type="info"
             showIcon
           />
+          {/* 易标 R6/R7 引用：叶子（小节）数越界预警，手工编辑目录后可能使正文字数不符合预期 */}
+          {leafWarn && leafWarn.configured && (
+            <Alert
+              style={{ marginTop: 12 }}
+              type={leafWarn.outside ? "warning" : "success"}
+              showIcon
+              message={
+                leafWarn.outside
+                  ? "当前目录叶子数可能不符合字数控制预期"
+                  : "当前目录叶子数在允许区间内"
+              }
+              description={
+                <span style={{ fontSize: 12 }}>
+                  目标小节数允许区间（易标 R6/R7）：
+                  <Text strong>{leafWarn.range[0]}</Text> ~{" "}
+                  <Text strong>{leafWarn.range[1] ?? "不限"}</Text> 节；
+                  当前目录共 <Text strong>{leafWarn.current}</Text> 个叶子章节。
+                  {leafWarn.outside
+                    ? " 您手动修改的目录可能导致生成正文字数不符合预期，建议调整字数配置或重新生成目录。"
+                    : " 已满足字数控制要求。"}
+                </span>
+              }
+            />
+          )}
         </Card>
       )}
 
@@ -1270,7 +1378,7 @@ const applyTitles = (nodes: SectionTreeNode[]): SectionTreeNode[] =>
           </div>
         </div>
         <div style={{ maxHeight: 450, overflowY: "auto", border: "1px solid #f0f0f0", borderRadius: 6, padding: "8px 4px" }}>
-          {pendingReviewTree?.map((node, index) => (
+          {annotatedReviewTree?.map((node, index) => (
             <div key={node.id}>
               <div
                 style={{
@@ -1283,7 +1391,7 @@ const applyTitles = (nodes: SectionTreeNode[]): SectionTreeNode[] =>
                 }}
               >
                 <span style={{ color: "#8c8c8c", fontSize: 11, minWidth: 20, textAlign: "center" }}>
-                  {index + 1}
+                  {node.number || index + 1}
                 </span>
                 <span style={{ color: getLevelColor(1), fontSize: 11, fontWeight: 600, minWidth: 48, flexShrink: 0 }}>
                   {getLevelLabel(1)}
@@ -1344,7 +1452,7 @@ const applyTitles = (nodes: SectionTreeNode[]): SectionTreeNode[] =>
                     }}
                   >
                     <span style={{ color: "#bbb", fontSize: 10, minWidth: 30, textAlign: "right" }}>
-                      {index + 1}.{ci + 1}
+                      {child.number || `${index + 1}.${ci + 1}`}
                     </span>
                     <span style={{ color: getLevelColor(2), fontSize: 10, fontWeight: 500, minWidth: 36, flexShrink: 0 }}>
                       {getLevelLabel(2)}
@@ -1390,7 +1498,7 @@ const applyTitles = (nodes: SectionTreeNode[]): SectionTreeNode[] =>
                         }}
                       >
                         <span style={{ color: "#ccc", fontSize: 10, minWidth: 45, textAlign: "right" }}>
-                          {index + 1}.{ci + 1}.{gi + 1}
+                          {grandchild.number || `${index + 1}.${ci + 1}.${gi + 1}`}
                         </span>
                         <span style={{ color: getLevelColor(3), fontSize: 10, fontWeight: 400, minWidth: 36, flexShrink: 0 }}>
                           {getLevelLabel(3)}

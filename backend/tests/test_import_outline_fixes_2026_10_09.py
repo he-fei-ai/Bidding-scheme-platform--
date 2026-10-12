@@ -27,6 +27,7 @@ O-2  编号命名空间统一：_renumber_items 是死代码，落库目录树�
 
 import asyncio
 import inspect
+import re
 import sys
 import time
 from pathlib import Path
@@ -150,12 +151,19 @@ class TestParseCacheInvalidation:
         )
 
     def test_async_parse_task_clears_cache_before_extract(self):
-        """源码断言：清缓存必须先于解析调用（防后续重构破坏时序）。"""
-        src = self._task_source()
-        assert "_clear_parse_cache(file_path)" in src
-        assert src.index("_clear_parse_cache(file_path)") < src.index(
-            "extract_text_from_path(file_path)"
-        )
+        """源码断言：清缓存必须先于解析调用（防后续重构破坏时序）。
+
+        R-3/BUG-5 2026-10-12：解析+落盘+终态逻辑已下沉到
+        ``services.files._persist_file_extraction``，缓存清先于解析的时序转而由该
+        函数保证，本用例据此改为检查该函数源码。
+        """
+        import inspect
+
+        from app.services import files as fmod
+
+        src = inspect.getsource(fmod._persist_file_extraction)
+        assert "_clear_parse_cache(" in src
+        assert src.index("_clear_parse_cache(") < src.index("extract_text_from_path(")
 
     def test_async_parse_task_actually_invokes_cache_clear(self, monkeypatch, tmp_path):
         """行为断言：任务内真实调用 _clear_parse_cache，且带的是待解析文件路径。"""
@@ -222,19 +230,37 @@ class TestParseCacheInvalidation:
 # ============================================================================
 class TestUploadedFilesScopedByProject:
     def test_parse_task_updates_scoped_by_project(self):
+        """uploaded_files 的写操作必须按 project_id 收敛。
+
+        R-3/BUG-5 2026-10-12：原 task 内的两处 UPDATE 已下沉到
+        ``services.files._persist_file_extraction``，异常兜底里的 failed UPDATE 仍
+        留在 task。故分两处校验，且两处合计至少 3 处 uploaded_files 更新都带
+        project_id 作用域。
+        """
+        import inspect
+
+        from app.services import files as fmod
+
+        fs_src = inspect.getsource(fmod._persist_file_extraction)
         text = (BACKEND_DIR / "app" / "tasks" / "__init__.py").read_text(encoding="utf-8")
         # 去掉整行注释，防止修复注释里引用旧写法造成假阳性
-        src = "\n".join(
+        task_src = "\n".join(
             line for line in text.splitlines() if not line.lstrip().startswith("#")
         )
-        assert "SET status = 'processing' WHERE id = ? AND project_id = ?" in src, (
+        # 归一化 Python 的隐式字符串拼接：把相邻字面量之间的
+        # 「引号 + 换行 + 缩进 + 引号」折叠掉，使跨行书写的 SQL 在源码里
+        # 表现为单行形态。否则同一段 SQL 仅因排版方式不同就会让源码断言假阴性
+        # （R-3 重构把长 UPDATE 拆成两个相邻字面量即触发过此问题）。
+        task_src = re.sub(r'"[ \t]*\n[ \t]*"', "", task_src)
+        assert "SET status = 'processing' WHERE id = ? AND project_id = ?" in fs_src, (
             "processing 更新未按 project_id 收敛"
         )
-        assert "SET status = ?, extracted_text_path = ?, message = ?" in src
-        assert "SET status = 'failed', message = ?" in src
-        assert src.count("AND project_id = ?") >= 3, (
-            "三处 uploaded_files 更新必须都带 project_id 作用域"
-        )
+        assert "SET status = ?, extracted_text_path = ?, message = ?" in fs_src
+        # task 异常兜底里的 failed UPDATE 仍按项目收敛（单行即可匹配，跨行 SQL 不可直接拼接断言）
+        assert "SET status = 'failed', message = ?" in task_src
+        assert (
+            fs_src.count("AND project_id = ?") + task_src.count("AND project_id = ?") >= 3
+        ), "三处 uploaded_files 更新必须都带 project_id 作用域"
 
     def test_re_extract_update_scoped_by_project(self):
         from app.services.files import re_extract_text

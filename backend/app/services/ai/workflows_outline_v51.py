@@ -4591,7 +4591,27 @@ def _auto_fix_issues(level1: list[dict], issues: list[str]) -> list[dict]:
                                     and 0 <= k < len(l2_children)
                                     and isinstance(l2_children[k], dict)
                                 ):
-                                    l2_children[k]["title"] = f"内容{k + 1}"
+                                    # BUG-FIX 2026-10-12（P1）：原写死
+                                    # `f"内容{k + 1}"` —— 零语义的纯序号占位，
+                                    # 与「专项6」同属用户投诉的占位泛化标题。
+                                    # 改为按父级语义派生（与同函数「无二级/无三级
+                                    # 子目录」分支已用的 `_derive_child_title`
+                                    # 同一套规则），既无占位又不与兄弟撞名。
+                                    from .outline_common import _derive_child_title
+
+                                    _used_l3: set[str] = {
+                                        str(_s.get("title") or "").strip()
+                                        for _s in l2_children
+                                        if isinstance(_s, dict)
+                                    }
+                                    _used_l3.discard("")
+                                    l2_children[k]["title"] = _derive_child_title(
+                                        children[j].get("title", ""),
+                                        k,
+                                        _used_l3,
+                                        level=3,
+                                        grandparent_title=level1[i].get("title", ""),
+                                    )
                 except (ValueError, IndexError):
                     pass
 
@@ -5006,6 +5026,119 @@ def _collect_gate_suggestions(verdict: dict, max_items: int = 8) -> list[str]:
     return out
 
 
+def _post_selfcheck_title_safety_net(outline: list[dict]) -> list[dict]:
+    """AI 自检之后的标题兜底：清洗占位/泛化标题 + 同级去重。
+
+    BUG-FIX 2026-10-12（P1 · 目录脏标题漏出）：`_self_check_v51` 会**改标题**——
+      1) `_quick_local_check` 检出空标题/同级重名后交给 `_auto_fix_issues` 重命名，
+         而它的兜底文案是「子章节N」「内容N」这类无语义占位；
+      2) `outline_gate.reorder_by_zone` 会整章搬移节点，父子关系变化后
+         同级重名可能新出现。
+    但三级标题质量收口链（清洗 → 去重 → 具体性校验 → AI 修复）此前整体跑在
+    `_self_check_v51` **之前**，自检引入的新问题没有任何一道防线再兜一次，
+    占位标题与重复标题直接进入最终审核与落库。这正是用户报告的
+    「三级标题大量是占位式泛化名称（专项6/总体实施策划（2））」能绕过全部
+    规则清洗直抵界面的结构性原因。
+
+    此处补上自检后的最后一道规则兜底。刻意**不再调 AI**：自检已在其后执行过
+    AI 语义审查，且再插一轮 AI 调用会显著拉长生成时长；AI 精化仍由
+    `_l3_specificity_closeout` 在生成中段承担。
+
+    只做规则操作（幂等、纯本地、不抛异常），任何异常都原样返回入参目录，
+    绝不阻断生成。
+    """
+    if not isinstance(outline, list):
+        return outline
+    try:
+        _fixed = _cleanup_placeholder_titles(outline)
+        outline = _uniquify_outline_titles(outline)
+        # 清洗可能与既有兄弟节点撞名，再收一次（幂等）
+        _fixed2 = _cleanup_placeholder_titles(outline)
+        if _fixed or _fixed2:
+            logger.info(
+                "V5.1 自检后标题兜底: 清洗 %d 个占位/泛化三级标题", _fixed + _fixed2
+            )
+        return outline
+    except Exception as _e:
+        logger.warning("V5.1 自检后标题兜底异常（已忽略）: %s", _e)
+        return outline
+
+
+async def _l3_specificity_closeout(
+    provider: Any,
+    outline: list[dict],
+    *,
+    summary: str = "",
+    tender_context: str = "",
+    boq_text: str = "",
+    project_scope: str = "",
+    phase_callback: Callable | None = None,
+    phase_label: str = "V5.1标题质量",
+) -> list[dict]:
+    """三级标题「具体性校验 → AI 修复 → 二次收口」。
+
+    与 `_apply_l3_quality_closeout` 的分工：后者是**完整收口**（清洗 → 去重 →
+    本函数），供直出路径在生成末尾整体调用；本函数只做**具体性**那一段，供
+    分步路径在「清洗 → 去重」之后、以及审核回灌重生成路径单独复用。
+
+    抽出独立函数的原因（BUG-FIX 2026-10-12）：分步主路径与审核回灌路径此前各自
+    内联了一份逻辑完全相同、但极易漂移的代码块（回灌那份还漏掉了 AI 修复环节），
+    两处口径不一致。统一后新增调用点只需一行。
+
+    ⚠️ 接线契约：本函数不得返回 int（历史上 `_cleanup_placeholder_titles` 的返回值
+    被误赋给目录树变量，导致目录树退化为 int 并在下游抛
+    `TypeError: 'int' object is not iterable`，让整条审核回灌路径静默失效）。
+    """
+    try:
+        _passed, _warnings = validate_l3_specificity(outline)
+        if not _passed and provider is not None:
+            if phase_callback:
+                await phase_callback(
+                    phase_label,
+                    f"检测到 {len(_warnings)} 个缺乏项目针对性的三级标题，正在修复...",
+                )
+            outline = await repair_l3_generic_titles(
+                provider,
+                outline,
+                summary or "",
+                tender_context or "",
+                boq_text or "",
+                "",
+                "",
+                project_scope or "",
+            )
+            # 修复后再次收口（与分步路径一致）：AI 修复结果可能引入新的占位/重复。
+            # ⚠️ _cleanup_placeholder_titles 返回清洗计数（int），不可赋给 outline。
+            _cleanup_placeholder_titles(outline)
+            outline = _uniquify_outline_titles(outline)
+            _passed2, _warnings2 = validate_l3_specificity(outline)
+            logger.info(
+                "%s: 三级标题具体性校验 %d → %d 个问题（修复后 %s）",
+                phase_label,
+                len(_warnings),
+                len(_warnings2),
+                "通过" if _passed2 else "仍有残留",
+            )
+        elif not _passed:
+            # 无 AI provider（离线/未配置密钥）时，validate 发现的问题只能停留在
+            # 规则兜底标题。显式暴露，避免用户无法区分「已精化」与「规则兜底」。
+            logger.warning(
+                "%s: %d 个三级标题由规则兜底生成（未配置 AI provider）。样例: %s",
+                phase_label,
+                len(_warnings),
+                "、".join(w["title"] for w in _warnings[:3]),
+            )
+            if phase_callback:
+                await phase_callback(
+                    phase_label,
+                    f"{len(_warnings)} 个三级标题为规则兜底生成，配置 AI 后可自动精化",
+                )
+    except Exception as _e:
+        # 具体性收口属增强环节，任何异常都不得阻断目录生成
+        logger.warning("%s 异常（已忽略，保留当前目录）: %s", phase_label, _e)
+    return outline
+
+
 async def _apply_l3_quality_closeout(
     provider: Any,
     outline: list[dict],
@@ -5050,54 +5183,16 @@ async def _apply_l3_quality_closeout(
         logger.info(
             "V5.1直出路径 L3质量收口: 清洗 %d 个占位/泛化三级标题", _cleaned
         )
-    try:
-        _passed, _warnings = validate_l3_specificity(outline)
-        if not _passed and provider is not None:
-            if phase_callback:
-                await phase_callback(
-                    "V5.1标题质量",
-                    f"检测到 {len(_warnings)} 个缺乏项目针对性的三级标题，正在修复...",
-                )
-            outline = await repair_l3_generic_titles(
-                provider,
-                outline,
-                summary or "",
-                tender_context or "",
-                boq_text or "",
-                "",
-                "",
-                project_scope or "",
-            )
-            # 修复后再次收口（与分步路径一致）：AI 修复结果可能引入新的占位/重复。
-            # ⚠️ _cleanup_placeholder_titles 返回清洗计数（int），不可赋给 outline，
-            # 否则目录树被替换为 int，后续 _uniquify_outline_titles 崩溃
-            # （'int' object is not iterable）——2026-10-11 固化回归。
-            _cleaned_after = _cleanup_placeholder_titles(outline)
-            outline = _uniquify_outline_titles(outline)
-            _passed2, _warnings2 = validate_l3_specificity(outline)
-            logger.info(
-                "V5.1直出路径 L3质量收口: 具体性校验 %d → %d 个问题（修复后 %s）",
-                len(_warnings),
-                len(_warnings2),
-                "通过" if _passed2 else "仍有残留",
-            )
-        elif not _passed:
-            # 无 AI provider（离线/未配置密钥）时，validate 发现的问题只能停留在
-            # 规则兜底标题，显式暴露，避免用户无法区分「已精化」与「规则兜底」。
-            logger.warning(
-                "V5.1直出路径 L3质量收口: %d 个三级标题由规则兜底生成"
-                "（未配置 AI provider）。样例: %s",
-                len(_warnings),
-                "、".join(w["title"] for w in _warnings[:3]),
-            )
-            if phase_callback:
-                await phase_callback(
-                    "V5.1标题质量",
-                    f"{len(_warnings)} 个三级标题为规则兜底生成，配置 AI 后可自动精化",
-                )
-    except Exception as _e:
-        # 质量收口属增强环节，任何异常都不得阻断目录生成
-        logger.warning("V5.1直出路径 L3质量收口异常（已忽略）: %s", _e)
+    outline = await _l3_specificity_closeout(
+        provider,
+        outline,
+        summary=summary or "",
+        tender_context=tender_context or "",
+        boq_text=boq_text or "",
+        project_scope=project_scope or "",
+        phase_callback=phase_callback,
+        phase_label="V5.1直出路径 L3质量收口",
+    )
     logger.info(
         "[V5.1-PHASE] 直出路径 L3质量收口耗时: %.1fs", time.monotonic() - _t_phase
     )
@@ -5415,57 +5510,18 @@ async def generate_outline_v51(
         level1 = _uniquify_outline_titles(level1)
         if _cleaned_l3:
             logger.info("V5.1 L3质量收口: 清洗 %d 个占位/泛化三级标题", _cleaned_l3)
-        try:
-            _passed, _l3_warnings = validate_l3_specificity(level1)
-            if not _passed and provider is not None:
-                if phase_callback:
-                    await phase_callback(
-                        "V5.1标题质量",
-                        f"检测到 {len(_l3_warnings)} 个缺乏项目针对性的三级标题，正在修复...",
-                    )
-                level1 = await repair_l3_generic_titles(
-                    provider,
-                    level1,
-                    summary or "",
-                    tender_context or "",
-                    boq_text or "",
-                    "",
-                    "",
-                    project_scope or "",
-                )
-                # 与上同：清洗先行，避免去重把裸编号后缀挪到标题中间导致清洗失效
-                # ⚠️ _cleanup_placeholder_titles 返回清洗计数（int），不可赋给 level1，
-                # 否则目录树被替换为 int，后续 _uniquify_outline_titles 崩溃
-                # （'int' object is not iterable）——2026-10-11 固化回归。
-                _cleaned_l3_after = _cleanup_placeholder_titles(level1)
-                level1 = _uniquify_outline_titles(level1)
-                _passed2, _l3_warnings2 = validate_l3_specificity(level1)
-                logger.info(
-                    "V5.1 L3质量收口: 具体性校验 %d → %d 个问题（修复后 %s）",
-                    len(_l3_warnings),
-                    len(_l3_warnings2),
-                    "通过" if _passed2 else "仍有残留",
-                )
-            elif not _passed:
-                # 2026-10-10 加固：无 AI provider（离线/未配置密钥）时，
-                # validate 发现的问题只能停留在规则兜底标题。此处显式暴露，
-                # 否则用户在界面上无法区分「标题已由 AI 精化」与「标题为
-                # 规则组合生成」，只能靠肉眼比对质量。
-                logger.warning(
-                    "V5.1 L3质量收口: %d 个三级标题由规则兜底生成"
-                    "（未配置 AI provider，跳过 AI 精化）。样例: %s",
-                    len(_l3_warnings),
-                    "、".join(w["title"] for w in _l3_warnings[:3]),
-                )
-                if phase_callback:
-                    await phase_callback(
-                        "V5.1标题质量",
-                        f"{len(_l3_warnings)} 个三级标题为规则兜底生成，"
-                        "配置 AI 后可自动精化",
-                    )
-        except Exception as _e:
-            # L3 质量收口属增强环节，任何异常都不得阻断目录生成
-            logger.warning("V5.1 L3质量收口异常（已忽略，保留当前目录）: %s", _e)
+        # BUG-FIX 2026-10-12：与审核回灌路径共用同一实现，消除两处内联副本的漂移
+        # （回灌那份此前整体缺失「具体性校验 → AI 修复」环节）。
+        level1 = await _l3_specificity_closeout(
+            provider,
+            level1,
+            summary=summary or "",
+            tender_context=tender_context or "",
+            boq_text=boq_text or "",
+            project_scope=project_scope or "",
+            phase_callback=phase_callback,
+            phase_label="V5.1标题质量",
+        )
         logger.info(
             "[V5.1-PHASE] L3标题质量收口耗时: %.1fs", time.monotonic() - _t_phase
         )
@@ -5503,6 +5559,7 @@ async def generate_outline_v51(
     logger.info(
         "[V5.1-PHASE] AI 自检阶段耗时: %.1fs", time.monotonic() - _t_phase
     )
+    level1 = _post_selfcheck_title_safety_net(level1)
 
     # ===== ENHANCE 2026-10-09（文档五）：审核不通过 → 带建议重生成一次 =====
     # 文档五的闭环是「生成 → 审核 → 审核建议回灌 → 二次生成」，而不是把有问题的
@@ -5551,8 +5608,35 @@ async def generate_outline_v51(
                 _retry_tree, _ = _tech_enhance_titles(_retry_tree)
                 # 2026-10-11 修复（O-10）：与主路径一致，_ensure_min_children / _tech_enhance_titles
                 # 之后必须执行清洗+去重，避免引入的占位标题和重复标题遗留到最终输出。
-                _retry_tree = _cleanup_placeholder_titles(_retry_tree)
+                #
+                # BUG-FIX 2026-10-12（P0）：原写作 `_retry_tree = _cleanup_placeholder_titles(...)`，
+                # 而该函数返回的是**清洗计数 int**（不是目录树）——`_retry_tree` 立刻退化为
+                # int，随后的 `_uniquify_outline_titles(int)` 静默 no-op（内部 isinstance
+                # 守卫），再传给 `_self_check_v51(int, ...)` 抛
+                # `TypeError: 'int' object is not iterable`，被下方 `except Exception` 吞掉
+                # 只留一条 warning。净效果：**「审核不通过 → 带建议重生成」整条路径 100% 失效**，
+                # 每次都走到 "重生成失败，保留原目录"。同类缺陷在主路径已于 2026-10-11 修复
+                # （见本文件 L5437-5439 注释），本处当时漏改。改为分离返回值与目录树。
+                _retry_ph_fixed = _cleanup_placeholder_titles(_retry_tree)
+                if _retry_ph_fixed:
+                    logger.info(
+                        "V5.1 审核回灌：清洗 %d 个占位/泛化三级标题", _retry_ph_fixed
+                    )
                 _retry_tree = _uniquify_outline_titles(_retry_tree)
+                # BUG-FIX 2026-10-12（P1）：重生成路径此前只有规则清洗，缺少主路径的
+                # 「具体性校验 → AI 修复 → 二次收口」，与主路径质量口径不一致
+                # （门禁重排后新引入的泛化标题不会被 AI 精化）。
+                if OUTLINE_L3_QUALITY_ENHANCE_ENABLED:
+                    _retry_tree = await _l3_specificity_closeout(
+                        provider,
+                        _retry_tree,
+                        summary=summary or "",
+                        tender_context=tender_context or "",
+                        boq_text=boq_text or "",
+                        project_scope=project_scope or "",
+                        phase_callback=phase_callback,
+                        phase_label="V5.1审核回灌",
+                    )
                 _retry_verdict: dict = {}
                 _retry_tree = await _self_check_v51(
                     provider,
@@ -5565,6 +5649,7 @@ async def generate_outline_v51(
                     word_budget_text=_word_budget_text,
                     verdict_out=_retry_verdict,
                 )
+                _retry_tree = _post_selfcheck_title_safety_net(_retry_tree)
                 _before = int(_gate_verdict.get("issue_count") or 0)
                 _after = int(_retry_verdict.get("issue_count") or 0)
                 if _after < _before:

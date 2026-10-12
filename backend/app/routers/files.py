@@ -33,6 +33,17 @@ class FileRoleUpdate(BaseModel):
 
     file_role: str = Field(..., description='文件角色：main 或 supporting')
 
+
+class SupportedFormatsResponse(BaseModel):
+    """支持的上传格式清单（TD6 2026-10-12 单一真相端点）"""
+
+    extensions: list[str] = Field(..., description='带点的扩展名列表，如 [".docx", ".pdf"]')
+    accept: str = Field(..., description='可直接用于 <input accept> 的逗号分隔字符串')
+    image_extensions: list[str] = Field(..., description='走 OCR 的图片扩展名')
+    max_file_size: int = Field(..., description='单文件大小上限（字节）')
+    max_file_size_mb: int = Field(..., description='单文件大小上限（MB，便于展示）')
+    ocr_enabled: bool = Field(..., description='OCR 引擎是否已启用（图片能否解析出文本）')
+
 def allowed_extension(filename: str) -> bool:
     """检查文件扩展名是否允许"""
     if not filename or '.' not in filename:
@@ -83,6 +94,45 @@ async def upload_file(project_id: int, file: UploadFile=File(...), file_role: st
     except Exception as e:
         logger.error('文件上传失败 [%s]: %s', file.filename, e, exc_info=True)
         raise HTTPException(status_code=500, detail='文件上传失败，请检查日志') from e
+
+@router.get('/supported-formats')
+async def get_supported_formats(
+    project_id: int,
+    current_user: Annotated[object, Depends(get_current_user)]=None,
+):
+    """返回本项目可上传的格式清单（TD6 2026-10-12 单一真相端点）
+
+    **为什么需要这个端点（技术债 TD6）**
+
+    支持格式的权威定义只有一处：``services/files.SUPPORTED_EXTENSIONS``。
+    路由层的白名单已于 2026-10-05 改为从它派生（见文件头 ALLOWED_EXTENSIONS），
+    但**前端 Upload.Dragger 的 accept 属性仍是一份手工维护的字符串副本**
+    （frontend/src/pages/FileUploadPage.tsx:379）。历史上同一类副本已经造成过
+    真实故障：服务层早已支持 .wps 与图片 OCR，路由层白名单却没放行，
+    导致扫描件与 WPS 文档「入口封死」，用户完全无法上传（见文件头 BUG-FIX 2026-09-18）。
+    同一个故障模式在前端一侧没有任何回归保护 —— 后端有
+    ``tests/test_import_enhancements_2026_10_05.py`` 钉住两个集合相等，前端没有。
+
+    本端点把唯一真相暴露给前端：``accept`` 字符串由 ``SUPPORTED_EXTENSIONS``
+    现场生成，前端改为运行时拉取并驱动 ``Upload.Dragger.accept``，
+    从此「后端加一个格式」不再需要人工同步三处字符串。
+
+    行为兼容性：
+      - 老前端不调用本端点时，上传路径完全不变（本端点是纯新增只读端点）。
+      - 前端拉取失败时回落到本地常量，不影响上传。
+      - 仍以 ``ALLOWED_EXTENSIONS`` 做服务端最终校验，前端 accept 只是筛选提示。
+    """
+    await enforce_project_access(project_id, current_user)
+    exts = sorted(ALLOWED_EXTENSIONS)
+    return SupportedFormatsResponse(
+        extensions=exts,
+        accept=",".join(exts),
+        image_extensions=sorted(file_service.IMAGE_EXTENSIONS),
+        max_file_size=MAX_FILE_SIZE,
+        max_file_size_mb=MAX_FILE_SIZE // (1024 * 1024),
+        ocr_enabled=bool(getattr(file_service, "OCR_ENABLED", False)),
+    )
+
 
 @router.get('')
 async def list_files(project_id: int, current_user: Annotated[object, Depends(get_current_user)]=None):

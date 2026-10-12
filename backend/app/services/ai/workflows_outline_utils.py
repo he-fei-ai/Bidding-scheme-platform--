@@ -1014,6 +1014,50 @@ async def repair_l3_generic_titles(
             continue
         repair_tasks.append((path, node, l1_title, parent_title, l3_title))
 
+    # BUG-FIX 2026-10-12（P1）：AI 复读/返回占位时**不再原样保留脏标题**，
+    # 改为回落到规则化语义标题。旧行为下「专项7」被拒绝后，节点标题仍是
+    # 「总体实施策划（2）」/「专项6」这类占位名，等于白调一次 AI 且把脏标题
+    # 原样带进最终审核与落库（`_cleanup_placeholder_titles` 只在 level>=3 清洗，
+    # 若该节点位于更深层级或后续结构被改动，脏标题就漏出去了）。
+    # 规则兜底 `_semantic_fallback_title` 以「工程实体 × 专业维度」组合生成，
+    # 保证有意义、唯一、且绝不带裸编号后缀。
+    _global_used_titles: set[str] = set()
+
+    def _collect_used(nodes: Any) -> None:
+        if not isinstance(nodes, list):
+            return
+        for _n in nodes:
+            if not isinstance(_n, dict):
+                continue
+            _t = (_n.get("title") or "").strip()
+            if _t:
+                _global_used_titles.add(_t)
+            _collect_used(_n.get("children"))
+
+    _collect_used(repaired)
+
+    def _rule_based_fallback(
+        node: dict, l1_title: str, l2_title: str, path: str
+    ) -> str:
+        """按父级语义生成一个具体、非占位的兜底标题（不含裸编号后缀）。"""
+        try:
+            from .outline_common import _semantic_fallback_title
+
+            _parent = l2_title or l1_title or "工程实施"
+            # idx 取路径末段（同级 1-based 序号），使同父下的多个兜底标题彼此错开
+            _parts = [p for p in str(path or "").split(".") if p.isdigit()]
+            _idx = int(_parts[-1]) if _parts else 0
+            _new = _semantic_fallback_title(
+                _parent,
+                _idx,
+                set(_global_used_titles),
+                context_title=l1_title or "",
+            )
+            return _new or ""
+        except Exception as _fe:  # noqa: BLE001
+            logger.debug("[L3修复] 规则兜底标题生成失败: %s", _fe)
+            return ""
+
     async def _repair_one(
         path: str, node: dict, l1_title: str, l2_title: str, l3_title: str
     ) -> None:
@@ -1031,6 +1075,19 @@ async def repair_l3_generic_titles(
                 role="user", content=f'请将以下三级标题替换为结合本项目具体内容的标题："{l3_title}"'
             ),
         ]
+
+        def _fallback(reason: str) -> None:
+            """AI 修复失败时的规则兜底：绝不把脏标题留给用户。"""
+            _new = _rule_based_fallback(node, l1_title, l2_title, path)
+            if _new and _new != l3_title and not _is_dirty_l3_title(_new):
+                node["title"] = _new
+                _global_used_titles.add(_new)
+                logger.info("[L3修复] %s → %s（规则兜底: %s）", l3_title[:30], _new[:30], reason)
+            else:
+                logger.warning(
+                    "[L3修复] 规则兜底亦失败，保留原标题「%s」（%s）", l3_title[:30], reason
+                )
+
         try:
             new_title = await with_timeout(
                 provider.chat(messages, temperature=0.3),
@@ -1043,14 +1100,17 @@ async def repair_l3_generic_titles(
             # 必须用统一脏标题判定拦截，否则等于白调一次 AI。
             if new_title and len(new_title) >= 5 and new_title != l3_title and not _is_dirty_l3_title(new_title):
                 node["title"] = new_title
+                _global_used_titles.add(new_title)
                 logger.info("[L3修复] %s → %s", l3_title[:30], new_title[:30])
             elif new_title:
                 logger.info(
-                    "[L3修复] 拒绝 AI 返回的占位/重复标题（保留原标题）: %s",
+                    "[L3修复] 拒绝 AI 返回的占位/重复标题，改用规则兜底: %s",
                     new_title[:30],
                 )
+                _fallback(f"AI 返回「{new_title[:20]}」")
         except Exception as e:
             logger.warning("[L3修复] AI调用失败 (%s): %s", l3_title[:20], e)
+            _fallback("AI 调用异常")
 
     if repair_tasks:
         # 2026-10-10 加固：旧实现直接 asyncio.gather 全量并发，实际并发数等于

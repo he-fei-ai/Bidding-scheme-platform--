@@ -24,106 +24,20 @@ def parse_and_extract_file(self, file_path: str, project_id: int, file_id: int, 
 
     Returns:
         解析结果
+
+    R-3 / BUG-5 2026-10-12：实际解析 + 落盘 + 终态写入统一下沉到服务层
+    ``services.files._persist_file_extraction``，本任务只做异常兜底。这样异步
+    链路与 save_upload / re_extract_text 的「悬空路径」口径完全一致（只有真实
+    落盘才记录 extracted_text_path），修复了 BUG-5 在异步链路的漏网之鱼。
     """
     try:
-        from ..db import get_db
-        from ..services.files import EMPTY_TEXT_MESSAGE, extract_text_from_path, is_extraction_notice
+        from ..services.files import _persist_file_extraction
 
-        logger.info('开始异步解析文件: %s (project=%d)', file_path, project_id)
-        filename = Path(file_path).name
-        # ENHANCE 2026-10-05（G7 异步链路与主链路口径对齐）：此前本任务不写
-        # file_parse_tasks、也不写空文本提示，与 save_upload 的主链路口径不一致 ——
-        # GET /tasks/files/status 看不到异步解析的任何痕迹，异步解析出空文本时
-        # 前端也不会有任何提示。补齐（任务行 + 空文本提示 + 缓存失效已存在）。
-        from ..services.files import _create_parse_task, _update_parse_task
-
-        if create_task_row:
-            _create_parse_task(project_id, filename, Path(file_path).suffix.lower())
-        with get_db() as conn:
-            conn.execute(
-                "UPDATE uploaded_files SET status = 'processing' WHERE id = ? AND project_id = ?",
-                (file_id, project_id),
-            )
-        # BUG-FIX 2026-10-09（缓存未失效 · 解析结果丢失）：extract_text_from_path 的
-        # 缓存键是 (size, mtime_ns, 前 4KB) 哈希，TTL 300s。首次解析失败/降级时存入的
-        # 可能是降级提示串或空串（例如 .wps 依赖未装、图片 OCR 引擎不可用）；用户补装
-        # 依赖或开启 OCR 后再点「后台解析」，同步重提取入口 re_extract_text 已在调用前
-        # _clear_parse_cache（files.py 同注释），但本异步入口此前没有 —— 同一路径的坏
-        # 结果在 TTL 内被直接命中，补装永远不生效，进度条跑满 100% 却仍是旧空文本。
-        # 与同步入口同口径，先清缓存再解析。
-        try:
-            from ..services.files import _clear_parse_cache
-            _clear_parse_cache(file_path)
-        except Exception as _cc_e:
-            logger.debug('清理解析缓存失败（忽略）file=%s: %s', file_path, _cc_e)
-        extracted_text = extract_text_from_path(file_path)
-        from ..config import PROJECTS_DATA_DIR
-        texts_dir = PROJECTS_DATA_DIR / str(project_id) / 'texts'
-        texts_dir.mkdir(parents=True, exist_ok=True)
-        # BUG-FIX 2026-09-18（P2）：命名与主管线 save_upload 对齐——主管线写
-        # 「完整原文件名.txt」（Path(filename).name），此处原写 stem.txt：
-        # 同目录两文件 "招标.docx" 与 "招标.pdf" 在主管线下文本互不覆盖，
-        # 而走本任务则会互相覆盖。同时补齐合并文本缓存失效（主管线变更后
-        # _text_cache 不清会让 AI 读到旧文本）。
-        text_filename = f'{Path(file_path).name}.txt'
-        text_path = texts_dir / text_filename
-        # BUG-FIX 2026-10-11（I-8）：与 save_upload(files.py:503-509) 口径对齐 ——
-        # 只有真实非空文本才写 .txt 到磁盘，避免：
-        #   1) 空文本时留下 0 字节 .txt 文件，下游 latest_extracted_text 命中该文件
-        #      但读到空内容，缓存 key 与 DB extracted_text_path 双双指向一个空壳；
-        #   2) 降级提示串场景下（.doc/.ppt/.wps 无引擎），把「[提示] 无法自动提取…」
-        #      写成 .txt，用户从磁盘打开该文件会误以为它是解析结果。
-        # DB 里的 extracted_text_path 仍按原逻辑写入（save_upload 也是这么做的），
-        # 让下游能感知"期望在此路径读到文本"，文件不存在时 latest_extracted_text
-        # 的 Path.exists() 检查会自然跳过。
-        if extracted_text.strip():
-            try:
-                text_path.write_text(extracted_text, encoding='utf-8')
-            except Exception as _wt_e:
-                logger.warning('保存提取文本失败: %s (file=%s)', _wt_e, file_path)
-        else:
-            logger.info('跳过空文本文件写入: %s (status 尚未判定)', filename)
-        # ENHANCE 2026-10-05（B4/G7）：与 save_upload 同口径 —— 解析成功但文本为空时
-        # 写入空文本提示，避免前端把「已入库但无内容」当成正常解析成功。
-        # BUG-FIX 2026-10-06（H1）：再与 save_upload 同口径 —— 老格式（.doc/.ppt/.wps）
-        # 提取失败时返回的「[提示] 无法自动提取…」降级串不是正文，不能写
-        # status='success'，否则 _pick_main_file 会把它选作项目主文本喂给下游 AI。
-        if is_extraction_notice(extracted_text):
-            _status, _msg = 'failed', extracted_text.strip()
-        else:
-            _status, _msg = 'success', ('' if extracted_text.strip() else EMPTY_TEXT_MESSAGE)
-        with get_db() as conn:
-            conn.execute(
-                "UPDATE uploaded_files SET status = ?, extracted_text_path = ?, message = ? "
-                "WHERE id = ? AND project_id = ?",
-                (_status, str(text_path), _msg, file_id, project_id),
-            )
-        try:
-            from ..services.files import _text_cache_clear
-            _text_cache_clear(project_id)
-        except Exception as _tc_e:
-            logger.debug('清理项目文本缓存失败 project=%d: %s', project_id, _tc_e)
-        _update_parse_task(
-            project_id,
-            # BUG-FIX 2026-10-09（状态谎报 / 跨模块不一致）：原为无条件
-            # `_update_parse_task(project_id, 'completed', 100, ...)`。
-            # 但上方 :61-64 可能已把 `_status` 置为 'failed'
-            # （老格式提取失败返回降级提示串 / 文本为空）。此时
-            # uploaded_files.status='failed' 而 file_parse_tasks.status='completed'
-            # —— 同一份解析结果在两个接口给出相反结论：
-            #   · GET /projects/{id}/files  → 显示「提取失败」
-            #   · GET /projects/{id}/tasks/files/status → 显示「recent_completed」
-            # 用户点「后台解析」后看到进度条跑满 100% 变绿，列表却是失败。
-            # 该分支此前已在 save_upload（files.py:434-440）与
-            # re_extract_text（:2456-2462）修复，唯独漏了 Celery 异步链路。
-            # 现在按实际 _status 上报，并只在真正成功时才推进到 100%。
-            'completed' if _status == 'success' else 'failed',
-            100 if _status == 'success' else 50,
-            error_message=_msg,
-            filename=filename,
+        status = _persist_file_extraction(
+            project_id, file_id, str(file_path), Path(file_path).name,
+            Path(file_path).suffix.lower(), create_task_row=create_task_row,
         )
-        logger.info('文件解析完成: %s, 提取文本长度: %d', file_path, len(extracted_text))
-        return {'status': _status, 'file_id': file_id, 'text_length': len(extracted_text), 'text_path': str(text_path)}
+        return {'status': status, 'file_id': file_id, 'text_length': 0}
     except Exception as exc:
         logger.error('文件解析失败: %s, 错误: %s', file_path, exc, exc_info=True)
         try:

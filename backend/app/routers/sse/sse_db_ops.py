@@ -512,6 +512,31 @@ def _count_outline_nodes(outline: list) -> int:
 
     return total
 
+
+def _snapshot_titles(outline: list) -> list[str]:
+    """按前序遍历收集全树标题（用于消歧前后 diff 计数）。"""
+    out: list[str] = []
+
+    def _walk(nodes: list) -> None:
+        if not isinstance(nodes, list):
+            return
+        for _n in nodes:
+            if not isinstance(_n, dict):
+                continue
+            out.append(str(_n.get("title") or ""))
+            _walk(_n.get("children"))
+
+    _walk(outline)
+    return out
+
+
+def _count_title_changes(before: list[str], after: list[str]) -> int:
+    """前后同位置标题发生变化的节点数（长度不一致时按较大值兜底）。"""
+    n = min(len(before), len(after))
+    changed = sum(1 for _i in range(n) if before[_i] != after[_i])
+    return changed + abs(len(before) - len(after))
+
+
 def _clear_and_save_outline(project_id: int, outline: list) -> list:
 
     """清除现有目录并保存新目录，返回带数据库整数 ID 的 outline"""
@@ -555,10 +580,33 @@ def _clear_and_save_outline(project_id: int, outline: list) -> list:
             "_clear_and_save_outline: 占位标题安全网跳过（不阻塞落库）: %s", _ph_exc
         )
 
+    # 2026-10-12 收尾闭环（BUG-FIX P1）：cleanup 改写标题后可能与**兄弟节点**撞名，
+    # 而此时 `_dedupe_outline_titles`（第 535 行）早已跑完，无人再消歧。此处补一次
+    # 同级去重——顺序严格遵守「清洗 → 去重」（与 workflows_outline_v51 主链路口径一致）：
+    # 反序会把裸编号后缀从标题末尾挪到中间，令 cleanup 的末尾匹配失效。
+    # 此前这里只落 warning 让用户「重跑目录生成解决」，等于把可确定修复的问题
+    # 推给用户；现在直接修，并把修复计数打进日志便于审计。
+    _ph_fixed_after_uniquify = 0
+    try:
+        from ...services.ai.outline_common import _uniquify_outline_titles
+        _before_titles = _snapshot_titles(outline)
+        outline = _uniquify_outline_titles(outline)
+        _changed = _count_title_changes(_before_titles, _snapshot_titles(outline))
+        if _changed:
+            _ph_fixed_after_uniquify = _changed
+            logger.info(
+                "_clear_and_save_outline: 清洗后同级撞名消歧 %d 处 project=%d",
+                _changed, project_id,
+            )
+    except Exception as _uq_exc:
+        logger.warning(
+            "_clear_and_save_outline: 同级消歧跳过（不阻塞落库）: %s", _uq_exc
+        )
+
     # 2026-10-12 收尾闭环：cleanup 内部已用 global_used 防跨父撞名，
-    # 但 _dedupe_outline_titles 的副产物（如"总体实施策划（2）"）被
-    # cleanup 改写后可能因 dedupe 已跑完而无法消歧。这里追加轻量撞名
-    # 检测（只检查同级兄弟节点），有则 warning 日志暴露问题（不阻塞落库）。
+    # 但去重/清洗改写产生的副产物可能带来新的同级撞名。这里追加轻量检测
+    # 作为**兜底校验**：正常情况下应为 0，非 0 说明前面某道防线漏了，
+    # 仅告警不阻塞（落库优先，避免为极端脏数据卡死目录生成）。
     try:
         _dup_count = 0
         def _check_siblings(nodes, depth=0):

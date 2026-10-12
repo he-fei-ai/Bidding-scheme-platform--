@@ -1283,6 +1283,100 @@ export function formatParsingStatusText(
 }
 
 // ============================================================
+// 上传解析模块 —— 支持格式单一真相（TD6 2026-10-12）
+// ============================================================
+
+/**
+ * 本地兜底 accept 列表（与后端 services/files.SUPPORTED_EXTENSIONS 一致）。
+ *
+ * 它只是**网络失败时的降级值** —— 正常路径下 Upload.Dragger 的 accept 由
+ * `GET /projects/{id}/files/supported-formats` 现场下发（后端从
+ * SUPPORTED_EXTENSIONS 生成，是唯一真相）。历史上前端把这份列表手抄在
+ * 组件 JSX 里，与后端白名单之间没有任何联动也没有测试约束；后端曾在
+ * 服务层早已支持 .wps / 图片 OCR 的情况下忘记放开路由白名单，导致这些
+ * 格式「入口封死」完全无法上传。现在这条降级路径集中在 utils 一处，
+ * 且组件测试会把它与后端常量逐项比对。
+ */
+export const FALLBACK_ACCEPT: string = [
+  ".doc", ".docx", ".pdf", ".xls", ".xlsx", ".txt", ".md",
+  ".ppt", ".pptx", ".html", ".htm", ".wps",
+  ".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".webp",
+].join(",");
+
+/**
+ * 从后端下发的格式清单归一化出可用的 accept 字符串（纯函数，便于组件级测试）。
+ *
+ * 防御点：
+ *   - 后端返回空/缺字段/畸形数组 → 回落 `FALLBACK_ACCEPT`（不能因为格式查询
+ *     失败就让用户一个文件都传不了，这是「优化」不能变成「新故障」）。
+ *   - 统一补点、统一小写、去重 —— 后端当前已返回规范化的 `accept`，
+ *     但这里是前端唯一的最后一道防线，不假设上游永远正确。
+ */
+export function resolveAccept(
+  remote: { accept?: string | null; extensions?: string[] | null } | null | undefined,
+  fallback: string = FALLBACK_ACCEPT,
+): string {
+  const raw =
+    typeof remote?.accept === "string" && remote.accept.trim()
+      ? remote.accept
+      : Array.isArray(remote?.extensions) && remote.extensions.length
+        ? remote!.extensions!.join(",")
+        : "";
+  if (!raw) return fallback;
+  const parts = raw
+    .split(",")
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean)
+    .map((s) => (s.startsWith(".") ? s : `.${s}`));
+  const uniq = Array.from(new Set(parts));
+  return uniq.length ? uniq.join(",") : fallback;
+}
+
+// ============================================================
+// 上传解析模块 —— 提取文本预览（激活 GET /files/{id}/text 死链）
+// ============================================================
+
+/**
+ * 提取文本预览的分页裁剪（纯函数）。
+ *
+ * 为什么需要它：`GET /files/{id}/text` 此前**在前端零调用方**（api 层导出了
+ * getFileText 却没有任何组件使用），用户无法看到系统究竟解析出了什么正文，
+ * 「提取成功」但提不出要点的场景完全无法自查。这里在展示层做长度上限，
+ * 避免把几十万字的招标文件正文整个塞进 Modal 导致页面卡死。
+ *
+ * @param text 服务端返回的原文
+ * @param maxChars 展示上限，默认 20000 字
+ * @returns { preview, truncated, total } preview 为裁剪后的文本
+ */
+export function buildTextPreview(
+  text: string | null | undefined,
+  maxChars = 20_000,
+): { preview: string; truncated: boolean; total: number } {
+  const total = (text || "").length;
+  if (total <= maxChars) {
+    return { preview: text || "", truncated: false, total };
+  }
+  return {
+    preview: (text || "").slice(0, maxChars),
+    truncated: true,
+    total,
+  };
+}
+
+/** 提取文本为空时的提示（区分「未提取到」与「该文件根本没有文本」） */
+export function formatEmptyPreviewText(
+  status: string | null | undefined,
+): string {
+  if (status === "failed") {
+    return "该文件解析失败，没有可预览的提取文本。可点击「重新提取」重试。";
+  }
+  if (status === "pending") {
+    return "该文件尚未提取文本。可点击「重新提取」触发解析。";
+  }
+  return "该文件没有提取到文本内容（可能为空文件、纯图片扫描件或 OCR 引擎未启用）。";
+}
+
+// ============================================================
 // 提取项目（要点/评分点）模块 —— 前端交互纯函数（组件级可测化 2026-10-05）
 // 从 SummaryReviewPage.tsx 抽取，行为逐分支等价。
 // ============================================================

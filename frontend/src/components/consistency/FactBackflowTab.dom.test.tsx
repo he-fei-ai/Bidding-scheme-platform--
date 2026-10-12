@@ -1,12 +1,27 @@
-// @vitest-environment jsdom
+﻿// @vitest-environment jsdom
 /**
- * FactBackflowTab 组件级交互测试（ENHANCE 2026-10-11）。
+ * FactBackflowTab 组件级交互测试（ENHANCE 2026-10-11；2026-10-12 修复加载失败）。
  *
  * 覆盖：
  * 1. 组件可挂载，空项目时优雅展示
  * 2. 候选列表渲染：Table + rowSelection
  * 3. 采纳按钮：selectedKeys 触发 acceptFactProposals
- * 4. minOccurrences 参数透传
+ * 4. 无选中时采纳按钮禁用
+ *
+ * ── 2026-10-12 修复：本文件此前**从未真正执行过任何用例**（vitest 报
+ * 「Failed Suites / No test suite found」）。叠加三因：
+ *   (1) `describe.skipIf(!hasDom, "FactBackflowTab", () => {...})` 参数错位 ——
+ *       `describe.skipIf(cond)` 只接受条件，suite 名必须传给返回的函数；
+ *       原写法把名字传给了 skipIs，最终 `describe(回调)` 把回调当 options，
+ *       vitest 从未注册任何 suite。正解：`describe.skipIf(cond)("名称", fn)`。
+ *   (2) `vi.mock` 工厂的 TDZ（静态 import 组件 + 顶层 const mock）。
+ *       改用 `vi.hoisted()` 提升 mock 实例。
+ *   (3) 断言用了未安装的 `@testing-library/jest-dom` matcher
+ *       `toBeInTheDocument`（Invalid Chai property），改为 vitest 原生断言。
+ *   (4) `vi.mock("../../utils", ...)` 用单键桩整体替换 utils 模块，
+ *       改为透传原模块后只覆盖目标导出。
+ * 另外原用例对「30」这类文本用 getByText，而它同时出现在取值 Tag 与
+ * 出现次数 Tag 中，会抛 "Found multiple elements" —— 改用 getAllByText。
  */
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { render, screen, waitFor, cleanup, fireEvent } from "@testing-library/react";
@@ -15,7 +30,12 @@ const hasDom = typeof window !== "undefined" && typeof document !== "undefined";
 
 import FactBackflowTab from "./FactBackflowTab";
 
-const proposalsMock = vi.fn(async (_pid: number, opts?: { minOccurrences?: number }) => ({
+const { proposalsMock, acceptMock } = vi.hoisted(() => ({
+  proposalsMock: vi.fn(),
+  acceptMock: vi.fn(),
+}));
+
+const DEFAULT_PROPOSALS = async (_pid: number) => ({
   status: "ok",
   proposals: [
     {
@@ -33,80 +53,111 @@ const proposalsMock = vi.fn(async (_pid: number, opts?: { minOccurrences?: numbe
   ],
   skipped: 2,
   conflicts_scanned: 3,
-}));
+});
 
-const acceptMock = vi.fn(async (_pid: number, _proposals: unknown[]) => ({
+const DEFAULT_ACCEPT = async (_pid: number, _proposals: unknown[]) => ({
   status: "ok",
   added: 1,
   merged_total: 1,
-}));
+});
+
+proposalsMock.mockImplementation(DEFAULT_PROPOSALS);
+acceptMock.mockImplementation(DEFAULT_ACCEPT);
 
 vi.mock("../../api", () => ({
   proposeFactsFromConflicts: proposalsMock,
   acceptFactProposals: acceptMock,
 }));
 
-vi.mock("../../utils", () => ({
-  extractApiError: (e: unknown) => String(e),
-}));
+vi.mock("../../utils", async (importOriginal) => {
+  const actual = await importOriginal<Record<string, unknown>>();
+  return {
+    ...actual,
+    extractApiError: (e: unknown) =>
+      e instanceof Error ? e.message : String(e),
+  };
+});
 
-describe.skipIf(!hasDom, "FactBackflowTab", () => {
+describe.skipIf(!hasDom)("FactBackflowTab", () => {
   afterEach(() => {
     cleanup();
+    // mockReset 会连实现一起清掉，必须显式恢复默认实现，
+    // 否则前一个用例里的 mockResolvedValue 会污染后续用例。
     proposalsMock.mockReset();
+    proposalsMock.mockImplementation(DEFAULT_PROPOSALS);
     acceptMock.mockReset();
+    acceptMock.mockImplementation(DEFAULT_ACCEPT);
   });
 
   it("可挂载，触发初始扫描", async () => {
     render(<FactBackflowTab projectId={1} />);
     await waitFor(() => {
       expect(proposalsMock).toHaveBeenCalledWith(1, expect.any(Object));
-      expect(screen.getByText(/事实回流/)).toBeInTheDocument();
+      expect(screen.getByText(/事实回流/)).toBeTruthy();
     });
   });
 
   it("候选列表渲染表格", async () => {
     render(<FactBackflowTab projectId={1} />);
     await waitFor(() => {
-      expect(screen.getByText(/工期/)).toBeInTheDocument();
-      expect(screen.getByText(/30/)).toBeInTheDocument();
-      expect(screen.getByText(/duration_days/)).toBeInTheDocument();
+      expect(screen.getByText(/工期/)).toBeTruthy();
+      // 「30」同时出现在取值 Tag 与出现次数 Tag 中，用 getAllByText。
+      expect(screen.getAllByText(/30/).length).toBeGreaterThan(0);
+      expect(screen.getByText(/duration_days/)).toBeTruthy();
     });
   });
 
   it("空项目（零候选）展示优雅提示", async () => {
     proposalsMock.mockResolvedValue({
-      status: "ok", proposals: [], skipped: 0, conflicts_scanned: 0,
+      status: "ok",
+      proposals: [],
+      skipped: 0,
+      conflicts_scanned: 0,
     });
     render(<FactBackflowTab projectId={1} />);
     await waitFor(() => {
-      expect(screen.getByText(/没有可扫描的未解决一致性冲突/)).toBeInTheDocument();
+      expect(
+        screen.getByText(/没有可扫描的未解决一致性冲突/),
+      ).toBeTruthy();
     });
   });
 
   it("采纳按钮在无选中时禁用", async () => {
     render(<FactBackflowTab projectId={1} />);
     await waitFor(() => {
-      const btn = screen.getByRole("button", { name: /采纳选中/ });
-      expect(btn).toBeDisabled();
+      expect(screen.getByText(/工期/)).toBeTruthy();
     });
+    const btn = screen.getByRole("button", { name: /采纳选中/ });
+    expect((btn as HTMLButtonElement).disabled).toBe(true);
   });
 
   it("选中后点击采纳调 acceptFactProposals", async () => {
     render(<FactBackflowTab projectId={1} />);
     await waitFor(() => {
-      expect(screen.getByText(/工期/)).toBeInTheDocument();
+      expect(screen.getByText(/工期/)).toBeTruthy();
     });
-    // 点击表格行的 checkbox —— antd Table 的 rowSelection checkbox
-    const checkbox = document.querySelector('input[type="checkbox"]');
-    if (checkbox) {
-      fireEvent.click(checkbox);
-    }
-    const acceptBtn = screen.getByRole("button", { name: /采纳选中/ });
-    expect(acceptBtn).toBeEnabled();
+    const checkbox = document.querySelector(
+      'input[type="checkbox"]',
+    ) as HTMLInputElement | null;
+    expect(checkbox).toBeTruthy();
+    fireEvent.click(checkbox as HTMLInputElement);
+
+    const acceptBtn = screen.getByRole("button", {
+      name: /采纳选中/,
+    });
+    await waitFor(() => {
+      expect((acceptBtn as HTMLButtonElement).disabled).toBe(false);
+    });
     fireEvent.click(acceptBtn);
+
     await waitFor(() => {
       expect(acceptMock).toHaveBeenCalled();
+      expect(acceptMock).toHaveBeenCalledWith(
+        1,
+        expect.arrayContaining([
+          expect.objectContaining({ conflict_id: "c1" }),
+        ]),
+      );
     });
   });
 });

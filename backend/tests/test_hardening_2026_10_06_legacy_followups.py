@@ -190,6 +190,155 @@ class TestGenerateContentImplParamGate:
             p.unlink(missing_ok=True)
 
 
+class TestGenerateContentImplParamWiring:
+    """G3 加固（2026-10-12）：签名门禁只证明「个数与顺序」，本组证明**值真的传到位**。
+
+    历史故障（b48f0e0 易标 R9/R10/R11）的形态：impl 末位新增 use_word_adjust，
+    router 漏暴露、调用点漏传 —— 结果不是 TypeError，而是参数被 FastAPI **静默
+    丢弃**、永远退回服务端默认。签名门禁能抓到这次漂移，但抓不到「参数传了却
+    传错值 / 传错位置」这类不改变 arity 的漂移，故补一层行为断言。
+    """
+
+    def _capture_impl(self, monkeypatch) -> dict:
+        """把 sections.generate_content_impl 换成记录实参的假实现。"""
+        from app.routers import sections
+
+        captured: dict = {}
+        sentinel = object()
+
+        async def fake_impl(
+            project_id,
+            writing_length,
+            regenerate_ids,
+            root_section_id,
+            regenerate_missing,
+            use_orchestration,
+            level2_default,
+            use_word_sampling,
+            use_fallback_expand,
+            use_consistency_audit,
+            concurrency,
+            orch_max_ai_images,
+            orch_table_ratio,
+            orch_prefer_mermaid,
+            orch_section_per_segment,
+            use_word_adjust,
+        ):
+            captured["project_id"] = project_id
+            captured["use_word_adjust"] = use_word_adjust
+            captured["orch_section_per_segment"] = orch_section_per_segment
+            captured["args"] = (project_id, use_word_adjust)
+            captured["sentinel"] = sentinel
+            return sentinel
+
+        monkeypatch.setattr(sections, "generate_content_impl", fake_impl)
+        return captured
+
+    def test_explicit_use_word_adjust_value_reaches_impl(self, monkeypatch):
+        """显式传参必须原样抵达 impl（值不能被默认值覆盖）。"""
+        import asyncio
+
+        from app.routers import sections
+
+        captured = self._capture_impl(monkeypatch)
+        out = asyncio.run(
+            sections.generate_content(
+                request=None,
+                project_id=7,
+                writing_length="standard",
+                use_word_adjust=True,
+                orch_section_per_segment=12,
+            )
+        )
+        assert out is captured["sentinel"], "router 必须原样返回 impl 的结果（SSE 流）"
+        assert captured["use_word_adjust"] is True
+        assert captured["project_id"] == 7
+        assert captured["orch_section_per_segment"] == 12
+
+    def test_omitted_use_word_adjust_declared_default_is_none(self):
+        """省略该参数时，FastAPI 解析出的值必须是 None（= 服务端按 config 判定）。
+
+        这里钉的是**声明的 Query 默认值**而非直接调用拿到的实参：直接调用
+        Python 函数时形参拿到的是 Query(None) 对象本身（FastAPI 只在 HTTP
+        链路上把它解析成实际值），若断言实参会把工具语义误判成产品缺陷。
+
+        必须是 None 而不是 False —— 否则补一个 router 参数的动作，会把全站
+        未显式传参的客户端从「服务端判定」静默改判成「显式关闭」。
+        """
+        import inspect as _inspect
+
+        from fastapi import params as fastapi_params
+
+        from app.routers import sections
+
+        p = _inspect.signature(sections.generate_content).parameters["use_word_adjust"]
+        assert isinstance(p.default, fastapi_params.Query)
+        assert p.default.default is None
+
+    def test_explicit_false_is_honoured(self, monkeypatch):
+        """显式 false 也必须原样抵达 impl（三态 None/true/false 各自可表达）。"""
+        import asyncio
+
+        from app.routers import sections
+
+        captured = self._capture_impl(monkeypatch)
+        asyncio.run(
+            sections.generate_content(
+                request=None,
+                project_id=7,
+                writing_length="standard",
+                use_word_adjust=False,
+            )
+        )
+        assert captured["use_word_adjust"] is False
+
+
+class TestExpandContentImplParamGate:
+    """G3 扩面（2026-10-12）：expand_content_impl 与 generate_content_impl 是**同一
+    失败模式**（router 以位置参数调用 impl），但此前无门禁。
+
+    两处调用点（sections.py 的 generate_content_impl / expand_content_impl）一旦
+    单侧增删参数，现象与历史 TypeError 完全一致，故套用同款三道门禁。注意
+    generate_outline_sse_impl 走的是**关键字**传参（outline_mode=outline_mode），
+    天然免疫位置错位，不在加固范围内。
+    """
+
+    def test_router_and_impl_query_params_match(self):
+        from app.routers import sections
+        from app.routers.sse import sse_content
+
+        router_params = _query_param_names(sections.expand_content)
+        impl_params = _query_param_names(sse_content.expand_content_impl)
+        assert router_params == impl_params, (
+            "expand_content 的 router 与 impl 的 Query 参数必须完全一致且同序："
+            f"router={router_params} impl={impl_params}"
+        )
+
+    def test_call_site_passes_all_params_positionally(self):
+        from app.routers.sse import sse_content
+
+        expected = 1 + len(_query_param_names(sse_content.expand_content_impl))
+        actual = _positional_call_arg_count(
+            BACKEND_DIR / "app" / "routers" / "sections.py", "expand_content_impl"
+        )
+        assert actual is not None, "未找到 expand_content_impl 的调用点"
+        assert actual == expected, (
+            f"expand_content 调用点位置参数个数 {actual} != 期望 {expected}"
+        )
+
+    def test_gate_actually_detects_drift(self):
+        """自证：本门禁确实能抓到少传一个参数（否则规则写坏了会永绿）。"""
+        from fastapi import Query
+
+        def router_ok(a: int = Query(1), b: int = Query(2)):
+            ...
+
+        def impl_drifted(a: int = Query(1)):
+            ...
+
+        assert _query_param_names(router_ok) != _query_param_names(impl_drifted)
+
+
 # ===========================================================================
 # G4 —— 评分标准达标对齐（确定性）
 # ===========================================================================

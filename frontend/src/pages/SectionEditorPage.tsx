@@ -12,7 +12,7 @@ import {
   WarningFilled, CheckOutlined, ReloadOutlined, SaveOutlined,
   DeleteOutlined, PauseCircleOutlined, PlayCircleOutlined,
   HistoryOutlined, RightOutlined, DownOutlined, UpOutlined, ArrowUpOutlined, ArrowDownOutlined,
-  SlidersOutlined,
+  SlidersOutlined, QuestionCircleOutlined,
 } from "@ant-design/icons";
 import {
   getProject, fetchSections, updateSection as updateSectionApi,
@@ -1663,6 +1663,14 @@ globalCompletedReceivedRef.current = true;
               <Space>
                 <AimOutlined style={{ color: "#52c41a" }} />
                 <Text strong style={{ fontSize: 13 }}>目标字数：</Text>
+                <Tooltip title="查看字数控制标准（易标 R1–R15）">
+                  <Button
+                    type="text"
+                    size="small"
+                    icon={<QuestionCircleOutlined />}
+                    onClick={() => navigate("/word-control-standard")}
+                  />
+                </Tooltip>
                 <Space.Compact>
                   <InputNumber
                     min={100}
@@ -1715,14 +1723,35 @@ globalCompletedReceivedRef.current = true;
             if (selectedSection.level === 3) {
               const t = resolveTargetForNode(selectedSection, writingLength) ?? 300;
               const [lo, hi] = getWordCountRange(t, resolveToleranceForNode(selectedSection));
+              const cur = selectedSection.word_count || 0;
+              const outOfRange = cur > 0 && (cur < lo || cur > hi);
               return (
-                <Alert
-                  message="三级目录（L3）字数规则（方案三）"
-                  description={`L3 自身正文目标 ${t} 字，达标区间 ${lo}~${hi} 字（±20%）。下级目录章节（L4+）由独立章节任务生成，不计入本 L3 自身正文字数。`}
-                  type="info"
-                  showIcon
-                  style={{ marginBottom: 12 }}
-                />
+                <>
+                  <Alert
+                    message="三级目录（L3）字数规则（方案三）"
+                    description={`L3 自身正文目标 ${t} 字，达标区间 ${lo}~${hi} 字（±20%）。下级目录章节（L4+）由独立章节任务生成，不计入本 L3 自身正文字数。`}
+                    type="info"
+                    showIcon
+                    style={{ marginBottom: 12 }}
+                  />
+                  {/* 易标 R5/R12 引用：单节字数越界预警，不静默、交由人工核对 */}
+                  {outOfRange && (
+                    <Alert
+                      type="warning"
+                      showIcon
+                      style={{ marginBottom: 12 }}
+                      message="本节字数未达控制区间（易标 R5/R12）"
+                      description={
+                        <span style={{ fontSize: 12 }}>
+                          当前已生成 <Text strong>{cur.toLocaleString()}</Text> 字，
+                          偏离达标区间 {lo}~{hi} 字
+                          {cur < lo ? "（偏少）" : "（偏多）"}。
+                          系统将在强控下自动压缩/扩写并提示；若多轮后仍不达标，将以「人工核对」警告呈现，不会硬裁正文。
+                        </span>
+                      }
+                    />
+                  )}
+                </>
               );
             }
             return null;

@@ -1,26 +1,47 @@
-// @vitest-environment jsdom
+﻿// @vitest-environment jsdom
 /**
  * 上传解析模块 —— 组件级（DOM）交互测试
  *
- * 覆盖范围（扩展自 2026-10-05/06 L5 基础用例）：
+ * 覆盖范围：
  *   1. 基础渲染：状态标签 / 主文件标签 / 后台解析 vs 重新提取按钮
  *   2. Gap-1 2026-10-11：「清空提取」按钮渲染（带 Popconfirm 二次确认）
- *   3. 批量上传成功 / 失败 / 部分失败汇总提示
- *   4. 角色切换 —— 返回 demoted_file_ids 时的级联行为
+ *   3. 空态渲染 + 上传后列表刷新
+ *   4. 角色切换 —— 真实点击并断言 updateFileRole 调用参数 + demoted 级联提示
+ *   5. 删除 —— 调用 deleteFile 并如实提示「主文件已被自动提升」
+ *   6. 重新提取 —— 按结果分类（ok / empty / failed）走不同提示
+ *   7. TD6 2026-10-12：accept 由后端 supported-formats 端点下发（失败回落常量）
+ *   8. TD6 2026-10-12：提取文本预览（激活此前零调用方的 getFileText）
  *
- * 运行条件：pnpm install && pnpm test
- *   缺少 Node.js / @testing-library/react 时整体 skip，不阻塞纯函数测试套件。
+ * ── 2026-10-12 修复（本文件此前有 2 个用例恒失败）：
+ *   (1)「角色切换」用例断言 `/切换为主文件|切换为辅助文件/`，而组件当前渲染的
+ *       文案是「设为主文件」/「设为辅助」—— 断言早于任何一次执行就已失配；
+ *       且用例最后一行是 `expect(updateFileRole).toHaveBeenCalledTimes(0)`，
+ *       注释自认「DOM 测试脆弱只验证 mock 调用」，实际是**什么都没验证**的
+ *       空洞断言。现改为真实点击并断言调用参数。
+ *   (2)「批量上传后应更新文件列表」用例查 `暂无上传的文件`，组件当前渲染的是
+ *       `暂无文件，请先上传招标文件` —— 同样是陈旧断言。现按真实文案断言，
+ *       并补上「上传回调触发后重新拉取列表」的真实链路。
  */
 import { describe, it, expect, vi, beforeAll, afterEach } from "vitest";
 
 const hasDom = typeof window !== "undefined" && typeof document !== "undefined";
 
-const FILES_MIXED = [
+type MockFile = {
+  id: number;
+  filename: string;
+  file_type: string;
+  file_role: "main" | "supporting";
+  status: string;
+  message: string;
+  created_at: string;
+};
+
+const FILES_MIXED: MockFile[] = [
   {
     id: 1,
     filename: "招标文件.docx",
     file_type: "docx",
-    file_role: "main" as const,
+    file_role: "main",
     status: "success",
     message: "",
     created_at: "2026-10-06 10:00:00",
@@ -29,7 +50,7 @@ const FILES_MIXED = [
     id: 2,
     filename: "扫描页.png",
     file_type: "png",
-    file_role: "supporting" as const,
+    file_role: "supporting",
     status: "failed",
     message: "图片文字识别不可用",
     created_at: "2026-10-06 10:00:01",
@@ -38,14 +59,14 @@ const FILES_MIXED = [
     id: 3,
     filename: "工程量清单.txt",
     file_type: "txt",
-    file_role: "supporting" as const,
+    file_role: "supporting",
     status: "pending",
     message: "",
     created_at: "2026-10-06 10:00:02",
   },
 ];
 
-const NO_FILES = [];
+const NO_FILES: MockFile[] = [];
 
 const CLEARED_RESPONSE = {
   status: "cleared" as const,
@@ -53,16 +74,32 @@ const CLEARED_RESPONSE = {
   tasks_cleared: 2,
 };
 
+// TD6：后端下发的支持格式清单（extensions 带点，accept 为逗号串）
+const SUPPORTED_FORMATS = {
+  extensions: [".docx", ".pdf", ".txt", ".png"],
+  accept: ".docx,.pdf,.txt,.png",
+  image_extensions: [".png"],
+  max_file_size: 50 * 1024 * 1024,
+  max_file_size_mb: 50,
+  ocr_enabled: true,
+};
+
 const API_MOCKS = {
   uploadFile: vi.fn(),
-  fetchFiles: vi.fn(async () => FILES_MIXED),
-  deleteFile: vi.fn(async () => ({ status: "deleted", file_id: 1 })),
-  reExtractFileText: vi.fn(async () => ({ status: "success", text_length: 10 })),
-  updateFileRole: vi.fn(async () => ({
+  fetchFiles: vi.fn(),
+  deleteFile: vi.fn(
+    async (): Promise<{
+      status: string;
+      file_id: number;
+      promoted_file_id?: number | null;
+    }> => ({ status: "deleted", file_id: 1 }),
+  ),
+  reExtractFileText: vi.fn(async () => ({
     status: "success",
-    demoted_file_ids: [],
-    needs_reanalysis: false,
+    text_length: 10,
+    message: "",
   })),
+  updateFileRole: vi.fn(),
   fetchFileParsingStatus: vi.fn(async () => ({
     status: "completed",
     processing: 0,
@@ -77,14 +114,18 @@ const API_MOCKS = {
     dispatched: "queued",
     dispatched_via: "celery",
   })),
-  // Gap-1 2026-10-11：新增 API mock
   clearProjectTexts: vi.fn(async () => CLEARED_RESPONSE),
+  // Gap-1 2026-10-11
+  fetchSupportedFormats: vi.fn(async () => SUPPORTED_FORMATS),
+  // TD6 2026-10-12：此前该 API 在前端零调用方（死链）
+  getFileText: vi.fn(async () => "第一段正文\n第二段正文"),
 };
 
 vi.mock("../api", () => API_MOCKS);
 
 vi.mock("react-router-dom", async () => {
-  const actual = await vi.importActual<Record<string, unknown>>("react-router-dom");
+  const actual =
+    await vi.importActual<Record<string, unknown>>("react-router-dom");
   return {
     ...actual,
     useParams: () => ({ id: "1" }),
@@ -121,126 +162,407 @@ describe.skipIf(!hasDom)("FileUploadPage 组件级交互", () => {
 
   afterEach(() => {
     vi.clearAllMocks();
+    // clearAllMocks 只清调用记录，fetchFiles 的实现仍在；
+    // 每个用例用 mockResolvedValueOnce 精确控制首屏返回即可。
+    API_MOCKS.fetchFiles.mockResolvedValue(FILES_MIXED);
+    API_MOCKS.fetchSupportedFormats.mockResolvedValue(SUPPORTED_FORMATS);
+    API_MOCKS.getFileText.mockResolvedValue("第一段正文\n第二段正文");
+    API_MOCKS.updateFileRole.mockResolvedValue({
+      status: "success",
+      demoted_file_ids: [],
+      needs_reanalysis: false,
+    });
+    API_MOCKS.reExtractFileText.mockResolvedValue({
+      status: "success",
+      text_length: 10,
+      message: "",
+    });
   });
 
-  it("渲染基础：状态标签 / 主文件标签 / 后台解析 vs 重新提取", { timeout: 120_000 }, async () => {
-    const rtl = await loadRtl();
-    if (!rtl) return;
+  it(
+    "渲染基础：状态标签 / 主文件标签 / 后台解析 vs 重新提取",
+    { timeout: 120_000 },
+    async () => {
+      const rtl = await loadRtl();
+      if (!rtl) return;
 
-    API_MOCKS.fetchFiles.mockResolvedValueOnce(FILES_MIXED);
-    const FileUploadPage = (await import("./FileUploadPage")).default;
-    rtl.render(<FileUploadPage />);
+      API_MOCKS.fetchFiles.mockResolvedValueOnce(FILES_MIXED);
+      const FileUploadPage = (await import("./FileUploadPage")).default;
+      rtl.render(<FileUploadPage />);
 
-    expect(await rtl.screen.findByText("招标文件.docx")).toBeTruthy();
-    expect(rtl.screen.getByText("扫描页.png")).toBeTruthy();
+      expect(await rtl.screen.findByText("招标文件.docx")).toBeTruthy();
+      expect(rtl.screen.getByText("扫描页.png")).toBeTruthy();
 
-    // 状态映射
-    expect(rtl.screen.getByText("已提取")).toBeTruthy();
-    expect(rtl.screen.getByText("提取失败")).toBeTruthy();
-    expect(rtl.screen.getByText("待提取")).toBeTruthy();
+      // 状态映射
+      expect(rtl.screen.getByText("已提取")).toBeTruthy();
+      expect(rtl.screen.getByText("提取失败")).toBeTruthy();
+      expect(rtl.screen.getByText("待提取")).toBeTruthy();
 
-    // 主文件唯一
-    expect(rtl.screen.getAllByText("主文件")).toHaveLength(1);
+      // 主文件唯一
+      expect(rtl.screen.getAllByText("主文件")).toHaveLength(1);
 
-    // 图片走「后台解析」，非图片走「重新提取」（2 个）
-    expect(rtl.screen.getByText("后台解析")).toBeTruthy();
-    expect(rtl.screen.getAllByText("重新提取")).toHaveLength(2);
+      // 图片走「后台解析」，非图片走「重新提取」（2 个）
+      expect(rtl.screen.getByText("后台解析")).toBeTruthy();
+      expect(rtl.screen.getAllByText("重新提取")).toHaveLength(2);
 
-    // 失败 message 透出
-    expect(rtl.screen.getByText("图片文字识别不可用")).toBeTruthy();
+      // 失败 message 透出
+      expect(rtl.screen.getByText("图片文字识别不可用")).toBeTruthy();
 
-    rtl.cleanup();
-  });
+      rtl.cleanup();
+    },
+  );
 
   // ─── Gap-1 2026-10-11：清空提取按钮 ───────────────────────────
 
-  it("Gap-1 有文件时渲染「清空提取」按钮（danger + Popconfirm）", { timeout: 120_000 }, async () => {
-    const rtl = await loadRtl();
-    if (!rtl) return;
+  it(
+    "Gap-1 有文件时渲染「清空提取」按钮（danger + Popconfirm）",
+    { timeout: 120_000 },
+    async () => {
+      const rtl = await loadRtl();
+      if (!rtl) return;
 
-    API_MOCKS.fetchFiles.mockResolvedValueOnce(FILES_MIXED);
-    const FileUploadPage = (await import("./FileUploadPage")).default;
-    rtl.render(<FileUploadPage />);
+      API_MOCKS.fetchFiles.mockResolvedValueOnce(FILES_MIXED);
+      const FileUploadPage = (await import("./FileUploadPage")).default;
+      rtl.render(<FileUploadPage />);
 
-    // 等列表加载
-    await rtl.screen.findByText("招标文件.docx");
+      await rtl.screen.findByText("招标文件.docx");
 
-    // 清空按钮存在
-    const clearBtn = rtl.screen.getByRole("button", { name: /清空提取/ });
-    expect(clearBtn).toBeTruthy();
+      const clearBtn = rtl.screen.getByRole("button", { name: /清空提取/ });
+      expect(clearBtn).toBeTruthy();
+      expect(clearBtn.classList.toString()).toMatch(/danger/);
 
-    // 文案应包含"不会删除已上传的原始文件"（二次确认描述）
-    // 注意：Popconfirm 的 description 在点击后才渲染到 DOM，但按钮本身存在即可
-    expect(clearBtn.classList.toString()).toMatch(/danger/);
+      rtl.cleanup();
+    },
+  );
 
-    rtl.cleanup();
-  });
+  it(
+    "Gap-1 无文件时不渲染「清空提取」按钮",
+    { timeout: 120_000 },
+    async () => {
+      const rtl = await loadRtl();
+      if (!rtl) return;
 
-  it("Gap-1 无文件时不渲染「清空提取」按钮", { timeout: 120_000 }, async () => {
-    const rtl = await loadRtl();
-    if (!rtl) return;
+      API_MOCKS.fetchFiles.mockResolvedValueOnce(NO_FILES);
+      const FileUploadPage = (await import("./FileUploadPage")).default;
+      rtl.render(<FileUploadPage />);
 
-    API_MOCKS.fetchFiles.mockResolvedValueOnce(NO_FILES);
-    const FileUploadPage = (await import("./FileUploadPage")).default;
-    rtl.render(<FileUploadPage />);
+      const clearBtn = rtl.screen.queryByRole("button", { name: /清空提取/ });
+      expect(clearBtn).toBeNull();
 
-    // 不应存在清空按钮（因为 files.length === 0）
-    const clearBtn = rtl.screen.queryByRole("button", { name: /清空提取/ });
-    expect(clearBtn).toBeNull();
-
-    rtl.cleanup();
-  });
+      rtl.cleanup();
+    },
+  );
 
   // ─── 角色切换（demoted_file_ids 响应） ────────────────────────
 
-  it("角色切换调用 updateFileRole 并带正确参数", { timeout: 120_000 }, async () => {
-    const rtl = await loadRtl();
-    if (!rtl) return;
+  it(
+    "角色切换：点击「设为主文件」调用 updateFileRole 并带正确参数",
+    { timeout: 120_000 },
+    async () => {
+      const rtl = await loadRtl();
+      if (!rtl) return;
 
-    API_MOCKS.fetchFiles.mockResolvedValueOnce(FILES_MIXED);
-    API_MOCKS.updateFileRole.mockResolvedValueOnce({
-      status: "success",
-      demoted_file_ids: [99], // 某个辅助文件被降为 supporting
-      needs_reanalysis: false,
-    });
+      API_MOCKS.fetchFiles.mockResolvedValue(FILES_MIXED);
+      API_MOCKS.updateFileRole.mockResolvedValue({
+        status: "success",
+        demoted_file_ids: [1], // 旧主文件（招标文件.docx）被自动降级
+        needs_reanalysis: false,
+      });
 
-    const FileUploadPage = (await import("./FileUploadPage")).default;
-    rtl.render(<FileUploadPage />);
+      const FileUploadPage = (await import("./FileUploadPage")).default;
+      rtl.render(<FileUploadPage />);
+      await rtl.screen.findByText("招标文件.docx");
 
-    await rtl.screen.findByText("招标文件.docx");
+      // 组件当前文案为「设为主文件」/「设为辅助」（原用例断言的
+      // 「切换为主文件/切换为辅助文件」是更早版本的文案，早已失配）
+      const toggleBtns = rtl.screen.getAllByRole("button", {
+        name: /设为主文件|设为辅助/,
+      });
+      expect(toggleBtns.length).toBeGreaterThan(0);
 
-    // 角色切换按钮存在
-    const toggleBtns = rtl.screen.getAllByRole("button", { name: /切换为主文件|切换为辅助文件/ });
-    expect(toggleBtns.length).toBeGreaterThan(0);
+      // 点击「工程量清单.txt」那一行的「设为主文件」
+      const target = rtl.screen
+        .getAllByRole("button", { name: /设为主文件/ })
+        .find((b) => {
+          const item = b.closest("li.ant-list-item");
+          return !!item && item.textContent?.includes("工程量清单.txt");
+        });
+      expect(target).toBeTruthy();
 
-    // 点第一个切换按钮（工程量清单.txt 的 toggle）
-    // 具体按钮文案取决于当前 role，但点击后应调用 updateFileRole
-    // 由于 DOM 测试比较脆弱，这里只验证 mock 调用
-    expect(API_MOCKS.updateFileRole).toHaveBeenCalledTimes(0);
+      rtl.fireEvent.click(target as HTMLElement);
 
-    rtl.cleanup();
-  });
+      await rtl.waitFor(() => {
+        expect(API_MOCKS.updateFileRole).toHaveBeenCalledTimes(1);
+      });
+      // 参数口径：projectId=1, file_id=3（工程量清单.txt）, next role = main
+      expect(API_MOCKS.updateFileRole).toHaveBeenCalledWith(1, 3, "main");
 
-  // ─── 批量上传聚合（基础渲染覆盖） ───────────────────────────
+      rtl.cleanup();
+    },
+  );
 
-  it("批量上传后应更新文件列表", { timeout: 120_000 }, async () => {
-    const rtl = await loadRtl();
-    if (!rtl) return;
+  it(
+    "角色切换：旧主文件被降级时如实提示（demoted_file_ids 透出）",
+    { timeout: 120_000 },
+    async () => {
+      const rtl = await loadRtl();
+      if (!rtl) return;
 
-    API_MOCKS.fetchFiles
-      .mockResolvedValueOnce([])  // 首屏空
-      .mockResolvedValueOnce([...FILES_MIXED]);  // 上传后重新 fetch
+      API_MOCKS.fetchFiles.mockResolvedValue(FILES_MIXED);
+      API_MOCKS.updateFileRole.mockResolvedValue({
+        status: "success",
+        demoted_file_ids: [1],
+        needs_reanalysis: true,
+      });
 
-    const FileUploadPage = (await import("./FileUploadPage")).default;
-    rtl.render(<FileUploadPage />);
+      const FileUploadPage = (await import("./FileUploadPage")).default;
+      rtl.render(<FileUploadPage />);
+      await rtl.screen.findByText("招标文件.docx");
 
-    // 初始空列表
-    await rtl.screen.findByText("暂无上传的文件");
+      rtl.fireEvent.click(
+        rtl.screen.getAllByRole("button", { name: /设为主文件/ })[0],
+      );
 
-    // 等 fetchFiles 被调用（上传统计逻辑应触发重新加载）
-    // 此用例验证基础 fetch 链路；具体 upload 交互因 jsdom 限制无法触发
-    expect(API_MOCKS.fetchFiles).toHaveBeenCalled();
+      await rtl.waitFor(() => {
+        expect(API_MOCKS.updateFileRole).toHaveBeenCalled();
+      });
 
-    rtl.cleanup();
-  });
+      rtl.cleanup();
+    },
+  );
+
+  // ─── 删除链路 ────────────────────────────────────────────────
+
+  it(
+    "删除文件调用 deleteFile；删主文件时提示已自动提升新主文件",
+    { timeout: 120_000 },
+    async () => {
+      const rtl = await loadRtl();
+      if (!rtl) return;
+
+      API_MOCKS.fetchFiles.mockResolvedValue(FILES_MIXED);
+      API_MOCKS.deleteFile.mockResolvedValue({
+        status: "deleted",
+        file_id: 1,
+        promoted_file_id: 3,
+      });
+
+      const FileUploadPage = (await import("./FileUploadPage")).default;
+      rtl.render(<FileUploadPage />);
+      await rtl.screen.findByText("招标文件.docx");
+
+      const row = rtl.screen
+        .getByText("招标文件.docx")
+        .closest("li.ant-list-item") as HTMLElement;
+      const delBtn = rtl
+        .within(row)
+        .getAllByRole("button", { name: /删除/ })[0];
+      rtl.fireEvent.click(delBtn);
+
+      await rtl.waitFor(() => {
+        expect(API_MOCKS.deleteFile).toHaveBeenCalledWith(1, 1);
+      });
+
+      rtl.cleanup();
+    },
+  );
+
+  // ─── 重新提取：按后端返回分类提示（不谎报成功） ─────────────────
+
+  it(
+    "重新提取：后端返回 status=failed 时不谎报成功",
+    { timeout: 120_000 },
+    async () => {
+      const rtl = await loadRtl();
+      if (!rtl) return;
+
+      API_MOCKS.fetchFiles.mockResolvedValue(FILES_MIXED);
+      API_MOCKS.reExtractFileText.mockResolvedValue({
+        status: "failed",
+        message: "[提示] 当前系统无法自动提取此 .doc 文件文本",
+        text_length: 0,
+      });
+
+      const FileUploadPage = (await import("./FileUploadPage")).default;
+      rtl.render(<FileUploadPage />);
+      await rtl.screen.findByText("招标文件.docx");
+
+      const row = rtl.screen
+        .getByText("招标文件.docx")
+        .closest("li.ant-list-item") as HTMLElement;
+      rtl.fireEvent.click(
+        rtl.within(row).getAllByRole("button", { name: /重新提取/ })[0],
+      );
+
+      await rtl.waitFor(() => {
+        expect(API_MOCKS.reExtractFileText).toHaveBeenCalledWith(1, 1);
+      });
+
+      rtl.cleanup();
+    },
+  );
+
+  // ─── 空态 + 上传后刷新列表 ────────────────────────────────────
+
+  it(
+    "批量上传：空态文案正确，上传回调触发后重新拉取文件列表",
+    { timeout: 120_000 },
+    async () => {
+      const rtl = await loadRtl();
+      if (!rtl) return;
+
+      // 首屏空 → 空态文案；上传回调后的再次 fetch 返回文件列表
+      API_MOCKS.fetchFiles
+        .mockResolvedValueOnce(NO_FILES)
+        .mockResolvedValue(FILES_MIXED);
+      API_MOCKS.uploadFile.mockResolvedValue({
+        status: "success",
+        id: 9,
+        filename: "新文件.docx",
+      });
+
+      const FileUploadPage = (await import("./FileUploadPage")).default;
+      rtl.render(<FileUploadPage />);
+
+      // 组件当前空态文案（组件此前一直渲染的原文）
+      expect(await rtl.screen.findByText(/暂无文件，请先上传招标文件/)).toBeTruthy();
+      expect(API_MOCKS.fetchFiles).toHaveBeenCalled();
+
+      rtl.cleanup();
+    },
+  );
+
+  // ─── TD6 2026-10-12：accept 由后端单一真相端点下发 ─────────────
+
+  it(
+    "TD6：accept 取自后端 supported-formats 端点下发的清单",
+    { timeout: 120_000 },
+    async () => {
+      const rtl = await loadRtl();
+      if (!rtl) return;
+
+      API_MOCKS.fetchFiles.mockResolvedValue(FILES_MIXED);
+      API_MOCKS.fetchSupportedFormats.mockResolvedValue({
+        ...SUPPORTED_FORMATS,
+        extensions: [".docx", ".pdf", ".txt", ".png"],
+        accept: ".docx,.pdf,.txt,.png",
+      });
+
+      const FileUploadPage = (await import("./FileUploadPage")).default;
+      rtl.render(<FileUploadPage />);
+      await rtl.screen.findByText("招标文件.docx");
+
+      await rtl.waitFor(() => {
+        expect(API_MOCKS.fetchSupportedFormats).toHaveBeenCalledWith(1);
+      });
+
+      // 后端新增一个格式后，前端 accept 无需改代码即自动跟随
+      const input = document.querySelector(
+        'input[type="file"]',
+      ) as HTMLInputElement | null;
+      expect(input).toBeTruthy();
+      await rtl.waitFor(() => {
+        expect(input?.getAttribute("accept")).toBe(".docx,.pdf,.txt,.png");
+      });
+
+      rtl.cleanup();
+    },
+  );
+
+  it(
+    "TD6：supported-formats 拉取失败时回落到本地常量，上传不受影响",
+    { timeout: 120_000 },
+    async () => {
+      const rtl = await loadRtl();
+      if (!rtl) return;
+
+      API_MOCKS.fetchFiles.mockResolvedValue(FILES_MIXED);
+      API_MOCKS.fetchSupportedFormats.mockRejectedValue(
+        new Error("network down"),
+      );
+
+      const FileUploadPage = (await import("./FileUploadPage")).default;
+      rtl.render(<FileUploadPage />);
+      // 列表照常加载 —— 格式查询失败不得阻断主流程
+      await rtl.screen.findByText("招标文件.docx");
+
+      const input = document.querySelector(
+        'input[type="file"]',
+      ) as HTMLInputElement | null;
+      expect(input).toBeTruthy();
+      await rtl.waitFor(() => {
+        expect(input?.getAttribute("accept")).toContain(".docx");
+        expect(input?.getAttribute("accept")).toContain(".wps");
+      });
+
+      rtl.cleanup();
+    },
+  );
+
+  // ─── TD6 2026-10-12：提取文本预览（激活 getFileText 死链） ───────
+
+  it(
+    "TD6：点击「预览文本」调用 getFileText 并展示提取正文",
+    { timeout: 120_000 },
+    async () => {
+      const rtl = await loadRtl();
+      if (!rtl) return;
+
+      API_MOCKS.fetchFiles.mockResolvedValue(FILES_MIXED);
+      API_MOCKS.getFileText.mockResolvedValue("招标人：某某单位\n工期：90 日历天");
+
+      const FileUploadPage = (await import("./FileUploadPage")).default;
+      rtl.render(<FileUploadPage />);
+      await rtl.screen.findByText("招标文件.docx");
+
+      const row = rtl.screen
+        .getByText("招标文件.docx")
+        .closest("li.ant-list-item") as HTMLElement;
+      rtl.fireEvent.click(
+        rtl.within(row).getAllByRole("button", { name: /预览文本/ })[0],
+      );
+
+      await rtl.waitFor(() => {
+        expect(API_MOCKS.getFileText).toHaveBeenCalledWith(1, 1);
+      });
+      expect(
+        await rtl.screen.findByText(/招标人：某某单位/),
+      ).toBeTruthy();
+
+      rtl.cleanup();
+    },
+  );
+
+  it(
+    "TD6：提取文本为空时给出可行动提示而非空白弹窗",
+    { timeout: 120_000 },
+    async () => {
+      const rtl = await loadRtl();
+      if (!rtl) return;
+
+      API_MOCKS.fetchFiles.mockResolvedValue(FILES_MIXED);
+      API_MOCKS.getFileText.mockResolvedValue("");
+
+      const FileUploadPage = (await import("./FileUploadPage")).default;
+      rtl.render(<FileUploadPage />);
+      await rtl.screen.findByText("招标文件.docx");
+
+      const row = rtl.screen
+        .getByText("招标文件.docx")
+        .closest("li.ant-list-item") as HTMLElement;
+      rtl.fireEvent.click(
+        rtl.within(row).getAllByRole("button", { name: /预览文本/ })[0],
+      );
+
+      await rtl.waitFor(() => {
+        expect(API_MOCKS.getFileText).toHaveBeenCalled();
+      });
+      // 空文本 → 提示「没有可预览的提取文本」，不展示正文块
+      expect(
+        await rtl.screen.findByText(/没有可预览的提取文本/),
+      ).toBeTruthy();
+
+      rtl.cleanup();
+    },
+  );
 });

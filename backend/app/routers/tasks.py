@@ -331,9 +331,21 @@ async def ack_interrupted_tasks(project_id: int, task_type: str | None=Query(Non
 
 @router.get('/files/status')
 async def get_file_parsing_status(project_id: int, current_user: Annotated[Any, Depends(get_current_user)]=None):
-    """获取文件解析状态"""
+    """获取文件解析状态
+
+    BUG-FIX 2026-10-12（高·事件循环阻塞）：此前在 `async def` 里**直调**
+    `_get_file_parsing_status(project_id)` —— 它执行 3 条同步 sqlite 查询
+    （readonly 连接虽不抢写锁，但 sqlite I/O 与连接重试 sleep 仍跑在事件循环
+    线程上）。而本端点正是 FileUploadPage 上传在途期间以 1.5s 间隔轮询的
+    高频接口（frontend/src/pages/FileUploadPage.tsx:137 setInterval 1500），
+    并发批量上传 + 正文生成高峰时会把整个事件循环拖住，连带冻结 SSE 心跳。
+    同一函数的另一个调用方 `GET /tasks/status`（:150）早在 2026-09-16 就已改用
+    `asyncio.to_thread` —— 本端点是那次修复的漏网之鱼。
+    现统一移入线程池，行为（响应体、返回 None 时的 idle 兜底）完全不变。
+    """
     await _ensure_project_access(project_id, current_user)
-    return _get_file_parsing_status(project_id) or {'status': 'idle', 'message': '没有文件解析任务'}
+    status = await asyncio.to_thread(_get_file_parsing_status, project_id)
+    return status or {'status': 'idle', 'message': '没有文件解析任务'}
 
 def _get_file_parsing_status(project_id: int) -> dict | None:
     """获取文件解析任务状态（项目级聚合）

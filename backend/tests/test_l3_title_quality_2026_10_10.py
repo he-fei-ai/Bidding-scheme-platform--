@@ -598,7 +598,13 @@ class TestL3GenericTitleRepair:
 
     @pytest.mark.asyncio
     async def test_rejects_placeholder_ai_reply(self):
-        """AI 复读占位标题时必须保留原标题，不得写入占位结果。"""
+        """AI 复读占位标题时必须改用规则兜底，不得把占位结果写进目录。
+
+        BUG-FIX 2026-10-12：旧行为是「拒绝 AI 结果 + 原样保留脏标题」，
+        于是「总体实施策划（2）」「专项6」原封不动流到最终审核与落库。
+        现在 AI 不可用时回落到 `_semantic_fallback_title`（工程实体 × 专业维度），
+        保证任何分支下都不会留下占位标题。
+        """
         from app.services.ai.workflows_outline_utils import repair_l3_generic_titles
 
         provider = self._FakeProvider(["专项7", "总体实施策划（3）"])
@@ -607,8 +613,9 @@ class TestL3GenericTitleRepair:
             provider, tree, "", "", "", "", "", max_repair=2
         )
         titles = [c["title"] for c in out[0]["children"][0]["children"]]
-        assert titles[0] == "总体实施策划（2）", f"占位结果被写入: {titles}"
-        assert titles[1] == "样板区质量控制"
+        assert not any(_is_dirty_l3_title(t) for t in titles), f"仍有占位标题: {titles}"
+        assert titles[1] == "样板区质量控制", "未脏标题不得被误改"
+        assert titles[0] != "总体实施策划（2）", f"脏标题被保留: {titles}"
 
     @pytest.mark.asyncio
     async def test_accepts_concrete_ai_reply(self):
@@ -640,7 +647,10 @@ class TestL3GenericTitleRepair:
 
     @pytest.mark.asyncio
     async def test_provider_exception_does_not_raise(self):
-        """AI 异常不得向上传播（增强环节，不能阻断目录生成）。"""
+        """AI 异常不得向上传播（增强环节，不能阻断目录生成）。
+
+        BUG-FIX 2026-10-12：异常同样走规则兜底，绝不把脏标题留给用户。
+        """
         from app.services.ai.workflows_outline_utils import repair_l3_generic_titles
 
         class _BoomProvider:
@@ -651,7 +661,8 @@ class TestL3GenericTitleRepair:
         out = await repair_l3_generic_titles(
             _BoomProvider(), tree, "", "", "", "", "", max_repair=2
         )
-        assert out[0]["children"][0]["children"][0]["title"] == "总体实施策划（2）"
+        titles = [c["title"] for c in out[0]["children"][0]["children"]]
+        assert not any(_is_dirty_l3_title(t) for t in titles), f"异常后仍是脏标题: {titles}"
 
     @pytest.mark.asyncio
     async def test_concurrency_is_bounded_by_config(self):
@@ -860,12 +871,22 @@ class TestL3QualityNoProviderWiring:
     """
 
     def _block(self) -> str:
+        """主链路收口块 + 被它委托的 `_l3_specificity_closeout` 实现。
+
+        BUG-FIX 2026-10-12：主链路的「具体性校验 → AI 修复」内联逻辑已抽成
+        `_l3_specificity_closeout`（与审核回灌路径共用，消除两份易漂移的副本）。
+        本类断言的语义是「这两个函数确实被调用、且失败不阻断生成」，
+        因此扫描范围必须同时覆盖调用块与被调用函数体，否则会在重构后误报。
+        """
         from app.services.ai import workflows_outline_v51 as v51
 
         src = Path(v51.__file__).read_text(encoding="utf-8")
         start = src.index("L3 标题质量收口")
         end = src.index("# ===== AI 自检 =====")
-        return src[start:end]
+        main_block = src[start:end]
+        h_start = src.index("async def _l3_specificity_closeout(")
+        h_end = src.index("async def _apply_l3_quality_closeout(")
+        return main_block + "\n# ---- 委托实现 ----\n" + src[h_start:h_end]
 
     def test_dead_code_is_actually_invoked(self):
         """本轮修复核心：两个函数必须在 v51 主链路里被真正调用。"""
@@ -873,8 +894,10 @@ class TestL3QualityNoProviderWiring:
 
         assert "validate_l3_specificity" in v51.__dict__, "validate 未从 utils 导入"
         assert "repair_l3_generic_titles" in v51.__dict__, "repair 未从 utils 导入"
+        src = Path(v51.__file__).read_text(encoding="utf-8")
+        assert "_l3_specificity_closeout(" in src, "主链路未调用具体性收口函数"
         block = self._block()
-        assert "validate_l3_specificity(level1)" in block, "validate 未被调用"
+        assert "validate_l3_specificity(outline)" in block, "validate 未被调用"
         assert "repair_l3_generic_titles(" in block, "repair 未被调用"
 
     def test_quality_block_is_gated_by_config(self):

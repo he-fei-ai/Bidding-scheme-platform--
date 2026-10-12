@@ -726,6 +726,21 @@ _PLACEHOLDER_TITLE_RE = re.compile(r"^专项\d+$")
 
 # 任意位置的「专项N」（覆盖「分阶段推进专项13」「总体方案专项6」）
 _PLACEHOLDER_ANYWHERE_RE = re.compile(r"专项\s*\d+")
+
+# 纯序号占位标题：「内容3」「子章节2」「章节1」「小节4」…
+#
+# BUG-FIX 2026-10-12（P1）：`_auto_fix_issues`（workflows_outline_v51.py）在修复
+# 「空标题」issue 时的兜底文案就是 `f"内容{k+1}"` / `f"子章节{j+1}"` / `f"章节{i+1}"`。
+# 这些标题零语义、且逐章递增重复，本质上与「专项6」是同一类占位垃圾——用户看到的
+# 「三级标题大量是占位式泛化名称」里就有它们。此前脏标题判定器完全不认识这形态，
+# 于是它们可以绕过 `_cleanup_placeholder_titles` 直接进入最终审核与落库。
+# 现纳入判定，让清洗链把它们改写为「工程实体 × 专业维度」的语义化标题。
+#
+# 正则刻意收紧为「通用结构词 + 纯数字」，避免误伤「第一内容」「内容管理」
+# 「第三章施工部署」这类合法标题。
+_PLACEHOLDER_ORDINAL_ONLY_RE = re.compile(
+    r"^(?:内容|子章节|章节|小节|条|项|节)\s*\d{1,3}$"
+)
 # 裸编号冲突后缀（括号式）：（2）/（3）/（第2项）/（二）/半角 (2)
 #
 # 2026-10-11 修复：旧正则只认全角括号，导致「总体实施策划(2)」这类半角括号
@@ -907,6 +922,7 @@ def _is_dirty_l3_title(title: str) -> bool:
       5. 结尾带裸数字且去掉数字后仍为泛化词（「总体实施策划2」）
          —— 只判定不剥离；且必须收窄，见下方说明
       6. 标题恰好等于纯泛化词（「总体实施策划」）
+      7. 纯序号占位（「内容3」「子章节2」「章节1」）
     """
     t = (title or "").strip()
     if not t:
@@ -914,6 +930,8 @@ def _is_dirty_l3_title(title: str) -> bool:
     if _PLACEHOLDER_TITLE_RE.match(t):
         return True
     if _PLACEHOLDER_ANYWHERE_RE.search(t):
+        return True
+    if _PLACEHOLDER_ORDINAL_ONLY_RE.match(t):
         return True
     if _ORDINAL_SUFFIX_RE.search(t):
         return True
@@ -2779,9 +2797,30 @@ def sanitize_framework_titles(
                         chapter_used_titles,
                         i + _attempt,
                     )
-                # 最终兜底：加章节索引后缀保证唯一
+                # 最终兜底：保证全局唯一。
+                #
+                # BUG-FIX 2026-10-12（P1）：原写作 `f"{new_title}（{chapter_idx + 1}）"`，
+                # 即本仓库**最后一个仍在生产「（N）」裸编号后缀**的代码点 —— 正是用户
+                # 报告的「总体实施策划（2）/（3）」形态之一（此处为「第 N 章」变体）。
+                # 该后缀既无语义、又会被 `_is_dirty_l3_title` 判脏、被
+                # `_title_core` 归一化剥离，等于在目录里埋了一颗定时炸弹：落库前的
+                # 占位清洗会把它改写掉，产生一次无谓的重命名抖动。
+                # 改用与全局其余消歧路径同一份语义化实现 `_disambiguate_title`
+                # （专业维度词 → 父级差异词前缀 → 「之N」中文序数），既保证唯一，
+                # 又不产出裸编号。父级标题传 l2，使前缀消歧与该节点语义相关。
                 if new_title in pool:
-                    new_title = f"{new_title}（{chapter_idx + 1}）"
+                    new_title = _disambiguate_title(
+                        new_title,
+                        {_title_core(_t) for _t in pool},
+                        parent_title=l2_title,
+                    )
+                    # 理论上 `_disambiguate_title` 必然返回未占用的候选；
+                    # 极端情况下若仍冲突（理论上不可达），用无括号序数兜底，
+                    # 绝不回退到「（N）」。
+                    _guard = 101
+                    while _title_core(new_title) in {_title_core(_t) for _t in pool} and _guard < 200:
+                        new_title = f"{_strip_ordinal_suffix(new_title)}之{_cn_ordinal(_guard)}"
+                        _guard += 1
 
                 logger.debug(
                     "[兜底标题] L3[%d][%d] placeholder='%s' -> '%s' (retries=%d)",

@@ -241,7 +241,7 @@ async def generate_outline_sse(project_id: int, strategy: str | None=Query(None)
     return await generate_outline_sse_impl(project_id, outline_mode=outline_mode)
 
 @router.get('/generate-content', dependencies=[limit_per_endpoint])
-async def generate_content(request: Request, project_id: int, writing_length: str=Query('standard'), regenerate_ids: str=Query(''), root_section_id: int | None=Query(None), regenerate_missing: bool=Query(False), use_orchestration: bool=Query(CONTENT_USE_ORCHESTRATION_DEFAULT), level2_default: int=Query(3500, ge=1000, le=10000), use_word_sampling: bool=Query(CONTENT_USE_WORD_SAMPLING_DEFAULT), use_fallback_expand: bool=Query(False), use_consistency_audit: bool=Query(CONTENT_USE_CONSISTENCY_AUDIT_DEFAULT), concurrency: int=Query(4, ge=1, le=8), orch_max_ai_images: int=Query(6, ge=0, le=50), orch_table_ratio: str=Query('moderate'), orch_prefer_mermaid: bool=Query(True), orch_section_per_segment: int=Query(10, ge=3, le=40), current_user: Annotated[Any, Depends(get_current_user)]=None):
+async def generate_content(request: Request, project_id: int, writing_length: str=Query('standard'), regenerate_ids: str=Query(''), root_section_id: int | None=Query(None), regenerate_missing: bool=Query(False), use_orchestration: bool=Query(CONTENT_USE_ORCHESTRATION_DEFAULT), level2_default: int=Query(3500, ge=1000, le=10000), use_word_sampling: bool=Query(CONTENT_USE_WORD_SAMPLING_DEFAULT), use_fallback_expand: bool=Query(False), use_consistency_audit: bool=Query(CONTENT_USE_CONSISTENCY_AUDIT_DEFAULT), concurrency: int=Query(4, ge=1, le=8), orch_max_ai_images: int=Query(6, ge=0, le=50), orch_table_ratio: str=Query('moderate'), orch_prefer_mermaid: bool=Query(True), orch_section_per_segment: int=Query(10, ge=3, le=40), use_word_adjust: bool | None=Query(None), current_user: Annotated[Any, Depends(get_current_user)]=None):
     """SSE 并发生成正文（EventSource 只支持 GET）
 
     2026-08-21 修复：权限验证和参数验证异常包装在 SSE 流中，确保始终返回 text/event-stream
@@ -251,6 +251,14 @@ async def generate_content(request: Request, project_id: int, writing_length: st
     与改动前逐字一致 —— 运维想全开可用 CONTENT_USE_*_DEFAULT=true 统一打开，
     前端显式传参依旧优先。不在此处静默翻转默认值是因为三项门禁都会显著增加
     AI 调用量与耗时，属产品决策。
+
+    FIX 2026-10-12：补齐 use_word_adjust 的 router 暴露与位置传参。
+    易标 R9/R10/R11 已在 generate_content_impl 末位实现该参数（None = 服务端
+    按 config 判定，true/false = 单次强制），但本 router 漏了同名 Query 形参、
+    调用点也未传 —— 结果是客户端传入的 use_word_adjust 被 FastAPI 静默丢弃，
+    永远退回服务端默认。追加在 current_user 之前、且保持与 impl 同序，是
+    「位置参数调用不整体错位」的硬约束（见 generate_content_impl 内注释）。
+    不传时行为与改动前逐字一致，向后兼容。
     """
     try:
         if current_user:
@@ -270,7 +278,7 @@ async def generate_content(request: Request, project_id: int, writing_length: st
         async def error_generator():
             yield f"data: {json.dumps({'status': 'error', 'message': _error_msg}, ensure_ascii=False)}\n\n"
         return StreamingResponse(error_generator(), media_type='text/event-stream; charset=utf-8', headers={'Cache-Control': 'no-cache, no-transform', 'Connection': 'keep-alive', 'X-Accel-Buffering': 'no', 'Content-Encoding': 'none'})
-    return await generate_content_impl(project_id, writing_length, regenerate_ids, root_section_id, regenerate_missing, use_orchestration, level2_default, use_word_sampling, use_fallback_expand, use_consistency_audit, concurrency, orch_max_ai_images, orch_table_ratio, orch_prefer_mermaid, orch_section_per_segment)
+    return await generate_content_impl(project_id, writing_length, regenerate_ids, root_section_id, regenerate_missing, use_orchestration, level2_default, use_word_sampling, use_fallback_expand, use_consistency_audit, concurrency, orch_max_ai_images, orch_table_ratio, orch_prefer_mermaid, orch_section_per_segment, use_word_adjust)
 
 @router.get('/v51-pending-task')
 async def v51_pending_task_route(project_id: int, current_user: Annotated[Any, Depends(get_current_user)]=None):

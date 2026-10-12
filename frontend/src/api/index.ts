@@ -605,6 +605,31 @@ export async function clearProjectTexts(projectId: number): Promise<{
   return res.data;
 }
 
+// TD6 2026-10-12：支持格式的单一真相端点（后端由 services/files.SUPPORTED_EXTENSIONS
+// 现场生成）。此前 Upload.Dragger 的 accept 是一份手工维护的字符串副本，
+// 与后端白名单没有任何联动、也没有回归保护 —— 后端历史上已真实发生过
+// 「服务层早已支持 .wps 与图片 OCR、路由层白名单却没放行 → 扫描件/WPS 入口封死」
+// 的故障，前端一侧至今仍是同类风险敞口。
+// 拉取失败时调用方回落本地常量（FALLBACK_ACCEPT），不影响上传主流程。
+export async function fetchSupportedFormats(projectId: number): Promise<{
+  extensions: string[];
+  accept: string;
+  image_extensions: string[];
+  max_file_size: number;
+  max_file_size_mb: number;
+  ocr_enabled: boolean;
+}> {
+  const res = await http.get<{
+    extensions: string[];
+    accept: string;
+    image_extensions: string[];
+    max_file_size: number;
+    max_file_size_mb: number;
+    ocr_enabled: boolean;
+  }>(`/projects/${projectId}/files/supported-formats`);
+  return res.data;
+}
+
 // AI Analysis
 export async function getAnalysis(projectId: number): Promise<AnalysisResult> {
   const res = await http.get<AnalysisResult>(`/projects/${projectId}/ai/analysis`);

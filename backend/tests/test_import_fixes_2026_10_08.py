@@ -463,13 +463,33 @@ class TestFrontendFixes:
     """验证前端修复的代码存在性。"""
 
     def test_frontend_file_size_validation(self):
-        """前端应包含 50MB 文件大小校验。"""
-        frontend_path = Path(__file__).parent.parent.parent / "frontend" / "src" / "pages" / "FileUploadPage.tsx"
+        """前端应对超大文件做客户端校验（TD6 2026-10-12：上限改由后端下发）
+
+        原用例断言源码里出现字面量 ``50 * 1024 * 1024`` 与「文件大小超过 50MB」。
+        2026-10-12 起这两处硬编码被移除：上限改为由
+        ``GET /files/supported-formats`` 下发的 ``max_file_size_mb`` 驱动
+        （默认值仍是 50，行为不变），目的是消除「后端调大上限、前端仍按 50MB
+        拦，用户传不上去」的漂移风险 —— 而那正是本用例想防的问题本身。
+        因此断言口径同步更新为：仍做客户端校验 + 上限来自后端下发值。
+        """
+        fe_root = Path(__file__).parent.parent.parent / "frontend" / "src"
+        frontend_path = fe_root / "pages" / "FileUploadPage.tsx"
         assert frontend_path.exists(), f"前端文件不存在: {frontend_path}"
 
         content = frontend_path.read_text(encoding="utf-8")
-        assert "50 * 1024 * 1024" in content, "应包含 50MB 大小限制"
-        assert "文件大小超过 50MB" in content, "应包含文件大小错误提示"
+        # 客户端校验仍必须保留（否则超大文件会先读入内存再被后端拒绝）
+        assert "maxFileSizeMb * 1024 * 1024" in content, \
+            "客户端大小校验缺失，或未使用后端下发的上限"
+        assert "文件大小超过 ${maxFileSizeMb}MB 限制" in content, \
+            "应透出动态大小上限提示"
+        # 默认值仍为 50MB，向后兼容
+        assert "useState<number>(50)" in content, \
+            "maxFileSizeMb 默认值应为 50MB"
+        # 上限来源必须是后端端点（消除前后端硬编码漂移）
+        assert "fetchSupportedFormats" in content, \
+            "大小上限应来自后端 supported-formats 端点"
+        api_src = (fe_root / "api" / "index.ts").read_text(encoding="utf-8")
+        assert "max_file_size_mb" in api_src, "api 层应透出 max_file_size_mb"
 
     def test_frontend_loadfiles_race_protection(self):
         """前端 loadFiles 应包含在途状态防护。"""

@@ -4,7 +4,7 @@ import {
   Alert, Button, Card, Col, Empty, InputNumber, Progress, Row, Space, Statistic, Switch, Table, Tag, Tooltip, Typography, message,
 } from "antd";
 import {
-  ArrowLeftOutlined, FileTextOutlined, CheckCircleOutlined, AimOutlined, WarningOutlined, BarChartOutlined, ControlOutlined, SafetyCertificateOutlined,
+  ArrowLeftOutlined, FileTextOutlined, CheckCircleOutlined, AimOutlined, WarningOutlined, BarChartOutlined, ControlOutlined, SafetyCertificateOutlined, QuestionCircleOutlined,
 } from "@ant-design/icons";
 import {
   computeWordControlDerived,
@@ -403,7 +403,20 @@ export default function WordCountPage() {
       {wcDraft && (
         <Card
           style={{ marginBottom: 16 }}
-          title={<Space><ControlOutlined /> 字数控制（生成正文的绝对字数目标）</Space>}
+          title={
+            <Space>
+              <ControlOutlined />
+              <span>字数控制（生成正文的绝对字数目标）</span>
+              <Tooltip title="查看字数控制标准（易标 R1–R15）">
+                <Button
+                  type="text"
+                  size="small"
+                  icon={<QuestionCircleOutlined />}
+                  onClick={() => navigate("/word-control-standard")}
+                />
+              </Tooltip>
+            </Space>
+          }
           extra={
             <Space>
               <Button type="primary" size="small" loading={wcSaving} onClick={handleSaveWordControl}>
@@ -424,6 +437,23 @@ export default function WordCountPage() {
           }
         >
           <Space direction="vertical" size={12} style={{ width: "100%" }}>
+            {/* 易标字数控制标准（R1–R15）面向用户的规则说明，引用自
+                J:\编程\报告_易标文字生成数量控制规则与标准_2026-10-12.md */}
+            <Alert
+              type="info"
+              showIcon
+              message="字数控制规则（引用易标 R1–R15 标准）"
+              description={
+                <ol style={{ margin: 0, paddingLeft: 18, fontSize: 12, lineHeight: 1.8 }}>
+                  <li><b>输入单位</b>（R2）：最少/最多/每小节字数均以「万字」为单位，0 = 不控制，最多 4 位小数。</li>
+                  <li><b>强控区间</b>（R5）：开启「强控」后每小节字数须落在目标 ±20% 内，越界将自动压缩/扩写并提示；关闭时仅约束总字数。</li>
+                  <li><b>数量反推</b>（R6/R8）：系统按总字数与每节字数反推「目标小节数」与「单节初稿目标」，并预估页数 ≈ 总字数 ÷ 650（R4，仅供估算，不作验收标准）。</li>
+                  <li><b>快照锚定</b>（R14）：保存配置后须点「固化快照」才生效，快照与当前目录版本配对；正文生成链只认快照，无快照将拒绝生成。</li>
+                  <li><b>失败兜底</b>（R12）：经多轮调整后仍不达标不会硬裁正文，仅输出「人工核对」警告并逐节列出明细，最终裁量权交给你。</li>
+                  <li><b>统计口径</b>（R1）：字数 = 可读字数（CJK 逐字 + 西文按词），剔除 Markdown 标记、代码块、图片、链接、HTML。</li>
+                </ol>
+              }
+            />
             <Space size={24} wrap align="start">
               <Space direction="vertical" size={4}>
                 <Text type="secondary">最少字数</Text>

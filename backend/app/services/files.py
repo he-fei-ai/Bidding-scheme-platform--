@@ -518,6 +518,19 @@ def save_upload(project_id: int, filename: str, content: bytes, file_role: str =
                 "filename": filename,
             }
 
+    # R-3 2026-10-12：图片等 OCR 耗时格式在上传时改为后台异步解析，避免占满上传线程池
+    # （asyncio.to_thread 内的同步 OCR 在批量图片上传时会让同进程其它阻塞型调用排队）。
+    # 仅当 broker 可达、任务真正入队（dispatched_via='celery'）时才走异步；其余情况
+    # （无 broker→进程内直调 / 入队失败→同步回退）均与旧同步行为一致，保证零回归。
+    _img_role = normalize_file_role(file_role, filename)
+    # 注意 IMAGE_EXTENSIONS 存的是带点的扩展名（".png"），ext 已是 Path.suffix（带点），
+    # 直接 `ext in IMAGE_EXTENSIONS`，不要 lstrip('.')（否则永远匹配不到）。
+    if ext in IMAGE_EXTENSIONS:
+        _img = _save_upload_image_async(project_id, filename, str(file_path), _img_role)
+        if _img is not None:
+            _text_cache_clear(project_id)
+            return _img
+
     # 提取文本
     try:
         extracted_text = extract_text_from_path(str(file_path))
@@ -552,13 +565,26 @@ def save_upload(project_id: int, filename: str, content: bytes, file_role: str =
     text_filename = f"{Path(filename).name}.txt"
     text_path = texts_dir / text_filename
     # BUG-FIX 2026-10-08：提取失败时不写空 .txt 文件，避免下游误判文件存在
+    text_written = False
     if extracted_text.strip():
         try:
             text_path.write_text(extracted_text, encoding="utf-8")
+            text_written = True
         except Exception as e:
             logger.error("保存提取文本失败: %s", e)
     else:
         logger.info("跳过空文本文件写入: %s (status=%s)", filename, status)
+
+    # BUG-FIX 2026-10-12（解析结果丢失 · 悬空路径）：2026-10-08 的修复只做了
+    # 「不写空文件」，却仍然把 `str(text_path)` 无条件写进 uploaded_files。
+    # 结果是：DB 声称该文件有一份提取文本，实际磁盘上并不存在该文件 ——
+    # 任何只看 DB 字段判断「有没有正文」的代码/脚本/报表都会被误导，
+    # 且与 clear_project_texts 之后 `extracted_text_path=''` 的干净状态自相矛盾
+    # （同一个字段两处口径不一致，字段错位）。
+    # 现统一口径：**只有真正落盘成功**才记录路径，否则置空串，
+    # 下游 latest_extracted_text / _first_text_by_keywords / get_file_text
+    # 的 `if path and Path(path).exists()` 判空语义因此在两条路径上完全一致。
+    stored_text_path = str(text_path) if text_written else ""
 
     # 写入数据库
     file_type = ext.lstrip(".")
@@ -576,22 +602,7 @@ def save_upload(project_id: int, filename: str, content: bytes, file_role: str =
             # 同症状、不同入口）。降级与 INSERT 同处 get_db() 写锁事务内，与
             # set_file_role 的互斥口径一致。
             if final_role == "main":
-                downgraded = conn.execute(
-                    "SELECT id FROM uploaded_files "
-                    "WHERE project_id = ? AND file_role = 'main'",
-                    (project_id,),
-                ).fetchall()
-                demoted = [r["id"] for r in downgraded]
-                if demoted:
-                    conn.execute(
-                        "UPDATE uploaded_files SET file_role = 'supporting' "
-                        "WHERE project_id = ? AND file_role = 'main'",
-                        (project_id,),
-                    )
-                    # REVIEW-FIX m2：main 换源且已有缓存分析产物 → 旧摘要/评分基于
-                    # 旧主文件，透出 needs_reanalysis 供前端提示重新「提取项目」。
-                    # 非破坏式：不静默清空用户已确认（confirmed_*）的数据。
-                    needs_reanalysis = _analysis_has_cached(conn, project_id)
+                demoted, needs_reanalysis = _demote_existing_mains(conn, project_id)
             cursor = conn.execute(
                 """INSERT INTO uploaded_files
                    (project_id, filename, path, file_type, file_role,
@@ -604,7 +615,7 @@ def save_upload(project_id: int, filename: str, content: bytes, file_role: str =
                     file_type,
                     final_role,
                     status,
-                    str(text_path),
+                    stored_text_path,
                     message,
                 ),
             )
@@ -639,6 +650,215 @@ def save_upload(project_id: int, filename: str, content: bytes, file_role: str =
         "message": message,
         # REVIEW-FIX 2026-10-04（M1/m2）：上传换主文件时被自动降级的旧 main id；
         # 以及旧摘要/评分是否需基于新主文件重新生成（仅多 main 降级时可能为 true）
+        "demoted_file_ids": demoted,
+        "needs_reanalysis": needs_reanalysis,
+    }
+
+
+def _demote_existing_mains(conn, project_id: int) -> tuple[list[int], bool]:
+    """在给定事务内降级已有 main 文件，返回 (被降级 id 列表, 是否需要重新分析)。
+
+    供 save_upload / _save_upload_image_async 复用，确保「主文件互斥」不变式
+    与 set_file_role 同口径，且降级与 INSERT 处于同一写事务。
+    """
+    downgraded = conn.execute(
+        "SELECT id FROM uploaded_files WHERE project_id = ? AND file_role = 'main'",
+        (project_id,),
+    ).fetchall()
+    demoted = [r["id"] for r in downgraded]
+    needs_reanalysis = False
+    if demoted:
+        conn.execute(
+            "UPDATE uploaded_files SET file_role = 'supporting' "
+            "WHERE project_id = ? AND file_role = 'main'",
+            (project_id,),
+        )
+        # REVIEW-FIX m2：main 换源且已有缓存分析产物 → 旧摘要/评分基于旧主文件，
+        # 透出 needs_reanalysis 供前端提示重新「提取项目」（非破坏式，不静默清空
+        # 用户已确认数据）。
+        needs_reanalysis = _analysis_has_cached(conn, project_id)
+    return demoted, needs_reanalysis
+
+
+def _persist_file_extraction(
+    project_id: int, file_id: int, file_path: str, filename: str, ext: str,
+    create_task_row: bool = True,
+) -> str:
+    """提取文本并落盘 + 更新 uploaded_files 终态 + 解析任务行（同步/异步链路共用）。
+
+    BUG-FIX 2026-10-12（BUG-5 异步链路悬空路径）：此前 Celery 任务
+    ``tasks.file.parse_and_extract`` 在「文本为空 / OCR 未启用」时仍把
+    ``extracted_text_path`` 写成磁盘上并不存在的 .txt 路径（与 save_upload /
+    re_extract_text 已修复的悬空路径口径不一致，是 BUG-5 在异步链路的漏网之鱼）。
+    现统一在此：**只有真正落盘成功（text_written）才记录路径，否则置空串**，
+    与 save_upload(files.py:574) 完全同口径。
+
+    R-3 2026-10-12：抽取为共用函数，save_upload 同步回退路径与 Celery 异步任务
+    都调用它，杜绝两条链路再次出现口径漂移。
+    """
+    if create_task_row:
+        _create_parse_task(project_id, filename, ext)
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE uploaded_files SET status = 'processing' WHERE id = ? AND project_id = ?",
+            (file_id, project_id),
+        )
+    try:
+        _clear_parse_cache(str(file_path))
+    except Exception as _cc_e:  # pragma: no cover - 缓存清理失败不影响主流程
+        logger.debug("清理解析缓存失败（忽略）file=%s: %s", file_path, _cc_e)
+
+    extracted_text = extract_text_from_path(str(file_path))
+
+    texts_dir = PROJECTS_DATA_DIR / str(project_id) / "texts"
+    texts_dir.mkdir(parents=True, exist_ok=True)
+    text_filename = f"{Path(file_path).name}.txt"
+    text_path = texts_dir / text_filename
+
+    # 与 save_upload 同口径：只有真实非空文本才写 .txt；只有落盘成功才记录路径。
+    text_written = False
+    if extracted_text.strip():
+        try:
+            text_path.write_text(extracted_text, encoding="utf-8")
+            text_written = True
+        except Exception as _wt_e:
+            logger.warning("保存提取文本失败: %s (file=%s)", _wt_e, file_path)
+    else:
+        logger.info("跳过空文本文件写入: %s", filename)
+
+    # 与 save_upload 同口径：老格式降级提示串判 failed；空文本 success + 空提示。
+    if is_extraction_notice(extracted_text):
+        _status, _msg = "failed", extracted_text.strip()
+    else:
+        _status, _msg = "success", ("" if extracted_text.strip() else EMPTY_TEXT_MESSAGE)
+
+    stored_text_path = str(text_path) if text_written else ""
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE uploaded_files SET status = ?, extracted_text_path = ?, message = ? "
+            "WHERE id = ? AND project_id = ?",
+            (_status, stored_text_path, _msg, file_id, project_id),
+        )
+    _text_cache_clear(project_id)
+    _update_parse_task(
+        project_id,
+        "completed" if _status == "success" else "failed",
+        100 if _status == "success" else 50,
+        error_message=_msg,
+        filename=filename,
+    )
+    return _status
+
+
+def _read_uploaded_file_status(file_id: int) -> tuple[str, str]:
+    """读取 uploaded_files 的 (status, message)，行不存在时返回 ('failed', '')。"""
+    with get_db(readonly=True) as conn:
+        row = conn.execute(
+            "SELECT status, message FROM uploaded_files WHERE id = ?", (file_id,)
+        ).fetchone()
+    if row:
+        return row["status"], row["message"]
+    return "failed", ""
+
+
+def _dispatch_async_parse(
+    project_id: int, file_path: str, filename: str, file_id: int, ext: str
+) -> dict:
+    """派发后台解析任务（tasks.file.parse_and_extract）。
+
+    返回 dispatch_task 的结果字典。注意 dispatch_task 在 broker 不可达时会**自动
+    降级为进程内直调**（dispatched_via='inline'），不会抛异常；调用方据此判断
+    是否真正异步（'celery'）还是已在当前进程同步跑完（'inline' / 'none'）。
+    若派发本身抛异常（极少见，如任务未登记），这里捕获并返回 not_dispatched，
+    交由 _save_upload_image_async 同步收尾，避免上传直接 500。
+    """
+    from ..celery_app import dispatch_task
+
+    try:
+        return dispatch_task(
+            "tasks.file.parse_and_extract",
+            (str(file_path), project_id, file_id),
+            {"create_task_row": False},
+        )
+    except Exception as e:  # 派发异常兜底：绝不让图片上传因 broker 抖动而 500
+        logger.warning("图片后台解析派发失败，回退同步解析: %s", e)
+        return {"status": "not_dispatched", "dispatched_via": "none", "error": str(e)}
+
+
+def _save_upload_image_async(
+    project_id: int, filename: str, file_path: str, final_role: str
+) -> dict:
+    """图片上传的异步解析快路径（R-3）。
+
+    返回最终要透出给前端的 dict。内部已处理三种派发结果：
+      - dispatched_via='celery'：任务已入队，返回 status='processing'，由 worker 收尾；
+      - dispatched_via='inline'：broker 不可达，任务已在本进程同步跑完，读终态返回；
+      - dispatched_via='none'  / 入队失败：任务未执行，同步调用 _persist_file_extraction
+        收尾后读终态返回 —— 与旧同步行为完全一致，保证无 broker 环境零回归。
+
+    落库（降级旧 main + INSERT processing 行）与 save_upload 同步路径同口径，
+    得到 file_id 后由任务或回退路径 UPDATE 终态。
+    """
+    ext = Path(filename).suffix.lower()
+    try:
+        with get_db() as conn:
+            demoted, needs_reanalysis = ([], False)
+            if final_role == "main":
+                demoted, needs_reanalysis = _demote_existing_mains(conn, project_id)
+            cursor = conn.execute(
+                """INSERT INTO uploaded_files
+                   (project_id, filename, path, file_type, file_role,
+                    status, extracted_text_path, message)
+                   VALUES (?, ?, ?, ?, ?, 'processing', '', '')""",
+                (
+                    project_id,
+                    filename,
+                    file_path,
+                    ext.lstrip("."),
+                    final_role,
+                ),
+            )
+            file_id = cursor.lastrowid
+    except Exception as e:
+        logger.error("图片上传落库失败: %s", e)
+        _update_parse_task(project_id, "failed", 0, f"保存文件记录失败: {e}", filename)
+        return {
+            "status": "failed",
+            "message": f"保存文件记录失败: {e}",
+            "filename": filename,
+        }
+
+    dispatched = _dispatch_async_parse(project_id, file_path, filename, file_id, ext)
+    via = dispatched.get("dispatched_via")
+
+    if via != "celery":
+        # 非真正异步：inline（已在本进程跑完）或 none（未派发）→ 同步收尾确保终态落库
+        if via != "inline":
+            try:
+                _persist_file_extraction(
+                    project_id, file_id, file_path, filename, ext, create_task_row=False
+                )
+            except Exception as _pe:
+                logger.error("图片同步回退解析失败: %s", _pe)
+        status, message = _read_uploaded_file_status(file_id)
+        return {
+            "id": file_id,
+            "filename": filename,
+            "file_type": ext.lstrip("."),
+            "file_role": final_role,
+            "status": status,
+            "message": message,
+            "demoted_file_ids": demoted,
+            "needs_reanalysis": needs_reanalysis,
+        }
+
+    return {
+        "id": file_id,
+        "filename": filename,
+        "file_type": ext.lstrip("."),
+        "file_role": final_role,
+        "status": "processing",
+        "message": "",
         "demoted_file_ids": demoted,
         "needs_reanalysis": needs_reanalysis,
     }
@@ -2295,6 +2515,23 @@ def _text_cache_clear(project_id: int) -> None:
         _project_versions[project_id] = _project_versions.get(project_id, 0) + 1
 
 
+def _latest_text_query_rows(project_id: int):
+    """TD-13 2026-10-12（事件循环阻塞·读链一致性）：``latest_extracted_text`` 此前在
+    ``async def`` 内**直连** `with get_db(readonly=True)` 做同步查询 —— 这条只读
+    查询虽不抢写锁，但仍跑在事件循环线程上，与同模块 ``list_files`` /
+    ``get_file_text`` 已由 router 用 ``asyncio.to_thread`` 包出的口径不一致；
+    且合并文本路径读取（_read_text_auto）虽已在线程池，但「取路径列表」这一步
+    仍是事件循环内的阻塞 DB 往返。现抽为同步函数并整体移入线程池，与模块既有的
+    「DB/IO 一律 to_thread」约定完全对齐（行为、返回形状不变）。
+    """
+    with get_db(readonly=True) as conn:
+        return conn.execute(
+            "SELECT id, filename, file_type, file_role, status, extracted_text_path "
+            "FROM uploaded_files WHERE project_id = ? ORDER BY id",
+            (project_id,),
+        ).fetchall()
+
+
 async def latest_extracted_text(project_id: int) -> str:
     """合并主文件和辅助文件，主文件优先（带项目级缓存）"""
     cached = _text_cache_get(project_id)
@@ -2309,12 +2546,9 @@ async def latest_extracted_text(project_id: int) -> str:
     # 但这把是**全局写锁**：一个「读取项目文本」请求（GET /files/text）会把全进程
     # 的写操作挡在锁外，而它本身主要时间在磁盘 IO 上。
     # 现在：DB 查询只用只读连接速取路径（不抢写锁），IO 全部在 `with` 之外做。
-    with get_db(readonly=True) as conn:
-        rows = conn.execute(
-            "SELECT id, filename, file_type, file_role, status, extracted_text_path "
-            "FROM uploaded_files WHERE project_id = ? ORDER BY id",
-            (project_id,),
-        ).fetchall()
+    # TD-13 2026-10-12：即便只是只读连接的查询，也整体移入线程池，避免事件循环
+    # 线程内的任何同步 DB 往返（与 list_files/get_file_text 的 to_thread 口径一致）。
+    rows = await asyncio.to_thread(_latest_text_query_rows, project_id)
 
     if not rows:
         return ""
@@ -2355,8 +2589,14 @@ async def latest_extracted_text(project_id: int) -> str:
 
 
 def get_project_files(project_id: int) -> list[dict]:
-    """获取项目的文件列表"""
-    with get_db() as conn:
+    """获取项目的文件列表
+
+    TD-12 2026-10-12（技术债·读锁）：本函数只做 SELECT，此前却走 `get_db()`
+    抢全局写锁。批量上传高峰期 save_upload 频繁拿写锁，列表/文本读取若也抢写锁
+    会互相排队（虽已被 router 用 asyncio.to_thread 移出事件循环，但锁本身仍串行）。
+    db.py 明确约定「只读查询传 readonly=True 可跳过全局写锁」，这里对齐。
+    """
+    with get_db(readonly=True) as conn:
         rows = conn.execute(
             "SELECT id, filename, file_type, file_role, status, message, created_at "
             "FROM uploaded_files WHERE project_id = ? ORDER BY id",
@@ -2366,8 +2606,13 @@ def get_project_files(project_id: int) -> list[dict]:
 
 
 def get_file_text(project_id: int, file_id: int) -> str:
-    """获取指定文件的提取文本"""
-    with get_db() as conn:
+    """获取指定文件的提取文本
+
+    TD-12 2026-10-12（技术债·读锁）：仅 SELECT，改走 readonly 连接跳过全局写锁
+    （与 get_project_files 同口径，理由见其 docstring）。router 已用
+    asyncio.to_thread 包裹本函数，但连接层面仍不应抢占写锁。
+    """
+    with get_db(readonly=True) as conn:
         row = conn.execute(
             "SELECT extracted_text_path FROM uploaded_files " "WHERE id = ? AND project_id = ?",
             (file_id, project_id),
@@ -2394,7 +2639,7 @@ def _first_text_by_keywords(project_id: int, keywords: list[str]) -> str:
     共 15 行），任何一处编码/路径修复都要改四遍（BUG-FIX-66/76 就是这么漏的）。
     合并为单一实现，四个公开函数保留原签名与行为（零迁移）。
     """
-    with get_db() as conn:
+    with get_db(readonly=True) as conn:
         rows = conn.execute(
             "SELECT id, filename, status, extracted_text_path "
             "FROM uploaded_files WHERE project_id = ? AND status = 'success' ORDER BY id",
@@ -2746,24 +2991,41 @@ def re_extract_text(project_id: int, file_id: int) -> dict:
     # 使该 file_id 的状态永远停在旧值；且旧文本在 DB 更新之前就被 unlink，
     # 一旦 DB 更新失败则新旧文本皆失，文件彻底失联。现改为：写失败如实返回
     # failed 且保留旧文本；DB 更新成功后再清理旧文件，清理失败只告警。
-    try:
-        text_path.write_text(extracted_text, encoding="utf-8")
-    except Exception as e:
-        logger.error("重新提取：写入提取文本失败 file_id=%s: %s", file_id, e)
-        _update_parse_task(project_id, "failed", 0, f"写入提取文本失败: {e}", filename)
-        return {
-            "file_id": file_id,
-            "filename": filename,
-            "status": "failed",
-            "message": f"写入提取文本失败: {e}",
-            "text_length": 0,
-        }
+    #
+    # BUG-FIX 2026-10-12（悬空路径 · 字段错位）：此前**无条件** write_text，
+    # 提取失败（extracted_text 为空串）时也会在磁盘上留下一个 0 字节 .txt，
+    # 并把该路径写进 uploaded_files.extracted_text_path —— 与 save_upload 在
+    # 2026-10-08 建立的口径（空文本不落盘）直接冲突，等于同一模块两套行为：
+    #   * `ls texts/` 里凭空多出空文件，运维/清理脚本无法区分「解析出空正文」
+    #     与「解析失败」；
+    #   * DB 指向的路径存在但内容为空，下游 `latest_extracted_text` 与
+    #     `_first_text_by_keywords` 的 `Path(path).exists()` 判空守卫被绕过
+    #     （它们只判存在性，不判大小），于是把空串当成正文合并进上下文，
+    #     AI 侧表现为「明明解析成功了却提不出任何要点」。
+    # 现与 save_upload 对齐：仅在文本非空时落盘；未落盘时把 DB 字段置空串。
+    text_written = False
+    if extracted_text.strip():
+        try:
+            text_path.write_text(extracted_text, encoding="utf-8")
+            text_written = True
+        except Exception as e:
+            logger.error("重新提取：写入提取文本失败 file_id=%s: %s", file_id, e)
+            _update_parse_task(project_id, "failed", 0, f"写入提取文本失败: {e}", filename)
+            return {
+                "file_id": file_id,
+                "filename": filename,
+                "status": "failed",
+                "message": f"写入提取文本失败: {e}",
+                "text_length": 0,
+            }
+    else:
+        logger.info("重提取未产出文本，不落盘: %s (status=%s)", filename, status)
 
     with get_db() as conn:
         conn.execute(
             "UPDATE uploaded_files SET status = ?, message = ?, extracted_text_path = ? "
             "WHERE id = ? AND project_id = ?",
-            (status, message, str(text_path), file_id, project_id),
+            (status, message, str(text_path) if text_written else "", file_id, project_id),
         )
 
     # 清理旧文本文件（DB 已指向新路径后再删，避免中途失败导致新旧皆失）

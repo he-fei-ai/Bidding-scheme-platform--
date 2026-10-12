@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback, useRef } from "react";
-import { Card, Upload, Button, message, List, Tag, Space, Typography, Spin, Alert, Popconfirm } from "antd";
+import { Card, Upload, Button, message, List, Tag, Space, Typography, Spin, Alert, Popconfirm, Modal, Tooltip } from "antd";
 import {
   UploadOutlined,
   DeleteOutlined,
@@ -13,6 +13,7 @@ import {
   InfoCircleOutlined,
   StarOutlined,
   ClearOutlined,
+  EyeOutlined,
 } from "@ant-design/icons";
 import type { UploadProps } from "antd";
 import { useParams, useNavigate } from "react-router-dom";
@@ -25,6 +26,8 @@ import {
   fetchFileParsingStatus,
   asyncReparseFile,
   clearProjectTexts,
+  fetchSupportedFormats,
+  getFileText,
 } from "../api";
 import type { FileInfo, FileParsingStatus } from "../types";
 import {
@@ -42,6 +45,10 @@ import {
   formatParsingStatusText,
   isImageFile,
   EMPTY_BATCH_TOTALS,
+  resolveAccept,
+  FALLBACK_ACCEPT,
+  buildTextPreview,
+  formatEmptyPreviewText,
   type UploadBatchTotals,
 } from "../utils";
 import PageHeader from "@/components/PageHeader";
@@ -93,6 +100,43 @@ export default function FileUploadPage() {
   const loadFilesRef = useRef(false);
   // Gap-1 2026-10-11：清空提取按钮的在途状态（防重复点击）
   const [clearing, setClearing] = useState(false);
+  // TD6 2026-10-12：accept 由后端单一真相端点下发，拉取失败回落本地常量。
+  const [acceptAttr, setAcceptAttr] = useState<string>(FALLBACK_ACCEPT);
+  // TD6 2026-10-12：单文件大小上限同样由后端下发，避免前端 50MB 硬编码
+  // 与后端 MAX_FILE_SIZE 漂移（后端调大后前端仍按 50MB 拦，用户传不上去）。
+  const [maxFileSizeMb, setMaxFileSizeMb] = useState<number>(50);
+  // 提取文本预览（激活 getFileText 死链）
+  const [previewOpen, setPreviewOpen] = useState(false);
+  const [previewLoading, setPreviewLoading] = useState(false);
+  const [preview, setPreview] = useState<{
+    filename: string;
+    text: string;
+    truncated: boolean;
+    total: number;
+  } | null>(null);
+  // BUG-FIX 2026-10-12（并发竞态）：快速连续点不同文件的「预览」时，
+  // 先发的请求可能后到，把 A 文件的正文显示在 B 文件的标题下。
+  // 用请求序号守卫，只接受最后一次发起的请求结果。
+  const previewSeqRef = useRef(0);
+
+  useEffect(() => {
+    if (!projectId) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const info = await fetchSupportedFormats(projectId);
+        if (cancelled) return;
+        setAcceptAttr(resolveAccept(info));
+        if (info?.max_file_size_mb > 0) setMaxFileSizeMb(info.max_file_size_mb);
+      } catch {
+        // 格式查询失败不影响上传主流程，静默使用本地兜底常量
+        if (!cancelled) setAcceptAttr(FALLBACK_ACCEPT);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [projectId]);
 
   const loadFiles = useCallback(async () => {
     if (!projectId) return;
@@ -134,22 +178,31 @@ export default function FileUploadPage() {
         cancelled = true;
       };
     }
-    const timer = window.setInterval(() => void fetchOnce(), 1500);
+    // ENHANCE 2026-10-12（R-3 数据链闭环）：后台异步解析的图片文件在上传响应里
+    // 先以 status='processing' 返回，解析任务完成后才落终态。上传在途期间除轮询
+    // 聚合解析状态外，必须同步刷新文件列表，否则 UI 会一直显示「解析中」直到手动
+    // 刷新。loadFiles 自带在途 ref 守卫，1.5s 轮询重复触发是安全的。
+    const timer = window.setInterval(() => {
+      void fetchOnce();
+      void loadFiles();
+    }, 1500);
     return () => {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [projectId, uploading]);
+  }, [projectId, uploading, loadFiles]);
 
   const handleUpload = async (options: UploadRequestOptions) => {
     const { file, onSuccess, onError } = options;
     if (!projectId) return;
 
     // BUG-FIX 2026-10-08：客户端文件大小校验，避免超大文件先读入内存再被后端拒绝
-    const MAX_FILE_SIZE = 50 * 1024 * 1024; // 50MB，与后端 MAX_FILE_SIZE 对齐
+    // TD6 2026-10-12：上限改由后端 supported-formats 端点下发（默认仍是 50MB），
+    // 与后端 MAX_FILE_SIZE 不再需要人工保持一致。
+    const MAX_FILE_SIZE = maxFileSizeMb * 1024 * 1024;
     if ((file as File).size > MAX_FILE_SIZE) {
-      message.error(`${(file as File).name} 文件大小超过 50MB 限制`);
-      onError?.(new Error("文件大小超过 50MB 限制"));
+      message.error(`${(file as File).name} 文件大小超过 ${maxFileSizeMb}MB 限制`);
+      onError?.(new Error(`文件大小超过 ${maxFileSizeMb}MB 限制`));
       return;
     }
 
@@ -325,6 +378,43 @@ export default function FileUploadPage() {
     }
   }, [projectId, clearing, loadFiles]);
 
+  // TD6 2026-10-12：提取文本预览 —— 激活 GET /files/{id}/text。
+  // 该 API 在 api 层导出已久却没有任何调用方（死链），用户无法核对系统究竟
+  // 解析出了什么正文；「显示已提取却提不出要点」这类问题完全无法自查。
+  const handlePreviewText = async (file: FileInfo) => {
+    if (!projectId) return;
+    previewSeqRef.current += 1;
+    const seq = previewSeqRef.current;
+    setPreviewOpen(true);
+    setPreviewLoading(true);
+    setPreview({ filename: file.filename, text: "", truncated: false, total: 0 });
+    try {
+      const text = await getFileText(projectId, file.id);
+      // 并发守卫：只有最后一次发起的请求才允许写入展示态
+      if (previewSeqRef.current !== seq) return;
+      if (!text || !text.trim()) {
+        setPreview(null);
+        message.info(formatEmptyPreviewText(file.status));
+        return;
+      }
+      const built = buildTextPreview(text);
+      setPreview({
+        filename: file.filename,
+        text: built.preview,
+        truncated: built.truncated,
+        total: built.total,
+      });
+    } catch (err) {
+      if (previewSeqRef.current !== seq) return;
+      setPreview(null);
+      message.error(
+        `获取提取文本失败：${err instanceof Error ? err.message : String(err)}`,
+      );
+    } finally {
+      if (previewSeqRef.current === seq) setPreviewLoading(false);
+    }
+  };
+
   return (
     <div>
       <PageHeader
@@ -376,7 +466,7 @@ export default function FileUploadPage() {
           <Upload.Dragger
             name="file"
             multiple
-            accept=".doc,.docx,.pdf,.xls,.xlsx,.txt,.md,.ppt,.pptx,.html,.htm,.wps,.png,.jpg,.jpeg,.bmp,.tiff,.webp"
+            accept={acceptAttr}
             customRequest={handleUpload}
             showUploadList={false}
             disabled={uploading}
@@ -454,6 +544,16 @@ export default function FileUploadPage() {
                 renderItem={(file) => (
                   <List.Item
                     actions={[
+                      <Tooltip key="preview" title="预览提取文本">
+                        <Button
+                          size="small"
+                          type="text"
+                          icon={<EyeOutlined />}
+                          onClick={() => handlePreviewText(file)}
+                        >
+                          预览文本
+                        </Button>
+                      </Tooltip>,
                       <Button
                         key="role"
                         size="small"
@@ -530,6 +630,50 @@ export default function FileUploadPage() {
           )}
         </Card>
       </Space>
+
+      {/* TD6 2026-10-12：提取文本预览弹窗（激活 getFileText 死链） */}
+      <Modal
+        open={previewOpen}
+        title={preview ? `提取文本预览 · ${preview.filename}` : "提取文本预览"}
+        onCancel={() => setPreviewOpen(false)}
+        footer={null}
+        width={900}
+        destroyOnHidden
+      >
+        {previewLoading ? (
+          <div style={{ textAlign: "center", padding: "40px 0" }}>
+            <Spin />
+          </div>
+        ) : preview ? (
+          <>
+            <Alert
+              type={preview.truncated ? "warning" : "info"}
+              showIcon
+              style={{ borderRadius: 8, marginBottom: 12 }}
+              message={
+                preview.truncated
+                  ? `文本共 ${preview.total} 字，已截断显示前 ${preview.text.length} 字`
+                  : `文本共 ${preview.total} 字`
+              }
+            />
+            <Text
+              style={{
+                display: "block",
+                maxHeight: "55vh",
+                overflow: "auto",
+                whiteSpace: "pre-wrap",
+                wordBreak: "break-all",
+                fontSize: 13,
+                lineHeight: 1.7,
+              }}
+            >
+              {preview.text}
+            </Text>
+          </>
+        ) : (
+          <Text type="secondary">该文件没有可预览的提取文本。</Text>
+        )}
+      </Modal>
     </div>
   );
 }

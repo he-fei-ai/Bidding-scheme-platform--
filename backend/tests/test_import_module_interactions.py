@@ -224,9 +224,22 @@ class TestRouteServiceWhitelistConsistency:
         # olefile 解析失败时服务层优雅降级为提示文本；不允许再出现 400 拒绝入口
         assert data["status"] in ("success", "failed"), data
 
-    def test_image_accepted_with_graceful_empty_text(self, client, project_id):
-        """图片进入解析链路；OCR 未启用时 success + 空文本提示（BUG-FIX 2026-09-29）"""
+    def test_image_accepted_with_graceful_empty_text(
+        self, client, project_id, monkeypatch
+    ):
+        """图片进入解析链路；OCR 未启用时 success + 空文本提示（BUG-FIX 2026-09-29）。
+
+        R-3 2026-10-12：图片现走后台异步解析，有 broker 时返回 processing。本用例
+        模拟 broker 不可达（派发异常→同步回退），确定性地校验「同步收尾 + 空文本提示」
+        口径，与路由层必须接受图片（不得 400）的初衷一致。
+        """
         from app.config import OCR_ENABLED
+        import app.celery_app as celery_mod
+
+        def _raise(*a, **k):
+            raise RuntimeError("broker unreachable (simulated)")
+
+        monkeypatch.setattr(celery_mod, "dispatch_task", _raise)
 
         # 1x1 PNG
         png = bytes.fromhex(
