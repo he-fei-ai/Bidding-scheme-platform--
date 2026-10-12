@@ -4558,10 +4558,28 @@ def _auto_fix_issues(level1: list[dict], issues: list[str]) -> list[dict]:
                 try:
                     # BUG-FIX-12: 使用 _path_to_index 替代 int() 解析点号ID格式
                     # 原实现 int("1.1") 抛 ValueError，导致 L2/L3 空标题修复完全失效
+                    # BUG-FIX 2026-10-12（P1）：三个分支原分别写死
+                    # `章节{i+1}` / `子章节{j+1}` / `内容{k+1}` —— 零语义的纯序号
+                    # 占位，与「专项6」同属用户投诉的占位泛化标题。统一改为按父级
+                    # 语义派生（与同函数「无二级/无三级子目录」分支同一套规则）。
+                    # 用 `_semantic_fallback_title`（工程实体 × 专业维度）而非
+                    # `_derive_child_title`：L1 无父级可用，后者对 level=1 没有
+                    # 对应的语义池分支。
+                    from .outline_common import _semantic_fallback_title
+
+                    def _sibling_titles(nodes: list) -> set[str]:
+                        return {
+                            str(_s.get("title") or "").strip()
+                            for _s in (nodes or [])
+                            if isinstance(_s, dict) and str(_s.get("title") or "").strip()
+                        }
+
                     if len(parts) == 1:
                         idx = _path_to_index(parts[0])
                         if 0 <= idx < len(level1) and isinstance(level1[idx], dict):
-                            level1[idx]["title"] = f"章节{idx + 1}"
+                            level1[idx]["title"] = _semantic_fallback_title(
+                                "总体策划", idx, _sibling_titles(level1)
+                            )
                     elif len(parts) == 2:
                         i, j = _path_to_index(parts[0]), _path_to_index(parts[1])
                         if 0 <= i < len(level1) and isinstance(level1[i], dict):
@@ -4571,7 +4589,11 @@ def _auto_fix_issues(level1: list[dict], issues: list[str]) -> list[dict]:
                                 and 0 <= j < len(children)
                                 and isinstance(children[j], dict)
                             ):
-                                children[j]["title"] = f"子章节{j + 1}"
+                                children[j]["title"] = _semantic_fallback_title(
+                                    level1[i].get("title", ""),
+                                    j,
+                                    _sibling_titles(children),
+                                )
                     elif len(parts) == 3:
                         i, j, k = (
                             _path_to_index(parts[0]),

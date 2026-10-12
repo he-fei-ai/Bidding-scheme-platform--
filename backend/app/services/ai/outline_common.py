@@ -2704,22 +2704,40 @@ def sanitize_framework_titles(
 ) -> dict:
     """替换框架中的占位标题为项目相关标题，避免占位文本存入数据库。
 
-    当 AI 填充失败时，fill_children_with_retry 会返回原始框架，
-    其中包含如"【请根据项目实际替换为具体标题】二级第1项"的占位标题。
-    此函数将这些占位标题替换为基于项目章节名的实际标题，
-    并使用章节类型感知策略生成多样化标题，避免不同章节使用相同模式。
+    ⚠️ 【已废弃 · 不在生产链路】BUG-FIX 2026-10-12（死代码治理）
 
-    V5.2 增强：支持跨章节全局去重（global_used_titles），
-    防止多个章节各自独立兜底时生成相同的 L2/L3 标题。
-    未传入时自动降级为章节内去重（向后兼容）。
+    本函数**没有任何生产调用方**，且其行为被 2026-10-09/10/11 三轮三级标题
+    占位治理"绕过"了还不自知 —— 这正是最危险的地方：
+
+      · docstring 原文声称「当 AI 填充失败时，``fill_children_with_retry`` 会
+        返回原始框架」。**该说法自 2026-09 起就已失效**：`fill_children_with_retry`
+        是 `workflows.py::_legacy_stub` 里的退役桩，直接抛 NotImplementedError。
+        陈旧的依赖描述会让后来者以为本函数仍在生效。
+      · V5.1 主链路的真实兜底是 `workflows_outline_v51._default_l2_children_for_skeleton`
+        （由 `_generate_level2_v51` 在 AI 填充失败时调用），它走
+        `_derive_child_title(level=2/3)` 按父级语义派生，**与本函数是两套完全
+        不同的标题生成策略**。
+      · 因此本函数里那 15 个单测（test_diversity / test_e2e_diversity）验证的是
+        一条**不会运行**的链路，提供的是虚假信心。
+
+    之所以保留函数体而不是直接删除：它仍是本仓唯一一处「跨章节全局去重 +
+    语义化消歧」的完整示例，且 2026-10-12 已把其最后那个裸编号后缀生产点
+    `f"{new_title}（{chapter_idx + 1}）"` 换成 `_disambiguate_title` —— 万一将来
+    要复活这条链路，代码已经是正确的。
+
+    保留的同时由 `tests/test_outline_module_audit_2026_10_12.py` 钉住两条不变式：
+      1) 本模块（除 tests 外）不得再 import 它，防止它悄悄变成影子链路；
+      2) 真实兜底 `_default_l2_children_for_skeleton` 产出的标题零占位。
+
+    历史行为（供复活时参考）：
+    替换「【请根据项目实际替换为具体标题】二级第1项」这类占位标题；
+    V5.2 起支持跨章节全局去重（``global_used_titles``），未传入时降级为章节内去重。
 
     Args:
         framework: AI 生成的目录框架（可能含占位标题）
         chapter_title: 一级章节标题（用于生成项目相关的二级/三级标题）
         chapter_idx: 章节序号（用于跨章节去重，确保不同章节的兜底标题不同）
-        global_used_titles: 跨章节共享的已用标题池（所有章节共用同一个 set）。
-                            传入时函数会从中读取 + 写入，实现跨章节去重；
-                            不传入则退化为章节内去重（V5.1 行为）。
+        global_used_titles: 跨章节共享的已用标题池；不传则退化为章节内去重。
 
     Returns:
         dict: 占位标题已被替换的框架

@@ -112,6 +112,19 @@ export interface SectionTreeNode {
   has_content: boolean;
   word_count: number;
   chart_flags?: string[];
+  /**
+   * 展示编号（纯前端派生，后端不存储、不返回）。
+   *
+   * 由 `utils.annotateOutlineWithNumbers` 按树位置生成（V3.1 体系：
+   * 第一节、/ 一、/ 1、/ 1.1、…），与后端 `renumber_outline_ids` 的
+   * 「层级只由树位置派生」是同一条不变量的两种呈现。
+   *
+   * 2026-10-12 提升为类型上的可选字段（此前只存在于
+   * `SectionTreeNode & { number?: string }` 这个交叉类型里，
+   * 导致嵌套 children 上的 number 无法访问 —— V5.1 审核弹窗因此
+   * 被迫自己另算一套 `index+1.ci+1` 编号，与主目录树显示不一致）。
+   */
+  number?: string;
 }
 
 export interface Section {

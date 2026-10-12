@@ -18,7 +18,11 @@ from .outline_common import (
     build_chapter7_framework,
     build_framework_for_chapter,
     generate_nodes_distribution,
-    sanitize_framework_titles,
+    # BUG-FIX 2026-10-12（死代码治理）：`sanitize_framework_titles` 已从本 facade
+    # 移除 —— 全仓无任何生产调用方（V5.1 主链路的兜底是
+    # `_default_l2_children_for_skeleton` + `_derive_child_title`），
+    # 继续 re-export 会让它看起来仍是被支持的公共 API。此处保留导入会诱使
+    # 后续代码继续走这条不生效的影子链路。
 )
 from .workflows_analysis import normalize_writing_targets
 from .workflows_base import (

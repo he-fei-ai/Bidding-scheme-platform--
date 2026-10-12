@@ -237,6 +237,63 @@ def _normalize_sibling_sort_order(conn, section_id: int, requested: int | None =
     )
 
 
+def _strip_body_heading_numbering(conn, section_ids: list[int]) -> int:
+    """剥离指定章节正文里 Markdown 标题的编号前缀，返回实际改写的章节数。
+
+    BUG-FIX 2026-10-12（编号命名空间 · 正文侧统一）：
+    导出端对 **L1~L4** 的正文标题会剥掉内嵌编号并按目录结构重新生成
+    （export.py `clean_text = _strip_heading_numbering(block.text)`），
+    但 **L5+ 直接取 `raw_line` 原样输出**（export.py:1462，2026-09-04 的
+    「L5+ 保留 AI 原始格式」设计）。于是正文里 AI 写下的
+    `3.1.2.1 / 3.1.2.2` 这类**深层内嵌编号**会带着「生成那一刻的树位置」
+    一直活到导出，而章节自身的编号早已按当前目录结构重算 ——
+    文档里就出现「H2 是 `三、进度管理与纠偏`，三级之下却挂着 `3.1.2.1`」。
+
+    何时需要剥离：任何会改变该章节**编号语义**的操作。原先只有
+    `parent_id` 变更会触发（BUG-P3-B 2026-10-11），而实际上至少还有三类：
+      1) `sort_order` 变更（上移/下移/同级插入）—— 章节位置变了，编号就变了；
+      2) `title` 变更（改名）—— 正文里的编号往往对应旧标题自带的编号方案；
+      3) 批量重排（`reorder_sections`）。
+    这三类此前全部绕过，导致「目录层级与正文内嵌编号不一致」成为常态。
+
+    口径与 2026-10-11 的换父修复保持一致（剥掉内嵌编号、只保留标题正文），
+    不做重新编号：L5+ 的呈现策略是导出端的既定设计，正文生成侧的编号归一
+    （`heading_standard.normalize_content`）目前无生产调用方，不宜在此
+    另起一套与之竞争的编号体系。
+
+    非关键路径：任何异常都降级为「不剥离」，绝不阻断章节写入/移动。
+    """
+    if not section_ids:
+        return 0
+    try:
+        from .content_cleaning import strip_heading_numbering_from_content
+    except Exception as _imp_err:  # pragma: no cover - 循环导入/可选依赖兜底
+        logger.debug("[正文编号净化] 跳过（导入失败）: %s", _imp_err)
+        return 0
+    _changed = 0
+    for _cid in dict.fromkeys(section_ids):  # 去重且保序
+        if _cid is None:
+            continue
+        _row = conn.execute(
+            "SELECT id, content FROM sections WHERE id = ?", (_cid,)
+        ).fetchone()
+        if not _row or not _row["content"]:
+            continue
+        _new_content = strip_heading_numbering_from_content(_row["content"])
+        if _new_content == _row["content"]:
+            continue
+        _wc = _count_words(_new_content)
+        conn.execute(
+            "UPDATE sections SET content = ?, word_count = ?, readable_word_count = ? "
+            "WHERE id = ?",
+            (_new_content, _wc, _count_readable_words(_new_content), _cid),
+        )
+        _changed += 1
+    if _changed:
+        logger.info("[正文编号净化] 剥离 %d 个章节正文的内嵌标题编号", _changed)
+    return _changed
+
+
 def _insert_section(conn, project_id: int, data: SectionCreate, now: str) -> Section:
     """使用已有连接插入章节（用于事务内调用）"""
     cursor = conn.execute(
@@ -361,28 +418,40 @@ def update_section(section_id: int, data: SectionUpdate) -> Section | None:
             # 此前只重算 level、不触及 content——重排后导出端从目录结构重新生成
             # 编号时，目录层级与正文内嵌编号（## 1.1 xxx / ### 2.3.1 yyy）
             # 可能不一致。现对整棵子树的 content 剥离内嵌编号前缀，只保留标题正文。
+            # BUG-FIX 2026-10-12：抽成 `_strip_body_heading_numbering` 共用实现，
+            # 与 sort_order 变更 / move / reorder 三条路径口径统一。
             try:
-                from .content_cleaning import strip_heading_numbering_from_content
-                for r in _depth_rows:
-                    _cid = r["id"]
-                    _content_row = conn.execute(
-                        "SELECT id, content FROM sections WHERE id = ?", (_cid,)
-                    ).fetchone()
-                    if _content_row and _content_row["content"]:
-                        _new_content = strip_heading_numbering_from_content(_content_row["content"])
-                        if _new_content != _content_row["content"]:
-                            _wc = _count_words(_new_content)
-                            conn.execute(
-                                "UPDATE sections SET content = ?, word_count = ?, "
-                                "readable_word_count = ? WHERE id = ?",
-                                (_new_content, _wc, _count_readable_words(_new_content), _cid),
-                            )
+                _strip_body_heading_numbering(conn, [r["id"] for r in _depth_rows])
             except Exception as _strip_err:
                 # 编号净化是非关键路径；失败降级为只重算 level
                 logger.debug("[章节重排] 正文编号净化跳过: %s", _strip_err)
             # 换父后同级 sort_order 可能与既有节点撞号（前端拖拽只带 order 不带
             # sort_order 时尤其明显），落库前归一到 1 起连续，编号/展示顺序才确定。
             _normalize_sibling_sort_order(conn, section_id, updates.get("sort_order"))
+        # BUG-FIX 2026-10-12（编号命名空间 · 改名/换序不净化正文）：
+        # 换父之外的另外两类「编号语义已变」操作此前完全没有触发正文净化：
+        #   · 改名（title）—— 正文里的 `3.1.2.1` 对应的是旧标题自带的编号方案，
+        #     改名后该方案在文档里已不存在；
+        #   · 换序（sort_order）—— 章节位置变了、编号也就变了，但
+        #     `move_section` / `reorder_sections` 走的是各自的 SQL 路径，
+        #     根本不经过本函数。
+        # 两者都会让「目录层级」与「正文内嵌编号」长期不一致，且只有重新生成
+        # 正文才能自愈 —— 正是 content_cleaning.py:1120 注释里点名的缺口。
+        # 口径与换父一致：剥离内嵌编号，保留标题正文。
+        _strip_ids: list[int] = []
+        if "title" in updates and updates["title"] != (existing_row["title"] or ""):
+            _strip_ids.append(section_id)
+        if "sort_order" in updates and updates["sort_order"] is not None:
+            try:
+                if int(updates["sort_order"]) != int(existing_row["sort_order"] or 0):
+                    _strip_ids.append(section_id)
+            except (TypeError, ValueError):
+                pass
+        if _strip_ids:
+            try:
+                _strip_body_heading_numbering(conn, _strip_ids)
+            except Exception as _strip_err2:
+                logger.debug("[章节更新] 正文编号净化跳过: %s", _strip_err2)
         # BUG-FIX 2026-10-04（P1·BUG-C）：正文变更时同一条 SQL 同步持久化 word_count。
         # 旧实现只在返回对象里重算字数，DB 列陈旧——一致性审计路径
         # （sse_content.update_section(SectionUpdate(content=...))）与前端编辑保存后，
@@ -820,6 +889,21 @@ def move_section(section_id: int, direction: str) -> bool:
                 "UPDATE sections SET sort_order = ? WHERE id = ?",
                 [(new_order, sib["id"]) for new_order, sib in enumerate(siblings, start=1)],
             )
+            # BUG-FIX 2026-10-12（编号命名空间 · 移动不净化正文）：
+            # 交换位置后，被移动章节与它换位的那个兄弟**编号双双改变**
+            # （3→2 与 2→3）。导出端对 L1~L4 会按目录结构重新生成编号，
+            # 但 L5+ 正文标题沿用 `raw_line` 原样输出（export.py:1462），
+            # 于是这两个章节正文里的 `3.1.2.1` 之类内嵌编号会指向已不存在的位置。
+            # 此前 move 路径完全不碰 content，缺口只能靠重新生成正文自愈。
+            # 只处理这两个换位的节点——其余兄弟的编号未变，无需付出剥离代价。
+            _swap_idx = idx - 1 if direction == "up" else idx + 1
+            _affected = [section_id]
+            if 0 <= _swap_idx < len(siblings) and siblings[_swap_idx]["id"] != section_id:
+                _affected.append(siblings[_swap_idx]["id"])
+            try:
+                _strip_body_heading_numbering(conn, _affected)
+            except Exception as _strip_err:
+                logger.debug("[章节移动] 正文编号净化跳过: %s", _strip_err)
             logger.info(
                 "移动章节 section_id=%d %s 成功，已重建 %d 个兄弟节点的 sort_order",
                 section_id,
@@ -866,6 +950,40 @@ def reorder_sections(project_id: int, groups: list[dict]) -> list[SectionTreeNod
     """
     if not groups:
         return build_tree(project_id)
+
+    # BUG-FIX 2026-10-12（编号命名空间 · 批量重排不净化正文）：
+    # 预收集「顺序真的发生变化」的章节 id。批量重排与 move 是同一类语义变化
+    # （章节位置变 → 编号变），但走的是完全不同的 SQL 路径，同样不碰 content，
+    # 导致 L5+ 正文的内嵌编号指向已不存在的旧位置。
+    # 先按「重排前顺序」取快照，重排后逐组比对，只对真正换了位的节点付出
+    # 剥离代价 —— 没换位的节点内容完全不受影响，避免无谓的全量重写。
+    _pre_order: dict[int, int] = {}
+    _moved_ids: list[int] = []
+    with get_db() as conn:
+        try:
+            for group in groups:
+                ordered_ids = group.get("ordered_ids") or []
+                if not ordered_ids:
+                    continue
+                for _pos, _sid in enumerate(ordered_ids, start=1):
+                    _row = conn.execute(
+                        "SELECT sort_order FROM sections WHERE id = ? AND project_id = ?",
+                        (_sid, project_id),
+                    ).fetchone()
+                    if _row is None:
+                        continue
+                    try:
+                        _old = int(_row["sort_order"] or 0)
+                    except (TypeError, ValueError):
+                        _old = 0
+                    _pre_order[_sid] = _old
+                    if _old != _pos:
+                        _moved_ids.append(_sid)
+            if _moved_ids:
+                _strip_body_heading_numbering(conn, _moved_ids)
+        except Exception as _pre_err:
+            # 预扫描/净化失败不得阻断重排本身
+            logger.debug("[批量重排] 正文编号净化跳过: %s", _pre_err)
 
     with get_db() as conn:
         try:

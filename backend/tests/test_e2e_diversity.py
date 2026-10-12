@@ -51,8 +51,10 @@ def test_end_to_end_diversity():
         _classify_chapter_type,
         _generate_diverse_l2_title,
         _generate_diverse_l3_title,
-        sanitize_framework_titles,
     )
+    # BUG-FIX 2026-10-12（死代码治理）：`sanitize_framework_titles` 已从
+    # `workflows` facade 移除（全仓无生产调用方），改从定义模块直接导入。
+    from app.services.ai.outline_common import sanitize_framework_titles
 
     chapters = _make_chapters()
     print(f"\n{'='*70}")

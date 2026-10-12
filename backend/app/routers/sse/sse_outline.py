@@ -603,7 +603,30 @@ async def generate_outline_sse_impl(
 
 
 
+        # BUG-FIX 2026-10-12（SSE 重连幂等 · 事件序号）：
+        # 本连接上的每条事件都盖一个单调递增的 `seq`，前端据此**去重**。
+        #
+        # 背景：断线重连时服务端会重放 `state['last_event']`
+        # （下面 is_reconnection 分支），而 `task_registry.broadcast_event`
+        # 对**每一类**事件（含 completed/error/stopped 终态）都执行
+        # `task.last_event = event`，只保留最后一条。于是：
+        #   · 客户端已经消费过的进度事件被原样重放 → 进度条倒退
+        #     （`reduceOutlineGeneratingEvent` 是绝对赋值，无单调性保护）；
+        #   · 若断线前最后一条恰是终态，重放会与直播流里的终态**各触发一次**
+        #     → 双弹 toast、两次 loadTree 定时器、close() 调用两次。
+        # 有了 seq，前端可以精确判定「这条我见过」，而不必靠猜。
+        #
+        # 注意：重放走的是 broadcast 缓存里的**已盖章**事件，因此重放出去的
+        # seq 与客户端此前收到的一致，去重才成立。若这里改成后置盖章就会失效。
+        _event_seq = [0]
+
         async def _qput(evt):
+
+            if isinstance(evt, dict) and "status" in evt:
+
+                _event_seq[0] += 1
+
+                evt.setdefault("seq", _event_seq[0])
 
             await outline_queue.put(evt)
 

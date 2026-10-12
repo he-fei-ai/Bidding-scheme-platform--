@@ -57,8 +57,23 @@ def _new_project(name: str) -> int:
 
 
 def _source_without_comments(path: str) -> str:
-    """读取源码并去掉整行注释，避免「修复注释里原文引用旧写法」造成假阳性。"""
-    text = Path(path).read_text(encoding="utf-8")
+    """读取源码并去掉整行注释，避免「修复注释里原文引用旧写法」造成假阳性。
+
+    BUG-FIX 2026-10-12（测试依赖调用目录）：原实现直接 `Path(path)`，
+    路径相对于**当前工作目录**解析。本仓库的测试既可能从仓库根目录
+    （`pytest backend/tests`）也可能从 `backend/`（`pytest tests`）启动，
+    前者下 `app/celery_app.py` 根本不存在 → 10 个源码扫描用例全部
+    `FileNotFoundError`。这类失败与被测代码无关，却会在全量回归里
+    伪装成"任务层坏了"，极易误导排查方向。
+
+    现把相对路径锚定到 **backend 根目录**（本文件所在目录的上级），
+    与调用目录解耦。绝对路径仍原样处理，向后兼容。
+    """
+    _backend_root = Path(__file__).resolve().parents[1]
+    _p = Path(path)
+    if not _p.is_absolute():
+        _p = _backend_root / _p
+    text = _p.read_text(encoding="utf-8")
     return "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
 
 

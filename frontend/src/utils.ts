@@ -990,6 +990,15 @@ export interface OutlineGeneratingPatch {
   outlineStep?: number;
   progressPercent?: number;
   progressMessage: string;
+  /** 进度发生回退（重连重放 / 乱序到达），UI 应保持原值不动 */
+  regressed?: boolean;
+}
+
+export interface OutlineProgressFloor {
+  /** 已展示的最高步骤；新步骤更小时视为回退 */
+  step?: number;
+  /** 已展示的最高百分比；新百分比更小时视为回退 */
+  percent?: number;
 }
 
 /**
@@ -997,19 +1006,40 @@ export interface OutlineGeneratingPatch {
  * 所有 phase 统一按 outline_step 计算百分比，消除 outline_phase 与其他
  * phase（context/saving/v51）之间的进度跳跃。心跳事件仅更新提示文案，
  * 不改变步骤与百分比。返回对象中缺省的字段表示“保持当前值不变”。
+ *
+ * BUG-FIX 2026-10-12（单调性下限 floor）：本函数此前是**绝对赋值**，
+ * 只要收到一条 `outline_step` 更小的事件（断线重连时服务端重放
+ * `state['last_event']`，恰恰就是一条旧进度事件），进度条就会**倒退** ——
+ * 用户看到 AI 明明在第 6 步，界面却退回第 3 步的 25%。
+ * 传入 `floor`（当前已展示值）后，低于下限的增量会被丢弃并置 `regressed`，
+ * 调用方可据此打日志；不传 `floor` 时行为与改动前逐字一致，向后兼容。
  */
 export function reduceOutlineGeneratingEvent(
   data: { phase?: string; outline_step?: number; message?: string },
   stepLabels: string[] = OUTLINE_STEPS_V51,
+  floor: OutlineProgressFloor = {},
 ): OutlineGeneratingPatch {
   const totalSteps = stepLabels.length;
   const pct = (step: number) =>
     Math.min(100, Math.round(((step - 1) / totalSteps) * 100));
+  const minStep = typeof floor.step === "number" ? floor.step : 0;
+  const minPct = typeof floor.percent === "number" ? floor.percent : 0;
+
+  /** 低于下限则退回 undefined（保持现值）并标记 regressed */
+  const clamp = (
+    step: number,
+    percent: number,
+  ): Pick<OutlineGeneratingPatch, "outlineStep" | "progressPercent" | "regressed"> => {
+    if (step < minStep || percent < minPct) {
+      return { regressed: true };
+    }
+    return { outlineStep: step, progressPercent: percent };
+  };
 
   if (data.phase === "outline_phase" && data.outline_step) {
+    const c = clamp(data.outline_step, pct(data.outline_step));
     return {
-      outlineStep: data.outline_step,
-      progressPercent: pct(data.outline_step),
+      ...c,
       progressMessage: data.message || stepLabels[data.outline_step - 1] || "",
     };
   }
@@ -1019,8 +1049,7 @@ export function reduceOutlineGeneratingEvent(
   // 其他阶段（context、saving、v51 等）：有 outline_step 时按其计算进度
   if (data.outline_step) {
     return {
-      outlineStep: data.outline_step,
-      progressPercent: pct(data.outline_step),
+      ...clamp(data.outline_step, pct(data.outline_step)),
       progressMessage: data.message || "",
     };
   }

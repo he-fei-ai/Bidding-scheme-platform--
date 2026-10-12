@@ -87,6 +87,13 @@ export default React.memo(function OutlineEditorPage() {
   // BUG-FIX 2026-10-12：SSE 回调里需要拿到本次生成注册的 taskId 与最新百分比，
   // 但闭包会捕获 startTask 时的旧值。用 ref 承载，避免依赖 stale state。
   const taskIdRef = useRef<string>("");
+  // BUG-FIX 2026-10-12（SSE 重连幂等）：已应用的最大事件 seq / 终态是否已落定。
+  // 两者都必须是 ref（不是 state）：onmessage 闭包里读 state 会拿到注册回调时的
+  // 旧值，去重与幂等守卫会静默失效 —— 与本次同批修掉的 progress stale closure
+  // 是同一类缺陷。
+  const appliedSeqRef = useRef<number | null>(null);
+  const terminalAppliedRef = useRef(false);
+  const outlineStepRef = useRef(0);
   const [progressMessage, setProgressMessage] = useState("");
   const [outlineStep, setOutlineStep] = useState(0);
   const [outlineProgress, setOutlineProgress] = useState<{ level1: number; completed: number; total: number } | null>(null);
@@ -259,12 +266,18 @@ export default React.memo(function OutlineEditorPage() {
 
     setIsGenerating(true);
     setProgressPercent(0);
+    progressPercentRef.current = 0;
     setProgressMessage("准备生成目录...");
     setOutlineStep(0);
+    outlineStepRef.current = 0;
     setOutlineProgress(null);
     setOutlineGenerationDone(false);
     setGenerationEndState(null);
     setReviewConfirmed(false);
+    // 每次生成都是一次全新的事件流：重置 SSE 幂等守卫，
+    // 否则上一轮残留的 terminalApplied/seq 会让本轮的终态被当作重放丢弃。
+    appliedSeqRef.current = null;
+    terminalAppliedRef.current = false;
     userStoppedRef.current = false;
 
     const eventSource = createOutlineEventSource(projectId, outlineMode);
@@ -277,14 +290,47 @@ export default React.memo(function OutlineEditorPage() {
       try {
         const data = JSON.parse(event.data);
 
+        // BUG-FIX 2026-10-12（SSE 重连幂等）：服务端在重连时会重放
+        // `state['last_event']`，而 `task_registry.broadcast_event` 对每一类事件
+        // （含终态）都覆盖 `task.last_event` —— 于是客户端已经消费过的进度事件
+        // 会被原样重放一次。服务端为此给每条事件盖了单调递增的 `seq`
+        // （sse_outline.py `_qput`），这里按 seq 去重，保证「至多应用一次」。
+        //
+        // 不用 seq 时（服务端未升级 / 事件无 seq）自动跳过该保护，保持兼容。
+        const seq = typeof data?.seq === "number" ? data.seq : null;
+        if (seq !== null) {
+          if (appliedSeqRef.current !== null && seq <= appliedSeqRef.current) return;
+          appliedSeqRef.current = seq;
+        }
+
+        // 终态幂等：completed/stopped/cancelled/error 各分支都不是幂等的
+        //（双弹 toast、两次 loadTree 定时器、close() 调两次）。一旦终态已落定，
+        // 后续任何终态事件（含重放）直接忽略。
+        const TERMINAL = ["completed", "stopped", "cancelled", "error"];
+        if (data && typeof data.status === "string" && TERMINAL.includes(data.status)) {
+          if (terminalAppliedRef.current) return;
+          terminalAppliedRef.current = true;
+        }
+
         if (data.status === "connected") {
           hasConnected = true;
         } else if (data.status === "generating") {
           // BUG-OUTLINE-03 修复：统一进度计算逻辑（抽取为纯函数 reduceOutlineGeneratingEvent，
           // 与 utils 单测钉住），所有 phase 都按 outline_step 计算百分比，
           // 消除 outline_phase 与其他 phase 的进度跳跃（如 context 阶段突然跳到 90%）
-          const patch = reduceOutlineGeneratingEvent(data);
-          if (patch.outlineStep !== undefined) setOutlineStep(patch.outlineStep);
+          const patch = reduceOutlineGeneratingEvent(data, OUTLINE_STEPS_V51, {
+            step: outlineStepRef.current,
+            percent: progressPercentRef.current,
+          });
+          if (patch.regressed) {
+            console.debug(
+              `[outline] 忽略回退的进度事件: step=${data.outline_step} < 已展示 ${outlineStepRef.current}`,
+            );
+          }
+          if (patch.outlineStep !== undefined) {
+            setOutlineStep(patch.outlineStep);
+            outlineStepRef.current = patch.outlineStep;
+          }
           if (patch.progressPercent !== undefined) {
             setProgressPercent(patch.progressPercent);
             progressPercentRef.current = patch.progressPercent;
@@ -295,13 +341,16 @@ export default React.memo(function OutlineEditorPage() {
           // 但本页此前**从不读取**该字段，`outlineProgress` 只有初始的 setXxx(null)，
           // 于是「章节进度 n/N 章」区块恒不渲染（死 UI），用户对长方案只能看到一个
           // 不动的总百分比。改为真正消费该字段。
+          // completed 取单调上限：重连重放的旧进度事件不得让章数倒退。
           const prog = (data as { progress?: { level1?: number; completed?: number; total?: number } }).progress;
           if (prog && typeof prog.completed === "number" && typeof prog.total === "number") {
-            setOutlineProgress({
-              level1: typeof prog.level1 === "number" ? prog.level1 : prog.total,
-              completed: prog.completed,
-              total: prog.total,
-            });
+            const _total = prog.total;
+            const _level1 = typeof prog.level1 === "number" ? prog.level1 : _total;
+            setOutlineProgress((prev) => ({
+              level1: _level1,
+              completed: Math.max(prog.completed as number, prev?.completed ?? 0),
+              total: _total,
+            }));
           }
           // 顶部全局任务条此前只在 startTask 写一次、此后从不更新，
           // 整个目录生成期间进度条恒为 0%（TaskStatusBar 显示「目录生成 0%」）。
@@ -420,7 +469,12 @@ export default React.memo(function OutlineEditorPage() {
             setReviewStage("level1");
           }
           setReviewModalVisible(true);
-          setReviewConfirmed(false);
+          // BUG-FIX 2026-10-12（审核弹窗重入）：原实现无条件 `setReviewConfirmed(false)`。
+          // 断线重连时服务端可能重放一条**旧的** `review_needed`（`last_event`），
+          // 此时工作流其实已经推进到下一个阶段甚至已结束 —— 弹窗会重新弹出盖住
+          // 界面，并把「已确认」状态打回未确认，用户不得不重新确认一次。
+          // 只在「确实还没确认过任何阶段」时置 false：已确认过说明存在陈旧重放。
+          setReviewConfirmed((prev) => (prev ? true : false));
           setReviewEditTitles({});
           const phaseLabel = phase === 'level1' ? '一级' : phase === 'level2' ? '二级' : '最终';
           setProgressMessage(data.message || `请审核${phaseLabel}目录`);

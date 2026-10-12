@@ -29,8 +29,15 @@ from app.services.ai.workflows import (
     build_chapter7_framework,
     build_framework_for_chapter,
     generate_nodes_distribution,
-    sanitize_framework_titles,
 )
+
+# BUG-FIX 2026-10-12（死代码治理）：`sanitize_framework_titles` 已从
+# `workflows` facade 移除（全仓无生产调用方，见 outline_common 中该函数的
+# 废弃说明）。它仍在 outline_common 中定义，本文件继续对其做单元验证 ——
+# 但这些用例验证的是一条**不会运行**的链路，切勿据此判断线上标题质量。
+# 真正生效的兜底是 `workflows_outline_v51._default_l2_children_for_skeleton`
+# （已由 tests/test_outline_module_audit_2026_10_12.py 钉住）。
+from app.services.ai.outline_common import sanitize_framework_titles
 
 
 # ===========================================================================
