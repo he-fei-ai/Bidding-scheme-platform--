@@ -303,6 +303,11 @@ const [progressTotal, setProgressTotal] = useState(0);
   const [useConsistencyAudit, setUseConsistencyAudit] = useState(false);
   // 并发生成正文并发数（可选项：2/4/6/8，后端硬上限 MAX_CONTENT_CONCURRENCY=8）
   const [concurrency, setConcurrency] = useState<number>(4);
+  // W-3 2026-10-12：易标 R9/R10/R11 字数双向多轮调整的「单次强制」开关。
+  // 后端 use_word_adjust 是 bool | None 三态，因此这里用三态而非布尔：
+  //   null = **不下发** → 服务端按 config 判定（默认；强控项目自动启用），零回归；
+  //   true = 单次强制开启（会产生额外 AI 调用）；false = 单次强制关闭。
+  const [useWordAdjust, setUseWordAdjust] = useState<boolean | null>(null);
 
   // ENHANCE 2026-10-05（P-11）：正文编排参数（对齐易标规格六.4/六.5）
   // 表格密度 / AI 生图上限 / mermaid 偏好 / 分段择优粒度
@@ -740,7 +745,7 @@ const handleSelectSection = (node: SectionTreeNode) => {
       tableRatio: orchTableRatio,
       preferMermaid: orchPreferMermaid,
       sectionPerSegment: orchSectionPerSegment,
-    } : undefined);
+    } : undefined, useWordAdjust);
 eventSourceRef.current = eventSource;
     let finishedNormally = false;
     let hasConnected = false;
@@ -2204,6 +2209,26 @@ globalCompletedReceivedRef.current = true;
                 onChange={(v) => setOrchSectionPerSegment(v ?? 10)}
                 style={{ width: 64 }}
                 disabled={isGenerating || isExpanding}
+              />
+            </Space>
+            {/* W-3 2026-10-12：易标 R9/R10/R11 字数双向多轮调整的单次强制开关。
+                默认「服务端判定」= 不下发 use_word_adjust，与改动前行为一致；
+                强制开启会产生额外 AI 调用与耗时，故显式提示。 */}
+            <Space size={4}>
+              <Tooltip title="生成后按字数目标做多轮双向调整（强控项目默认自动启用）。「服务端判定」= 不下发该参数，与默认行为一致；强制开启会产生额外 AI 调用与耗时。">
+                <Text style={{ fontSize: 12, borderBottom: "1px dashed #b4bccb", cursor: "help" }}>字数调整</Text>
+              </Tooltip>
+              <Select
+                size="small"
+                value={useWordAdjust === null ? "auto" : String(useWordAdjust)}
+                onChange={(v) => setUseWordAdjust(v === "auto" ? null : v === "true")}
+                style={{ width: 108 }}
+                disabled={isGenerating || isExpanding}
+                options={[
+                  { value: "auto", label: "服务端判定" },
+                  { value: "true", label: "强制开启" },
+                  { value: "false", label: "强制关闭" },
+                ]}
               />
             </Space>
             <Checkbox

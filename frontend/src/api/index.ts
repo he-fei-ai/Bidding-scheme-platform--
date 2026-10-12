@@ -1396,6 +1396,7 @@ export function generateContentSSEUrl(
   useConsistencyAudit?: boolean,
   concurrency?: number,
   orchOptions?: ContentOrchOptions,
+  useWordAdjust?: boolean | null,
 ): string {
   const params = new URLSearchParams();
   params.set("writing_length", writingLength);
@@ -1441,6 +1442,16 @@ export function generateContentSSEUrl(
       params.set("orch_section_per_segment", String(orchOptions.sectionPerSegment));
     }
   }
+  // W-3 2026-10-12：易标 R9/R10/R11 字数双向调整的「单次强制」下发。
+  // 后端 /generate-content 的 use_word_adjust 是 bool | None 三态：
+  //   · undefined / null → **不下发**该参数 → 服务端按 config 判定
+  //     （默认 false，但强控项目自动启用），与改动前行为逐字一致；
+  //   · true  → 单次强制开启（会产生额外 AI 调用）；
+  //   · false → 单次强制关闭。
+  // 只有用户显式选择过才下发，保证未改动路径零回归。
+  if (useWordAdjust === true || useWordAdjust === false) {
+    params.set("use_word_adjust", String(useWordAdjust));
+  }
   return toSSEFullUrl(`/api/v1/projects/${projectId}/sections/generate-content?${params.toString()}`);
 }
 
@@ -1457,8 +1468,9 @@ export function createContentEventSource(
   useConsistencyAudit?: boolean,
   concurrency?: number,
   orchOptions?: ContentOrchOptions,
+  useWordAdjust?: boolean | null,
 ): EventSource {
-  const url = generateContentSSEUrl(projectId, writingLength, regenerateIds, rootSectionId, regenerateMissing, level2Default, useOrchestration, useWordSampling, useFallbackExpand, useConsistencyAudit, concurrency, orchOptions);
+  const url = generateContentSSEUrl(projectId, writingLength, regenerateIds, rootSectionId, regenerateMissing, level2Default, useOrchestration, useWordSampling, useFallbackExpand, useConsistencyAudit, concurrency, orchOptions, useWordAdjust);
   return new EventSource(url, { withCredentials: false });
 }
 
@@ -1479,6 +1491,7 @@ export function createContentStream(
   useConsistencyAudit?: boolean,
   concurrency?: number,
   orchOptions?: ContentOrchOptions,
+  useWordAdjust?: boolean | null,
 ): {
   onopen: (() => void) | null;
   onmessage: ((event: { data: string }) => void) | null;
@@ -1488,7 +1501,7 @@ export function createContentStream(
   markTerminalEvent: () => void;
   promise: Promise<void>;
 } {
-  const url = generateContentSSEUrl(projectId, writingLength, regenerateIds, rootSectionId, regenerateMissing, level2Default, useOrchestration, useWordSampling, useFallbackExpand, useConsistencyAudit, concurrency, orchOptions);
+  const url = generateContentSSEUrl(projectId, writingLength, regenerateIds, rootSectionId, regenerateMissing, level2Default, useOrchestration, useWordSampling, useFallbackExpand, useConsistencyAudit, concurrency, orchOptions, useWordAdjust);
 
   let aborted = false;
   let detached = false;
