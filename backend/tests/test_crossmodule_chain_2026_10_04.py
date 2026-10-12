@@ -209,12 +209,18 @@ class TestPdfTableExtract:
     def test_disabled_switch_skips_plumber_branch(self):
         """PDF_TABLE_EXTRACT_ENABLED=false：强制旧 pypdf 路径（向后兼容出口）"""
         import inspect
+        import re
 
         src = inspect.getsource(file_service._extract_pdf)
-        # 开关守卫必须在 plumber 提取之前（关闭时不得触碰 pdfplumber 分支）
-        guard_pos = src.index("if PDF_TABLE_EXTRACT_ENABLED:")
-        plumber_pos = src.index("_extract_pdf_pdfplumber(")
-        assert guard_pos < plumber_pos
+        # 开关守卫必须在 plumber 提取之前（关闭时不得触碰 pdfplumber 分支）。
+        # R-1 2026-10-12：提取器搬迁后，开关与被调用方都经 _late() 晚解析
+        # （保住 monkeypatch 接缝），源码形态随之变化 —— 这里用正则容忍
+        # 「裸名 / _late("名")」两种写法，只钉住「守卫先于调用」这一语义。
+        m_guard = re.search(r"if\s+.*?PDF_TABLE_EXTRACT_ENABLED", src)
+        assert m_guard, "缺少 PDF_TABLE_EXTRACT_ENABLED 开关守卫"
+        m_plumber = re.search(r"_extract_pdf_pdfplumber", src)
+        assert m_plumber, "未找到 pdfplumber 提取分支调用"
+        assert m_guard.start() < m_plumber.start()
 
 
 # ============================================================

@@ -85,7 +85,14 @@ class TestIsExtractionNotice:
         """
         import re
 
-        src = (BACKEND_DIR / "app" / "services" / "files.py").read_text(encoding="utf-8")
+        # R-1 2026-10-12：降级提示串常量已随提取器下放到
+        # services/extractors/_notices.py（为破除 files ↔ extractors 循环导入）。
+        # 守卫必须同时扫描新位置 —— 否则搬走后扫不到任何字面量，会退化成
+        # 「恒绿但不再防漂移」的空转。
+        src = "\n".join(
+            (BACKEND_DIR / "app" / "services" / p).read_text(encoding="utf-8")
+            for p in ("files.py", "extractors/_notices.py")
+        )
         code_lines = []
         for line in src.splitlines():
             if line.strip().startswith("#"):
@@ -315,12 +322,18 @@ class TestExcelPptxErrorNoticeRecognition:
         assert files_mod.is_extraction_notice("[Excel 解析错误]") is True
 
     def test_registry_no_drift_with_error_prefix_literals(self):
-        """防漂移守卫：files.py 里所有以 `[Excel`/`[PPTX` 起头的 f-string 错误前缀
+        """防漂移守卫：所有以 `[Excel`/`[PPTX` 起头的 f-string 错误前缀
         必须已登记进 EXTRACT_ERROR_PREFIXES。新增前缀而未登记会让该分支
-        重新退化成「被标 success 的假正文」。"""
+        重新退化成「被标 success 的假正文」。
+
+        R-1 2026-10-12：Excel/PPTX 提取分支已搬迁到 services/extractors/，
+        守卫同步扫描新位置，避免搬走后扫不到字面量而退化成空转。"""
         import re
 
-        src = (BACKEND_DIR / "app" / "services" / "files.py").read_text(encoding="utf-8")
+        src = "\n".join(
+            (BACKEND_DIR / "app" / "services" / p).read_text(encoding="utf-8")
+            for p in ("files.py", "extractors/__init__.py")
+        )
         code_lines = [
             line for line in src.splitlines()
             if not line.strip().startswith("#") and 'return f"' in line
