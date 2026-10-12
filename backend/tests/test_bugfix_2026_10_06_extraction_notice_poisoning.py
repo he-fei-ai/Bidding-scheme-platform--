@@ -227,18 +227,43 @@ class TestNoticeNeverReachesAiContext:
 # ---------- 4. Celery 异步路径口径一致（防双路径漂移） ----------
 
 class TestCeleryPathAligned:
-    def test_task_module_uses_shared_helper(self):
-        """tasks/__init__.py 必须复用同一 helper，而不是各自复制判定逻辑"""
-        src = (BACKEND_DIR / "app" / "tasks" / "__init__.py").read_text(encoding="utf-8")
-        assert "is_extraction_notice" in src, "Celery 解析路径未接入共享的降级提示判定"
-        assert "'success', extracted_text_path" not in src, (
+    """Celery 异步路径必须与同步路径**共用同一份**「降级提示 → failed」判定。
+
+    BUG-FIX 2026-10-12：判定逻辑原先内联在 tasks/__init__.py 里，与 save_upload
+    口径漂移过一次（Celery 路径无条件写 status='success'，把降级提示串当正文
+    喂给下游 AI）。现已下沉到 services.files._persist_file_extraction 单点实现，
+    任务模块只做异常兜底。因此本组断言的落点随实现**上移**为「任务模块必须复用
+    helper，且判定逻辑只存在于 helper 一处」——把断言留在原位置只会钉死过时的
+    实现细节，反而在真正的口径漂移回归时仍保持绿色（假绿）。
+    """
+
+    TASK_SRC = (BACKEND_DIR / "app" / "tasks" / "__init__.py").read_text(encoding="utf-8")
+    FILES_SRC = (BACKEND_DIR / "app" / "services" / "files.py").read_text(encoding="utf-8")
+
+    def test_task_module_delegates_to_shared_helper(self):
+        """任务模块不得再内联判定，必须调用共用 helper。"""
+        assert "_persist_file_extraction" in self.TASK_SRC, (
+            "Celery 解析路径未接入共用的落盘/判定 helper"
+        )
+        assert "is_extraction_notice" not in self.TASK_SRC, (
+            "Celery 路径又内联了一份降级提示判定，会与 save_upload 口径再次漂移"
+        )
+        assert "'success', extracted_text_path" not in self.TASK_SRC, (
             "Celery 路径仍在无条件写 status='success'，会与 save_upload 口径漂移"
         )
 
-    def test_task_module_status_variable(self):
-        """Celery 路径的返回 status 必须跟随判定结果"""
-        src = (BACKEND_DIR / "app" / "tasks" / "__init__.py").read_text(encoding="utf-8")
-        assert "'status': _status" in src
+    def test_notice_branch_lives_only_in_helper(self):
+        """判定逻辑的唯一落点必须在 helper 内（防止被删掉后静默回归）。"""
+        assert "is_extraction_notice(extracted_text)" in self.FILES_SRC, (
+            "helper 内的降级提示判定被移除，降级串会被当正文写库"
+        )
+        assert "_status, _msg" in self.FILES_SRC
+
+    def test_task_module_status_follows_helper(self):
+        """任务返回的 status 必须取自 helper 返回值，不得自行硬编码成功。"""
+        assert "'status': status" in self.TASK_SRC, (
+            "任务未把 helper 的判定结果原样返回，前端会看到与列表相反的结论"
+        )
 
 
 # ---------- 5. I-6（2026-10-11）Excel/PPT 动态错误串必须被识别为降级 ----------

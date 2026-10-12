@@ -71,26 +71,26 @@ class TestI8AsyncParseSkipsEmptyTextFile:
             )
             fid = int(cur.lastrowid)
 
-        monkeypatch.setattr(files_mod, "extract_text_from_path", lambda _p: "")
-        # tasks/__init__.py 内是 `from ..config import PROJECTS_DATA_DIR` 延迟导入，
-        # 必须 patch config 模块本身（而非 services.files 的副本）才能生效。
-        import app.config as cfg_mod
-        monkeypatch.setattr(cfg_mod, "PROJECTS_DATA_DIR", tmp_path)
-        from app.tasks import parse_and_extract_file
-
-        res = parse_and_extract_file(
-            file_path=str(fake_file), project_id=pid, file_id=fid, create_task_row=False
-        )
+        # 2026-10-12：走类内 _run_task（同时 patch services.files 的
+        # PROJECTS_DATA_DIR）。落盘目录此前由 tasks/__init__.py 的函数内延迟
+        # 导入决定，只 patch config 即生效；重构下沉到
+        # services.files._persist_file_extraction 后改用**模块级**绑定，
+        # 只 patch config 会静默失效（.txt 仍写进真实 DATA 目录）。
+        res = self._run_task("", tmp_path, monkeypatch, fid, pid, str(fake_file))
         assert res["status"] == "success", "空文本仍应标为 success（不是提示串），仅跳过写盘"
         # 关键断言：磁盘上不得留下 0 字节 .txt
         txt_path = tmp_path / str(pid) / "texts" / f"{fake_file.name}.txt"
         assert not txt_path.exists(), "空文本不应写出 .txt 文件（与 save_upload 口径不一致）"
-        # DB 仍应记录 extracted_text_path（save_upload 也是这么做的），但指向不存在的文件
+        # 悬空路径（BUG-5）：未落盘就不得记录路径 —— 否则下游 exists() 守卫会
+        # 放行、读到 0 字节，缓存 key 与 DB 指针双双指向空壳。
         with get_db() as conn:
             row = conn.execute(
                 "SELECT status, message, extracted_text_path FROM uploaded_files WHERE id = ?", (fid,)
             ).fetchone()
         assert row["status"] == "success"
+        assert not (row["extracted_text_path"] or ""), (
+            "空文本不得记录 extracted_text_path（悬空路径回归）"
+        )
         assert "empty" in (row["message"] or "").lower() or "空" in (row["message"] or "")
 
     def test_non_empty_text_writes_file(self, tmp_path, monkeypatch):
@@ -111,14 +111,8 @@ class TestI8AsyncParseSkipsEmptyTextFile:
             )
             fid = int(cur.lastrowid)
 
-        monkeypatch.setattr(files_mod, "extract_text_from_path", lambda _p: "真实正文内容")
-        import app.config as cfg_mod
-        monkeypatch.setattr(cfg_mod, "PROJECTS_DATA_DIR", tmp_path)
-        from app.tasks import parse_and_extract_file
-
-        res = parse_and_extract_file(
-            file_path=str(fake_file), project_id=pid, file_id=fid, create_task_row=False
-        )
+        # 同上：走类内 _run_task 才能把落盘目录重定向到 tmp_path
+        res = self._run_task("真实正文内容", tmp_path, monkeypatch, fid, pid, str(fake_file))
         assert res["status"] == "success"
         txt_path = tmp_path / str(pid) / "texts" / f"{fake_file.name}.txt"
         assert txt_path.exists(), "非空文本仍应写出 .txt 文件"
