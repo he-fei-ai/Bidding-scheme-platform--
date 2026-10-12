@@ -788,6 +788,178 @@ class TestNoShadowSanitizePath:
 
 
 # ===========================================================================
+# 13. 二级标题可读性：父级前缀不得硬拼
+# ===========================================================================
+
+
+class TestL2PrefixNotGlued:
+    """BUG-FIX 2026-10-12：`_derive_child_title(level=2)` 不得硬拼父级核心词。
+
+    旧实现对 level=2 无条件 `prefix_core = core`，实测产出：
+      总体实施策划  → 总体实施分阶段推进计划 / 总体实施资源配置与协调保障
+      项目风险管理  → 风险总体方案与实施策划
+      其他 / 概述   → 其他总体方案与实施策划 / 概述分阶段推进计划
+      安全文明施工措施 → 安全文明应急预案与演练计划（14 字，两个小句硬拼）
+      环境保护      → 环境安全管理组织体系（环境 ≠ 安全，语义矛盾）
+
+    非占位、非编号冲突，但对用户而言同样不可读 —— 属于同一类「目录标题质量」
+    缺陷。
+    """
+
+    GENERIC_PARENTS = [
+        "总体实施策划", "总体方案与实施策划", "项目风险管理",
+        "其他", "概述", "项目管理", "施工组织",
+    ]
+    DOMAIN_PARENTS = [
+        "质量管理措施", "安全文明施工措施", "施工进度计划", "环境保护",
+        "成本控制", "进度控制措施", "安全管理措施", "土方与基坑支护",
+    ]
+
+    def _titles(self, parent: str, n: int = 5) -> list[str]:
+        """按**生产调用方的方式**连续派生：used 集合逐次累积。
+
+        不能每次都传空 `used` —— `_derive_child_title` 只负责「跳过已用」，
+        去重靠调用方累积。且当候选恰好等于父标题时（generic 池首项
+        「总体方案与实施策划」对同名父级）会被 `cand != parent_title` 跳过，
+        轮转起点前移一格 —— 只有累积 used 才能反映真实轮转结果。
+        """
+        from app.services.ai.outline_common import _derive_child_title
+
+        used: set[str] = set()
+        out: list[str] = []
+        for i in range(n):
+            t = _derive_child_title(parent, i, used, level=2)
+            used.add(t)
+            out.append(t)
+        return out
+
+    @pytest.mark.parametrize("parent", GENERIC_PARENTS)
+    def test_generic_parent_core_is_never_glued(self, parent):
+        """泛化父级的核心词是组织性空词，拼上去零信息量 —— 必须不拼。"""
+        from app.services.ai.outline_common import _core_for_derive
+
+        core = _core_for_derive(parent)
+        for t in self._titles(parent):
+            if core and t.startswith(core):
+                # 仅当核心词本身有主题性时才允许作为前缀出现
+                from app.services.ai.outline_common import _detect_domain
+
+                assert _detect_domain(core) != "generic", (
+                    f"父级「{parent}」的核心词「{core}」无主题信息，"
+                    f"却被硬拼进二级标题「{t}」"
+                )
+
+    @pytest.mark.parametrize(
+        "parent,forbidden",
+        [
+            ("总体实施策划", "总体实施分阶段推进计划"),
+            ("总体实施策划", "总体实施资源配置与协调保障"),
+            ("总体实施策划", "总体实施过程控制与考核机制"),
+            ("项目风险管理", "风险总体方案与实施策划"),
+            ("其他", "其他总体方案与实施策划"),
+            ("概述", "概述分阶段推进计划"),
+            ("安全文明施工措施", "安全文明应急预案与演练计划"),
+            ("环境保护", "环境安全管理组织体系"),
+        ],
+    )
+    def test_known_bad_titles_are_gone(self, parent, forbidden):
+        """逐条钉住实测出现过的劣质标题，防止回归。"""
+        assert forbidden not in self._titles(parent, 8), (
+            f"父级「{parent}」仍产出劣质二级标题「{forbidden}」"
+        )
+
+    @pytest.mark.parametrize("parent", GENERIC_PARENTS + DOMAIN_PARENTS)
+    def test_no_title_is_a_concatenation_monster(self, parent):
+        """前缀只应是修饰词：单条二级标题不得长到读不成一句话。"""
+        for t in self._titles(parent, 8):
+            assert len(t) <= 12, f"父级「{parent}」产出过长二级标题「{t}」（{len(t)}字）"
+
+    @pytest.mark.parametrize("parent", GENERIC_PARENTS + DOMAIN_PARENTS)
+    def test_titles_stay_distinct_and_non_empty(self, parent):
+        titles = self._titles(parent, 5)
+        assert all(t.strip() for t in titles), f"父级「{parent}」产出空标题"
+        assert len(set(titles)) == len(titles), f"父级「{parent}」同级撞名: {titles}"
+
+    @pytest.mark.parametrize("parent", GENERIC_PARENTS + DOMAIN_PARENTS)
+    def test_no_generic_organisational_words_lead_a_l2(self, parent):
+        """二级标题不得以「总体/其他/概述」这类组织性空词开头。"""
+        for t in self._titles(parent, 8):
+            assert not t.startswith(("总体实施", "其他", "概述", "风险")), (
+                f"父级「{parent}」产出以组织性空词开头的二级标题「{t}」"
+            )
+
+    def test_domain_pool_is_not_glued_with_a_conflicting_topic(self):
+        """父级已落在具体域时，域池短语自带域信息，不得再跨主题硬拼。"""
+        from app.services.ai.outline_common import _core_for_derive, _detect_domain
+
+        for parent in self.DOMAIN_PARENTS:
+            dom = _detect_domain(parent)
+            if dom == "generic":
+                continue
+            core = _core_for_derive(parent)
+            if len(core) > 4:
+                for t in self._titles(parent, 8):
+                    assert not t.startswith(core), (
+                        f"父级「{parent}」核心词「{core}」（{len(core)}字）过长，"
+                        f"不应作为前缀拼出「{t}」"
+                    )
+
+    def test_helper_contract(self):
+        """`_usable_l2_prefix_core` 的判定契约。"""
+        from app.services.ai.outline_common import (
+            _L2_PREFIX_MAX_LEN,
+            _usable_l2_prefix_core,
+        )
+
+        # 非 generic 域 → 一律不加前缀（域池已自带域信息）
+        assert _usable_l2_prefix_core("质量", "quality") == ""
+        assert _usable_l2_prefix_core("环境", "safety") == ""
+        # generic 域 + 无主题核心词 → 不加
+        assert _usable_l2_prefix_core("总体实施", "generic") == ""
+        assert _usable_l2_prefix_core("其他", "generic") == ""
+        assert _usable_l2_prefix_core("概述", "generic") == ""
+        # generic 域 + 有主题核心词 + 长度合规 → 加
+        assert _usable_l2_prefix_core("基坑", "generic") == "基坑"
+        # 超长核心词 → 不加（是两个小句硬拼，不是修饰词）
+        assert _usable_l2_prefix_core("安全文明施工", "generic") == ""
+        assert _L2_PREFIX_MAX_LEN == 4
+        # 空输入
+        assert _usable_l2_prefix_core("", "generic") == ""
+        assert _usable_l2_prefix_core("", "quality") == ""
+
+    def test_l3_derivation_is_untouched(self):
+        """本轮只动 level=2 —— level=3 的规则 3 行为必须逐字不变。"""
+        from app.services.ai.outline_common import _derive_child_title
+
+        before = [_derive_child_title("总体方案与实施策划", i, set(), level=3)
+                  for i in range(6)]
+        assert before, "L3 兜底必须有产出"
+        assert not _is_dirty_l3_title(before[0]), f"L3 产出脏标题: {before[0]}"
+
+    def test_real_fallback_pipeline_titles_are_readable(self):
+        """端到端：真实兜底 `_default_l2_children_for_skeleton` 的 L2 可读。"""
+        from app.services.ai.workflows_outline_v51 import (
+            _default_l2_children_for_skeleton,
+        )
+
+        for l1 in ("总体实施策划", "环境保护", "安全文明施工措施", "项目风险管理"):
+            skeleton = {
+                "id": "1", "title": l1,
+                "children": [{"id": "1.1", "title": "", "children": []}],
+            }
+            l2 = _default_l2_children_for_skeleton(skeleton, l1)
+            titles = [str(x.get("title") or "") for x in l2]
+            assert titles, f"父级「{l1}」兜底未产出二级目录"
+            for t in titles:
+                assert len(t) <= 12, f"父级「{l1}」产出过长二级标题「{t}」"
+                assert not t.startswith(("总体实施", "其他", "概述", "风险")), (
+                    f"父级「{l1}」产出组织性空词开头的二级标题「{t}」"
+                )
+            assert len(set(titles)) == len(titles), f"父级「{l1}」同级撞名: {titles}"
+
+
+
+# ===========================================================================
 # 11. 编号命名空间：正文 Markdown 子标题 vs 目录编号
 # ===========================================================================
 

@@ -643,6 +643,78 @@ def _core_for_derive(parent_title: str) -> str:
     return core if len(core) >= 2 else "工程"
 
 
+# L2 前缀可用性上限：前缀必须是「修饰词」而非「重复小句」。
+# 4 字是中文里定语长度的舒适上限（"基坑""环境保护""混凝土"）；
+# 再长就变成两个并列小句硬拼（"安全文明施工"+"应急预案与演练计划" = 14 字），
+# 读起来像把两句话挤在一起，而不是一个标题。
+_L2_PREFIX_MAX_LEN = 4
+
+
+def _ordered_unique(items: list) -> list:
+    """保序去重。
+
+    BUG-FIX 2026-10-12（二级轮转退化）：`dom == "generic"` 时
+    `pool = _L2_SUFFIX_POOL[dom]` 与 `generic_pool = _L2_SUFFIX_POOL["generic"]`
+    **是同一个元组**，于是 `full_pool = pool + generic_pool` 把每个候选都放了两遍。
+    轮转 `idx % len(full_pool)` 因此只有一半的槽位是新的：generic 域本就只有 5 个
+    候选，前 5 次取完后就只能反复命中已用过的条目并最终落到
+    `_semantic_fallback_title` —— 池容量被白白砍半。
+    L3 分支的 `pool_filtered + entity + generic_filtered` 同样会重复。
+    """
+    return list(dict.fromkeys(items))
+
+
+def _usable_l2_prefix_core(core: str, dom: str) -> str:
+    """判定 L2 派生标题是否可以拼上父级核心词前缀；不可用时返回 ""。
+
+    BUG-FIX 2026-10-12（二级标题可读性 · 父级前缀硬拼）
+
+    旧实现对 level=2 无条件 `prefix_core = core`，只要后缀与核心词无 ≥2 字
+    重叠就硬拼。实测产出了一批**零信息量或语义矛盾**的标题：
+
+      父级「总体实施策划」 → 总体实施分阶段推进计划 / 总体实施资源配置与协调保障
+      父级「项目风险管理」 → 风险总体方案与实施策划
+      父级「其他」「概述」 → 其他总体方案与实施策划 / 概述分阶段推进计划
+      父级「安全文明施工措施」 → 安全文明应急预案与演练计划（14 字，两个小句硬拼）
+      父级「环境保护」     → 环境安全管理组织体系（环境 ≠ 安全，语义矛盾）
+
+    成因有二，且都与「前缀的作用」错配：
+      1. **前缀是组织性空词时不承载任何主题信息**。「总体实施」「其他」「概述」
+         「风险」「项目管理」这类核心词拼上去只增加噪音，不建立父子语义关联 ——
+         恰恰抵消了 `_core_for_derive` docstring 声明的「保证子标题与父标题的
+         显性关联」初衷。
+      2. **后缀池本来就按父级语义域选过了**。`dom != "generic"` 时
+         `_L2_SUFFIX_POOL[dom]` 里的每个短语本身已带该域信息，此时再拼父级
+         核心词要么同义重复（质量 + 质量保证组织体系），要么跨主题矛盾
+         （环境 + 安全管理组织体系）。
+
+    因此前缀只在**同时**满足以下条件时启用 —— 也就是它真正有增量的那个狭窄区间：
+      · 父级判为 generic 域，即后缀只能取到 generic 池、不带任何域信息；
+      · 核心词本身**有主题性**（`_detect_domain(core) != "generic"`），
+        排除「总体实施」「其他」「概述」这类纯组织词；
+      · 核心词长度在 2~4 字，读起来是修饰词而不是重复小句。
+
+    其余情况一律返回 ""，后缀短语本身就是完整可读的二级章节名
+    （`分阶段推进计划` / `质量保证组织体系` / `关键线路分析与控制`），
+    直接使用即可。
+
+    跨章节去重不依赖此前缀：`_ensure_min_children` 传的是**全局** used 集合，
+    `_default_l2_children_for_skeleton` 的同名标题由 `_uniquify_outline_titles`
+    的同级消歧兜底；跨父同名本就合法（2026-10-11 起「同级唯一」为唯一口径）。
+    """
+    if not core:
+        return ""
+    # 池已按域选过 → 后缀自带域信息，前缀只增噪不增量
+    if dom != "generic":
+        return ""
+    if not (2 <= len(core) <= _L2_PREFIX_MAX_LEN):
+        return ""
+    # 核心词自身也无主题信息 → 纯组织性空词，拼上去零增量
+    if _detect_domain(core) == "generic":
+        return ""
+    return core
+
+
 def _has_bigram_overlap(core: str, text: str) -> bool:
     """检查 core 的核心内容（≥2字连续子串）是否出现在 text 中（叠词防护）。
 
@@ -1478,12 +1550,14 @@ def _derive_child_title(
         if not pool_filtered and not generic_filtered:
             # 极端兜底：核心短语屏蔽后两池全空 → 退回未过滤池，
             # 避免节点生成失败；此时仍无前缀拼合，语义解耦基本成立
-            full_pool = list(pool) + list(_entity_cands) + list(generic_pool)
+            full_pool = _ordered_unique(list(pool) + list(_entity_cands) + list(generic_pool))
         else:
-            full_pool = list(pool_filtered) + list(_entity_cands) + list(generic_filtered)
+            full_pool = _ordered_unique(
+                list(pool_filtered) + list(_entity_cands) + list(generic_filtered)
+            )
     else:
-        prefix_core = core
-        full_pool = list(pool) + list(generic_pool)
+        prefix_core = _usable_l2_prefix_core(core, dom)
+        full_pool = _ordered_unique(list(pool) + list(generic_pool))
 
     def _candidate(sfx: str) -> str:
         if prefix_core and not _has_bigram_overlap(prefix_core, sfx) and prefix_core not in sfx:
@@ -1507,8 +1581,16 @@ def _derive_child_title(
 def _generate_fallback_l3_for_ensure(l2_title: str, idx: int, l2_index: int = 0) -> str:
     """为 _ensure_min_children 生成专业的兜底三级标题。
 
-    从 L2 标题按语义域派生：不同 L2 核心词不同 → 标题不重名；
-    前缀核心词注入 → 三级与父级二级目录语义关联。
+    从 L2 标题按语义域派生：不同 L2 核心词不同 → 标题不重名。
+
+    BUG-FIX 2026-10-12（修正陈旧描述）：原 docstring 称「前缀核心词注入 →
+    三级与父级二级目录语义关联」，但 2026-09-04 用户定制规则 3 已在
+    `_derive_child_title` 的 level==3 分支把 `prefix_core` 置空 —— 三级标题
+    **不再**注入父级前缀，改由域池过滤 + 「工程实体 × 专业维度」组合保证
+    语义具体性。保留的错误描述会让后来者以为规则 3 未生效。
+
+    注：本函数目前**无生产调用方**（`_ensure_min_children` 走的是
+    `_derive_child_title(..., level=3)` 直调），属历史遗留包装。
     """
     return _derive_child_title(l2_title or "工程实施", idx, set(), level=3)
 
