@@ -53,6 +53,9 @@ import {
 } from "../utils";
 import PageHeader from "@/components/PageHeader";
 import ProgressPanel, { type ProgressItem } from "@/components/ProgressPanel";
+// R-5 2026-10-12：上传页文案接入 i18n（此前全部硬编码中文，i18n.ts 无对应 key）。
+// 默认语言 zh-CN，t() 回落 zh-CN，故中文渲染与改动前逐字一致。
+import { t } from "../i18n";
 
 const { Text, Paragraph } = Typography;
 
@@ -419,31 +422,31 @@ export default function FileUploadPage() {
     <div>
       <PageHeader
         icon={<UploadOutlined />}
-        title="招标文件上传"
-        description="支持 Word（含 .wps）、PDF、Excel 清单（.xlsx/.xls）、PPT、Markdown、HTML、图片扫描件（png/jpg 等，需 OCR）等格式，系统将自动解析正文内容，用于后续要点提取与方案生成。清单类文件请命名为含“清单/工程量”的文件名，便于工程量自动分析。"
+        title={t("upload.pageTitle")}
+        description={t("upload.pageDesc")}
         extra={
           files.length > 0 ? (
             <Space size={12}>
               {/* Gap-1 2026-10-11：清空提取按钮 —— 带二次确认，防误触
                   不删除原始文件，只清空提取文本 + 重置状态 */}
               <Popconfirm
-                title="确认清空已提取文本？"
-                description="将清空所有文件的提取文本并重置为「待提取」状态（不会删除已上传的原始文件）。解析失败记录也会一起清理。"
-                okText="确认清空"
+                title={t("upload.confirmClearTitle")}
+                description={t("upload.confirmClearDesc")}
+                okText={t("upload.okClear")}
                 okButtonProps={{ danger: true }}
-                cancelText="取消"
+                cancelText={t("common.cancel")}
                 onConfirm={handleClearTexts}
                 disabled={clearing || files.length === 0}
               >
                 <Button danger icon={<ClearOutlined />} loading={clearing}>
-                  清空提取
+                  {t("upload.clearTexts")}
                 </Button>
               </Popconfirm>
               <Button
                 type="primary"
                 onClick={() => navigate(`/projects/${projectId}/review`)}
               >
-                下一步：要点提取 <ArrowRightOutlined />
+                {t("upload.nextExtract")} <ArrowRightOutlined />
               </Button>
             </Space>
           ) : null
@@ -491,10 +494,10 @@ export default function FileUploadPage() {
                     <UploadOutlined style={{ fontSize: 40, color: "#1677ff" }} />
                   </p>
                   <p className="ant-upload-text" style={{ fontSize: 15, fontWeight: 600, color: "#1f2733" }}>
-                    点击选择文件，或拖拽文件到此处
+                    {t("upload.dragTitle")}
                   </p>
                   <p className="ant-upload-hint" style={{ color: "#8a94a6", fontSize: 13 }}>
-                    支持 Word / PDF / Excel 清单 / PPT / Markdown / HTML 等格式，可同时上传多个文件
+                    {t("upload.dragHint")}
                   </p>
                 </>
               )}
@@ -505,7 +508,7 @@ export default function FileUploadPage() {
         <Card
           title={
             <Space size={8}>
-              <span>已上传文件</span>
+              <span>{t("upload.uploadedFiles")}</span>
               {files.length > 0 && <Tag color="blue" style={{ borderRadius: 5 }}>{files.length}</Tag>}
             </Space>
           }
@@ -515,7 +518,7 @@ export default function FileUploadPage() {
               icon={<ReloadOutlined />}
               onClick={loadFiles}
             >
-              刷新
+              {t("upload.refresh")}
             </Button>
           }
           style={{ borderRadius: 12 }}
@@ -527,7 +530,7 @@ export default function FileUploadPage() {
           ) : files.length === 0 ? (
             <div className="empty-state" style={{ borderStyle: "dashed" }}>
               <InfoCircleOutlined style={{ fontSize: 28, color: "#b4bccb", marginBottom: 12 }} />
-              <Text style={{ color: "#5b6675" }}>暂无文件，请先上传招标文件</Text>
+              <Text style={{ color: "#5b6675" }}>{t("upload.empty")}</Text>
             </div>
           ) : (
             <>
@@ -536,7 +539,7 @@ export default function FileUploadPage() {
                   type="success"
                   showIcon
                   style={{ marginBottom: 14, borderRadius: 8 }}
-                  message={`已有 ${extractedCount} 个文件完成文本提取，可以进入下一步`}
+                  message={t("upload.extractedReady", { count: String(extractedCount) })}
                 />
               )}
               <List
@@ -544,14 +547,14 @@ export default function FileUploadPage() {
                 renderItem={(file) => (
                   <List.Item
                     actions={[
-                      <Tooltip key="preview" title="预览提取文本">
+                      <Tooltip key="preview" title={t("upload.previewTooltip")}>
                         <Button
                           size="small"
                           type="text"
                           icon={<EyeOutlined />}
                           onClick={() => handlePreviewText(file)}
                         >
-                          预览文本
+                          {t("upload.previewText")}
                         </Button>
                       </Tooltip>,
                       <Button
@@ -561,7 +564,7 @@ export default function FileUploadPage() {
                         icon={<StarOutlined style={{ color: file.file_role === "main" ? "#faad14" : "#b4bccb" }} />}
                         onClick={() => handleToggleRole(file)}
                       >
-                        {file.file_role === "main" ? "设为辅助" : "设为主文件"}
+                        {file.file_role === "main" ? t("upload.setSupporting") : t("upload.setMain")}
                       </Button>,
                       <Button
                         key="reextract"
@@ -575,7 +578,7 @@ export default function FileUploadPage() {
                         }
                       >
                         {/* 遗留修复 L2：图片走后台异步解析（OCR 耗时），其余格式同步重提取 */}
-                        {isImageFile(file.file_type, file.filename) ? "后台解析" : "重新提取"}
+                        {isImageFile(file.file_type, file.filename) ? t("upload.asyncParse") : t("upload.reExtract")}
                       </Button>,
                       <Button
                         key="delete"
@@ -584,9 +587,9 @@ export default function FileUploadPage() {
                         danger
                         icon={<DeleteOutlined />}
                         onClick={() => handleDelete(file.id)}
-                      >
-                        删除
-                      </Button>,
+                        >
+                        {t("upload.delete")}
+                        </Button>,
                     ]}
                   >
                     <List.Item.Meta
@@ -595,14 +598,14 @@ export default function FileUploadPage() {
                       description={
                         <Space size={10} wrap>
                           {file.file_role === "main" ? (
-                            <Tag color="gold" style={{ borderRadius: 5, marginInlineEnd: 0 }}>主文件</Tag>
+                            <Tag color="gold" style={{ borderRadius: 5, marginInlineEnd: 0 }}>{t("upload.mainFile")}</Tag>
                           ) : (
-                            <Tag style={{ borderRadius: 5, marginInlineEnd: 0 }}>辅助文件</Tag>
+                            <Tag style={{ borderRadius: 5, marginInlineEnd: 0 }}>{t("upload.supportingFile")}</Tag>
                           )}
                           {statusTag(file.status)}
                           {file.file_type ? (
                             <Text type="secondary" style={{ fontSize: 12 }}>
-                              {file.file_type.toUpperCase()} 文档
+                              {t("upload.docType", { type: file.file_type.toUpperCase() })}
                             </Text>
                           ) : null}
                           {file.status === "failed" && file.message ? (
@@ -624,7 +627,7 @@ export default function FileUploadPage() {
                 )}
               />
               <Paragraph type="secondary" style={{ fontSize: 12, marginTop: 14, marginBottom: 0 }}>
-                上传后系统会自动提取文本内容。若提取失败可点击"重新提取"，或删除后重新上传。
+                {t("upload.afterUploadHint")}
               </Paragraph>
             </>
           )}
@@ -634,7 +637,7 @@ export default function FileUploadPage() {
       {/* TD6 2026-10-12：提取文本预览弹窗（激活 getFileText 死链） */}
       <Modal
         open={previewOpen}
-        title={preview ? `提取文本预览 · ${preview.filename}` : "提取文本预览"}
+        title={preview ? `${t("upload.previewModalTitle")} · ${preview.filename}` : t("upload.previewModalTitle")}
         onCancel={() => setPreviewOpen(false)}
         footer={null}
         width={900}
@@ -652,8 +655,11 @@ export default function FileUploadPage() {
               style={{ borderRadius: 8, marginBottom: 12 }}
               message={
                 preview.truncated
-                  ? `文本共 ${preview.total} 字，已截断显示前 ${preview.text.length} 字`
-                  : `文本共 ${preview.total} 字`
+                  ? t("upload.previewTruncated", {
+                      total: String(preview.total),
+                      shown: String(preview.text.length),
+                    })
+                  : t("upload.previewTotal", { total: String(preview.total) })
               }
             />
             <Text
@@ -671,7 +677,7 @@ export default function FileUploadPage() {
             </Text>
           </>
         ) : (
-          <Text type="secondary">该文件没有可预览的提取文本。</Text>
+          <Text type="secondary">{t("upload.noPreview")}</Text>
         )}
       </Modal>
     </div>
