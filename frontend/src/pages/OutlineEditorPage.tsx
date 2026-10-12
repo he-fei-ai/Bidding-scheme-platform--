@@ -79,11 +79,14 @@ export default React.memo(function OutlineEditorPage() {
   const [project, setProject] = useState<any>(null);
   const [loading, setLoading] = useState(false);
   const [tree, setTree] = useState<SectionTreeNode[]>([]);
-  const strategy = "v51" as const;
   const [isGenerating, setIsGenerating] = useState(false);
   const isGeneratingRef = useRef(false);
 
   const [progressPercent, setProgressPercent] = useState(0);
+  const progressPercentRef = useRef(0);
+  // BUG-FIX 2026-10-12：SSE 回调里需要拿到本次生成注册的 taskId 与最新百分比，
+  // 但闭包会捕获 startTask 时的旧值。用 ref 承载，避免依赖 stale state。
+  const taskIdRef = useRef<string>("");
   const [progressMessage, setProgressMessage] = useState("");
   const [outlineStep, setOutlineStep] = useState(0);
   const [outlineProgress, setOutlineProgress] = useState<{ level1: number; completed: number; total: number } | null>(null);
@@ -240,8 +243,10 @@ export default React.memo(function OutlineEditorPage() {
     }
 
     // 2026-08-21 增强：在 taskStore 中注册任务，支持跨页面追踪
+    const _taskId = `outline_${projectId}_${Date.now()}`;
+    taskIdRef.current = _taskId;
     taskStore.startTask({
-      taskId: `outline_${projectId}_${Date.now()}`,
+      taskId: _taskId,
       projectId,
       taskType: "outline",
       status: "running",
@@ -280,8 +285,32 @@ export default React.memo(function OutlineEditorPage() {
           // 消除 outline_phase 与其他 phase 的进度跳跃（如 context 阶段突然跳到 90%）
           const patch = reduceOutlineGeneratingEvent(data);
           if (patch.outlineStep !== undefined) setOutlineStep(patch.outlineStep);
-          if (patch.progressPercent !== undefined) setProgressPercent(patch.progressPercent);
+          if (patch.progressPercent !== undefined) {
+            setProgressPercent(patch.progressPercent);
+            progressPercentRef.current = patch.progressPercent;
+          }
           setProgressMessage(patch.progressMessage);
+          // BUG-FIX 2026-10-12（跨模块进度断链）：后端 SSE 在 L2 并发生成期逐章
+          // 推送 `progress: { level1, completed, total }`（sse_outline.py:846），
+          // 但本页此前**从不读取**该字段，`outlineProgress` 只有初始的 setXxx(null)，
+          // 于是「章节进度 n/N 章」区块恒不渲染（死 UI），用户对长方案只能看到一个
+          // 不动的总百分比。改为真正消费该字段。
+          const prog = (data as { progress?: { level1?: number; completed?: number; total?: number } }).progress;
+          if (prog && typeof prog.completed === "number" && typeof prog.total === "number") {
+            setOutlineProgress({
+              level1: typeof prog.level1 === "number" ? prog.level1 : prog.total,
+              completed: prog.completed,
+              total: prog.total,
+            });
+          }
+          // 顶部全局任务条此前只在 startTask 写一次、此后从不更新，
+          // 整个目录生成期间进度条恒为 0%（TaskStatusBar 显示「目录生成 0%」）。
+          // 同一处补上 updateTask，让跨页面追踪真正可用。
+          const _pct = patch.progressPercent ?? progressPercentRef.current;
+          taskStore.updateTask(taskIdRef.current, {
+            progress: _pct,
+            message: patch.progressMessage,
+          });
         } else if (data.status === "completed") {
           finishedNormally = true;
           setIsGenerating(false);
@@ -616,29 +645,6 @@ export default React.memo(function OutlineEditorPage() {
       const input = document.getElementById("add-title-input") as HTMLInputElement;
       input?.focus();
     }, 100);
-  };
-
-  const handleReorder = async (newTree: SectionTreeNode[]) => {
-    const flat: Array<{ node: SectionTreeNode; parentId: number | null }> = [];
-    const buildFlat = (nodes: SectionTreeNode[], parentId: number | null) => {
-      for (const n of nodes) {
-        flat.push({ node: n, parentId });
-        if (n.children && n.children.length > 0) buildFlat(n.children, n.id);
-      }
-    };
-    buildFlat(newTree, null);
-    const groups = new Map<number | null, number[]>();
-    for (const { node, parentId } of flat) {
-      const pid = parentId;
-      if (!groups.has(pid)) groups.set(pid, []);
-      groups.get(pid)!.push(node.id);
-    }
-    try {
-      const result = await reorderSections(projectId, Array.from(groups.entries()).map(([parent_id, ordered_ids]) => ({ parent_id, ordered_ids })));
-      setTree(result);
-    } catch {
-      message.error("排序失败");
-    }
   };
 
   const handleReview = async () => {
@@ -1269,7 +1275,7 @@ const applyTitles = (nodes: SectionTreeNode[]): SectionTreeNode[] =>
           <Alert
             style={{ marginTop: 12 }}
             message="提示"
-            description="点击目录右侧「···」可编辑标题、添加子目录、上移/下移或删除。拖拽目录节点可调整顺序。快捷键：Ctrl+B 生成目录 / Ctrl+G 生成正文"
+            description="点击目录右侧「···」可编辑标题、添加子目录、上移/下移或删除。快捷键：Ctrl+B 生成目录 / Ctrl+G 生成正文"
             type="info"
             showIcon
           />
@@ -1421,7 +1427,7 @@ const applyTitles = (nodes: SectionTreeNode[]): SectionTreeNode[] =>
                     />
                     <Button
                       type="text" size="small" icon={<DownOutlined />}
-                      disabled={index === pendingReviewTree.length - 1}
+                      disabled={index === (annotatedReviewTree?.length ?? 0) - 1}
                       onClick={() => handleReviewMoveNode(index, "down")}
                       style={{ padding: "0 4px" }} title="下移"
                     />
