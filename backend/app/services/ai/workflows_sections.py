@@ -447,8 +447,8 @@ def extract_section_charts(content: str, section_title: str = "", summary: str =
     def _real_data_or_none(d: dict) -> dict | None:
         """真实可用数据返回 dict；空壳或结构校验未通过返回 None（需降级为提示条目）。
 
-        FIX 2026-10-08（遗留3）：把 `_validate_chart_data` 真正接进落库前的判定链，
-        终结「两套校验都零调用」的状态。畸形数据不再伪装成真实图表堵住配图编排。
+        ENHANCE 2026-10-08（已修复）：`_validate_chart_data` 已接入落库前判定链，
+        调用 `chart_validators` 权威校验器；畸形数据不再伪装成真实图表堵住配图编排。
         """
         if not isinstance(d, dict) or not _chart_has_real_data(d):
             return None
@@ -597,11 +597,8 @@ def _extract_charts_from_content(content: str) -> list:
 def _validate_chart_data(chart_type: str, data: dict) -> tuple:
     """验证图表数据有效性 (chart_type, data) -> (is_valid, error_msg)
 
-    FIX 2026-10-08（遗留3）：历史上存在两套互不一致的校验实现（本函数与
-    `services/chart_validators.py`），且两套都**零调用**，形同虚设——毫无校验地
-    把 AI 输出落库，正是「空壳/畸形数据伪装成真实图表」类缺陷的土壤。
-
-    现统一口径：**`chart_validators` 为唯一权威**，本函数退化为薄适配层：
+    2026-10-08（已修复）：已统一接入 `chart_validators` 权威校验器作为唯一判定
+    标准。校验失败的数据在此降级为「配图提示」，不阻塞生成主链路。
       - 未覆盖的图表类型 → 视为通过（保持对既有数据形态的兼容）；
       - 校验器不可导入（循环依赖/模块缺失）→ 视为通过并告警，
         不因工具链问题阻断生成主链路。
@@ -639,38 +636,6 @@ def _validate_chart_data(chart_type: str, data: dict) -> tuple:
         _detail = "; ".join(str(x) for x in (list(_errors or [])[:3]))
         return False, (_detail or "数据结构校验未通过")
     return True, ""
-
-
-def _generate_fallback_chart(chart_type: str, section_title: str = "", 
-                             summary: str = "", nodes: list = None, date: str = "") -> dict:
-    """DEPRECATED 2026-10-08（遗留3）：**不得接入任何主链路**，保留仅为兼容引用。
-
-    这是历史上的「凭空构造图表数据」实现，与当前的无降级原则直接冲突
-    （`resolve_chart_marker` 文档明确：宁缺毋假，真实数据一律来自配图编排管线
-    写入的 `sections.*_json`）。全仓零调用方；新代码请走
-    `extract_section_charts` → 配图编排（hint 条目）链路。
-    """
-    if chart_type == "flowchart":
-        return {
-            "type": "flowchart",
-            "nodes": nodes or [
-                {"id": "N1", "label": section_title or "步骤1"},
-                {"id": "N2", "label": "步骤2"},
-                {"id": "N3", "label": "完成"},
-            ],
-            "edges": [[0, 1], [1, 2]],
-        }
-    elif chart_type == "gantt":
-        return {
-            "type": "gantt",
-            "date_format": "YYYY-MM-DD",
-            "duration": [
-                {"id": "T1", "name": section_title or "阶段1", "start": date or "2025-01-01", "duration": 10},
-                {"id": "T2", "name": "阶段2", "start": date or "2025-01-11", "duration": 15},
-            ],
-            "tasks": [],
-        }
-    return {"type": chart_type, "nodes": nodes or []}
 
 
 def _scoring_context_to_text(scoring_context: Any) -> str:
@@ -1982,7 +1947,6 @@ async def _auto_continue_on_length(
     _logger = _logging.getLogger(__name__)
 
     final_content = existing_content
-    section_title = section.get("title", "")
     writing_length = context.get("writing_length", "detailed")
     cancel_event = context.get("cancel_event")
 

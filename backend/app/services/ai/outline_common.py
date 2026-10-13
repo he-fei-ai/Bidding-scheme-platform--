@@ -11,8 +11,24 @@
 - JSON 结构校验（check_json）
 - 承包范围解析（_parse_scope_items）
 - 节点计数（_count_outline_nodes）
+- 路径式子编号（child_number / tree_path_numbers）— 编号命名空间唯一事实源
 
 所有新代码应直接 import 本模块。
+
+## 路径式编号（2026-10-13 统一，编号命名空间单一事实源）
+
+「1 / 1.2 / 1.2.3」式路径编号曾有三处各自实现：
+  1. `outline_gate.renumber_outline_ids`（内存树位置 id，门禁修正用）；
+  2. `sse_db_ops._save_nodes`（落库时随节点透出的 `path_number`）；
+  3. `services.sections.get_section_path`（DB 动态路径号，导出/正文消费）。
+三处算法相同但各自维护，任何一处口径漂移都会让「同一节点三个编号」。
+现收敛为：
+  - `child_number(parent_number, index)`：**拼接算法唯一实现**（三处共用）；
+  - `tree_path_numbers(nodes)`：内存树版批量计算（DFS 顺序，与节点一一对应）；
+  - DB 版（`get_section_path`）消费同一 `child_number` 自顶向下拼接。
+一致性由 `tests/test_outline_l3_hardening_2026_10_13.py::TestPathNumberNamespace`
+锁定（同结构四出口一致）。
+
 
 ## 标题去重策略（2026-10-11 修正，**勿回退**）
 
@@ -330,6 +346,67 @@ def _count_outline_nodes(outline: list[dict]) -> int:
         if isinstance(children, list):
             total += _count_outline_nodes(children)
     return total
+
+
+# ========== 路径式子编号（编号命名空间唯一事实源，2026-10-13） ==========
+
+
+def child_number(parent_number: str, index: int) -> str:
+    """路径式子编号拼接算法（唯一实现）。
+
+    `parent_number=""` + index=1 → `"1"`；`"1"` + index=2 → `"1.2"`；
+    `"1.2"` + index=3 → `"1.2.3"`。
+
+    对「父号是否带尾点」两种调用约定都兼容（`"1"` 与 `"1."` 都给 `"1.2"`）——
+    这正是一线口径分裂的实证：`_save_nodes` 的递归约定是父号带尾点
+    （传 `f"{node_number}."`），而 `renumber_outline_ids` 的约定是不带点、
+    拼接时加点。两者输出恰好一致，所以漂移长期不可见；统一到本函数后
+    两种约定都归一为同一输出，新增消费方无需关心尾点归属。
+
+    三个消费方共用本函数，保证同节点同编号：
+      - `outline_gate.renumber_outline_ids`（内存树位置 id，不带点约定）
+      - `sse_db_ops._save_nodes`（落库透出的 `path_number`，带尾点约定）
+      - `sections.get_section_path`（DB 动态路径号，不带点约定）
+
+    边界说明（2026-10-13 · 与前端编号体系的关系）：本函数是**后端位置式
+    路径号**的唯一拼接算法，服务于生成编排 / 落库 / 门禁等**内部**场景。
+    前端目录编辑 / 章节编辑展示的章节号是另一套**层级式文档标题号**
+    （`frontend/src/utils.ts::annotateOutlineWithNumbers` →
+    `deriveHeadingPath` + `formatV21Heading`，按 L1~L8 规则逐层重置），
+    二者**用途不同、本就不必逐位相同**：正文内嵌编号在生成/保存时即被剥离
+    （`content_cleaning.strip_heading_numbering_from_content`），文档编号在
+    导出/展示时按当前树结构现算。故此处**不**与前端数字对齐——强行对齐会把
+    前端层级展示号改成位置路径号，属展示回归。两套体系自此各自单一事实源，
+    仅在此交叉注明，防止后续误「修复」本非缺陷的差异。
+    """
+    if not parent_number:
+        return str(index)
+    if parent_number.endswith("."):
+        return f"{parent_number}{index}"
+    return f"{parent_number}.{index}"
+
+
+def tree_path_numbers(nodes: list[dict]) -> list[str]:
+    """按 DFS（深度优先、兄弟按序）顺序产出路径式子编号列表。
+
+    返回列表与 `_flatten_dfs(nodes)` 的节点一一对应（同序遍历口径），
+    供落库/门禁侧做「编号 ↔ 节点」配对，避免各处重算口径漂移。
+    非 dict 节点跳过（与 `_count_outline_nodes` 的容错口径一致）。
+    """
+    out: list[str] = []
+
+    def _walk(level_nodes: Any, prefix: str) -> None:
+        if not isinstance(level_nodes, list):
+            return
+        for index, node in enumerate(level_nodes, 1):
+            if not isinstance(node, dict):
+                continue
+            number = child_number(prefix, index)
+            out.append(number)
+            _walk(node.get("children"), number)
+
+    _walk(nodes, "")
+    return out
 
 
 # ========== 承包范围解析 ==========
@@ -775,7 +852,12 @@ _DISAMBIG_DIMENSIONS: tuple[str, ...] = (
 )
 
 # 旧版占位标题识别（需被清洗）
-_PLACEHOLDER_TITLE_RE = re.compile(r"^专项\d+$")
+#
+# BUG-FIX 2026-10-13（G1 · 中文数字占位漏判）：旧正则只认阿拉伯数字，
+# 「专项六」「专项一」「地下室专项六」这类中文序数占位完全穿透判定与清洗
+# （`_PLACEHOLDER_ANYWHERE_RE` 同理）——用户报告的「专项6」家族里，
+# AI 与规则兜底都会产中文数字变体。现两种数字体系都纳入。
+_PLACEHOLDER_TITLE_RE = re.compile(r"^专项\s*[0-9一二三四五六七八九十百]+\s*$")
 
 # ---------------------------------------------------------------------------
 # 2026-10-10 增强：占位泛化标题识别器扩展
@@ -797,7 +879,14 @@ _PLACEHOLDER_TITLE_RE = re.compile(r"^专项\d+$")
 # ---------------------------------------------------------------------------
 
 # 任意位置的「专项N」（覆盖「分阶段推进专项13」「总体方案专项6」）
-_PLACEHOLDER_ANYWHERE_RE = re.compile(r"专项\s*\d+")
+#
+# BUG-FIX 2026-10-13（G1 · 中文数字占位漏判）：旧正则只认阿拉伯数字，
+# 「专项六」「专项一」「地下室专项三」这类中文序数占位完全穿透判定与清洗
+# （`_PLACEHOLDER_TITLE_RE` 同理）——用户报告的「专项6」家族里，AI 与规则
+# 兜底都会产中文数字变体，且含实体词的「地下室专项六」连
+# `_is_l3_title_project_specific` 的实体词白名单都能穿透，直接存活到落库。
+# 现两种数字体系都纳入。
+_PLACEHOLDER_ANYWHERE_RE = re.compile(r"专项\s*[0-9一二三四五六七八九十百]+")
 
 # 纯序号占位标题：「内容3」「子章节2」「章节1」「小节4」…
 #
@@ -1019,6 +1108,32 @@ def _is_dirty_l3_title(title: str) -> bool:
     if t in _GENERIC_ONLY_TITLES:
         return True
     if t in _L3_L2LIKE_TITLES:
+        return True
+    return False
+
+
+def _is_dirty_l3_title_deep(title: str) -> bool:
+    """深度脏判定：原文 + 剥离冗余后缀后的形态都过一遍 `_is_dirty_l3_title`。
+
+    BUG-FIX 2026-10-13（G2 · 「（其N）」残渣漏判）：`_QI_ORDINAL_SUFFIX_RE`
+    此前只参与 `_title_core` 归一化（去重/消歧口径），`_is_dirty_l3_title`
+    本身不查它。后果：唯一存在的「总体实施策划（其三）」既不会被
+    `_cleanup_placeholder_titles` 改写（原文不判脏），也不会有同名兄弟触发
+    `_uniquify_outline_titles` 的消歧 → 占位泛化标题原样流出到审核与落库。
+
+    设计取舍：**不把「（其N）」本身判脏**。「砌体成品保护（其2）」这类
+    「合法标题 + 历史残渣」的正确修法是剥后缀保留主体（`_clean_legacy_suffix_tree`
+    的职责），整体替换反而丢业务语义。因此深度判定只对**剥离后**的形态生效：
+      - 「砌体成品保护（其2）」→ 剥离后非脏 → 不清洗（后续统一剥后缀）；
+      - 「总体实施策划（其三）」→ 剥离后命中泛化词表 → 清洗为语义化标题。
+    """
+    if _is_dirty_l3_title(title):
+        return True
+    _t = (title or "").strip()
+    if not _t:
+        return False
+    _stripped = _strip_legacy_redundant_suffix(_t)
+    if _stripped != _t and _is_dirty_l3_title(_stripped):
         return True
     return False
 
@@ -1447,6 +1562,12 @@ def _cleanup_placeholder_titles(
     """
     _fixed = 0
     _used = global_used if global_used is not None else set()
+    # BUG-FIX 2026-10-13（G10 · 清洗序号恒 0）：旧实现 `_idx = len(children)`，
+    # 而三级被洗节点几乎都是叶子（children 恒空）→ 所有被洗节点都以 idx=0 调
+    # `_semantic_fallback_title`，候选轮转起点完全相同，仅靠 used 累加保证不重，
+    # 多样性严重受损（同章多个脏标题会拿到同一实体词的不同维度）。
+    # 改为按「本棵树内已清洗计数」轮转，跨父级也连续错开。
+    _clean_seq = 0
 
     def _collect(nodes: list) -> None:
         for _n in nodes:
@@ -1456,7 +1577,7 @@ def _cleanup_placeholder_titles(
     def _walk(
         nodes: list, parent_title: str = "", grandparent_title: str = "", level: int = 1
     ) -> None:
-        nonlocal _fixed
+        nonlocal _fixed, _clean_seq
         for _node in nodes:
             if not isinstance(_node, dict):
                 continue
@@ -1465,17 +1586,16 @@ def _cleanup_placeholder_titles(
             # 旧实现无条件套用占位判定，但「其他」「概述」「说明」这类词
             # 同为 28 章模板的合法一级/二级标题（FIXED_28_CHAPTERS[27]="其他"），
             # 若一并清洗会误伤合法章节标题。
-            _is_placeholder = level >= 3 and _is_dirty_l3_title(_title)
+            # 2026-10-13 修复（G2）：判定升级为深度判定（含「（其N）」剥离后
+            # 仍为泛化词的形态），见 `_is_dirty_l3_title_deep`。
+            _is_placeholder = level >= 3 and _is_dirty_l3_title_deep(_title)
             if _is_placeholder:
-                _idx = 0
-                _children = _node.get("children", []) or []
-                if isinstance(_children, list):
-                    _idx = len(_children)
                 _new = _semantic_fallback_title(
-                    parent_title or "", _idx, _used, context_title=grandparent_title
+                    parent_title or "", _clean_seq, _used, context_title=grandparent_title
                 )
                 _node["title"] = _new
                 _used.add(_new)
+                _clean_seq += 1
                 _fixed += 1
             _sub = _node.get("children")
             if isinstance(_sub, list):
@@ -1570,6 +1690,15 @@ def _derive_child_title(
         if cand != parent_title and cand not in used:
             # level=3 最后一道保险：候选仍不得含父级核心短语
             if level == 3 and core and core in cand:
+                continue
+            # BUG-FIX 2026-10-13（G4 · 主循环无脏判定复检）：旧实现只查
+            # parent/used/core 三重条件。各池条目当前虽均不命中脏词表，但
+            # 这是一处「缺最后防线」的设计缺口——任何新增池条目若恰好等于
+            # `_GENERIC_ONLY_TITLES`/`_L3_L2LIKE_TITLES` 成员（如把
+            # 「总体实施策划」加回 generic 池），脏标题会从这里直接漏出，
+            # 且绕过 `_cleanup_placeholder_titles` 之前的所有检查。
+            # 补一道统一脏判定，与 `_semantic_fallback_title` 的候选口径一致。
+            if level == 3 and _is_dirty_l3_title(cand):
                 continue
             return cand
     # 极端兜底：所有池都耗尽（level=3 不再追加父级前缀）

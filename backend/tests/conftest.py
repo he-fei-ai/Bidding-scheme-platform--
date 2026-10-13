@@ -12,6 +12,18 @@ if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
 
+# HARDEN 2026-10-13（间歇性收集失败根因）：禁写字节码，规避中文路径
+# __pycache__/*.pyc 写入竞态。背景：全量收集期多模块导入时，__pycache__
+# 的 .pyc 写入在中文路径下偶发 WinError 5（安全软件锁文件 / 瞬时竞态），
+# conftest 早前注释即记载「间歇性 Killing 进程」，实证表现为 90 个测试文件
+# 在收集期报 ImportError（单文件复跑均正常、--co 亦正常，纯间歇）。
+# 根 conftest 于收集前加载，故在此设 sys.dont_write_bytecode=True 可阻止
+# 本进程在收集期为测试模块落 .pyc；同步写环境变量以覆盖测试衍生的子进程。
+# 代价仅为每次运行重新编译（无 .pyc 缓存），对正确性无影响。
+sys.dont_write_bytecode = True
+os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
+
+
 # 测试强制使用独立临时数据目录：
 # 1) 避免污染/依赖真实数据目录（真实目录可能因安全软件对 python 进程只读）
 # 2) 保证测试可重复、可并行

@@ -33,6 +33,7 @@ from typing import Any
 # 排序器（改顺序）与门禁（判顺序）必须共用同一套判据，否则会出现
 # "排序器认为合规、门禁却报乱序"的自相矛盾。
 from ...utils.scoring_points import is_scoring_placeholder
+from .outline_common import child_number
 from .outline_sort_optimizer import CORE_ZONE_MAP, KEYWORD_ZONE_MAP, ZONE_ORDER
 from .workflows_outline_utils import _is_title_duplicate, _normalize_title_core, _title_similarity
 
@@ -276,7 +277,12 @@ def renumber_outline_ids(outline: list[dict]) -> tuple[list[dict], int]:
         for index, node in enumerate(nodes, 1):
             if not isinstance(node, dict):
                 continue
-            new_id = f"{prefix}{index}" if not prefix else f"{prefix}.{index}"
+            # BUG-FIX 2026-10-13（L1 · 编号命名空间统一）：拼接算法收敛到
+            # `outline_common.child_number`——与落库 `_save_nodes` 的
+            # `path_number`、DB 版 `get_section_path` 同一实现，杜绝
+            # 「同节点三个编号」的漂移（一致性见
+            # tests/test_outline_l3_hardening_2026_10_13.py::TestPathNumberNamespace）。
+            new_id = child_number(prefix, index)
             if str(node.get("id") or "") != new_id:
                 node["id"] = new_id
                 changed += 1
@@ -285,11 +291,30 @@ def renumber_outline_ids(outline: list[dict]) -> tuple[list[dict], int]:
     _walk(outline, "", 1)
 
     # ENHANCE 2026-10-12（P0-1）：可选的模板化编号
+    #
+    # BUG-FIX 2026-10-13（B5 · 模板环境变量不生效）：旧实现导入了
+    # `OUTLINE_NUMBERING_TEMPLATE` 却未使用，`renumber_outline_with_template`
+    # 不传 template → 永远走硬编码 `DEFAULT_TEMPLATE_JSON`，运维通过环境变量
+    # 自定义编号模板（如「一、/(一)/1.」中文体系）完全不生效，且无任何报错。
+    # 现按配置构建模板传入；模板非法时回退默认模板并告警（不阻断主流程）。
     try:
         from ...config import OUTLINE_NUMBERING_ENABLED, OUTLINE_NUMBERING_TEMPLATE
         if OUTLINE_NUMBERING_ENABLED:
-            from .outline_numbering import renumber_outline_with_template
-            renumber_outline_with_template(outline, mutate=True)
+            from .outline_numbering import (
+                DEFAULT_TEMPLATE_JSON,
+                NumberingTemplate,
+                renumber_outline_with_template,
+            )
+            _template = None
+            if OUTLINE_NUMBERING_TEMPLATE:
+                try:
+                    _template = NumberingTemplate.from_json(OUTLINE_NUMBERING_TEMPLATE)
+                except Exception as _tpl_err:
+                    logger.warning(
+                        "OUTLINE_NUMBERING_TEMPLATE 非法，回退默认模板: %s", _tpl_err
+                    )
+                    _template = NumberingTemplate.from_json(DEFAULT_TEMPLATE_JSON)
+            renumber_outline_with_template(outline, template=_template, mutate=True)
     except Exception:
         # 静默失败，不阻断主流程
         pass

@@ -932,27 +932,6 @@ class ChartCache:
             logger.info("ChartCache: 清理了 %d 个超过 %d 天的缓存文件", count, max_age_days)
         return count
 
-def render_mermaid(mermaid_code: str, chart_type: str = "flowchart") -> str:
-    """[DEPRECATED] 兼容接口：返回 Mermaid 源码（不实际渲染）。
-
-    完整渲染请使用 render_mermaid_to_bytes()。
-    本函数于 2026-10-11 标记为 deprecated，从未被生产代码调用——仅为
-    向后兼容预留。保留到后续版本确认无外部调用者后移除。
-    """
-    import warnings
-    warnings.warn(
-        "render_mermaid() 已弃用（仅返回源码不做渲染），"
-        "请使用 render_mermaid_to_bytes() 替代。",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-    logger.warning(
-        "[DEPRECATED] render_mermaid() 被调用——返回源码而非图片，调用方可能无法正常渲染图表"
-    )
-    return mermaid_code
-
-
-
 # ============================================================
 # 向后兼容 re-export（拆分前可用的所有内部符号）
 # ============================================================

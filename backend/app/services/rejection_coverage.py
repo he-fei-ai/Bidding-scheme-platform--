@@ -117,7 +117,25 @@ def rejection_answer_coverage(
         ).fetchone()
         content_by_id = _load_all_project_content(conn, project_id)
 
-    if row is None or not row.get("results"):
+    # BUG-FIX 2026-10-13（P1 · 端点对「已跑过废标检查」的项目必然 500）：
+    # `row` 是 `sqlite3.Row`（`get_db` 设了 `row_factory=sqlite3.Row`），而
+    # `sqlite3.Row` **没有 `.get()` 方法**。原判断写成 `row.get("results")`，
+    # 于是：
+    #   - 从未跑过废标检查 → `row is None` 短路，走 no_checks，**看不出问题**；
+    #   - 跑过废标检查   → 进入 `row.get(...)` → AttributeError 冒泡出函数。
+    # 而路由层 `rejection_answer_coverage_endpoint` 直接
+    # `asyncio.to_thread(rejection_answer_coverage, project_id)` 且**无 try/except**
+    # → FastAPI 回 500。
+    # 也就是说：本端点只在「没有废标数据」时能用，一旦有数据就崩 —— 恰好把
+    # 它唯一的存在意义（量化条款应答情况）整条废掉。
+    # 修法：sqlite3.Row 用下标取值（与本模块后续 `row["results"]` 口径一致）。
+    results_raw = None
+    if row is not None:
+        try:
+            results_raw = row["results"]
+        except (IndexError, KeyError):  # pragma: no cover - 列缺失兜底
+            results_raw = None
+    if row is None or not results_raw:
         return {
             "status": "no_checks",
             "message": "该项目尚无已完成的大数据废标检查结果，无法计算应答覆盖率",
@@ -125,7 +143,7 @@ def rejection_answer_coverage(
         }
 
     try:
-        results = json.loads(row["results"] or "{}")
+        results = json.loads(results_raw or "{}")
     except json.JSONDecodeError:
         results = {}
 

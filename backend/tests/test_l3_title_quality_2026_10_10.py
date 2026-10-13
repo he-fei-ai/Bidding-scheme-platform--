@@ -1099,10 +1099,19 @@ class TestConfigDefaults:
         assert OUTLINE_L3_REPAIR_CONCURRENCY < OUTLINE_L3_REPAIR_MAX
 
     def test_legacy_placeholder_regex_is_still_exported(self):
-        """向后兼容：旧常量名保留，避免外部引用断裂。"""
+        """向后兼容：旧常量名保留，避免外部引用断裂。
+
+        BUG-FIX 2026-10-13（G1）：模式本身已扩展为兼容中文数字
+        （「专项六」也曾大量穿透判定）；此处同时锁定新旧两种形态，
+        既保证常量名不变，也保证修复不回退。
+        """
         from app.services.ai import outline_common
 
-        assert outline_common._PLACEHOLDER_TITLE_RE.pattern == r"^专项\d+$"
+        assert outline_common._PLACEHOLDER_TITLE_RE.pattern == (
+            r"^专项\s*[0-9一二三四五六七八九十百]+\s*$"
+        )
+        assert outline_common._PLACEHOLDER_TITLE_RE.match("专项6")
+        assert outline_common._PLACEHOLDER_TITLE_RE.match("专项六")
 
     def test_generic_only_titles_covers_legacy_check(self):
         # 旧实现硬编码 `_title == "实施要点"`，新词表必须覆盖

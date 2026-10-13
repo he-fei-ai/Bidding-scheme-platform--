@@ -1072,8 +1072,22 @@ async def generate_content_impl(
                         _target_lo = int(_resolved.lo)
                         _target_hi = int(_resolved.hi)
                         _target_source = _resolved.source
+                    else:
+                        # 兜底：未命中强控/解析器时使用章节默认目标
+                        _sec = sections_by_id.get(sid) or {}
+                        _lvl = _sec.get("level", 3)
+                        _default_t = 500 if _lvl == 1 else 300
+                        _target = _default_t
+                        _target_lo = int(max(0, _default_t * 0.8))
+                        _target_hi = _default_t
+                        _target_source = "fallback_default"
             except Exception as _tgt_e:
                 logger.debug("[字数目标] 章节 %s 目标解析失败（忽略）: %s", sid, _tgt_e)
+                # 兜底：确保即使出错也有默认值，防止 frontend 显示 NaN
+                _target = 300
+                _target_lo = 240
+                _target_hi = 300
+                _target_source = "error_fallback"
 
 
             await queue.put(
@@ -1113,10 +1127,11 @@ async def generate_content_impl(
             # leaf_dicts 是外层 generate_content_impl 的闭包变量，正常情况下恒存在；
             # 但 section_complete_callback 也可能在极端边界（如初始阶段回调）被调用，
             # 加 try/except NameError 兜底，防止死代码被移除后暴露隐患。
-            try:
-                _total = len(leaf_dicts)
-            except NameError:
-                _total = 0
+            # 使用 leaf_dicts 闭包变量确保 total 计数与章节生成列表一致。
+            # 始终在 leaf_dicts 定义后（第 360-378 行）才进入主循环，已通过
+            # generate_content_impl 的结构保证 leaf_dicts 恒定；若因极端边界（如
+            # 生成早期回调）仍未定义，兜底使用 0 并由 max(_,1) 避免零Division。
+            _total = len(leaf_dicts) if isinstance(leaf_dicts, list) else 0
             _done = saved_count + failed_count + cancelled_count
             _percent = round(_done / max(_total, 1) * 100)
             _now = _time.time()
@@ -2348,6 +2363,8 @@ async def generate_content_impl(
 
                         audited = await _audit(
 
+                            project_id,
+
                             provider,
 
                             results,
@@ -2770,9 +2787,12 @@ async def generate_content_impl(
 
         #   - 软告警（_warn_secs = _estimated * 1.5）：仅发 warning 事件，不熔断
 
-        #   - 硬熔断（_hard_secs = 4h）：只用于"AI 完全卡死"的最终保险
+        #
 
         _quality_retries = 2  # max_retries in quality check
+# ENHANCE 2026-10-13：质量重试次数对超时估算影响显著。
+# 如需微调，根据实际 AI 服务商的 429/质量评估重试经验对本值进行行业化调整。
+# 若观测到实际重试频率远超预期，可适当增加本值以降低误触软告警率。
 
         _per_chapter_secs = 120 * (1 + _quality_retries * 2) + 120  # ~840s worst case
 
@@ -2812,7 +2832,7 @@ async def generate_content_impl(
 
                         elapsed_total, _estimated_secs,
 
-                        )
+                    )
 
                     try:
 
@@ -2826,7 +2846,11 @@ async def generate_content_impl(
 
                                 f"运行 {int(elapsed_total)}s 超过预期估算 "
 
-                                f"{int(_estimated_secs)}s，AI 响应较慢但仍在继续"
+                                f"{int(_estimated_secs)}s，AI 响应较慢但仍在继续。"
+
+                                f"距硬熔断({SSE_TOTAL_TIMEOUT//60}min)还剩 "
+
+                                f"{int((SSE_TOTAL_TIMEOUT - elapsed_total)/60)} min"
 
                             ),
 

@@ -133,3 +133,32 @@ class TestNormalizeDeepLevelsSwitch:
         # L3 编号被重置为 1（不是 2）
         assert "1、三级" in out
 
+
+class TestStripHeadingNumberingDeepLevels:
+    """L4（2026-10-13 遗留项结论更正 + 回归锁定）。
+
+    第三轮加固报告曾把「strip_heading_numbering_from_content 对四级以上
+    编号只剥前三段（残留 .1）」列为遗留问题 L4。实测结论：该判断有误 ——
+    ATX/Setext 剥离正则的 `(?:\\.\\d+){2,}` 为贪婪匹配，`1.1.1.1` /
+    `1.1.1.1.1` 会被整段剥离。此处补测试锁定该行为，
+    防止将来收窄正则时回归出残留 `.1`。
+    """
+
+    def test_atx_deep_dotted_numbers_fully_stripped(self):
+        from app.services.content_cleaning import strip_heading_numbering_from_content
+
+        assert strip_heading_numbering_from_content("## 1.1.1.1 深化设计") == "## 深化设计"
+        assert strip_heading_numbering_from_content("## 1.1.1.1.1 超深层") == "## 超深层"
+        assert strip_heading_numbering_from_content("#### 2.3.4.5 机电调试") == "#### 机电调试"
+
+    def test_setext_deep_dotted_numbers_fully_stripped(self):
+        from app.services.content_cleaning import strip_heading_numbering_from_content
+
+        assert strip_heading_numbering_from_content("1.1.1.1 施工部署\n===") == "施工部署\n==="
+
+    def test_three_level_still_stripped(self):
+        """既有三级形态不回退。"""
+        from app.services.content_cleaning import strip_heading_numbering_from_content
+
+        assert strip_heading_numbering_from_content("### 2.3.1 深化设计") == "### 深化设计"
+

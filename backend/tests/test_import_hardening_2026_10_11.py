@@ -133,10 +133,18 @@ def test_extract_doc_no_duplicate_elif_branch():
     修复前第二个分支因 if/elif/elif 结构永远不可达（死代码），
     且用旧的 errors="ignore"（违背 2026-10-08 的 ignore→replace 修复）。
     本测试扫描源码验证只有一个匹配。
-    """
-    from app.services import files as files_mod
 
-    source_file = Path(files_mod.__file__)
+    BUG-FIX 2026-10-13（L5 · 测试定位漂移）：`_extract_doc` 已从
+    `app/services/files.py` 重构至 `app/services/extractors/__init__.py`
+    （doc 提取器子包化），旧路径扫描恒得 0 命中 → 测试假失败。
+    现改为定位到 extractors 包，并在目标缺失时显式失败而非静默 0 命中。
+    """
+    from app.services import extractors as extractors_mod
+
+    source_file = Path(extractors_mod.__file__)
+    assert "def _extract_doc(" in source_file.read_text(encoding="utf-8"), (
+        f"_extract_doc 不在预期文件 {source_file}，请同步更新本测试定位"
+    )
     doc_lines = source_file.read_text(encoding="utf-8").split("\n")
 
     # 定位 _extract_doc 函数源码范围

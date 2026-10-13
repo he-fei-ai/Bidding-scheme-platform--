@@ -299,6 +299,11 @@ def cancel_v51_task(project_id: int) -> bool:
 
         state.cancelled = True
     state.resume_event.set()
+    # BUG-FIX 2026-10-13（取消后 DB 行状态残留）：`mark_v51_cancelled` 此前
+    # 无任何调用方（死代码）——内存态 cancelled=True，但 v51_tasks 行的
+    # cancelled 列仍为 0，断点续生/恢复界面拿到的是「未取消」的旧行，
+    # 只能靠 2 小时 expired_at 兜底清理。取消是终态，在此统一落库。
+    mark_v51_cancelled(project_id)
     logger.info("V5.1 任务已取消: project=%d", project_id)
     return True
 

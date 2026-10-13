@@ -267,6 +267,14 @@ OUTLINE_L3_REPAIR_MAX = int(os.environ.get("OUTLINE_L3_REPAIR_MAX", "24"))
 OUTLINE_L3_REPAIR_CONCURRENCY = max(
     1, int(os.environ.get("OUTLINE_L3_REPAIR_CONCURRENCY", "5"))
 )
+# 三级标题 AI 修复的最大轮数（2026-10-13 新增）。
+# 背景：单轮最多修 OUTLINE_L3_REPAIR_MAX 条，大目录（>24 个泛化标题）
+# 单轮必然大量残留，而旧实现的二次校验只写日志不做补救。现在
+# `_l3_specificity_closeout` 按本配置循环修复，每轮后重新校验，
+# 问题数不降即提前收尾（避免空烧 AI 调用）。设为 1 退回历史单轮行为。
+OUTLINE_L3_REPAIR_MAX_ROUNDS = max(
+    1, int(os.environ.get("OUTLINE_L3_REPAIR_MAX_ROUNDS", "3"))
+)
 
 
 # ========== 增强 2.1: RAG 向量检索配置 ==========

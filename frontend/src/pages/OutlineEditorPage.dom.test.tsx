@@ -415,10 +415,19 @@ describe.skipIf(!hasDom)("OutlineEditorPage 组件级交互（2026-10-12 加固�
     await rtl.waitFor(() => expect(document.body.textContent).toContain("请审核一级目录"));
 
     // 编辑一级标题
-    const editable = Array.from(
-      document.querySelectorAll('input.ant-input'),
-    ).filter((el) => (el as HTMLInputElement).value === "施工部署");
-    expect(editable.length).toBeGreaterThan(0);
+    // BUG-FIX 2026-10-13（测试健壮性 · 非本模块，顺手修）：原用例在
+    // `waitFor(消息文案出现)` 之后**同步**查询 `input.ant-input`。但 antd Modal 是
+    // 先渲染标题/描述、后挂载 children 的，消息文案出现并不代表输入框已挂载 ——
+    // 全量并发跑（worker 抢 CPU）时这一步偶发拿到 0 个 input 而失败，单跑则稳定绿。
+    // 正确做法是 waitFor **它真正要断言的东西**（可编辑输入框出现），而不是
+    // waitFor 一个相关但更早出现的信号。
+    const editable = await rtl.waitFor(() => {
+      const found = Array.from(
+        document.querySelectorAll('input.ant-input'),
+      ).filter((el) => (el as HTMLInputElement).value === "施工部署");
+      expect(found.length).toBeGreaterThan(0);
+      return found;
+    });
     const setter = Object.getOwnPropertyDescriptor(
       window.HTMLInputElement.prototype, "value",
     )!.set!;

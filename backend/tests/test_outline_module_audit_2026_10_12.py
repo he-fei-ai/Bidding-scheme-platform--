@@ -777,12 +777,17 @@ class TestNoShadowSanitizePath:
             assert not _is_dirty_l3_title(t), f"兜底 L3 产出占位标题: {t}"
 
     def test_l3_dirty_check_is_level_scoped_by_design(self):
-        """`_is_dirty_l3_title` 只用于 L3+ —— L1/L2 合法用词不得被清洗。"""
+        """`_is_dirty_l3_title` 只用于 L3+ —— L1/L2 合法用词不得被清洗。
+
+        BUG-FIX 2026-10-13（G2）：判定升级为 `_is_dirty_l3_title_deep`
+        （额外覆盖「（其N）」剥离后仍为泛化词的残渣形态），level>=3 的
+        作用域约束保持不变。
+        """
         src = (Path(__file__).resolve().parents[1] / "app" / "services" / "ai"
                / "outline_common.py").read_text(encoding="utf-8")
         i = src.index("def _cleanup_placeholder_titles(")
         seg = src[i:i + 2000]
-        assert "level >= 3 and _is_dirty_l3_title(_title)" in seg, (
+        assert "level >= 3 and _is_dirty_l3_title_deep(_title)" in seg, (
             "占位清洗必须限定 level>=3，否则会误伤 28 章模板的合法 L1/L2 标题"
         )
 

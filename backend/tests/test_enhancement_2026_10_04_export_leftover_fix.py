@@ -382,9 +382,14 @@ class TestSseDisconnectResume:
         assert sid and sid in _STREAM_JOURNALS, "connected 事件的 stream_id 必须已注册 journal"
 
         journal = _STREAM_JOURNALS[sid]
-        deadline = time.time() + 120
+        # BUG-FIX 2026-10-13（L7 · 全量负载 flaky）：120s deadline 在满负载
+        # 全量运行（12min+）中曾触发一次超时（孤立/文件内/邻域均通过）——
+        # drain 接管线程要做真实 DOCX 构建，CPU 被其余 4000+ 测试争抢时
+        # 构建耗时显著拉长。放宽至 240s 并降低自旋频率（0.05→0.1s），
+        # 给负载高峰留足余量；终态到达后循环立即退出，不影响快速路径。
+        deadline = time.time() + 240
         while not journal.terminal and time.time() < deadline:
-            time.sleep(0.05)
+            time.sleep(0.1)
         assert journal.terminal, "断线后 journal 应在 drain 接管下于构建结束时封存"
         events = [item for _, item in journal.events]
         terminal_events = [e for e in events if e.get("event") in ("completed", "error")]

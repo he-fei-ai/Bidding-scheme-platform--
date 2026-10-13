@@ -16,6 +16,7 @@ from ..db import get_db
 from ..security.auth import get_current_user
 from .sections import require_project_permission
 from ..services.sections import invalidate_content_caches
+from ..services.task_guard import reject_if_generation_running
 
 
 logger = logging.getLogger(__name__)
@@ -208,6 +209,12 @@ async def restore_content_version(
     """
     if current_user:
         await require_project_permission(project_id, current_user)
+
+    # BUG-FIX 2026-10-13（L2 · 旁路写正文无守卫）：回滚是裸 SQL 写
+    # sections.content 的旁路链路，目录生成进行中执行会被收尾的
+    # DELETE+INSERT 静默覆盖（用户以为回滚成功）。按内容类写入口径防护：
+    # 目录生成中拒绝（409），正文生成中放行（与手写编辑同性质）。
+    reject_if_generation_running(project_id, allow_content_edit=True)
 
     # PERF（2026-10-05）：读版本/验章节/写正文/记回滚版本整段同步 I/O
     # 派发至工作线程（写锁在 worker 阻塞，不冻结事件循环）

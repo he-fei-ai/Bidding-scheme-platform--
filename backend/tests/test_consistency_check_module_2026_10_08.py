@@ -129,9 +129,16 @@ class TestPostGenerationAuditLink:
         from app.services.ai.workflows import consistency_audit_content
 
         params = inspect.signature(consistency_audit_content).parameters
-        # sse_content 以 (provider, results, sections_by_id, summary,
-        # tender_context, cancel_event=...) 六个参数调用
-        for name in ("provider", "results", "sections_by_id", "summary", "tender_context"):
+        # sse_content 以 (project_id, provider, results, sections_by_id, summary,
+        # tender_context, cancel_event=...) 七个参数调用（G1/G2 修复补了 project_id）
+        for name in (
+            "project_id",
+            "provider",
+            "results",
+            "sections_by_id",
+            "summary",
+            "tender_context",
+        ):
             assert name in params, f"签名缺少位置参数 {name}"
         assert "cancel_event" in params, "签名缺少 cancel_event（sse_content 以关键字传入）"
 
@@ -713,13 +720,21 @@ class TestConsistencyRulesNamespace:
         from app.services import consistency_rules as rules
 
         payload = rules.rules_payload()
-        assert set(payload) == {
+        # ENHANCE 2026-10-13：原断言是 `set(payload) == {…}` **等值**比较，把顶层键集
+        # 焊死成不可扩展——正因如此，2026-10-09 加「自动修复防护口径」时只能把
+        # window/scope 硬塞进语义上并不合适的 `facts` 块（那里本应只有事实名），
+        # 同一个隐性耦合逼出了下一轮的继续打补丁：本次要下发的废标覆盖率阈值同理。
+        # 改为「必备键 ⊆ 顶层键」+「每个值都是 dict」：既保住契约不被悄悄删，
+        # 又允许命名空间按需新增子块。
+        required = {
             "severity",
             "facts",
             "audit_status",
             "conflict_state",
             "scoring_status",
         }
+        assert required <= set(payload), f"规则快照缺必备顶层块: {required - set(payload)}"
+        assert all(isinstance(v, dict) for v in payload.values())
         assert payload["severity"]["order"] == ["high", "medium", "low"]
         assert payload["severity"]["meta"]["high"]["label"] == "严重"
         assert payload["conflict_state"] == {"open": "open", "resolved": "resolved"}

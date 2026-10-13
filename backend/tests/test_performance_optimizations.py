@@ -124,9 +124,19 @@ class TestBuildTreeCache:
         assert len(tree) > 0
 
     def test_build_tree_cache_hit(self):
-        """第二次调用应命中缓存（无额外 DB 查询）"""
+        """第二次调用应命中缓存（无额外 DB 查询）
+
+        BUG-FIX 2026-10-13（L7 · 计时断言 flaky）：旧断言 `elapsed < 10ms`
+        在**全量套件负载**下不稳定——三次全量运行中失败过一次（孤立/文件内/
+        邻域均通过），根因是 12 分钟满负载运行的 GC 与 IO 抖动，而非缓存失效，
+        计时阈值无法区分「缓存未命中」与「机器正忙」。
+        改为**结构性断言**：命中缓存时 `build_tree` 根本不进 `get_db()`，
+        用「第二次调用零 DB 连接」证明缓存命中——该性质与机器负载无关，
+        100% 稳定，且比计时更强（计时慢仍可能是命中，零查询必然是命中）。
+        """
         from app.services.sections import build_tree, _build_tree_cache, _invalidate_build_tree_cache
         from app.db import init_db, get_db
+        import app.services.sections as sections_mod
 
         init_db()
         with get_db() as conn:
@@ -142,19 +152,29 @@ class TestBuildTreeCache:
 
         _invalidate_build_tree_cache(pid)
 
-        # 第一次调用（未缓存）
+        # 第一次调用（未缓存，允许查库）
         tree1 = build_tree(pid)
         cache_key = _build_tree_cache.get(pid)
         assert cache_key is not None, "build_tree should populate cache"
 
-        # 第二次调用（应命中缓存）
-        start = time.perf_counter()
-        tree2 = build_tree(pid)
-        elapsed = time.perf_counter() - start
+        # 第二次调用：把 get_db 换成计数探针——命中缓存时一次都不该被调用
+        db_calls = {"n": 0}
+        real_get_db = sections_mod.get_db
+
+        def _counting_get_db(*args, **kwargs):
+            db_calls["n"] += 1
+            return real_get_db(*args, **kwargs)
+
+        sections_mod.get_db = _counting_get_db
+        try:
+            tree2 = build_tree(pid)
+        finally:
+            sections_mod.get_db = real_get_db
 
         assert tree1 == tree2
-        # 缓存命中应极快（< 10ms，考虑到 SQLite 初始化开销）
-        assert elapsed < 0.01, f"Cache miss: {elapsed:.4f}s"
+        assert db_calls["n"] == 0, (
+            f"缓存命中不应触发 DB 查询，实际 {db_calls['n']} 次 → 缓存未命中"
+        )
 
     def test_build_tree_cache_invalidated_on_update(self):
         """更新章节后缓存应失效"""
@@ -543,10 +563,16 @@ class TestPerformanceBenchmarks:
         assert elapsed < 1.0, f"count_words benchmark failed: {elapsed:.4f}s for {iterations} calls"
 
     def test_build_tree_cache_hit_100_calls_under_10ms(self):
-        """100次缓存命中的 build_tree 调用应 < 1s（含 @timer 装饰器日志开销）"""
+        """100次缓存命中：零 DB 查询 + 计时仅作参考（BUG-FIX 2026-10-13 L7）
+
+        旧断言 `elapsed < 1.0s` 是全量负载下的第二处计时 flaky 面
+        （@timer 装饰器的日志开销随负载波动）。主断言改为结构性：
+        100 次命中期间 get_db 零调用（证明全部命中且不进库）；
+        耗时降级为信息输出（logger.info），不再参与通过判定。
+        """
         from app.services.sections import build_tree, _build_tree_cache, _invalidate_build_tree_cache
         from app.db import init_db, get_db
-        from app.models import SectionTreeNode
+        import app.services.sections as sections_mod
 
         init_db()
         with get_db() as conn:
@@ -564,14 +590,28 @@ class TestPerformanceBenchmarks:
         # 预热缓存
         build_tree(pid)
 
-        # 100次缓存命中
-        iterations = 100
-        start = time.perf_counter()
-        for _ in range(iterations):
-            build_tree(pid)
-        elapsed = time.perf_counter() - start
+        # 100次缓存命中：计数 get_db 调用
+        db_calls = {"n": 0}
+        real_get_db = sections_mod.get_db
 
-        assert elapsed < 1.0, f"build_tree cache benchmark failed: {elapsed:.4f}s for {iterations} calls"
+        def _counting_get_db(*args, **kwargs):
+            db_calls["n"] += 1
+            return real_get_db(*args, **kwargs)
+
+        iterations = 100
+        sections_mod.get_db = _counting_get_db
+        try:
+            start = time.perf_counter()
+            for _ in range(iterations):
+                build_tree(pid)
+            elapsed = time.perf_counter() - start
+        finally:
+            sections_mod.get_db = real_get_db
+
+        assert db_calls["n"] == 0, (
+            f"100 次调用应全部命中缓存（零 DB 查询），实际 {db_calls['n']} 次查询"
+        )
+        print(f"\n[build_tree cache] {iterations} hits in {elapsed:.4f}s (信息输出，不参与判定)")
 
     def test_get_section_path_5_level_under_5ms(self):
         """5层目录路径查询应 < 5ms"""

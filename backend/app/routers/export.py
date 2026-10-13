@@ -74,10 +74,18 @@ def _register_stream_journal(journal: _StreamJournal) -> None:
     with _STREAM_JOURNAL_LOCK:
         _STREAM_JOURNALS[journal.stream_id] = journal
         # 淘汰过期与超限条目（调用方持锁，内部不再取锁）
+        # BUG-FIX 2026-10-13（P1·活动流被误淘汰）：原判据
+        # `(j.finished_at or j.created_at) + TTL < now` 对**未终态**的 journal
+        # 用 created_at 判过期 —— 大型标书构建超过 10 分钟仍未结束时，下一次
+        # 注册新流就会把它当过期条目删掉 → 客户端 resume 404 → 降级走同步导出
+        # → 撞上那条仍在持有的导出组锁 → 409，用户被「导出冲突」拦住。
+        # 现只淘汰**已终态且封存超 TTL** 的 journal；活动流仅受容量上限约束
+        # （下方 while 分支仍是最早注册优先淘汰的硬闸，防内存无界增长）。
         now = time.time()
         expired = [
             sid for sid, j in _STREAM_JOURNALS.items()
-            if (j.finished_at or j.created_at) + _STREAM_JOURNAL_TTL_SECONDS < now
+            if j.finished_at is not None
+            and j.finished_at + _STREAM_JOURNAL_TTL_SECONDS < now
         ]
         for sid in expired:
             _STREAM_JOURNALS.pop(sid, None)
@@ -294,16 +302,35 @@ async def export_html(project_id: int, config: ExportConfig=Body(default_factory
     if config is None:
         config = ExportConfig()
     await enforce_project_access(project_id, identity)
-    from ..services.html_export import build_html
+    # BUG-FIX 2026-10-13（P1·空文档口径不一致）：DOCX 与 SSE 分支都对空文档
+    # 返回 400，唯独 HTML 分支直接放行 → 产出只有封面没有正文的空壳文件。
+    check = await asyncio.to_thread(check_document, project_id, strict_mode=config.strict_mode)
+    if check.total_sections == 0:
+        raise HTTPException(status_code=400, detail='文档为空，无法导出')
+    # BUG-FIX 2026-10-13（P1·无互斥双写）：HTML 产物与 DOCX 同落 exports/ 目录，
+    # 但未抢导出组锁 → 两个 HTML 请求（或 HTML 与 DOCX 并发）各自生成产物，
+    # 同名时互相截断。抢同一把组锁后，冲突方得到 409 而不是半截文件。
+    lock_key, owner_id = await _acquire_export_lock(project_id)
+    _stop_keepalive = _task_lock.start_keepalive(lock_key, owner_id)
+    try:
+        from ..services.html_export import build_html
 
-    path, _fingerprint = await asyncio.to_thread(build_html, project_id, config)
+        path, _fingerprint = await asyncio.to_thread(build_html, project_id, config)
 
-    from pathlib import Path as _Path
-    _p = _Path(path)
-    if not _p.exists():
-        raise HTTPException(status_code=500, detail="HTML 导出产物落盘失败")
-    from fastapi.responses import FileResponse as _FileResponse
-    return _FileResponse(path=str(_p), filename=_p.name, media_type="text/html; charset=utf-8")
+        _p = Path(path)
+        if not _p.exists():
+            raise HTTPException(status_code=500, detail="HTML 导出产物落盘失败")
+        return FileResponse(path=str(_p), filename=_p.name, media_type="text/html; charset=utf-8")
+    except Exception as e:
+        # HTTPException 直接上抛，保持 400/409/500 语义不被「导出失败」包装
+        if isinstance(e, HTTPException):
+            raise
+        logger.exception('HTML 导出失败')
+        _record_export_failure(project_id, config, f'{type(e).__name__}: {str(e)[:200]}')
+        raise HTTPException(status_code=500, detail=f'导出失败: {type(e).__name__}: {str(e)[:200]}') from e
+    finally:
+        _stop_keepalive()
+        await _release_export_lock(lock_key, owner_id, why=f'HTML 导出 project={project_id}')
 
 @router.post('/docx-stream', dependencies=[limit_per_endpoint])
 async def export_docx_stream(request: Request, project_id: int, config: ExportConfig=Body(default_factory=ExportConfig), identity=Depends(verify_auth)):

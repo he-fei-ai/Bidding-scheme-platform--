@@ -27,6 +27,18 @@ export interface AgentRepairTabProps {
  *
  * 安全模型与补丁路径一致：AI 只提修改意图，宿主唯一命中校验后执行，
  * Agent 编造的 old_text / 越界 section_id 一律拒绝，幻觉 0 落库。
+ *
+ * ── BUG-FIX 2026-10-13（P0 · 真实后端响应导致整页白屏）：本组件原先对
+ * `report.rejected / unresolved / errors` **无保护地**取 `.length`。而后端
+ * `services/agent_repair.py` 的报告 dict 当时**没有 `errors` 键**（与姊妹链路
+ * `consistency_repair.repair_with_ai` 不对称 —— 后者有）。于是
+ *   TypeError: Cannot read properties of undefined (reading 'length')
+ * 一旦抛出，React 18 在无错误边界时**卸载整棵组件树**，而 `ConsistencyPage`
+ * 未挂 ErrorBoundary —— 「执行修复」拿到任何一份真实响应（**含成功响应**）
+ * 都会让整个一致性校核页白屏，Tab 全切不动。
+ * 现两处同改：① 后端补齐 `errors` / `max_turns`；② 前端全部改可选链，
+ * 对历史响应与第三方调用方同样健壮。另见 `AgentRepairTab.dom.test.tsx`
+ * 「真实契约」回归用例（桩数据此前手写了契约里不存在的字段，把 P0 永久掩盖）。
  */
 export default function AgentRepairTab({ projectId }: AgentRepairTabProps) {
   const [repairing, setRepairing] = useState(false);
@@ -62,6 +74,15 @@ export default function AgentRepairTab({ projectId }: AgentRepairTabProps) {
   if (!isValidProject) {
     return <Alert type="error" showIcon message="项目 ID 无效，无法启动 Agent 修复" />;
   }
+
+  // BUG-FIX 2026-10-13（P0）：把「可能缺失」的集合字段在这里一次性归一为数组。
+  // 之前散落在 JSX 里写 `report.rejected?.length > 0 && ...{report.rejected.length}`，
+  // 既脆（漏一处就是白屏）又过不了 TS 收窄（`?.length > 0` 的结果不会把
+  // `report.rejected` 收窄进 JSX 分支）。归一后全部按必填数组处理。
+  const rejected = report?.rejected ?? [];
+  const unresolved = report?.unresolved ?? [];
+  const errors = report?.errors ?? [];
+  const changedSections = report?.changed_sections ?? [];
 
   return (
     <Space direction="vertical" style={{ width: "100%" }} size="middle">
@@ -118,7 +139,9 @@ export default function AgentRepairTab({ projectId }: AgentRepairTabProps) {
                 {report.status}
               </Tag>
               {report.turns > 0 && (
-                <Tag color="blue">{report.turns}/{report.max_turns} 轮</Tag>
+                <Tag color="blue">
+                  {report.turns}/{report.max_turns ?? maxTurns} 轮
+                </Tag>
               )}
             </Space>
           }
@@ -134,8 +157,8 @@ export default function AgentRepairTab({ projectId }: AgentRepairTabProps) {
 
           {/* 统计指标 */}
           <Space size={[8, 8]} wrap style={{ marginBottom: 16 }}>
-            {report.changed_sections?.length > 0 && (
-              <Tag color="geekblue">修改章节 {report.changed_sections.length} 个</Tag>
+            {changedSections.length > 0 && (
+              <Tag color="geekblue">修改章节 {changedSections.length} 个</Tag>
             )}
             {report.conflict_states && (
               <>
@@ -147,23 +170,23 @@ export default function AgentRepairTab({ projectId }: AgentRepairTabProps) {
                 )}
               </>
             )}
-            {report.rejected.length > 0 && (
-              <Tag color="red">被拒绝 {report.rejected.length} 条</Tag>
+            {rejected.length > 0 && (
+              <Tag color="red">被拒绝 {rejected.length} 条</Tag>
             )}
-            {report.unresolved.length > 0 && (
-              <Tag color="orange">无法局部修复 {report.unresolved.length} 处</Tag>
+            {unresolved.length > 0 && (
+              <Tag color="orange">无法局部修复 {unresolved.length} 处</Tag>
             )}
-            {report.errors.length > 0 && (
-              <Tag color="red">错误 {report.errors.length} 条</Tag>
+            {errors.length > 0 && (
+              <Tag color="red">错误 {errors.length} 条</Tag>
             )}
           </Space>
 
           {/* 修改章节列表 */}
-          {report.changed_sections?.length > 0 && (
+          {changedSections.length > 0 && (
             <div style={{ marginBottom: 12 }}>
               <Text strong>涉及修改的章节：</Text>
               <Paragraph style={{ marginBottom: 0, marginTop: 4 }}>
-                {report.changed_sections
+                {changedSections
                   .map((s) => `[${s.id}] ${s.title}`)
                   .join("；")}
               </Paragraph>
@@ -171,14 +194,14 @@ export default function AgentRepairTab({ projectId }: AgentRepairTabProps) {
           )}
 
           {/* 被拒绝的补丁 */}
-          {report.rejected.length > 0 && (
+          {rejected.length > 0 && (
             <div style={{ marginBottom: 12 }}>
               <Space>
                 <CloseCircleOutlined style={{ color: "#ff4d4f" }} />
                 <Text strong>被拒绝的补丁：</Text>
               </Space>
               <div style={{ marginTop: 4 }}>
-                {report.rejected.slice(0, 10).map((r: unknown, i: number) => {
+                {rejected.slice(0, 10).map((r: unknown, i: number) => {
                   const item = r as { section_id?: string; title?: string; error?: string };
                   return (
                     <Text type="warning" key={i} style={{ display: "block", fontSize: 12 }}>
@@ -186,9 +209,9 @@ export default function AgentRepairTab({ projectId }: AgentRepairTabProps) {
                     </Text>
                   );
                 })}
-                {report.rejected.length > 10 && (
+                {rejected.length > 10 && (
                   <Text type="secondary" style={{ fontSize: 12 }}>
-                    ... 及其他 {report.rejected.length - 10} 条
+                    ... 及其他 {rejected.length - 10} 条
                   </Text>
                 )}
               </div>
@@ -196,14 +219,14 @@ export default function AgentRepairTab({ projectId }: AgentRepairTabProps) {
           )}
 
           {/* 无法局部修复 */}
-          {report.unresolved.length > 0 && (
+          {unresolved.length > 0 && (
             <div style={{ marginBottom: 12 }}>
               <Space>
                 <WarningOutlined style={{ color: "#faad14" }} />
                 <Text strong>Agent 判定无法局部修复：</Text>
               </Space>
               <div style={{ marginTop: 4 }}>
-                {report.unresolved.map((u, i) => (
+                {unresolved.map((u, i) => (
                   <Text type="secondary" key={i} style={{ display: "block", fontSize: 12 }}>
                     [{u.section_id}] {u.reason}
                   </Text>
@@ -213,16 +236,16 @@ export default function AgentRepairTab({ projectId }: AgentRepairTabProps) {
           )}
 
           {/* 错误 */}
-          {report.errors.length > 0 && (
+          {errors.length > 0 && (
             <div>
-              {report.errors.slice(0, 5).map((e, i) => (
+              {errors.slice(0, 5).map((e, i) => (
                 <Text type="danger" key={i} style={{ display: "block", fontSize: 12 }}>
                   {e}
                 </Text>
               ))}
-              {report.errors.length > 5 && (
+              {errors.length > 5 && (
                 <Text type="secondary" style={{ fontSize: 12 }}>
-                  ... 及其他 {report.errors.length - 5} 条错误
+                  ... 及其他 {errors.length - 5} 条错误
                 </Text>
               )}
             </div>

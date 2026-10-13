@@ -35,7 +35,7 @@ from ..db import DatabaseWriteLockTimeout, get_db
 from ..models import ReorderRequest, SectionCreate, SectionUpdate
 from ..security.auth import get_current_user
 from ..services.generation_manager import generation_manager
-from ..services.task_lock import TASK_LABELS, get_active_lock, is_lock_live
+from ..services.task_guard import reject_if_generation_running as _reject_if_generation_running
 from ..services.sections import build_tree, clear_project_sections, create_section, delete_section_tree, get_section, get_section_word_budget, list_sections, move_section, reorder_sections, update_section
 from ..services.v51_state import cancel_v51_task, clear_v51_state_from_db, get_v51_confirm_version, get_v51_last_reject_reason, get_v51_state, load_v51_state_from_db, resume_v51_task
 from .rate_limiter import limit_per_endpoint
@@ -114,45 +114,23 @@ def _ensure_section_in_project(project_id: int, section_id: int) -> None:
 def _live_group_lock(project_id: int) -> dict | None:
     """读取该项目所在技术方案任务组的存活锁（不存在或已过期返回 None）。
 
-    只看行镇锁不看进程内状态：多 worker 部署下 `TaskRegistry` 是进程内单例，
-    跨进程看不见彼此的任务；而锁行 sink 到 sqlite，任何 worker 都能读到同一个
-    判定依据（`services/task_lock.py` 的文档已说明这条取舍）。
+    BUG-FIX 2026-10-13（L2）：实现已抽至 `services/task_guard.live_group_lock`
+    （旁路写正文链路——一致性 autofix / AI 修复 / 版本回滚——与章节 CRUD 共用
+    同一防护门）。此处保留薄包装，兼容既有调用方。
     """
-    lock = get_active_lock('outline-generation', project_id=project_id)
-    if not lock:
-        return None
-    if not is_lock_live(lock.get('lock_key', '')):
-        # 持有者进程崩溃留下的超时锁，对调用方等价于无锁
-        return None
-    return lock
+    from ..services.task_guard import live_group_lock
+    return live_group_lock(project_id)
 
 
 def _reject_if_generation_running(project_id: int, *, allow_content_edit: bool=False) -> None:
     """ENHANCE 2026-09-15：目录编辑的任务运行中防护（返回 409）。
 
-    可研侧早就用 `TaskRunningError` → 409 拦住了「AI 任务运行中改大纲」
-    （`services/feasibility.py::assert_no_running_task`），而技术方案侧所有
-    章节编辑端点一直是裸奔：SSE 目录生成过程中用户仍可并发增删改章节，
-    生成收尾时 `_clear_and_save_outline` 的 `DELETE FROM sections` + 全量
-    INSERT 会把人工改动静默覆盖（`routers/sse/sse_db_ops.py`）。
-
-    粒度上有意区分两种任务，避免把正常用法一起挡掉：
-    - **目录生成中**：结构性改动（增删改 / 移动 / 重排）与章节内容改写都不允许 ——
-      结束时整表会被重建，任何改动都必然丢失；
-    - **正文生成中**：只允许继续手写章节内容（`allow_content_edit` 的路由不改结构），
-      结构性改动仍拒绝 —— 会让正在跑的章节映射到已经不存在的节点。
+    BUG-FIX 2026-10-13（L2）：实现已抽至 `services/task_guard`，
+    供 consistency / content_version 等旁路写正文路由共用。语义与粒度
+    （目录生成中全拒、正文生成中内容类放行）保持不变。
     """
-    lock = _live_group_lock(project_id)
-    if lock is None:
-        return
-    task_type = lock.get('task_type', '')
-    if task_type != 'outline-generation' and allow_content_edit:
-        return
-    label = TASK_LABELS.get(task_type, task_type or 'AI 生成任务')
-    raise HTTPException(
-        status_code=409,
-        detail=f'当前正在执行「{label}」，目录已锁定，请任务结束后再编辑章节。',
-    )
+    from ..services.task_guard import reject_if_generation_running
+    reject_if_generation_running(project_id, allow_content_edit=allow_content_edit)
 
 
 @router.get('')

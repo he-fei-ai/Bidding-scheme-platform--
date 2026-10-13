@@ -157,6 +157,15 @@ export function computeHeadingCounters(
  * 编号派生唯一实现（BUG-FIX 2026-10-08：统一编号命名空间）
  * computeHeadingCounters / annotateOutlineWithNumbers 共用，保证「界面展示编号」
  * 与「计算 path」永远同一份口径，不会各自漂移。
+ *
+ * 边界说明（2026-10-13 · 与后端编号体系的关系）：本函数产出**前端层级式
+ * 文档标题号**（L1~L8 逐层重置，`deriveHeadingPath` + `formatV21Heading`），
+ * 仅用于目录 / 章节编辑界面的展示。后端另有一套**位置式路径号**
+ * （`backend/app/services/ai/outline_common.py::child_number` →
+ * `sections.get_section_path`，形如 `1.2.3`），服务于生成编排 / 落库 / 门禁
+ * 等内部场景。二者用途不同、本就不必逐位相同：正文内嵌编号在生成 / 保存时
+ * 即被剥离，文档编号在导出 / 展示时按当前树结构现算。请勿为「对齐」把本展示
+ * 号改成后端位置路径号——那会是展示回归。
  */
 function collectHeadingPaths(
   nodes: readonly SectionTreeNode[],
@@ -1589,6 +1598,87 @@ export function mapConsistencySeverity(severity: string): ConsistencySeverityMet
     CONSISTENCY_SEVERITY_META[DEFAULT_CONSISTENCY_SEVERITY] || {
       color: "orange",
       label: "中等",
+    }
+  );
+}
+
+// ============================================================
+// 评分达标状态 —— 与 `services/consistency_rules.SCORING_STATUS_META` 同源
+// （BUG-FIX 2026-10-13 · P1）
+//
+// 问题：`ScoringComplianceTab.tsx` 自带一份写死的 `STATUS_META`
+// （unmapped/empty/weak/covered → 文案+配色），与后端命名空间
+// `consistency_rules.SCORING_STATUS_META` **各写一份、互不引用**。这正是
+// 本文件上一节那段「规则命名空间」注释里逐条列举、并在 2026-10-08 修过一次
+// 的漂移模式 —— 只不过严重度那一次修了、评分状态这一份漏了：
+// `ConsistencyPage` 拉了 `GET /consistency/rules`，却只 apply 了
+// `rules.severity.meta`，`rules.scoring_status.meta` **从未被任何代码消费**，
+// 于是后端改文案 / 加状态，评分 Tab 一动不动。
+//
+// 现按严重度那套完全相同的机制补齐：静态兜底 + 运行时对齐。
+// ============================================================
+
+export const DEFAULT_CONSISTENCY_SCORING_STATUS = "unknown";
+
+const BUILTIN_CONSISTENCY_SCORING_STATUS_META: Record<
+  string,
+  ConsistencySeverityMeta
+> = {
+  unmapped: { color: "red", label: "未挂载章节" },
+  empty: { color: "orange", label: "正文过短" },
+  weak: { color: "gold", label: "疑似未答到点" },
+  covered: { color: "green", label: "已达标" },
+  unknown: { color: "default", label: "未知" },
+};
+
+let CONSISTENCY_SCORING_STATUS_META: Record<string, ConsistencySeverityMeta> = {
+  ...BUILTIN_CONSISTENCY_SCORING_STATUS_META,
+};
+
+/** 消费 `GET /consistency/rules` 的 `scoring_status.meta`；结构不合法时返回 false 且不改动。 */
+export function applyConsistencyScoringStatusMeta(
+  meta: Record<string, ConsistencySeverityMeta> | null | undefined,
+): boolean {
+  if (!meta || typeof meta !== "object") return false;
+  const entries = Object.entries(meta).filter(
+    ([key, v]) =>
+      !!key &&
+      !!v &&
+      typeof (v as ConsistencySeverityMeta).label === "string" &&
+      typeof (v as ConsistencySeverityMeta).color === "string",
+  );
+  if (!entries.length) return false;
+  CONSISTENCY_SCORING_STATUS_META = Object.fromEntries(
+    entries.map(([key, v]) => [
+      key,
+      {
+        label: (v as ConsistencySeverityMeta).label,
+        color: (v as ConsistencySeverityMeta).color,
+      },
+    ]),
+  ) as Record<string, ConsistencySeverityMeta>;
+  return true;
+}
+
+export function resetConsistencyScoringStatusMeta(): void {
+  CONSISTENCY_SCORING_STATUS_META = {
+    ...BUILTIN_CONSISTENCY_SCORING_STATUS_META,
+  };
+}
+
+/**
+ * 评分达标状态 → 展示文案/配色。
+ * 未知状态回落到 `unknown` 中性标签（对应后端 `SCORING_STATUS_UNKNOWN_META`），
+ * 而不是回落到某个真实状态——后者会把「后端新增了一档」伪装成「已达标」。
+ */
+export function mapConsistencyScoringStatus(
+  status: string,
+): ConsistencySeverityMeta {
+  return (
+    CONSISTENCY_SCORING_STATUS_META[status] ||
+    CONSISTENCY_SCORING_STATUS_META[DEFAULT_CONSISTENCY_SCORING_STATUS] || {
+      color: "default",
+      label: "未知",
     }
   );
 }

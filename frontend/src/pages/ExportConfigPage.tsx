@@ -6,9 +6,9 @@ import {
 } from "antd";
 import {
   ArrowLeftOutlined, DownloadOutlined, CheckCircleOutlined,
-  FileWordOutlined, FilePdfOutlined, HistoryOutlined, WarningOutlined, LoadingOutlined,
+  FileWordOutlined, FilePdfOutlined, FileTextOutlined, HistoryOutlined, WarningOutlined, LoadingOutlined,
 } from "@ant-design/icons";
-import { getProject, checkDocument, exportDocx, exportDocxStream, getExportHistory, getExportDownloadUrl, getLatestExportUrl, getExportPresets, exportPdf } from "../api";
+import { getProject, checkDocument, exportDocx, exportDocxStream, getExportHistory, getExportDownloadUrl, getLatestExportUrl, getExportPresets, exportPdf, exportHtml } from "../api";
 import { extractApiError, formatExportFileSize, reduceExportProgressEvent, classifyExportFailure } from "../utils";
 import type { DocumentCheckResult, ExportRecord, ExportResult, ExportPresetCatalog } from "../types";
 
@@ -68,6 +68,8 @@ export default function ExportConfigPage() {
   const [history, setHistory] = useState<ExportRecord[]>([]);
   // ENHANCE 2026-10-04（T1）：PDF 按需转换期间记录行 id，按钮展示 loading 防重复点击
   const [pdfLoadingId, setPdfLoadingId] = useState<number | null>(null);
+  // ENHANCE 2026-10-13：HTML 导出 loading（第二交付格式入口，与 DOCX 导出互斥提示）
+  const [htmlLoading, setHtmlLoading] = useState(false);
   // BUG-EXPORT-03 修复：暴露 SSE 流中止能力 + 记录是否用户主动取消
   const exportAbortRef = useRef<(() => void) | null>(null);
   const cancelRequestedRef = useRef(false);
@@ -191,6 +193,38 @@ export default function ExportConfigPage() {
     }
   };
 
+  /**
+   * 组装导出配置对象（DOCX / HTML 两条导出链路共用同一份配置）。
+   * ENHANCE 2026-10-13：从 handleExport 内联提取，供 HTML 导出复用；
+   * 字段口径与既有 DOCX 导出完全一致（preset_id/theme_id 由后端解析补全）。
+   */
+  const buildExportConfig = () => ({
+    font_title: fontTitle,
+    font_body: fontBody,
+    size_title_1: sizeTitle1,
+    size_title_2: sizeTitle2,
+    size_title_3: sizeTitle3,
+    size_title_sub: sizeTitleSub,
+    size_body: sizeBody,
+    line_spacing: lineSpacing,
+    show_title_page: showTitlePage,
+    show_toc: showToc,
+    show_header_footer: showHeaderFooter,
+    bidder_name: bidderName,
+    // BUG-FIX-53 修复：原未传递这些字段，用户无法配置图表参数和严格模式
+    image_max_width_cm: 18.0,
+    image_dpi: 300,
+    gantt_max_columns: 18,
+    strict_mode: strictMode,
+    // D5 加固（2026-10-07）：图表标题兜底补图（仅命中强关键词的图表相关章节，不伪造数据）
+    auto_fallback_charts: autoFallbackCharts,
+    // ENHANCE 2026-09-14：把预设 id 传给后端。颜色/页边距/纸张/页码/分页等
+    // 未在此显式列出的字段，由后端按 preset_id + theme_id 解析补全，
+    // 这样新增预设项不必每次都改前端传参清单。
+    preset_id: presetId,
+    theme_id: themeId,
+  });
+
   const handleExport = async () => {
     setExporting(true);
     setExportProgress(0);
@@ -198,32 +232,7 @@ export default function ExportConfigPage() {
     cancelRequestedRef.current = false;
     exportAbortRef.current = null;
     try {
-      const config = {
-        font_title: fontTitle,
-        font_body: fontBody,
-        size_title_1: sizeTitle1,
-        size_title_2: sizeTitle2,
-        size_title_3: sizeTitle3,
-        size_title_sub: sizeTitleSub,
-        size_body: sizeBody,
-        line_spacing: lineSpacing,
-        show_title_page: showTitlePage,
-        show_toc: showToc,
-        show_header_footer: showHeaderFooter,
-        bidder_name: bidderName,
-        // BUG-FIX-53 修复：原未传递这些字段，用户无法配置图表参数和严格模式
-        image_max_width_cm: 18.0,
-        image_dpi: 300,
-        gantt_max_columns: 18,
-        strict_mode: strictMode,
-        // D5 加固（2026-10-07）：图表标题兜底补图（仅命中强关键词的图表相关章节，不伪造数据）
-        auto_fallback_charts: autoFallbackCharts,
-        // ENHANCE 2026-09-14：把预设 id 传给后端。颜色/页边距/纸张/页码/分页等
-        // 未在此显式列出的字段，由后端按 preset_id + theme_id 解析补全，
-        // 这样新增预设项不必每次都改前端传参清单。
-        preset_id: presetId,
-        theme_id: themeId,
-      };
+      const config = buildExportConfig();
 
       // 优先走 SSE 流式导出（实时进度）；失败时降级为同步接口
       try {
@@ -338,6 +347,30 @@ export default function ExportConfigPage() {
     if (exportAbortRef.current) {
       exportAbortRef.current();
       exportAbortRef.current = null;
+    }
+  };
+
+  // ENHANCE 2026-10-13：HTML 导出（第二交付格式）。与 DOCX 共用同一份配置；
+  // 后端已按导出组锁串行化同项目导出，冲突（409）直接提示，不重试。
+  const handleExportHtml = async () => {
+    if (htmlLoading || exporting) return;
+    setHtmlLoading(true);
+    try {
+      await exportHtml(projectId, buildExportConfig());
+      message.success("HTML 已下载");
+      loadData();
+    } catch (e: any) {
+      if (e?.status === 409) {
+        Modal.error({
+          title: "导出冲突",
+          content: e?.message || "当前已有导出任务在进行，请稍候再试",
+          icon: <WarningOutlined />,
+        });
+      } else {
+        message.error(extractApiError(e) || "HTML 导出失败");
+      }
+    } finally {
+      setHtmlLoading(false);
     }
   };
 
@@ -617,6 +650,17 @@ export default function ExportConfigPage() {
               size="large"
             >
               导出 DOCX
+            </Button>
+            {/* ENHANCE 2026-10-13：HTML 导出入口（后端 /export/html 已上线，
+                图表输出占位符；需要真实图表请选 DOCX/PDF） */}
+            <Button
+              icon={<FileTextOutlined />}
+              onClick={handleExportHtml}
+              loading={htmlLoading}
+              disabled={exporting}
+              size="large"
+            >
+              导出 HTML
             </Button>
           </div>
 

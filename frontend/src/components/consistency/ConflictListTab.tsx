@@ -11,7 +11,9 @@ import {
   applyAutoFix, getAuditSummary, getConflicts, getFixSuggestion, repairConsistencyWithAi,
   runConsistencyAudit,
 } from "../../api";
-import type { AiRepairReport, AuditResult, AuditSummary, Conflict, ConflictFilter } from "../../api";
+import type {
+  AiRepairReport, AuditResult, AuditSummary, AutoFixReport, Conflict, ConflictFilter,
+} from "../../api";
 import { extractApiError, mapConsistencySeverity, parseConflictSources } from "../../utils";
 import AuditSummaryCards from "./AuditSummaryCards";
 
@@ -68,11 +70,25 @@ export default function ConflictListTab({ projectId }: ConflictListTabProps) {
   const [aiRepairing, setAiRepairing] = useState(false);
   const [aiReport, setAiReport] = useState<AiRepairReport | null>(null);
 
+  // BUG-FIX 2026-10-13（工作流缺口·关键结果不可见）：autofix 的真实报告会返回
+  // `filtered`（被「就近标签词校验」判为其他事实、按设计跳过的取值计数）与
+  // `scoped_section_ids` / `scope_fallback_reason`（替换范围是否被限定在冲突
+  // 来源章节内）。这些**决定了替换结果**的信息此前只出现在 message 的一句话里
+  // 甚至完全不出现，用户看到「改了 3 处」却不知道另有 2 处没改、为什么没改 ——
+  // 这正是 2026-10-09 引入两道闸门后最需要向用户解释的事。现独立成卡片常驻。
+  const [fixReport, setFixReport] = useState<AutoFixReport | null>(null);
+
   // BUG-FIX 2026-10-08（响应竞态）：每次 load 自增序号，回来时序号不一致即丢弃。
   // 快速切换项目/筛选或并发「修复后刷新」时，慢响应会覆盖新结果。
   const loadSeqRef = useRef(0);
 
   const isValidProject = Number.isFinite(projectId) && projectId > 0;
+
+  // BUG-FIX 2026-10-13：autofix 报告里的 `filtered` / `scoped_section_ids` /
+  // `scope_fallback_reason` 是后端**一直在返回、类型里刚补上**的可选字段。
+  // 这里归一一次，JSX 里即可按必填数组处理（同时过 TS 收窄）。
+  const fixFiltered = fixReport?.filtered ?? [];
+  const fixSkipped = fixReport?.skipped ?? [];
 
   const load = useCallback(async (resolvedFilter: ConflictFilter = filter) => {
     if (!isValidProject) return;
@@ -122,12 +138,13 @@ setAudit(result);
       // 修复：审计后按当前筛选态重新拉取，而非用审计返回值直接覆盖。
       // 同时 `setAudit(result)` 保留（它承载 audit_time/conflicts_found 等
       // 本次审计的元信息，与页签无关）。
+      //
+      // BUG-FIX 2026-10-13（重复请求）：`load()` 内部 `Promise.all` 已同时拉
+      // conflicts 与 summary，此处原先在 `await load()` 之后**又**单独调了一次
+      // `getAuditSummary(projectId)` —— 每次点「开始审计」多打一次无用请求，
+      // 且两次取回的 summary 存在竞态（后到的可能覆盖前者）。删除。
       await load(filter);
       message.success(`审计完成，发现 ${result.conflicts_found} 处冲突`);
-      try {
-        const summaryRes = await getAuditSummary(projectId);
-        setSummary(summaryRes.summary || null);
-      } catch { /* 摘要刷新失败不阻断主流程 */ }
     } catch (e) {
       message.error(extractApiError(e));
     } finally {
@@ -164,6 +181,8 @@ setAudit(result);
     try {
       const report = await applyAutoFix(conflict.conflict_id, projectId, newValue.trim());
       setFixModal({ conflict: null, newValue: "", loading: false });
+      // BUG-FIX 2026-10-13：把报告存下来在表格上方常驻展示（见 fixReport 注释）。
+      setFixReport(report);
       // BUG-FIX 2026-09-14（高）：不能再无条件弹「已应用修复」。
       // 后端原实现只标记冲突已解决、从不改写正文；现在按真实报告区分展示。
       if (report.status === "ok") {
@@ -361,6 +380,70 @@ setAudit(result);
           </Button>
         </Space>
       </div>
+
+      {fixReport && (
+        <Card
+          size="small"
+          style={{ marginBottom: 16 }}
+          title={
+            <Space>
+              <CheckOutlined /> 自动修复结果
+              <Tag color={fixReport.status === "ok" ? "green" : "orange"}>
+                {fixReport.status}
+              </Tag>
+              <Text type="secondary" style={{ fontWeight: 400 }}>
+                统一为：{fixReport.unified_value}
+              </Text>
+            </Space>
+          }
+          extra={<Button size="small" type="link" onClick={() => setFixReport(null)}>关闭</Button>}
+        >
+          <Paragraph style={{ marginBottom: 8 }}>{fixReport.message}</Paragraph>
+          <Space size={[8, 8]} wrap style={{ marginBottom: 8 }}>
+            <Tag>修改章节 {fixReport.changed_sections} 个</Tag>
+            <Tag color="green">替换 {fixReport.total_replacements} 处</Tag>
+            {!!fixReport.replaced_values?.length && (
+              <Tag color="volcano">统一掉旧值 {fixReport.replaced_values.join("、")}</Tag>
+            )}
+            {fixSkipped.length > 0 && (
+              <Tag color="red">未能安全替换 {fixSkipped.length} 章</Tag>
+            )}
+            {fixFiltered.length > 0 && (
+              <Tag color="orange">
+                就近校验拦下 {fixFiltered.length} 章
+              </Tag>
+            )}
+          </Space>
+          {fixReport.scope_fallback_reason && (
+            <Alert
+              type="warning"
+              showIcon
+              style={{ marginBottom: 8 }}
+              message={fixReport.scope_fallback_reason}
+              description="本次替换未限定在冲突来源章节内，请核对下方明细以免误改无关数字。"
+            />
+          )}
+          {!!fixReport.scoped_section_ids?.length && (
+            <Text type="secondary" style={{ fontSize: 12, display: "block", marginBottom: 4 }}>
+              替换范围已限定在冲突来源章节：{fixReport.scoped_section_ids.join("、")}
+            </Text>
+          )}
+          {fixSkipped.map((s, i) => (
+            <div key={`sk${i}`}>
+              <Text type="danger" style={{ fontSize: 12 }}>
+                [{s.section_id} {s.title}] {s.reason}
+              </Text>
+            </div>
+          ))}
+          {fixFiltered.map((f, i) => (
+            <div key={`ft${i}`}>
+              <Text type="warning" style={{ fontSize: 12 }}>
+                [{f.section_id} {f.title}] {f.reason}
+              </Text>
+            </div>
+          ))}
+        </Card>
+      )}
 
       {aiReport && (
         <Card

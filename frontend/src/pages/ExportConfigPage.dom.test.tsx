@@ -12,7 +12,8 @@
  *  2. 点「完整性检查」→ checkDocument 被调用，且 strictMode 与开关状态一致；
  *  3. 点「导出 DOCX」→ 优先走 SSE 流（exportDocxStream），且把当前
  *     preset_id/theme_id 等配置透传，完成后渲染「下载文档」；
- *  4. 导出历史记录渲染到右侧表格。
+ *  4. 点「导出 HTML」（ENHANCE 2026-10-13）→ 调用 exportHtml 且透传同一份配置；
+ *  5. 导出历史记录渲染到右侧表格。
  */
 import { describe, it, expect, vi, beforeAll } from "vitest";
 import type { DocumentCheckResult } from "../types";
@@ -60,6 +61,8 @@ const exportDocxStreamMock = vi.fn((_pid: number, _cfg: Record<string, unknown>,
 }));
 const getExportHistoryMock = vi.fn(async (_pid: number) => [HISTORY_RECORD]);
 const exportPdfMock = vi.fn(async (_pid: number) => undefined);
+// ENHANCE 2026-10-13：HTML 导出（第二交付格式）mock
+const exportHtmlMock = vi.fn(async (_pid: number, _cfg?: Record<string, unknown>) => undefined);
 
 vi.mock("../api", () => ({
   getProject: vi.fn(async () => ({ id: 1, name: "测试项目", bidder_name: "测试单位" })),
@@ -76,6 +79,7 @@ vi.mock("../api", () => ({
     defaults: { layout_id: "formal-binding", theme_id: "" },
   })),
   exportPdf: (...args: [number]) => exportPdfMock(...args),
+  exportHtml: (...args: [number, Record<string, unknown>?]) => exportHtmlMock(...args),
 }));
 
 vi.mock("react-router-dom", async () => {
@@ -226,6 +230,45 @@ describe.skipIf(!hasDom)("ExportConfigPage 组件级交互（导出链契约）"
 
     // 历史记录文件名应出现在右侧历史区
     expect(await rtl.screen.findByText(/测试项目_20260101_000000/)).toBeTruthy();
+    rtl.cleanup();
+  });
+
+  // ENHANCE 2026-10-13：HTML 导出入口（后端 /export/html 上线后前端无入口，
+  // 功能不可达）。钉住：按钮存在 + 点击调用 exportHtml + 透传同一份配置。
+  it("点「导出 HTML」调用 exportHtml 并透传配置（含 preset_id）", { timeout: 120_000 }, async () => {
+    const rtl = await loadRtl();
+    if (!rtl) return;
+    exportHtmlMock.mockClear();
+
+    const Page = (await import("./ExportConfigPage")).default;
+    rtl.render(<Page />);
+
+    const btn = await rtl.screen.findByText("导出 HTML");
+    rtl.fireEvent.click(btn);
+
+    await vi.waitFor(() => expect(exportHtmlMock).toHaveBeenCalled());
+    const [pid, cfg] = exportHtmlMock.mock.calls[0] as [number, Record<string, unknown>];
+    expect(pid).toBe(1);
+    expect(cfg).toHaveProperty("preset_id", "formal-binding");
+    expect(cfg).toHaveProperty("strict_mode", false);
+    rtl.cleanup();
+  });
+
+  it("HTML 导出失败时展示错误提示（不静默）", { timeout: 120_000 }, async () => {
+    const rtl = await loadRtl();
+    if (!rtl) return;
+    exportHtmlMock.mockClear();
+    exportHtmlMock.mockRejectedValueOnce(new Error("文档为空，无法导出"));
+
+    const Page = (await import("./ExportConfigPage")).default;
+    rtl.render(<Page />);
+
+    const btn = await rtl.screen.findByText("导出 HTML");
+    rtl.fireEvent.click(btn);
+
+    // antd message.error 文案出现（按钮恢复可点）
+    await vi.waitFor(() => expect(exportHtmlMock).toHaveBeenCalled());
+    expect(await rtl.screen.findByText("文档为空，无法导出")).toBeTruthy();
     rtl.cleanup();
   });
 });

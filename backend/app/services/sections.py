@@ -9,6 +9,10 @@ from ..utils import count_words as _count_words
 from ..utils import normalize_newlines  # HARDEN 2026-10-12：读出侧 CRLF 归一
 from ..utils.performance import timer
 
+# L1（2026-10-13 编号命名空间统一）：路径式子编号的唯一拼接算法。
+# outline_common 零包内导入，模块级引用不会成环。
+from .ai.outline_common import child_number
+
 
 logger = logging.getLogger(__name__)
 
@@ -141,9 +145,42 @@ def _strip_title_numbering(title: str) -> str:
 def create_section(project_id: int, data: SectionCreate) -> Section:
     now = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S")
     data = data.model_copy(update={"title": _strip_title_numbering(data.title)})
+    # BUG-FIX 2026-10-13（B2 · 中间插入不净化正文编号）：客户端显式传
+    # sort_order 的中间插入会使后续兄弟编号整体后移（get_section_path 按
+    # 「排序后位置索引」现算），但它们正文里的内嵌编号仍指向旧位置。
+    # 追加到尾部（sort_order 缺省）不会改变任何兄弟编号，无需付出剥离代价。
+    _explicit_order = data.sort_order is not None
     with get_db() as conn:
         data = _normalize_section_position(conn, project_id, data)
         section = _insert_section(conn, project_id, data, now)
+        if _explicit_order:
+            try:
+                # BUG-FIX 2026-10-13（B2-2 · 过度剥离）：剥离集必须恰好等于
+                # 「因本次插入而真的后移了一位」的兄弟。get_section_path 的兄弟
+                # 排序键是 (sort_order, created_at) **升序**，新章节 created_at
+                # 最新 → 它排在所有**同 sort_order** 兄弟之后、仅排在**严格更大**
+                # sort_order 兄弟之前。故真正后移（+1）的只有 sort_order **严格
+                # 大于**插入值的兄弟；同值兄弟并不移动，其内嵌编号仍然有效。
+                # 原实现用 `>= ?` 把同值兄弟一并剥号（探针实证：插到 sort_order=2
+                # 时乙路径仍为 2，`## 2 乙…` 却被剥成 `## 乙…`），反而制造编号
+                # 不一致。改为 `> ?` 精准命中真正后移的兄弟。
+                # 与 _normalize_sibling_sort_order 一致：parent_id 为 NULL/非 NULL
+                # 分两条查询（SQLite 参数化 NULL 比较不走索引）。
+                if data.parent_id is None:
+                    _sib_rows = conn.execute(
+                        "SELECT id FROM sections WHERE project_id = ? AND parent_id IS NULL "
+                        "AND id != ? AND COALESCE(sort_order, 0) > ?",
+                        (project_id, section.id, data.sort_order or 0),
+                    ).fetchall()
+                else:
+                    _sib_rows = conn.execute(
+                        "SELECT id FROM sections WHERE project_id = ? AND parent_id = ? "
+                        "AND id != ? AND COALESCE(sort_order, 0) > ?",
+                        (project_id, data.parent_id, section.id, data.sort_order or 0),
+                    ).fetchall()
+                _strip_body_heading_numbering(conn, [r["id"] for r in _sib_rows])
+            except Exception as _strip_err:
+                logger.debug("[新增章节] 正文编号净化跳过: %s", _strip_err)
     # BUG-FIX 2026-09-29（跨模块缓存断点）：结构变更后除 build_tree（60s）外，
     # 还须失效 Redis 整包章节快照（30min）——正文生成入口
     # `_fetch_project_data_async` 优先读它，此前新增/修改章节后短时间内重跑
@@ -489,17 +526,24 @@ def delete_section(section_id: int) -> dict:
         }
     """
     with get_db() as conn:
-        # 合并查询：一次获取 children_count 和 project_id，减少 DB 往返
+        # 合并查询：一次获取 children_count/project_id/parent_id，减少 DB 往返
+        # parent_id 用于删除后定位「同父剩余兄弟」（正文编号净化）。
         row = conn.execute(
             """
             SELECT
                 (SELECT COUNT(*) FROM sections WHERE parent_id = ?) AS children_count,
-                (SELECT project_id FROM sections WHERE id = ?) AS project_id
+                (SELECT project_id FROM sections WHERE id = ?) AS project_id,
+                (SELECT parent_id FROM sections WHERE id = ?) AS parent_id
             """,
-            (section_id, section_id),
+            (section_id, section_id, section_id),
         ).fetchone()
         children_count = row["children_count"] if row else 0
         project_id = row["project_id"] if row else None
+        # 防御性读取：sqlite3.Row 与 dict 均有 keys()；旧调用方/测试的 mock
+        # 行可能不含 parent_id 列（本列 2026-10-13 新增），缺失时按顶层处理。
+        parent_id = (
+            row["parent_id"] if row is not None and "parent_id" in row else None
+        )
 
         if children_count > 0:
             logger.warning(
@@ -516,7 +560,36 @@ def delete_section(section_id: int) -> dict:
         cursor = conn.execute("DELETE FROM sections WHERE id = ?", (section_id,))
         deleted = cursor.rowcount > 0
         if deleted:
+            # BUG-FIX 2026-10-13（B2 · 删除不净化正文编号）：删除叶章节后，
+            # 同父剩余兄弟按 get_section_path 的「位置索引」整体前移一位，
+            # 但它们正文里的内嵌编号仍指向旧位置（与 move/reorder 同一类
+            # 编号语义变化）。此处净化同父剩余兄弟的正文编号。
+            # BUG-FIX 2026-10-13（B8 · 删除后单章缓存残留）：
+            # `invalidate_content_caches` → `CacheService.invalidate_sections`
+            # 内部按 project_id 重新 SELECT id 列表，已删行拿不到 →
+            # `section_content:{deleted_id}` 键永不删除。删前显式按 id 直删。
             if project_id:
+                try:
+                    if parent_id is None:
+                        _sib_rows = conn.execute(
+                            "SELECT id FROM sections WHERE project_id = ? AND parent_id IS NULL "
+                            "AND id != ?",
+                            (project_id, section_id),
+                        ).fetchall()
+                    else:
+                        _sib_rows = conn.execute(
+                            "SELECT id FROM sections WHERE project_id = ? AND parent_id = ? "
+                            "AND id != ?",
+                            (project_id, parent_id, section_id),
+                        ).fetchall()
+                    _strip_body_heading_numbering(conn, [r["id"] for r in _sib_rows])
+                except Exception as _strip_err:
+                    logger.debug("[删除章节] 正文编号净化跳过: %s", _strip_err)
+                try:
+                    from .redis_cache import CacheService
+                    CacheService.invalidate_section(section_id)
+                except Exception as _cache_err:
+                    logger.debug("[删除章节] 单章缓存直删跳过: %s", _cache_err)
                 invalidate_content_caches(project_id, [section_id])
             logger.info("成功删除章节 section_id=%d", section_id)
             return {
@@ -536,9 +609,33 @@ def delete_section(section_id: int) -> dict:
 @timer
 def delete_section_tree(section_id: int) -> dict:
     with get_db() as conn:
-        # 先获取父项目ID
-        sec = conn.execute("SELECT project_id FROM sections WHERE id = ?", (section_id,)).fetchone()
+        # 先获取父项目ID与父章节ID（parent_id 用于定位删除后需要净化正文编号的
+        # 同父剩余兄弟——整棵子树删掉后它们按位置索引整体前移）。
+        sec = conn.execute(
+            "SELECT project_id, parent_id FROM sections WHERE id = ?", (section_id,)
+        ).fetchone()
         project_id = sec["project_id"] if sec else None
+        parent_id = sec["parent_id"] if sec else None
+        # BUG-FIX 2026-10-13（B2 · 删除子树不净化正文编号）：与 delete_section
+        # 同一类编号语义变化——同父剩余兄弟编号前移，正文内嵌编号陈旧。
+        # 先收集再删（删后行已不存在）。
+        try:
+            if project_id is not None:
+                if parent_id is None:
+                    _sib_rows = conn.execute(
+                        "SELECT id FROM sections WHERE project_id = ? AND parent_id IS NULL "
+                        "AND id != ?",
+                        (project_id, section_id),
+                    ).fetchall()
+                else:
+                    _sib_rows = conn.execute(
+                        "SELECT id FROM sections WHERE project_id = ? AND parent_id = ? "
+                        "AND id != ?",
+                        (project_id, parent_id, section_id),
+                    ).fetchall()
+                _strip_body_heading_numbering(conn, [r["id"] for r in _sib_rows])
+        except Exception as _strip_err:
+            logger.debug("[删除章节树] 正文编号净化跳过: %s", _strip_err)
         deleted = _delete_tree(conn, section_id)
     if project_id:
         invalidate_content_caches(project_id)
@@ -1125,12 +1222,11 @@ def get_section_word_budget(project_id: int, default_level2: int = 3500) -> dict
         dict: 字数预算信息（含 level3_count / level3_default / tier_key / total_estimate 等）
     """
     from ..services.ai.writing_length_config import (
-        get_tier_config,
         get_default_tier_config,
+        get_l3_own_range,
         get_l3_own_target,
         get_l3_own_tolerance,
-        get_l3_own_range,
-        WRITING_LENGTH_TIER_CONFIG,
+        get_tier_config,
     )
 
     sections = list_sections(project_id)
@@ -1230,6 +1326,12 @@ def get_section_path(section_id: int) -> str:
     前端 `collectHeadingPaths`（`frontend/src/utils.ts:161-195`）为独立实现，
     审核态可能显示不同编号。后续需将前端实现对齐到本函数口径，
     或改为调用后端 API 获取路径，消除双实现漂移风险。
+
+    BUG-FIX 2026-10-13（L1 · 编号命名空间单一事实源）：本函数的拼接算法已与
+    门禁 `renumber_outline_ids`（内存位置 id）、落库 `_save_nodes`
+    （path_number）收敛到同一实现 `outline_common.child_number`，
+    后端三出口不再有漂移面；剩余漂移面仅前端独立实现（O-12 原文）。
+    一致性由 tests/test_outline_l3_hardening_2026_10_13.py::TestPathNumberNamespace 锁定。
     """
     section = get_section(section_id)
     if not section:
@@ -1262,14 +1364,21 @@ def get_section_path(section_id: int) -> str:
     for pid in siblings_by_parent:
         siblings_by_parent[pid].sort(key=lambda sid: sort_lookup.get(sid, (0, "")))
 
-    # 自底向上构建路径
+    # 自底向上收集每一层的「同级序号」，再自顶向下用共用拼接算法生成路径号。
+    # BUG-FIX 2026-10-13（L1 · 编号命名空间单一事实源）：拼接算法收敛到
+    # `outline_common.child_number`（与门禁 renumber_outline_ids 的位置 id、
+    # 落库 _save_nodes 的 path_number 同一实现）。原实现用
+    # `path_parts.insert(0, str(idx))` 自底向上拼（每层 O(n) 搬移 + 第三套
+    # 拼接口径），现改为收集序号后一次拼接，等价且同源。
+    # 一致性由 tests/test_outline_l3_hardening_2026_10_13.py::TestPathNumberNamespace 锁定。
+    #
     # BUG-FIX 2026-10-08（死循环/容错）：原实现 `while current_id is not None` 只判
     # None。一旦库里存在 parent_id 环（batch_create_sections 手工传 parent_id、
     # 历史脏数据、并发改父指针的中间态），沿链走永不为 None → 工作线程死循环、
     # GIL 占用、正文生成整任务挂起（与 BUG-FIX 2026-09-18 修的
     # _get_path_and_ancestors 同类风险的漏网副本）。
     # 加「已访问集合」护栏：一旦回到走过的节点即判定成环，中止并 error 留痕。
-    path_parts = []
+    indexes: list[int] = []
     current_id: int | None = section_id
     visited: set[int] = set()
     while current_id is not None:
@@ -1283,10 +1392,14 @@ def get_section_path(section_id: int) -> str:
         pid = parent_map.get(current_id)
         siblings = siblings_by_parent.get(pid, [])
         idx = siblings.index(current_id) + 1 if current_id in siblings else 1
-        path_parts.insert(0, str(idx))
+        indexes.append(idx)
         current_id = pid
 
-    return ".".join(path_parts)
+    # 自顶向下拼接（indexes 是自底向上收集的，反转后即根→叶顺序）
+    path_number = ""
+    for idx in reversed(indexes):
+        path_number = child_number(path_number, idx)
+    return path_number
 
 
 def get_ancestor_titles(section_id: int) -> list[str]:

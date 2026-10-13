@@ -89,6 +89,8 @@ from .workflows_base import (
 from .workflows_sections import _format_facts_list
 from app.config import (
     OUTLINE_L3_QUALITY_ENHANCE_ENABLED,
+    OUTLINE_L3_REPAIR_MAX,
+    OUTLINE_L3_REPAIR_MAX_ROUNDS,
     OUTLINE_MAX_TOKENS_DIRECT,
     OUTLINE_MAX_TOKENS_L1,
     OUTLINE_MAX_TOKENS_L2,
@@ -399,7 +401,6 @@ def _int_to_chinese_num(n: Any) -> str:
     tens, ones = divmod(n, 10)
     s = _CN_NUMS[tens] + "十"
     return s + (_CN_NUMS[ones] if ones else "")
-
 
 
 # ========== 参考模板（可根据项目特点增删章节） ==========
@@ -2341,302 +2342,6 @@ def _fix_ids_v51(level1: list[dict]) -> list[dict]:
 
 # ========== L3 三级目录生成（流水线模式） ==========
 
-# 场景模板映射：根据二级目录关键词匹配三级标题模板
-# 每个模板是一组自然的、专业的三级标题候选
-# 模板数量充足（≥20个），避免 idx 取模循环重复
-_L3_SCENE_TEMPLATES: dict[str, list[str]] = {
-    # 质量管理相关
-    "quality_system": [
-        "质量方针与目标",
-        "质量管理组织",
-        "质量管理制度",
-        "质量保证措施",
-        "质量控制流程",
-        "质量检验标准",
-        "质量问题处理",
-        "质量改进机制",
-        "质量记录管理",
-        "质量策划与部署",
-        "质量责任体系",
-        "质量风险管控",
-        "质量数据统计",
-        "质量考核评价",
-        "质量持续改进",
-        "质量通病防治",
-        "质量验收程序",
-        "质量追溯机制",
-        "质量信息管理",
-        "质量创新应用",
-    ],
-    # 安全管理相关
-    "safety_system": [
-        "安全责任体系",
-        "安全教育培训",
-        "安全检查制度",
-        "危险源辨识",
-        "安全防护措施",
-        "应急预案制定",
-        "安全事故处理",
-        "安全投入保障",
-        "安全绩效评估",
-        "安全组织架构",
-        "安全规章制度",
-        "安全风险分级",
-        "安全技术交底",
-        "安全设施管理",
-        "安全行为规范",
-        "安全台账记录",
-        "安全应急演练",
-        "安全隐患排查",
-        "安全事故报告",
-        "安全改进提升",
-    ],
-    # 进度管理相关
-    "progress": [
-        "进度计划编制",
-        "进度节点控制",
-        "进度动态跟踪",
-        "进度偏差分析",
-        "进度调整方案",
-        "关键路径管理",
-        "资源平衡调配",
-        "里程碑验收标准",
-        "进度报告制度",
-        "进度分级管理",
-        "进度预警机制",
-        "进度考核奖惩",
-        "进度优化方法",
-        "进度网络分析",
-        "进度资源配置",
-        "进度风险预案",
-        "进度协调沟通",
-        "进度总结归档",
-        "进度信息化管理",
-        "进度持续改进",
-    ],
-    # 技术方案相关
-    "technical": [
-        "施工工艺选择",
-        "技术参数确定",
-        "操作要点说明",
-        "质量控制指标",
-        "常见问题预防",
-        "技术交底内容",
-        "试验检测方法",
-        "工艺改进措施",
-        "技术创新应用",
-        "技术方案比选",
-        "技术要求规范",
-        "技术标准执行",
-        "技术难点攻关",
-        "技术路线规划",
-        "技术验证方案",
-        "技术资料整理",
-        "技术总结沉淀",
-        "技术专利申报",
-        "技术交流机制",
-        "技术成果转化",
-    ],
-    # 资源管理相关
-    "resource": [
-        "资源需求计划",
-        "资源采购管理",
-        "资源进场验收",
-        "资源存储保管",
-        "资源调配使用",
-        "资源消耗控制",
-        "资源盘点清查",
-        "资源利用率",
-        "资源节约措施",
-        "资源分类编码",
-        "资源供应商管理",
-        "资源价格监测",
-        "资源合同签订",
-        "资源物流配送",
-        "资源质量检验",
-        "资源动态监控",
-        "资源成本核算",
-        "资源效率提升",
-        "资源替代方案",
-        "资源循环利用",
-    ],
-    # 项目管理相关
-    "project": [
-        "项目组织架构",
-        "项目管理制度",
-        "项目沟通机制",
-        "项目文档管理",
-        "项目里程碑",
-        "项目风险管控",
-        "项目验收标准",
-        "项目总结评价",
-        "项目移交清单",
-        "项目范围管理",
-        "项目成本控制",
-        "项目质量管理",
-        "项目时间管理",
-        "项目人力资源",
-        "项目采购管理",
-        "项目集成管理",
-        "项目干系人管理",
-        "项目风险管理",
-        "项目合同管理",
-        "项目信息管理",
-    ],
-    # 通用管理
-    "general_management": [
-        "制度建设",
-        "流程规范",
-        "职责分工",
-        "考核指标",
-        "监督机制",
-        "改进措施",
-        "执行标准",
-        "操作指南",
-        "评估体系",
-        "组织架构",
-        "人员配置",
-        "岗位职责",
-        "工作流程",
-        "管理办法",
-        "实施细则",
-        "指导意见",
-        "实施计划",
-        "推进方案",
-        "保障措施",
-        "长效机制",
-    ],
-    # 施工工艺相关
-    "construction_method": [
-        "施工测量放线",
-        "土方开挖回填",
-        "基坑支护降水",
-        "钢筋加工安装",
-        "模板支设拆除",
-        "混凝土浇筑养护",
-        "砌体工程施工",
-        "防水工程施工",
-        "保温隔热施工",
-        "装饰装修施工",
-        "机电安装施工",
-        "脚手架搭拆",
-        "施工通道布置",
-        "材料垂直运输",
-        "施工面清理",
-        "季节性施工",
-        "夜间施工管理",
-        "交叉作业协调",
-        "施工工艺改进",
-        "新型工艺应用",
-    ],
-    # 成本管理
-    "cost_management": [
-        "成本预算编制",
-        "成本核算方法",
-        "成本控制措施",
-        "成本分析报告",
-        "成本优化方案",
-        "成本考核制度",
-        "成本预警机制",
-        "成本台账管理",
-        "成本审批流程",
-        "成本节约措施",
-        "成本动态监控",
-        "成本偏差分析",
-        "成本定额管理",
-        "成本报价策略",
-        "成本风险防控",
-        "成本调整机制",
-        "成本复盘总结",
-        "成本信息化管理",
-        "成本经验积累",
-        "成本持续优化",
-    ],
-    # 合同与法务
-    "contract_legal": [
-        "合同条款审查",
-        "合同签订流程",
-        "合同履约管理",
-        "变更索赔处理",
-        "合同争议解决",
-        "保险手续办理",
-        "法律风险防控",
-        "合规管理制度",
-        "知识产权保护",
-        "保密协议签订",
-        "担保手续办理",
-        "税务筹划安排",
-        "审计配合工作",
-        "法律文件归档",
-        "法务咨询机制",
-        "纠纷处理预案",
-        "仲裁诉讼准备",
-        "法律培训教育",
-        "合同履约评估",
-        "法务风险管理",
-    ],
-    # 信息化与数字化
-    "digitalization": [
-        "信息系统规划",
-        "数字化平台建设",
-        "数据采集标准",
-        "数据分析方法",
-        "可视化看板搭建",
-        "业务流程再造",
-        "移动应用开发",
-        "云平台部署",
-        "系统集成对接",
-        "数据安全保障",
-        "系统运维管理",
-        "信息化培训",
-        "数字化转型规划",
-        "智慧工地建设",
-        "BIM技术应用",
-        "物联网设备部署",
-        "大数据分析应用",
-        "AI智能辅助",
-        "数字化成果展示",
-        "信息化持续运营",
-    ],
-    # 施工方案专项（承包范围分部工程对应）
-    "construction_scheme": [
-        "施工测量放线与精度控制",
-        "土方开挖分层开挖工艺",
-        "基坑支护结构设计与施工",
-        "地基处理与基础浇筑",
-        "钢筋工程绑扎与连接工艺",
-        "模板工程支设与拆除",
-        "混凝土浇筑与养护工艺",
-        "砌体工程施工与验收",
-        "钢结构吊装与节点连接",
-        "屋面防水卷材施工",
-        "外墙保温板粘贴施工",
-        "装饰装修面层施工工艺",
-        "机电管线综合布置",
-        "脚手架搭设与拆除方案",
-        "施工降排水与降水方案",
-        "季节性施工技术措施",
-        "预制构件吊装与灌浆工艺",
-        "大体积混凝土温控措施",
-        "深基坑监测与预警系统",
-        "高空作业安全防护技术",
-        "施工临时设施搭设规范",
-        "特种工序质量检验标准",
-        "新材料新工艺应用方案",
-        "复杂节点施工工艺优化",
-        "预应力张拉与灌浆工艺",
-        "焊接工艺评定与无损检测",
-        "防水工程细部节点做法",
-        "幕墙龙骨安装与面板施工",
-        "灌注桩施工与检测工艺",
-        "地下室防水施工与试验",
-        "施工缝与后浇带处理",
-        "构件深化设计与BIM建模",
-        "绿色施工与环境保护措施",
-        "智慧工地数字化管控",
-    ],
-}
-
 # 关键词到场景模板的映射
 _L2_KEYWORD_TO_SCENE: list[tuple[list[str], str]] = [
     # 质量管理
@@ -2682,223 +2387,6 @@ _L2_KEYWORD_TO_SCENE: list[tuple[list[str], str]] = [
     # 通用管理（兜底）
     (["管理", "制度", "体系", "机制", "组织", "流程"], "general_management"),
 ]
-
-
-def _extract_l2_domain_keywords(l2_title: str) -> list[str]:
-    """从二级目录标题提取领域关键词，用于注入三级标题使其具体化。
-
-    提取的关键词代表 L2 的专业领域/分部工程，将用于丰富 L3 标题，
-    使不同 L2 下的 L3 标题具有明确的上下文差异。
-
-    例如：L2="混凝土工程施工方案" → ["混凝土"]
-         L2="基坑支护与降水方案" → ["基坑", "降水"]
-         L2="砌筑工程施工工艺" → ["砌筑"]
-    """
-    # 分部工程关键词（按优先级排序）
-    _DOMAIN_KEYWORDS = [
-        "混凝土",
-        "钢筋",
-        "模板",
-        "砌筑",
-        "砌",
-        "砌体",
-        "防水",
-        "保温",
-        "装饰",
-        "抹灰",
-        "涂料",
-        "幕墙",
-        "门窗",
-        "地面",
-        "墙面",
-        "顶棚",
-        "吊顶",
-        "土方",
-        "基坑",
-        "降水",
-        "桩基",
-        "基础",
-        "主体",
-        "屋面",
-        "外墙",
-        "内墙",
-        "机电",
-        "电气",
-        "给排水",
-        "暖通",
-        "消防",
-        "智能化",
-        "弱电",
-        "园林",
-        "绿化",
-        "道路",
-        "桥梁",
-        "隧道",
-        "管廊",
-        "钢结构",
-        "木结构",
-        "装配式",
-        "预制",
-        "脚手架",
-        "模板支撑",
-        "测量",
-        "放线",
-        "试验",
-        "检测",
-        "安全",
-        "质量",
-        "进度",
-        "成本",
-        "材料",
-        "资源",
-        "绿色",
-        "环保",
-        "节能",
-        "低碳",
-        "智慧",
-        "数字",
-        "BIM",
-    ]
-
-    found = []
-    for kw in _DOMAIN_KEYWORDS:
-        if kw in l2_title.strip():
-            found.append(kw)
-            # 最多取 2 个关键词，避免标题过长
-            if len(found) >= 2:
-                break
-
-    # 如果没找到分部工程关键词，尝试从标题前半段提取有意义的词
-    if not found and l2_title:
-        # 取标题核心（去除通用后缀）
-        core = _strip_l2_suffix(l2_title)
-        # 尝试从核心中提取 2 字以上的实体词
-        if len(core) >= 2:
-            # 移除通用动词/管理词
-            stop_words = {
-                "施工",
-                "方案",
-                "工艺",
-                "方法",
-                "工程",
-                "实施",
-                "组织",
-                "部署",
-                "管理",
-                "技术",
-                "计划",
-                "进度",
-                "质量",
-                "安全",
-            }
-            for word in stop_words:
-                core = core.replace(word, "")
-            if len(core) >= 2:
-                found.append(core[:4] if len(core) >= 4 else core)
-
-    return found
-
-
-def _enrich_l3_title_with_l2(candidate: str, l2_title: str, idx: int, l2_index: int) -> str:
-    """将候选三级标题与 L2 领域关键词融合，使其具体化。
-
-    这是解决目录重名/缺乏多样性的核心函数：
-    - 不同 L2 章节的 L3 标题即使使用相同模板，也会因为注入了 L2 的领域关键词而不同
-    - 例如：模板"质量控制流程" + L2="混凝土工程施工方案" → "混凝土质量控制流程"
-    - 例如：模板"安全操作规范" + L2="基坑支护方案" → "基坑安全操作规范"
-
-    Args:
-        candidate: 候选的三级标题（来自模板或生成策略）
-        l2_title: 父级二级目录标题
-        idx: 三级序号（用于轮转注入位置）
-        l2_index: 二级序号（用于多样化注入方式）
-    """
-    domain_keywords = _extract_l2_domain_keywords(l2_title)
-
-    if not domain_keywords:
-        return candidate
-
-    # 选取注入的领域关键词
-    keyword = domain_keywords[0]
-
-    # 避免注入重复（关键词已在标题中则跳过）
-    if keyword in candidate:
-        # 尝试第二关键词
-        if len(domain_keywords) > 1 and domain_keywords[1] not in candidate:
-            keyword = domain_keywords[1]
-        else:
-            return candidate
-
-    # 注入策略（根据 idx + l2_index 轮转，增加多样性）
-    strategy = (idx + l2_index) % 5
-
-    if strategy == 0:
-        # 前缀注入："混凝土质量控制流程"
-        return f"{keyword}{candidate}"
-
-    elif strategy == 1:
-        # 中间注入：通过在核心词后插入领域
-        # 找到 candidate 中的第一个语义核心词
-        _INJECT_CORE = [
-            "质量",
-            "安全",
-            "进度",
-            "成本",
-            "技术",
-            "施工",
-            "管理",
-            "控制",
-            "体系",
-            "机制",
-            "流程",
-            "标准",
-            "规范",
-            "组织",
-            "制度",
-            "措施",
-        ]
-        for core in _INJECT_CORE:
-            if core in candidate:
-                pos = candidate.index(core) + len(core)
-                # 避免重复
-                if pos < len(candidate) and candidate[pos : pos + len(keyword)] != keyword:
-                    return f"{candidate[:pos]}{keyword}{candidate[pos:]}"
-                break
-        # 回退到前缀
-        return f"{keyword}{candidate}"
-
-    elif strategy == 2:
-        # 介词连接："混凝土工程质量控制流程"
-        return f"{keyword}工程{candidate}"
-
-    elif strategy == 3:
-        # 叠词模式：适合专业标题
-        # 检查 candidate 是否以通用词开头
-        _GENERIC_STARTS = [
-            "施工",
-            "质量",
-            "安全",
-            "进度",
-            "成本",
-            "技术",
-            "管理",
-            "控制",
-            "体系",
-            "机制",
-            "流程",
-            "标准",
-        ]
-        for gs in _GENERIC_STARTS:
-            if candidate.startswith(gs):
-                return f"{keyword}{gs}{candidate[len(gs):]}"
-        return f"{keyword}{candidate}"
-
-    else:  # strategy == 4
-        # 复合注入：使用 L2 的核心词 + 候选
-        l2_core = _strip_l2_suffix(l2_title)
-        if l2_core and len(l2_core) >= 2 and l2_core not in candidate:
-            return f"{l2_core}{candidate}"
-        return f"{keyword}{candidate}"
 
 
 def _generate_diverse_l3_title(
@@ -2957,555 +2445,6 @@ def _generate_diverse_l3_title(
     return _semantic_fallback_title(
         l2_title or l1_title or "", idx, used_titles, context_title=l1_title
     )
-
-
-def _generate_generic_l3_title(
-    l2_title: str, idx: int, l1_title: str = "", l2_index: int = 0
-) -> str:
-    """通用三级标题生成策略，确保语义通顺、无重复词、多样化。
-
-    优化：
-    - 结合 l1_title 关键词作为上下文补充
-    - l2_index 用于模式轮转，避免相邻 L2 生成相同标题
-    - 12 种模式 × 10+ 后缀 = 120+ 组合
-    """
-    # 提取核心词（移除后缀后）
-    core = _strip_l2_suffix(l2_title)
-    if not core or len(core) < 2:
-        core = l2_title
-
-    # 从 core 中提取关键词（用于避免重复）
-    core_words = set()
-    for word in [
-        "体系",
-        "组织",
-        "制度",
-        "流程",
-        "机制",
-        "标准",
-        "规范",
-        "管理",
-        "质量",
-        "安全",
-        "技术",
-        "施工",
-        "方案",
-        "措施",
-        "计划",
-        "进度",
-        "资源",
-        "项目",
-        "责任制",
-        "实施",
-        "操作",
-        "控制",
-        "检查",
-        "评估",
-        "要点",
-        "要求",
-        "准则",
-        "方法",
-    ]:
-        if word in core:
-            core_words.add(word)
-
-    # 从 l1_title 提取上下文关键词
-    l1_keywords = set()
-    for word in [
-        "施工",
-        "部署",
-        "方案",
-        "管理",
-        "组织",
-        "规划",
-        "实施",
-        "技术",
-        "安全",
-        "质量",
-        "进度",
-        "资源",
-        "成本",
-        "合同",
-    ]:
-        if word in l1_title:
-            l1_keywords.add(word)
-
-    # 12 种生成模式，每种 10+ 选项
-    patterns = [
-        # 模式1: 核心 + 实施类后缀
-        {
-            "type": "core_suffix",
-            "suffixes": [
-                "建设",
-                "完善",
-                "规范",
-                "落实",
-                "执行",
-                "实施",
-                "推进",
-                "深化",
-                "加强",
-                "强化",
-                "提升",
-                "优化",
-            ],
-        },
-        # 模式2: 核心 + 流程类后缀
-        {
-            "type": "core_suffix",
-            "suffixes": [
-                "流程",
-                "步骤",
-                "方法",
-                "措施",
-                "方案",
-                "细则",
-                "规划",
-                "部署",
-                "安排",
-                "设计",
-                "体系",
-                "模式",
-            ],
-        },
-        # 模式3: 核心 + 管控类后缀
-        {
-            "type": "core_suffix",
-            "suffixes": [
-                "控制",
-                "监督",
-                "检查",
-                "评估",
-                "考核",
-                "评审",
-                "验收",
-                "监控",
-                "核查",
-                "审查",
-                "监管",
-                "督导",
-            ],
-        },
-        # 模式4: 动作 + 核心
-        {
-            "type": "action_core",
-            "prefixes": [
-                "建立",
-                "完善",
-                "强化",
-                "规范",
-                "明确",
-                "落实",
-                "推进",
-                "深化",
-                "加强",
-                "优化",
-                "构建",
-                "健全",
-            ],
-        },
-        # 模式5: 核心 + 修饰词 + 要点
-        {
-            "type": "core_keypoints",
-            "modifiers": [
-                "关键",
-                "核心",
-                "重要",
-                "主要",
-                "重点",
-                "基本",
-                "基础",
-                "首要",
-                "核心",
-                "关键",
-                "重要",
-                "主要",
-            ],
-        },
-        # 模式6: 核心 + 标准/要求
-        {
-            "type": "core_standard",
-            "suffixes": [
-                "标准",
-                "要求",
-                "规范",
-                "指标",
-                "条件",
-                "参数",
-                "尺度",
-                "准则",
-                "规定",
-                "规程",
-                "细则",
-                "要求",
-            ],
-        },
-        # 模式7: 核心 + 机制/体系
-        {
-            "type": "core_mechanism",
-            "suffixes": [
-                "机制",
-                "体系",
-                "系统",
-                "模式",
-                "方式",
-                "手段",
-                "形式",
-                "结构",
-                "框架",
-                "体系",
-                "机制",
-                "网络",
-            ],
-        },
-        # 模式8: 核心 + 组织/管理
-        {
-            "type": "core_org",
-            "suffixes": [
-                "组织",
-                "管理",
-                "协调",
-                "调度",
-                "指挥",
-                "统筹",
-                "安排",
-                "布置",
-                "部署",
-                "分工",
-                "管控",
-                "督导",
-            ],
-        },
-        # 模式9: 核心 + 专项/专题
-        {
-            "type": "core_suffix",
-            "suffixes": [
-                "专项方案",
-                "实施细则",
-                "操作指南",
-                "作业指导",
-                "技术交底",
-                "培训手册",
-                "检查清单",
-                "验收标准",
-                "预案",
-                "总结",
-            ],
-        },
-        # 模式10: 核心 + 分级/分类
-        {
-            "type": "core_classified",
-            "prefixes": [
-                "分级",
-                "分类",
-                "分层",
-                "分区域",
-                "分阶段",
-                "分专业",
-                "分模块",
-                "分项",
-                "分片",
-                "分单元",
-            ],
-        },
-        # 模式11: 核心 + 动态/持续
-        {
-            "type": "core_suffix",
-            "suffixes": [
-                "动态管理",
-                "持续改进",
-                "实时监控",
-                "定期评估",
-                "跟踪落实",
-                "反馈调整",
-                "循环优化",
-                "迭代升级",
-                "周期性检查",
-                "常态化运行",
-            ],
-        },
-        # 模式12: 核心 + 信息化/数字化
-        {
-            "type": "core_suffix",
-            "suffixes": [
-                "信息化管理",
-                "数字化监控",
-                "智能化管控",
-                "在线化管理",
-                "可视化分析",
-                "数据化决策",
-                "自动化执行",
-                "标准化流程",
-                "集成化管理",
-                "协同化运作",
-            ],
-        },
-    ]
-
-    # 用 l2_index 轮转模式，避免相邻 L2 用相同模式
-    pattern = patterns[(idx + l2_index * 3) % len(patterns)]
-
-    if pattern["type"] == "core_suffix":
-        suffixes = pattern["suffixes"]
-        valid_suffixes = [s for s in suffixes if not any(w in s for w in core_words)]
-        if not valid_suffixes:
-            valid_suffixes = suffixes
-        suffix = valid_suffixes[idx % len(valid_suffixes)]
-        return f"{core}{suffix}"
-
-    elif pattern["type"] == "action_core":
-        prefixes = pattern["prefixes"]
-        valid_prefixes = [p for p in prefixes if not any(w in p for w in core_words)]
-        if not valid_prefixes:
-            valid_prefixes = prefixes
-        prefix = valid_prefixes[idx % len(valid_prefixes)]
-        return f"{prefix}{core}"
-
-    elif pattern["type"] == "core_keypoints":
-        modifiers = pattern["modifiers"]
-        modifier = modifiers[idx % len(modifiers)]
-        full = f"{core}{modifier}要点"
-        # 检查重复词
-        for word in core_words:
-            if word * 2 in full:
-                suffixes = ["建设", "完善", "流程", "措施", "方法", "体系", "机制"]
-                valid_suffixes = [s for s in suffixes if s not in core_words]
-                suffix = (
-                    valid_suffixes[idx % len(valid_suffixes)] if valid_suffixes else suffixes[0]
-                )
-                return f"{core}{suffix}"
-        if f"{modifier}要点" in core:
-            suffixes = ["建设", "完善", "流程", "措施", "方法"]
-            valid_suffixes = [s for s in suffixes if s not in core_words]
-            suffix = valid_suffixes[idx % len(valid_suffixes)] if valid_suffixes else suffixes[0]
-            return f"{core}{suffix}"
-        return full
-
-    elif pattern["type"] == "core_classified":
-        prefixes = pattern["prefixes"]
-        prefix = prefixes[idx % len(prefixes)]
-        return f"{prefix}{core}"
-
-    elif pattern["type"] == "core_mechanism":
-        suffixes = pattern["suffixes"]
-        valid_suffixes = [s for s in suffixes if not any(w in s for w in core_words)]
-        if not valid_suffixes:
-            valid_suffixes = suffixes
-        suffix = valid_suffixes[idx % len(valid_suffixes)]
-        full = f"{core}{suffix}"
-        for word in core_words:
-            if word * 2 in full:
-                suffix = suffixes[(idx + 1) % len(suffixes)]
-                full = f"{core}{suffix}"
-                break
-        return full
-
-    elif pattern["type"] == "core_org":
-        suffixes = pattern["suffixes"]
-        valid_suffixes = [s for s in suffixes if not any(w in s for w in core_words)]
-        if not valid_suffixes:
-            valid_suffixes = suffixes
-        suffix = valid_suffixes[idx % len(valid_suffixes)]
-        return f"{core}{suffix}"
-
-    else:  # core_standard
-        suffixes = pattern["suffixes"]
-        valid_suffixes = [s for s in suffixes if not any(w in s for w in core_words)]
-        if not valid_suffixes:
-            valid_suffixes = suffixes
-        suffix = valid_suffixes[idx % len(valid_suffixes)]
-        return f"{core}{suffix}"
-
-
-def _generate_cross_context_l3_title(l1_title: str, l2_title: str, idx: int, l2_index: int) -> str:
-    """结合一级和二级标题的交叉上下文生成创新三级标题。
-
-    这是 Step 4 的创新生成策略，通过交叉组合 L1 和 L2 的核心词，
-    产生与纯 L2 衍生完全不同的标题，有效避免重复。
-    """
-    # 提取 L1 核心词
-    _strip_l2_suffix(l1_title) if l1_title else ""
-    # 提取 L2 核心词
-    l2_core = _strip_l2_suffix(l2_title)
-
-    # 从 L1 中提取有区分度的关键词
-    l1_distinct_words = set()
-    for word in [
-        "施工",
-        "部署",
-        "方案",
-        "规划",
-        "组织",
-        "实施",
-        "技术",
-        "安全",
-        "质量",
-        "进度",
-        "资源",
-        "成本",
-        "合同",
-        "信息化",
-        "数字化",
-        "BIM",
-        "环保",
-        "节能",
-        "绿色",
-    ]:
-        if word in l1_title and word not in l2_title:
-            l1_distinct_words.add(word)
-
-    # 交叉组合模式
-    cross_patterns = [
-        # L1 关键词 + L2 核心 + 后缀
-        lambda: f"{_pick_word(l1_distinct_words, idx, l2_index)}{l2_core}专项",
-        # L2 核心 + 特色 + 后缀
-        lambda: f"{l2_core}特色化建设",
-        # L1 关键词 + 专项 + L2 核心
-        lambda: f"{_pick_word(l1_distinct_words, idx, l2_index)}专项{l2_core}",
-        # L2 核心 + 提升类
-        lambda: f"{l2_core}效能提升",
-        # L2 核心 + 创新类
-        lambda: f"{l2_core}创新实践",
-        # L2 核心 + 精细化
-        lambda: f"{l2_core}精细化管理",
-        # L2 核心 + 标准化
-        lambda: f"{l2_core}标准化建设",
-        # L2 核心 + 一体化
-        lambda: f"{l2_core}一体化推进",
-        # L2 核心 + 全过程
-        lambda: f"{l2_core}全过程管控",
-        # L2 核心 + 全方位
-        lambda: f"{l2_core}全方位实施",
-    ]
-
-    pattern_idx = (idx + l2_index * 5) % len(cross_patterns)
-    return cross_patterns[pattern_idx]()
-
-
-def _pick_word(word_set: set, idx: int, offset: int) -> str:
-    """从集合中选取一个词，如果集合为空则返回默认词。"""
-    words = list(word_set)
-    if not words:
-        defaults = ["综合", "专项", "重点", "核心", "关键", "重要", "主要", "基础"]
-        return defaults[(idx + offset) % len(defaults)]
-    return words[(idx + offset) % len(words)]
-
-
-def _strip_l2_suffix(title: str) -> str:
-    """移除 L2 标题末尾的常见后缀词，提取核心内容。
-
-    采用多策略提取：
-    1. 优先按连接词（的/与/及/和）分割，取最长且有意义的段作为核心
-    2. 否则移除末尾的通用动词/形容词后缀
-    3. 保护重要名词如"体系""系统""组织"等
-    4. 确保核心词至少 4 个字符，信息量充足
-    """
-    # 保护重要名词列表
-    protected_nouns = [
-        "体系",
-        "系统",
-        "组织",
-        "机构",
-        "队伍",
-        "班子",
-        "责任制",
-        "制度",
-        "机制",
-        "模式",
-        "规划",
-        "计划",
-        "方案",
-        "措施",
-        "设计",
-        "部署",
-        "流程",
-        "标准",
-        "规范",
-        "制度",
-        "机制",
-        "模式",
-    ]
-
-    # 策略1: 按连接词分割（取最长且有意义的段）
-    connectors = ["的", "与", "及", "和", "对", "关于", "中", "内"]
-    for conn in connectors:
-        if conn in title:
-            parts = [p.strip() for p in title.split(conn) if p.strip()]
-            valid_parts = [p for p in parts if len(p) >= 2]
-            if valid_parts:
-                best = max(valid_parts, key=len)
-                if len(best) >= 3:
-                    # 如果分割后的核心词太短（<4字），回退到策略2
-                    if len(best) >= 4:
-                        return best
-                    # 保留更多上下文信息
-                    return title  # 返回原标题，不做分割
-
-    # 策略2: 移除末尾的通用动词/形容词后缀
-    verb_suffixes = sorted(
-        [
-            "施工方案",
-            "施工方法",
-            "施工工艺",
-            "专项方案",
-            "实施方案",
-            "设计方案",
-            "保障方案",
-            "优化方案",
-            "方案",
-            "措施",
-            "计划",
-            "设计",
-            "分析",
-            "研究",
-            "建设",
-            "实施",
-            "管理",
-            "规划",
-            "部署",
-            "安排",
-            "流程",
-            "标准",
-            "要求",
-            "内容",
-            "情况",
-            "方法",
-            "工艺",
-            "技术",
-            "配置",
-            "剖析",
-            "概论",
-            "概览",
-            "介绍",
-            "说明",
-            "控制",
-            "保证",
-            "监督",
-            "检查",
-        ],
-        key=len,
-        reverse=True,
-    )
-
-    result = title
-    for sfx in verb_suffixes:
-        if result.endswith(sfx) and len(result) - len(sfx) >= 4:
-            remaining = result[: -len(sfx)]
-            # 检查剥离后是否以保护名词结尾
-            is_protected = False
-            for pn in protected_nouns:
-                if remaining.endswith(pn):
-                    is_protected = True
-                    break
-            if not is_protected:
-                result = remaining
-                break
-
-    # 确保核心词长度充足（至少4字），否则返回原标题
-    if len(result) < 4:
-        return title
-
-    return result.strip()
 
 
 # ========== L2/L3 差异化后处理 ==========
@@ -3915,160 +2854,23 @@ def _generate_differentiated_l3_title(
         )
         if candidate and candidate != l2_title:
             return candidate
-    # 理论上不可达：_semantic_fallback_title 自身保证唯一性。
-    # 结尾用「之一」而非数字，避免再次触发占位判定。
-    return f"{core}专项之一"
-
-
-def _build_differentiated_candidates(
-    l2_title: str,
-    l2_core: str,
-    l3_idx: int,
-    l2_idx: int,
-    l1_title: str,
-) -> list[str]:
-    """构建一组差异化的 L3 候选标题。
-
-    关键原则：候选标题严禁复用 L2 核心词干。
-    策略：跨场景模板 + 施工工艺模板 + 前缀/后缀组合。
-    """
-    candidates: list[str] = []
-    core_chars = set(l2_core) if l2_core else set()
-    core_len = len(core_chars)
-
-    # 提取 L1 中的区分度关键词（排除已出现在 L2 中的）
-    l1_distinct: list[str] = []
-    for kw in [
-        "施工",
-        "部署",
-        "方案",
-        "规划",
-        "组织",
-        "实施",
-        "技术",
-        "安全",
-        "质量",
-        "进度",
-        "资源",
-        "成本",
-        "合同",
-        "信息化",
-        "数字化",
-        "BIM",
-        "环保",
-        "节能",
-        "绿色",
-        "装饰",
-        "机电",
-        "砌筑",
-        "防水",
-        "保温",
-        "幕墙",
-        "智能化",
-        "消防",
-    ]:
-        if kw in l1_title and kw not in l2_title:
-            l1_distinct.append(kw)
-
-    # 1. 跨场景模板：优先从与 L2 不匹配的场景中选取
-    #    这确保候选标题与 L2 核心天然不重叠
-    scene_match = _match_scene_for_diff(l2_title)
-    for scene_name, templates in _L3_SCENE_TEMPLATES.items():
-        if scene_name == scene_match:
-            continue  # 跳过匹配场景（其模板可能与 L2 核心重叠）
-        for template in templates:
-            cand_chars = set(template)
-            overlap = core_chars & cand_chars
-            # 允许最多 50% 字符重叠用于候选池（后续严格筛选）
-            if core_len == 0 or len(overlap) <= core_len * 0.5:
-                candidates.append(template)
-
-    # 2. 若跨场景模板不足，再从匹配场景中选取重叠最少的
-    if scene_match and scene_match in _L3_SCENE_TEMPLATES:
-        for template in _L3_SCENE_TEMPLATES[scene_match]:
-            cand_chars = set(template)
-            overlap = core_chars & cand_chars
-            # 仅保留重叠 <= 25% 的
-            if core_len == 0 or len(overlap) <= core_len * 0.25:
-                candidates.append(template)
-
-    # 3. 从 _L2_TITLE_PATTERNS 中选取（跨类别确保差异化）
-    #    场景名与模板类别名映射
-    _SCENE_TO_TEMPLATE_CAT = {
-        "quality_system": "quality",
-        "safety_system": "safety",
-        "progress": "schedule",
-        "technical": "construction",
-        "resource": "resource",
-        "project": "coordination",
-        "construction_method": "construction",
-        "cost_management": "analysis",
-        "contract_legal": "analysis",
-        "digitalization": "analysis",
-        "emergency": "emergency",
-    }
-    matched_cat = _SCENE_TO_TEMPLATE_CAT.get(scene_match, "") if scene_match else ""
-    from .workflows_outline_utils import _L2_TITLE_PATTERNS
-
-    for cat_name, templates in _L2_TITLE_PATTERNS.items():
-        if cat_name == matched_cat:
-            continue  # 跳过匹配类别
-        for template in templates:
-            cand_chars = set(template)
-            overlap = core_chars & cand_chars
-            if core_len == 0 or len(overlap) <= core_len * 0.5:
-                candidates.append(template)
-
-    # 4. 前缀 + 后缀组合（不含 L2 核心）
-    prefixes = _L3_DIFF_SPECIFIC_PREFIXES
-    suffixes = _L3_DIFF_SPECIFIC_SUFFIXES
-    for i in range(min(8, len(prefixes))):
-        p = prefixes[(l3_idx + l2_idx + i) % len(prefixes)]
-        s = suffixes[(l3_idx + i * 2) % len(suffixes)]
-        candidate = f"{p}{s}"
-        cand_chars = set(candidate)
-        overlap = core_chars & cand_chars
-        if core_len == 0 or len(overlap) <= core_len * 0.3:
-            candidates.append(candidate)
-
-    # 5. L1 区分词 + 前缀 + 后缀
-    for i, l1kw in enumerate(l1_distinct[:3]):
-        p = prefixes[(l3_idx + l2_idx + i + 3) % len(prefixes)]
-        s = suffixes[(l3_idx + i) % len(suffixes)]
-        candidate = f"{l1kw}{p}{s}"
-        cand_chars = set(candidate)
-        overlap = core_chars & cand_chars
-        if core_len == 0 or len(overlap) <= core_len * 0.3:
-            candidates.append(candidate)
-
-    # 6. 通用施工后缀变体
-    variant_suffixes = [
-        "专项施工方案",
-        "核心工艺要点",
-        "关键工序操作",
-        "重点管控措施",
-        "细化实施细则",
-        "具体操作规范",
-        "分步实施流程",
-        "分项管控标准",
-    ]
-    for i, vs in enumerate(variant_suffixes):
-        candidate = prefixes[(l3_idx + i) % len(prefixes)] + vs
-        cand_chars = set(candidate)
-        overlap = core_chars & cand_chars
-        if core_len == 0 or len(overlap) <= core_len * 0.3:
-            candidates.append(candidate)
-
-    return candidates
-
-
-def _match_scene_for_diff(l2_title: str) -> str | None:
-    """根据 L2 标题匹配场景模板。"""
-    for keywords, scene_name in _L2_KEYWORD_TO_SCENE:
-        for kw in keywords:
-            if kw in l2_title:
-                return scene_name
-    return None
+    # BUG-FIX 2026-10-13（G6）：旧兜底 `return f"{core}专项之一"` 有两个缺陷——
+    #   1) `core` 是**未定义局部变量**（形参名是 l2_core），一旦触发即 NameError，
+    #      异常被上层 `_ensure_l2_l3_differentiation` 的 try/except 吞掉，
+    #      修正静默失败；
+    #   2) 「专项之一」虽用中文序数规避了「专项+数字」的脏判定，但本质仍是
+    #      占位式命名，与用户报告的「专项6」同族。
+    # 改为与 `_semantic_fallback_title` 相同的「永不失败、永不脏」保证：
+    # 换序号多试几次，最后用 `_disambiguate_title` 收口（中文序数消歧、
+    # 无括号裸编号，必然收敛且非脏）。
+    from .outline_common import _disambiguate_title
+    for i in range(12, 40):
+        candidate = _semantic_fallback_title(
+            parent, l3_idx + i, used_titles, context_title=l1_title or ""
+        )
+        if candidate and candidate != l2_title:
+            return candidate
+    return _disambiguate_title(l2_title, used_titles, l1_title or "")
 
 
 async def _generate_level3_v51(
@@ -5048,6 +3850,35 @@ def _collect_gate_suggestions(verdict: dict, max_items: int = 8) -> list[str]:
     return out
 
 
+def _sync_edited_outline_after_safety_net(
+    v51_state: Any, sc_assigned: Any, level1: list[dict]
+) -> None:
+    """自检后标题安全网执行完毕，把 `v51_state.edited_outline` 刷新为新树。
+
+    BUG-FIX 2026-10-13（分步生成状态错乱 · 安全网结果被丢弃）：
+    `_self_check_v51` 收尾时把 `edited_outline` 置为自检后的树，而自检
+    （`_auto_fix_issues` 重命名 / 门禁重排）可能引入新的占位/重复标题，
+    需要安全网再兜一次。最终审核取 `edited_outline or level1`，若不同步，
+    auto_confirm 模式下安全网的清洗结果会被整体丢弃。
+
+    同步条件（全部满足才刷新）：
+      1. `v51_state` 非 None；
+      2. `sc_assigned` 非 None（自检确实写入过 edited_outline）；
+      3. 当前 `edited_outline` 仍是 `sc_assigned` 同一对象——即自检写入后
+         没有用户编辑/回灌采纳把它替换掉。对象被替换时尊重更新的值。
+    安全网是同步执行（无 await），调用前后对象不可能被并发替换，
+    因此该 identity 判定是精确的。
+    """
+    if v51_state is None or sc_assigned is None:
+        return
+    if getattr(v51_state, "edited_outline", None) is not sc_assigned:
+        return
+    try:
+        v51_state.edited_outline = level1
+    except Exception:
+        logger.debug("V5.1 安全网后 edited_outline 同步失败", exc_info=True)
+
+
 def _post_selfcheck_title_safety_net(outline: list[dict]) -> list[dict]:
     """AI 自检之后的标题兜底：清洗占位/泛化标题 + 同级去重。
 
@@ -5119,28 +3950,61 @@ async def _l3_specificity_closeout(
                     phase_label,
                     f"检测到 {len(_warnings)} 个缺乏项目针对性的三级标题，正在修复...",
                 )
-            outline = await repair_l3_generic_titles(
-                provider,
-                outline,
-                summary or "",
-                tender_context or "",
-                boq_text or "",
-                "",
-                "",
-                project_scope or "",
-            )
-            # 修复后再次收口（与分步路径一致）：AI 修复结果可能引入新的占位/重复。
-            # ⚠️ _cleanup_placeholder_titles 返回清洗计数（int），不可赋给 outline。
-            _cleanup_placeholder_titles(outline)
-            outline = _uniquify_outline_titles(outline)
-            _passed2, _warnings2 = validate_l3_specificity(outline)
-            logger.info(
-                "%s: 三级标题具体性校验 %d → %d 个问题（修复后 %s）",
-                phase_label,
-                len(_warnings),
-                len(_warnings2),
-                "通过" if _passed2 else "仍有残留",
-            )
+            # BUG-FIX 2026-10-13（G7 · 大目录修复上限结构性残留）：
+            # 旧实现单轮只修 `OUTLINE_L3_REPAIR_MAX`（默认 24）条，二次校验
+            # 的结果仅写日志、无任何补救。300 个泛化标题的目录只修 24 个，
+            # 276 个原样进入最终审核与落库。现改为多轮修复：
+            #   · 每轮最多修 OUTLINE_L3_REPAIR_MAX 条（并发/负载口径不变）；
+            #   · 轮数上限 OUTLINE_L3_REPAIR_MAX_ROUNDS（默认 3）；
+            #   · 任一轮修复后问题数不降（无进展）即提前收尾，避免空烧 AI；
+            #   · 仍有残留时显式 warning + phase_callback 告知，不再静默。
+            _max_rounds = max(1, OUTLINE_L3_REPAIR_MAX_ROUNDS)
+            _prev_count = len(_warnings)
+            for _round in range(_max_rounds):
+                outline = await repair_l3_generic_titles(
+                    provider,
+                    outline,
+                    summary or "",
+                    tender_context or "",
+                    boq_text or "",
+                    "",
+                    "",
+                    project_scope or "",
+                )
+                # 修复后再次收口（与分步路径一致）：AI 修复结果可能引入新的占位/重复。
+                # ⚠️ _cleanup_placeholder_titles 返回清洗计数（int），不可赋给 outline。
+                _cleanup_placeholder_titles(outline)
+                outline = _uniquify_outline_titles(outline)
+                _passed2, _warnings2 = validate_l3_specificity(outline)
+                logger.info(
+                    "%s: 三级标题具体性校验 第%d轮 %d → %d 个问题（%s）",
+                    phase_label,
+                    _round + 1,
+                    _prev_count,
+                    len(_warnings2),
+                    "通过" if _passed2 else "仍有残留",
+                )
+                if _passed2:
+                    break
+                if len(_warnings2) >= _prev_count:
+                    # 无进展：继续跑只会重复同样的失败，及时收尾
+                    break
+                _prev_count = len(_warnings2)
+            if not _passed2:
+                logger.warning(
+                    "%s: 三级标题具体性校验经 %d 轮修复后仍有 %d 个泛化标题残留"
+                    "（每轮上限 %d 条）。样例: %s",
+                    phase_label,
+                    _max_rounds,
+                    len(_warnings2),
+                    OUTLINE_L3_REPAIR_MAX,
+                    "、".join(w["title"] for w in _warnings2[:3]),
+                )
+                if phase_callback:
+                    await phase_callback(
+                        phase_label,
+                        f"仍有 {len(_warnings2)} 个三级标题为泛化名称（已达修复上限，可在目录编辑中手动调整）",
+                    )
         elif not _passed:
             # 无 AI provider（离线/未配置密钥）时，validate 发现的问题只能停留在
             # 规则兜底标题。显式暴露，避免用户无法区分「已精化」与「规则兜底」。
@@ -5197,13 +4061,25 @@ async def _apply_l3_quality_closeout(
     if not OUTLINE_L3_QUALITY_ENHANCE_ENABLED:
         return outline
     _t_phase = time.monotonic()
-    # 顺序必须是「清洗 → 去重」：先清裸编号后缀再判重，避免去重把
-    # 「总体实施策划（2）」的裸编号挪到标题中间导致清洗失效（与分步路径一致）。
-    _cleaned = _cleanup_placeholder_titles(outline)
-    outline = _uniquify_outline_titles(outline)
-    if _cleaned:
-        logger.info(
-            "V5.1直出路径 L3质量收口: 清洗 %d 个占位/泛化三级标题", _cleaned
+    # BUG-FIX 2026-10-13（G14）：旧实现 :5202-5203 两步无异常包裹，而
+    # `_cleanup_placeholder_titles` 只在被 `generate_outline_v51` 的
+    # `generate_outline_direct` try 块之外调用——一旦清洗抛异常（如树里混入
+    # 非 dict 节点的边界数据），异常会冒泡到直出分支的 except，把**已成功
+    # 生成的目录**当作直出失败丢弃并回退分步路径（整段直出成果作废）。
+    # 收口整体属增强环节，与 `_l3_specificity_closeout` 保持同一容错口径：
+    # 任何异常都原样返回入参目录，绝不阻断生成。
+    try:
+        # 顺序必须是「清洗 → 去重」：先清裸编号后缀再判重，避免去重把
+        # 「总体实施策划（2）」的裸编号挪到标题中间导致清洗失效（与分步路径一致）。
+        _cleaned = _cleanup_placeholder_titles(outline)
+        outline = _uniquify_outline_titles(outline)
+        if _cleaned:
+            logger.info(
+                "V5.1直出路径 L3质量收口: 清洗 %d 个占位/泛化三级标题", _cleaned
+            )
+    except Exception as _e:
+        logger.warning(
+            "V5.1直出路径 L3质量收口异常（已忽略，保留原目录）: %s", _e
         )
     outline = await _l3_specificity_closeout(
         provider,
@@ -5581,7 +4457,21 @@ async def generate_outline_v51(
     logger.info(
         "[V5.1-PHASE] AI 自检阶段耗时: %.1fs", time.monotonic() - _t_phase
     )
+    # BUG-FIX 2026-10-13（分步生成状态错乱 · 安全网结果被丢弃）：
+    # `_self_check_v51` 收尾时把 `v51_state.edited_outline` 置为自检后的树
+    # （见该函数结尾；test_self_check_v51_persists_edited_outline 锁定该语义），
+    # 而自检（_auto_fix_issues 重命名/门禁重排）可能引入新的占位/重复标题，
+    # 需要下面安全网再兜一次。但最终审核取的是
+    # `outline_for_review = v51_state.edited_outline or level1`：
+    #   · auto_confirm 模式下 `_wait_for_v51_review` 原样返回该树 → 安全网的
+    #     清洗/去重结果被整体丢弃，占位标题重新进入最终审核与落库前的展示；
+    #   · 交互模式下用户收到的 review_needed 事件同样是未过安全网的旧树。
+    # 修复：先快照自检写入的对象；安全网是同步执行（无 await，期间不可能被
+    # 用户编辑替换），其后若 edited_outline 仍是该对象，刷新为安全网后的
+    # 新树；若已被替换（用户在自检期间提交了编辑），尊重用户的值不覆盖。
+    _sc_assigned = getattr(v51_state, "edited_outline", None) if v51_state is not None else None
     level1 = _post_selfcheck_title_safety_net(level1)
+    _sync_edited_outline_after_safety_net(v51_state, _sc_assigned, level1)
 
     # ===== ENHANCE 2026-10-09（文档五）：审核不通过 → 带建议重生成一次 =====
     # 文档五的闭环是「生成 → 审核 → 审核建议回灌 → 二次生成」，而不是把有问题的

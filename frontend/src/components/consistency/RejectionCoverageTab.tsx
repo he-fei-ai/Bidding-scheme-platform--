@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { useNavigate } from "react-router-dom";
 import {
-  Alert, Button, Card, Empty, Progress, Space, Table, Tag, Typography, message,
+  Alert, Button, Card, Empty, Progress, Space, Table, Tag, Tooltip, Typography, message,
 } from "antd";
 import { ReloadOutlined, SafetyOutlined } from "@ant-design/icons";
 import { getRejectionCoverage } from "../../api";
@@ -22,8 +23,21 @@ export interface RejectionCoverageTabProps {
  *
  * 端点性质：**确定性**（不调 AI、不查网络），只查已有废标任务结果。
  * 如果项目从未跑过废标检查，返回 status='no_checks'（不是错误）。
+ *
+ * ── BUG-FIX 2026-10-13（P1 · 与后端契约三处不一致，本组件此前全错）：
+ *   1. `rowKey="clause_id"` —— 后端返回的键是 `id`（`rejection_coverage.py`
+ *      `_extract_clauses` 归一后的 `clause["id"]`），故**每一行**的 rowKey 都是
+ *      undefined，行标识完全失效；
+ *   2. `section_hits` 列按 `string[]` 声明并 `{h}` 直出，而后端给的是
+ *      `[{section_id, matched_bigrams}]` → 页面渲染出 `[object Object]`；
+ *   3. `threshold` 被当成「字数」展示（「默认 200 字」「单条阈值 0.25 字」），
+ *      而它其实是**字符二元组覆盖率比值**（默认 0.25），单位完全讲错。
+ * 现按后端真实结构渲染，并顺手把「命中最强章节」接成可点击深链（与冲突 Tab 同款
+ * 定位能力）——这一列此前即使修好也只能显示乱码，等于废列。
  */
 export default function RejectionCoverageTab({ projectId }: RejectionCoverageTabProps) {
+  const navigate = useNavigate();
+
   const [loading, setLoading] = useState(false);
   const [items, setItems] = useState<RejectionCoverageItem[]>([]);
   const [summary, setSummary] = useState<{
@@ -126,10 +140,23 @@ export default function RejectionCoverageTab({ projectId }: RejectionCoverageTab
       title: "正文章节命中",
       dataIndex: "section_hits",
       key: "section_hits",
-      render: (hits: string[]) => (
+      render: (hits: RejectionCoverageItem["section_hits"]) => (
         <Space size={[4, 4]} wrap>
           {(hits || []).length > 0 ? (
-            hits.map((h, i) => <Tag key={i} color="blue">{h}</Tag>)
+            hits.map((h, i) => (
+              <Tag
+                key={`${h.section_id}_${i}`}
+                color="blue"
+                style={{ cursor: "pointer" }}
+                onClick={() =>
+                  navigate(`/projects/${projectId}/sections?section=${h.section_id}`)
+                }
+              >
+                <Tooltip title={`字符二元组命中 ${h.matched_bigrams} 个`}>
+                  章节 {h.section_id}
+                </Tooltip>
+              </Tag>
+            ))
           ) : (
             <Text type="secondary">—</Text>
           )}
@@ -155,7 +182,9 @@ export default function RejectionCoverageTab({ projectId }: RejectionCoverageTab
         message="废标条款应答覆盖率"
         description={
           <>
-            统计项目正文对招标废标条款的应答覆盖率：每个条款返回「已覆盖 / 覆盖较弱 / 未应答」三档状态。低于阈值（默认 {summary?.threshold ?? 200} 字）的正文命中视为覆盖较弱。此端点
+            统计项目正文对招标废标条款的应答覆盖率：每个条款返回「已覆盖 / 覆盖较弱 / 未应答」三档状态。判定口径为条款字符二元组与全文正文字符二元组的重合率，低于阈值（默认{" "}
+            {(summary?.threshold ?? 0.25).toFixed(2)}，即{" "}
+            {Math.round((summary?.threshold ?? 0.25) * 100)}%）视为覆盖较弱。此端点
             <Text strong>确定性</Text>（不调 AI），仅依赖已有的大数据废标检查结果。
           </>
         }
@@ -192,7 +221,10 @@ export default function RejectionCoverageTab({ projectId }: RejectionCoverageTab
               <Tag color="orange">覆盖较弱 {summary.weakCount}</Tag>
               <Tag color="red">未应答 {summary.emptyCount}</Tag>
               <Tag>应答正文总字数 {summary.fullChars}</Tag>
-              <Tag>单条阈值 {summary.threshold} 字</Tag>
+              <Tag>
+                覆盖率阈值 {(summary.threshold ?? 0.25).toFixed(2)}（
+                {Math.round((summary.threshold ?? 0.25) * 100)}%）
+              </Tag>
             </Space>
 
             {/* 总览进度 */}
@@ -220,7 +252,7 @@ export default function RejectionCoverageTab({ projectId }: RejectionCoverageTab
 
       <Card title="废标条款明细" size="small">
         <Table
-          rowKey="clause_id"
+          rowKey="id"
           loading={loading}
           dataSource={items}
           columns={columns}

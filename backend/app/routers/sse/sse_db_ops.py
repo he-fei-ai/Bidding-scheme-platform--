@@ -9,6 +9,7 @@ from typing import Any
 from fastapi import HTTPException, Query
 from starlette.responses import StreamingResponse
 from ...db import get_db
+from ...services.ai.outline_common import child_number
 from ...services.ai.provider_factory import get_ai_config
 from ...models import SectionUpdate
 from ...services.ai.industry_profiles import get_industry_profile
@@ -753,17 +754,22 @@ def _clear_and_save_outline(project_id: int, outline: list) -> list:
                 scoring_point_id = node.get("scoring_point_id")
 
                 # BUG-FIX 2026-10-09（编号命名空间统一 · 跨模块数据传递丢失）：
-                # _renumber_items（workflows_outline_utils.py:281）本就是「路径式编号」的
-                # 权威实现（"1" / "1.2" / "1.2.3"，与 services.sections.get_section_path
-                # 的 DB 动态路径号同一口径），但它是**死代码** —— 全仓库没有任何生产
-                # 调用方，落库后的目录树从不携带 number 字段。后果是三层各算一遍：
+                # 落库后的目录树此前从不携带 number 字段，后果是三层各算一遍：
                 #   1. 前端 OutlineEditorPage 靠 outlineDictToTreeNodes 自算展示编号；
                 #   2. 导出/正文模块靠 get_section_path 从 DB 现算；
                 #   3. 任何 API 直取 outline JSON 的消费方（如 v51-confirm 回显、
                 #      前端刷新后重建树、外部对接方）拿不到编号，只能重新实现。
-                # 现在落库时随节点透出 path_number，与 get_section_path 同口径，
+                # 现落库时随节点透出 path_number，与 get_section_path 同口径，
                 # 作为跨模块的唯一编号事实源；title 保持纯文本，不改动。
-                node_number = f"{parent_number}{sort_order}" if parent_number else str(sort_order)
+                #
+                # BUG-FIX 2026-10-13（L1 · 编号命名空间单一事实源）：拼接算法
+                # 收敛到 `outline_common.child_number`（与门禁 renumber 的 id、
+                # DB 版 get_section_path 同一实现）；原注释所述
+                # `workflows_outline_utils._renumber_items` 早已不存在于生产
+                # 代码（该引用过时），事实源现为 `outline_common.tree_path_numbers`
+                # / `child_number`。一致性由
+                # tests/test_outline_l3_hardening_2026_10_13.py::TestPathNumberNamespace 锁定。
+                node_number = child_number(parent_number, sort_order)
 
 
 

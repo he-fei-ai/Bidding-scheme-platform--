@@ -33,6 +33,7 @@ from app.config import OUTLINE_L3_REPAIR_CONCURRENCY, OUTLINE_L3_REPAIR_MAX  # n
 from .outline_common import (  # noqa: E402
     _L3_ENTITY_WORDS,
     _is_dirty_l3_title,
+    _is_dirty_l3_title_deep,
     _title_core,
 )
 
@@ -778,7 +779,13 @@ def _is_l3_title_project_specific(title: str, l2_title: str = "") -> bool:
     # 2026-10-10：占位泛化标题（「专项6」「总体实施策划（2）」「总体实施策划」）
     # 必须先于一切正向判定直接否决 —— 否则「总体实施策划（2）」会因长度 ≥7
     # 且不在通用词表中被误判为具体标题，导致整个 L3 具体性校验再次空跑。
-    if _is_dirty_l3_title(title):
+    #
+    # BUG-FIX 2026-10-13（G1/G2）：判定升级为深度判定——
+    #   · 中文数字占位（「专项六」「地下室专项三」）此前连实体词白名单
+    #     （含「地下室」）都能穿透，直接放行到落库；
+    #   · 「（其N）」残渣（「总体实施策划（其三）」）剥离后即泛化词，
+    #     原文判定放行，成为漏网形态。
+    if _is_dirty_l3_title_deep(title):
         return False
 
     # 检查是否含项目特异性关键词
@@ -1047,10 +1054,17 @@ async def repair_l3_generic_titles(
             # idx 取路径末段（同级 1-based 序号），使同父下的多个兜底标题彼此错开
             _parts = [p for p in str(path or "").split(".") if p.isdigit()]
             _idx = int(_parts[-1]) if _parts else 0
+            # BUG-FIX 2026-10-13（G11 · used 副本不累加）：旧实现传
+            # `set(_global_used_titles)` 副本，`_semantic_fallback_title`
+            # 内部的 `used.add` 全写进副本后丢弃——多条记录同时走规则兜底时
+            # 各自从同一快照派生，可能拿到同一候选 → 同级重复标题，只能依赖
+            # 后续 `_uniquify_outline_titles` 消歧（追加维度词，标题质量下降）。
+            # 改传活集合：`_semantic_fallback_title` 无 await、纯同步执行，
+            # 并发任务间安全，且成功的候选本就会在 _fallback 里再登记一次。
             _new = _semantic_fallback_title(
                 _parent,
                 _idx,
-                set(_global_used_titles),
+                _global_used_titles,
                 context_title=l1_title or "",
             )
             return _new or ""
@@ -1098,7 +1112,9 @@ async def repair_l3_generic_titles(
             new_title = new_title.strip().strip("`").strip("json").strip()
             # 2026-10-10 增强：AI 可能返回另一个占位标题（或原样复读），
             # 必须用统一脏标题判定拦截，否则等于白调一次 AI。
-            if new_title and len(new_title) >= 5 and new_title != l3_title and not _is_dirty_l3_title(new_title):
+            # BUG-FIX 2026-10-13（G1/G2）：判定升级为深度判定，中文数字占位
+            # 与「（其N）+泛化词干」残渣同样拒绝接收。
+            if new_title and len(new_title) >= 5 and new_title != l3_title and not _is_dirty_l3_title_deep(new_title):
                 node["title"] = new_title
                 _global_used_titles.add(new_title)
                 logger.info("[L3修复] %s → %s", l3_title[:30], new_title[:30])

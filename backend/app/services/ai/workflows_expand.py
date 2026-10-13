@@ -1,9 +1,13 @@
 """workflows 子模块：workflows_expand（由 scripts/split_workflows.py 自动生成，勿手改）"""
 
 import asyncio
+import datetime
 import json
 import logging
+import uuid
 from typing import Any
+
+from ...db import get_db
 
 from ...utils import count_words as _count_words
 
@@ -478,14 +482,20 @@ async def _audit_one_group(
     results: list[dict],
     summary: str,
     cancel_event: asyncio.Event | None,
-) -> int:
-    """审计并修复一组正文，返回成功修复的小节数。
+) -> tuple[int, list[dict]]:
+    """审计并修复一组正文，返回 (成功修复的小节数, 本组审计发现列表)。
 
     拆成独立协程是为了让多组可以并发（首组仍串行预热 prompt cache）。
     异常由调用方 `_run` 兜住，单组失败不影响其余组。
+
+    G1 修复（2026-10-13）：返回值从 `int` 扩为 `tuple[int, list[dict]]`，
+    把 LLM 解析出的冲突发现（含修复状态）带回给调用方落库——此前发现只用于
+    就地修复正文，函数一返回就丢，审计留痕为零。
+    每个发现形如 ``{"section_id", "issue", "suggestion", "repaired"}``；
+    只有带 `section_id` 的发现会被记录（无归属章节的发现无法落库追溯）。
     """
     if cancel_event and cancel_event.is_set():
-        return 0
+        return 0, []
 
     parts: list[str] = []
     for r in group:
@@ -541,23 +551,34 @@ async def _audit_one_group(
 
     if not isinstance(parsed, dict):
         logger.warning("一致性审计第 %d 组返回非JSON格式，跳过", group_idx + 1)
-        return 0
+        return 0, []
 
     if not (parsed.get("has_conflicts") and parsed.get("conflicts")):
-        return 0
+        return 0, []
 
     conflicts = parsed["conflicts"]
     if not isinstance(conflicts, list):
         logger.warning("一致性审计冲突数据格式异常，跳过")
-        return 0
+        return 0, []
 
     repaired_count = 0
+    findings: list[dict] = []
     for conflict in conflicts:
         if not isinstance(conflict, dict):
             continue
         section_id = conflict.get("section_id")
         suggestion = conflict.get("suggestion", "")
-        if not (section_id and suggestion):
+        issue = conflict.get("issue", "")
+        if not section_id:
+            continue
+        finding = {
+            "section_id": section_id,
+            "issue": issue,
+            "suggestion": suggestion,
+            "repaired": False,
+        }
+        findings.append(finding)
+        if not suggestion:
             continue
         target = next(
             (r for r in results if str(r.get("id")) == str(section_id)),
@@ -604,6 +625,7 @@ async def _audit_one_group(
             ):
                 target["content"] = repaired
                 repaired_count += 1
+                finding["repaired"] = True
                 logger.info("一致性审计修复：章节 %s 已修复", section_id)
             elif repaired:
                 logger.warning(
@@ -615,10 +637,114 @@ async def _audit_one_group(
         except Exception as repair_e:
             logger.warning("一致性审计修复失败: %s", repair_e)
 
-    return repaired_count
+    return repaired_count, findings
+
+
+def _persist_ai_audit_findings(
+    project_id: int,
+    total_sections: int,
+    findings: list[dict],
+) -> None:
+    """G1 修复（2026-10-13）：把 AI 一致性审计的发现落库。
+
+    写入两张表（与确定性审计 `ConsistencyAuditor` 同一套数据模型）：
+
+    1. ``consistency_conflicts`` —— 逐条冲突。AI 路径的冲突是自由文本发现
+       （LLM 返回 ``section_id`` / ``issue`` / ``suggestion``，没有结构化的
+       fact 取值），映射口径：
+
+       - ``conflict_id`` = ``AI-{project_id}-{uuid12}``。确定性路径的 ID 前缀是
+         ``conflict_``（见 ``detect_conflicts``），二者永不互撞；
+       - ``fact_name`` 取 ``issue``（截 100 字），``description`` 带上修复建议；
+       - ``values`` 无结构化取值 → ``[]``；``sources`` 记冲突所在章节 ID；
+       - ``severity`` 无 LLM 判断 → 统一 ``medium``（``rules.SEVERITY_DEFAULT``
+         口径，与确定性路径「未识别回落 medium」一致）；
+       - **已修复**的发现（正文已被 AI 改写落库）直接记 ``resolved=1`` +
+         ``resolved_value='AI 自动修复'`` —— 与 ``apply_autofix``「真实落文
+         后才标 resolved」的语义一致，不会在待处理列表里留假未解决项；
+         未修复成功的留 ``resolved=0`` 供用户跟进。
+
+       写入前先清掉该项目**上一轮 AI 审计**的旧发现（``conflict_id LIKE
+       'AI-%'``）——正文已重新生成，旧发现过期；只清 AI 前缀，绝不动确定性
+       审计写入的 ``conflict_`` 行（那是「一致性检查」页的权威数据）。
+
+    2. ``consistency_audit_log`` —— 本轮审计摘要（追加，不清历史）。
+       ``facts_extracted`` 记 0：AI 路径不做结构化事实抽取，记 0 比编数诚实；
+       ``status`` 复用 ``consistency_rules`` 的常量，前端按既有口径渲染。
+
+    本函数只写库、不抛业务异常语义；调用方负责 try/except 兜底。
+    """
+    from .. import consistency_rules as rules
+
+    now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with get_db() as conn:
+        # 1) 清理上一轮 AI 审计的旧发现（见 docstring 的 ID 前缀约定）
+        conn.execute(
+            "DELETE FROM consistency_conflicts "
+            "WHERE project_id = ? AND conflict_id LIKE 'AI-%'",
+            (project_id,),
+        )
+
+        # 2) 写入本轮发现
+        log_conflicts: list[dict] = []
+        for finding in findings:
+            issue = str(finding.get("issue") or "").strip()
+            section_id = str(finding.get("section_id") or "")
+            suggestion = str(finding.get("suggestion") or "").strip()
+            repaired = bool(finding.get("repaired"))
+            fact_name = issue[:100] or "AI 一致性发现"
+            description = issue + (f"（修复建议：{suggestion}）" if suggestion else "")
+            conflict_id = f"AI-{project_id}-{uuid.uuid4().hex[:12]}"
+            severity = rules.SEVERITY_DEFAULT
+            conn.execute(
+                """INSERT INTO consistency_conflicts
+                   (project_id, conflict_id, fact_name, values_json,
+                    sources_json, severity, description,
+                    resolved, resolved_value, resolved_at, created_at)
+                   VALUES (?, ?, ?, '[]', ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    project_id,
+                    conflict_id,
+                    fact_name,
+                    json.dumps([section_id], ensure_ascii=False) if section_id else "[]",
+                    severity,
+                    description,
+                    1 if repaired else 0,
+                    "AI 自动修复" if repaired else None,
+                    now_str if repaired else None,
+                    now_str,
+                ),
+            )
+            log_conflicts.append(
+                {
+                    "conflict_id": conflict_id,
+                    "fact_name": fact_name,
+                    "values": [],
+                    "severity": severity,
+                }
+            )
+
+        # 3) 审计日志（追加一行本轮摘要）
+        conn.execute(
+            """INSERT INTO consistency_audit_log
+               (project_id, total_sections, facts_extracted,
+                conflicts_found, conflicts_json, audit_time, status)
+               VALUES (?, ?, 0, ?, ?, ?, ?)""",
+            (
+                project_id,
+                total_sections,
+                len(findings),
+                json.dumps(log_conflicts, ensure_ascii=False),
+                now_str,
+                rules.AUDIT_STATUS_COMPLETED
+                if findings
+                else rules.AUDIT_STATUS_NO_CONFLICTS,
+            ),
+        )
 
 
 async def consistency_audit_content(
+    project_id: int,
     provider: Any,
     results: list[dict],
     sections_by_id: dict,
@@ -629,15 +755,29 @@ async def consistency_audit_content(
     """全文一致性审计：检查正文与项目事实变量的冲突。
 
     参考易标模式：
-    1. 按字数上限分组
-    2. 审计正文与事实变量的冲突
-    3. AI 修复冲突小节
+     1. 按字数上限分组
+     2. 审计正文与事实变量的冲突
+     3. AI 修复冲突小节
 
     ENHANCE 2026-09-15：
       - 分组口径统一为「字符」，分组预算 == 送审提示词上限（见模块常量注释）；
       - 首组串行预热 prompt cache，其余组按 `AUDIT_GROUP_CONCURRENCY` 并发。
 
+    G1 修复（2026-10-13）：审计发现落库——此前 AI 路径只就地改 `results` 里的
+    content，函数一返回发现即丢，`consistency_conflicts` / `consistency_audit_log`
+    永远只有确定性审计（`ConsistencyAuditor`）的写入，前端无从看到「生成时 AI
+    审计查了什么、修了什么」。现由 `_persist_ai_audit_findings` 把发现写入两张表。
+
+    G2 修复（2026-10-13）：接入 `task_guard.reject_if_generation_running`。
+    本函数的写入性质是**内容类**（只改 `sections.content`），与章节内容编辑路由
+    同性质，故用 `allow_content_edit=True`：正文生成中（本函数通常就运行在生成
+    任务收尾段，锁即本任务所持）放行；若锁已被目录生成持有（全表重建会静默丢弃
+    本次写入）则拦截，放弃审计并原样返回。注意：不能抛 409 给调用方——SSE 流内
+    的调用方（`sse_content.generate_content_impl`）只 `except Exception` 记日志，
+    HTTPException 会把整个审计静默吞掉，故此处降级为「跳过审计」。
+
     Args:
+        project_id: 项目 ID
         provider: AI 提供商实例
         results: 生成结果列表 [{id, content, status, ...}]
         sections_by_id: {id: section_dict} 字典
@@ -648,6 +788,20 @@ async def consistency_audit_content(
         list[dict]: 修复后的结果列表
     """
     if cancel_event and cancel_event.is_set():
+        return results
+
+    # G2 修复：生成中路径拦截（内容类写入，allow_content_edit=True）。
+    # 被拦截（目录生成持锁）时跳过审计、原样返回——正文保持生成结果，不报错。
+    from fastapi import HTTPException
+
+    from ..task_guard import reject_if_generation_running
+
+    try:
+        reject_if_generation_running(project_id, allow_content_edit=True)
+    except HTTPException as _guard_e:
+        logger.warning(
+            "一致性审计被任务守卫拦截（目录生成进行中，跳过审计）: %s", _guard_e.detail
+        )
         return results
 
     completed_sections = [r for r in results if r.get("status") == "completed" and r.get("content")]
@@ -663,8 +817,8 @@ async def consistency_audit_content(
         AUDIT_SECTION_CHAR_LIMIT,
     )
 
-    async def _run(index: int, group: list[dict]) -> int:
-        """跑一组并把异常收敛成本组的 0 修复，避免拖垮其余组。"""
+    async def _run(index: int, group: list[dict]) -> tuple[int, list[dict]]:
+        """跑一组并把异常收敛成本组的 0 修复 + 空发现，避免拖垮其余组。"""
         try:
             return await _audit_one_group(
                 provider,
@@ -678,21 +832,34 @@ async def consistency_audit_content(
             )
         except Exception as e:
             logger.warning("一致性审计第 %d 组失败: %s", index + 1, e)
-            return 0
+            return 0, []
 
     # 首组串行：让服务端先建立 prompt cache —— 审计的 system prompt 与「项目事实」
     # 片段是各组共用的稳定前缀，首组跑完后再并发，后续组可以命中这份缓存。
-    repaired_total = await _run(0, audit_groups[0])
+    repaired_total, all_findings = await _run(0, audit_groups[0])
 
     remaining = list(enumerate(audit_groups))[1:]
     if remaining and not (cancel_event and cancel_event.is_set()):
         semaphore = asyncio.Semaphore(max(1, AUDIT_GROUP_CONCURRENCY))
 
-        async def _guarded(index: int, group: list[dict]) -> int:
+        async def _guarded(index: int, group: list[dict]) -> tuple[int, list[dict]]:
             async with semaphore:
                 return await _run(index, group)
 
-        repaired_total += sum(await asyncio.gather(*(_guarded(i, g) for i, g in remaining)))
+        for _n, _fs in await asyncio.gather(*(_guarded(i, g) for i, g in remaining)):
+            repaired_total += _n
+            all_findings.extend(_fs)
 
-    logger.info("一致性审计完成：共修复 %d 个小节", repaired_total)
+    logger.info(
+        "一致性审计完成：共修复 %d 个小节，发现 %d 处冲突",
+        repaired_total,
+        len(all_findings),
+    )
+
+    # G1 修复：审计发现落库。失败只记日志——落库异常不能影响已完成的修复结果。
+    try:
+        _persist_ai_audit_findings(project_id, len(completed_sections), all_findings)
+    except Exception as _persist_e:
+        logger.warning("一致性审计发现落库失败（不影响审计结果）: %s", _persist_e)
+
     return results

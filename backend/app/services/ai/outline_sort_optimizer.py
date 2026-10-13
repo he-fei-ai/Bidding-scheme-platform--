@@ -16,6 +16,19 @@
   3. AI 全局排序 + 关键词推断分区（降级方案）
   4. 排序后强制验证核心章顺序（最多 3 次重试）
   5. 完整降级：失败时按分区权重稳定排序
+
+STATUS 2026-10-13（L6 · 死代码评估结论，**有意保留不删**）：
+  - 本模块的**常量**（`CORE_28_CHAPTERS` / `CORE_ZONE_MAP` / `KEYWORD_ZONE_MAP` /
+    `ZONE_ORDER` / `CORE_TITLE_SET`）是**生产依赖**：`outline_gate.reorder_by_zone`
+    等工程逻辑重排直接导入它们（`from .outline_sort_optimizer import CORE_ZONE_MAP,
+    KEYWORD_ZONE_MAP, ZONE_ORDER`），模块不可删除；
+  - `OutlineSortOptimizer` / `OutlineSortOptimizerV2` **两个类目前无生产调用方**
+    （V5.1 分步工作流不调用 AI 全局排序），但 `test_bugfix_2026_09_15_outline_module`
+    等测试对它们的降级路径（`_enrich_zones` / `_composite_sort` / 同区稳定性）有
+    成体系的回归覆盖，且这些路径修复过真实缺陷。删除类会连带销毁这些回归保护，
+    收益（减维护面）小于风险，故**保留并在此标注为「已实现未接线」**。
+  - 接线前置条件（将来若要启用）：AI 全局排序必须接入 V5.1 审核链，且候选标题
+    须过 `outline_common._is_dirty_l3_title` 脏判定（2026-10-13 加固口径）。
 """
 
 from __future__ import annotations

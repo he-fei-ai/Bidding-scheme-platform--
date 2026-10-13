@@ -614,6 +614,43 @@ def scoring_status_meta(status: Any) -> dict[str, str]:
 # ============================================================================
 
 
+#: autofix 的 `new_value` 长度上限。超过即拒：正文里一个事实值不可能这么长，
+#: 超长输入只可能来自误填（把整段说明文案当值）或恶意请求。
+#:
+#: BUG-FIX 2026-10-13（命名空间收口）：此前该常量定义在
+#: `routers/consistency.py`（`AUTOFIX_VALUE_MAX_CHARS`），而本模块才是
+#: 「审核规则命名空间」的单一事实来源 —— 一个前端需要展示、且会被 400 拒绝的
+#: 判定阈值，却没有出现在 `GET /consistency/rules` 里，前端无从提示用户上限。
+#: 现移入本模块；`routers/consistency.py` 保留同名 import 以向后兼容既有引用。
+AUTOFIX_VALUE_MAX_CHARS = 200
+
+
+def autofix_value_max_chars() -> int:
+    """autofix ``new_value`` 的长度上限（字符数）。"""
+    return AUTOFIX_VALUE_MAX_CHARS
+
+
+def scoring_coverage_weak() -> float:
+    """评分标准「疑似未答到点」的覆盖率阈值（服务层标定值）。"""
+    from .scoring_compliance import COVERAGE_WEAK
+
+    return float(COVERAGE_WEAK)
+
+
+def rejection_coverage_weak() -> float:
+    """废标条款「覆盖较弱」的覆盖率阈值。
+
+    与 :func:`scoring_coverage_weak` **同量级但不同实现**：评分达标走字符三元组
+    （`scoring_compliance._terms`），废标应答走字符二元组（`rejection_coverage.
+    _char_bigrams`）。两个指标都叫「覆盖率」，粒度却不同，故各自独立标定，
+    不能互相复用常量——此处单列出来只为让 `/consistency/rules` 能把两个阈值都
+    下发，避免前端再各自硬编码。
+    """
+    from .rejection_coverage import COVERAGE_WEAK
+
+    return float(COVERAGE_WEAK)
+
+
 def rules_payload() -> dict[str, Any]:
     """`GET /consistency/rules` 的响应体 —— 前后端共用的判定标准快照。"""
     return {
@@ -633,13 +670,32 @@ def rules_payload() -> dict[str, Any]:
             # 「为什么有些位置没改」——替换只在冲突来源章节内进行，且值附近必须
             # 出现事实标签词。挂在 facts 之下而非新增顶层键，以保持
             # test_rules_payload_shape 对顶层键集合的既有断言成立。
+            #
+            # BUG-FIX 2026-10-13（P1 · 快照不反映配置生效值）：本块此前下发的是
+            # **模块常量** `AUTOFIX_KEYWORD_WINDOW_BEFORE/AFTER`（12 / 6），而
+            # 真正生效的是 `autofix_keyword_window_before()/after()`（读
+            # `CONSISTENCY_AUTOFIX_KEYWORD_WINDOW_BEFORE/AFTER` 配置项）。运维一旦
+            # 调环境变量，实际闸门口径变了，而这个「规则快照」端点**照旧返回 12/6**
+            # —— 前端据此展示的「替换保护范围」说明从此是错的，且没有任何
+            # 日志或告警。同理 `autofix_scope` 原是写死的字符串
+            # `"source_sections"`，而实际由 `autofix_scope_to_source_sections()`
+            # 开关决定。现一律改为下发**生效值**。
             "autofix_keywords": {
                 name: sorted(keywords) for name, keywords in FACT_KEYWORDS.items()
             },
-            "autofix_keyword_window_before": AUTOFIX_KEYWORD_WINDOW_BEFORE,
-            "autofix_keyword_window_after": AUTOFIX_KEYWORD_WINDOW_AFTER,
+            "autofix_keyword_window_before": autofix_keyword_window_before(),
+            "autofix_keyword_window_after": autofix_keyword_window_after(),
             "autofix_keyword_min_len": KEYWORD_MATCH_MIN_LEN,
-            "autofix_scope": "source_sections",
+            "autofix_scope": (
+                "source_sections"
+                if autofix_scope_to_source_sections()
+                else "all_sections"
+            ),
+            "autofix_require_keyword": autofix_requires_fact_keyword(),
+            # 2026-10-13：把 400 门槛一并下发，前端输入框可据此设 maxLength 提示
+            "autofix_value_max_chars": autofix_value_max_chars(),
+            "personnel_generic_keywords": sorted(PERSONNEL_GENERIC_KEYWORDS),
+            "personnel_role_prefixes": list(PERSONNEL_ROLE_PREFIXES),
         },
         "audit_status": {
             "success": sorted(AUDIT_SUCCESS_STATUSES),
@@ -651,5 +707,13 @@ def rules_payload() -> dict[str, Any]:
             "open": CONFLICT_STATE_OPEN,
             "resolved": CONFLICT_STATE_RESOLVED,
         },
-        "scoring_status": {"meta": SCORING_STATUS_META},
+        "scoring_status": {
+            "meta": SCORING_STATUS_META,
+            # 阈值下发：此前前端 `ScoringComplianceTab` 只展示判定结果、从不说明
+            # 「weak 是在什么阈值下判的」，用户看到「疑似未答到点」却无法自行复核
+            "coverage_weak": scoring_coverage_weak(),
+        },
+        "rejection_coverage": {
+            "coverage_weak": rejection_coverage_weak(),
+        },
     }

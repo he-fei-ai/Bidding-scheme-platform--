@@ -624,15 +624,10 @@ class CacheService:
         except Exception as e:
             logger.warning("缓存失效失败（忽略）: %s", e)
 
-    @classmethod
-    def get_outline_content(cls, project_id: int) -> str | None:
-        """获取大纲内容（缓存）"""
-        return RedisCache.get(f"{cls.OUTLINE_CONTENT}:{project_id}")
-
-    @classmethod
-    def set_outline_content(cls, project_id: int, content: str):
-        """设置大纲内容（缓存）"""
-        RedisCache.set(f"{cls.OUTLINE_CONTENT}:{project_id}", content, expire=cls.LONG_TTL)
+    # BUG-FIX 2026-10-13（L6 · 死代码清理）：get/set_outline_content 全仓零
+    # 调用方（大纲内容从未走该缓存键；OUTLINE_CONTENT 前缀本身仍被
+    # `invalidate_outline` 与运维缓存清理界面 routers/cache.py 的 prefix_map
+    # 使用，故保留前缀与失效方法），删除这两个方法以减少维护面。
 
     @classmethod
     def invalidate_outline(cls, project_id: int):

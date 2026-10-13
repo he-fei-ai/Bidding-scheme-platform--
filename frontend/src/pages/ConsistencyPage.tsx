@@ -4,7 +4,9 @@ import { Alert, Button, Space, Tabs, Typography } from "antd";
 import { ArrowLeftOutlined, AuditOutlined } from "@ant-design/icons";
 import { getConsistencyRules } from "../api";
 import type { ConsistencyRules } from "../api";
-import { applyConsistencySeverityMeta } from "../utils";
+import {
+  applyConsistencyScoringStatusMeta, applyConsistencySeverityMeta,
+} from "../utils";
 import ConflictListTab from "../components/consistency/ConflictListTab";
 import ScoringComplianceTab from "../components/consistency/ScoringComplianceTab";
 import AgentRepairTab from "../components/consistency/AgentRepairTab";
@@ -46,6 +48,11 @@ export default function ConsistencyPage() {
       .then((rules) => {
         if (cancelled) return;
         applyConsistencySeverityMeta(rules?.severity?.meta);
+        // BUG-FIX 2026-10-13（P1）：此前只 apply 了 `severity.meta`，
+        // `scoring_status.meta` 从未被消费 —— 后端 `SCORING_STATUS_META`
+        // 改了文案/加了新状态，评分 Tab 的写死副本纹丝不动（同一类漂移在
+        // 2026-10-08 修过一次严重度，这次是漏网的第二处）。一并对齐。
+        applyConsistencyScoringStatusMeta(rules?.scoring_status?.meta);
         setRules(rules);
       })
       .catch(() => {

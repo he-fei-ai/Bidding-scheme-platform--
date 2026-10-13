@@ -13,6 +13,7 @@ from ..security.auth import get_current_user
 from ..services import consistency_rules as rules
 from ..services.consistency_auditor import consistency_auditor
 from ..services.scoring_compliance import COVERAGE_WEAK
+from ..services.task_guard import reject_if_generation_running
 from .project_access import enforce_project_access
 
 
@@ -32,15 +33,53 @@ router = APIRouter(prefix='/consistency', tags=['consistency_audit'], dependenci
 _CONSISTENCY_OP_LOCKS: dict[int, asyncio.Lock] = {}
 _CONSISTENCY_OP_LOCKS_GUARD = threading.Lock()
 
+#: 锁表上限。BUG-FIX 2026-10-13（P2·无界增长）：`_CONSISTENCY_OP_LOCKS` 此前
+#: 「按项目 id 建锁、永不回收」，每个访问过的项目留下一把 asyncio.Lock 常驻进程。
+#: 单条约 100 字节看似无害，但这是**长驻 worker**（多 worker × 长期运行），
+#: 且项目数随使用持续增长、没有自然上界——属于典型的无界单例表。
+#: 回收策略：超过上限后按「空闲且未持有」淘汰最旧的。淘汰是安全的：拿不到锁的
+#: 项目会即时重建，而**正在等待或持有**的锁不参与淘汰，故绝不会把两个并发
+#: 操作拆到两把不同的锁上（那才是真正的竞态）。淘汰阈值取 512，远高于单实例
+#: 的合理并发项目数，正常运行期不会触发。
+_CONSISTENCY_OP_LOCKS_MAX = 512
+
+#: 锁的插入序（用于 LRU 淘汰）。与 _CONSISTENCY_OP_LOCKS 同步维护。
+_CONSISTENCY_OP_LOCKS_ORDER: list[int] = []
+
 
 def _consistency_op_lock(project_id: int) -> asyncio.Lock:
-    """取（必要时创建）该项目的操作锁；字典本身用线程锁保护。"""
+    """取（必要时创建）该项目的操作锁；字典本身用线程锁保护。
+
+    BUG-FIX 2026-10-13：补上无界增长的回收（见 `_CONSISTENCY_OP_LOCKS_MAX`）。
+    """
     with _CONSISTENCY_OP_LOCKS_GUARD:
         lock = _CONSISTENCY_OP_LOCKS.get(project_id)
         if lock is None:
+            if len(_CONSISTENCY_OP_LOCKS) >= _CONSISTENCY_OP_LOCKS_MAX:
+                _evict_idle_locks_locked()
             lock = asyncio.Lock()
             _CONSISTENCY_OP_LOCKS[project_id] = lock
+        # 命中即刷新 LRU 位置
+        if project_id in _CONSISTENCY_OP_LOCKS_ORDER:
+            _CONSISTENCY_OP_LOCKS_ORDER.remove(project_id)
+        _CONSISTENCY_OP_LOCKS_ORDER.append(project_id)
         return lock
+
+
+def _evict_idle_locks_locked() -> None:
+    """淘汰空闲锁直到低于上限（**调用方必须已持有** `_CONSISTENCY_OP_LOCKS_GUARD`）。
+
+    跳过 `locked()` 的锁——那把可能正被持有或有等待者，删掉会让后来的请求
+    拿到一把**新**锁，从而与持锁者并发进入临界区，把锁的意义直接抵消掉。
+    """
+    for pid in list(_CONSISTENCY_OP_LOCKS_ORDER):
+        if len(_CONSISTENCY_OP_LOCKS) < _CONSISTENCY_OP_LOCKS_MAX:
+            return
+        lock = _CONSISTENCY_OP_LOCKS.get(pid)
+        if lock is not None and lock.locked():
+            continue
+        _CONSISTENCY_OP_LOCKS.pop(pid, None)
+        _CONSISTENCY_OP_LOCKS_ORDER.remove(pid)
 
 
 class _LockManager:
@@ -60,7 +99,11 @@ class _LockManager:
 
 #: autofix 的 `new_value` 长度上限。超过即拒：正文里一个事实值不可能这么长，
 #: 超长输入只可能来自误填（把整段说明文案当值）或恶意请求。
-AUTOFIX_VALUE_MAX_CHARS = 200
+#:
+#: ENHANCE 2026-10-13：常量迁到 `consistency_rules`（审核规则命名空间），本处
+#: 保留同名再导出，使「既有 import `from .consistency import AUTOFIX_VALUE_MAX_CHARS`
+#: 」的调用方与测试不必改动，同时该阈值已随 `GET /consistency/rules` 下发。
+AUTOFIX_VALUE_MAX_CHARS = rules.autofix_value_max_chars()
 
 
 @router.get('/rules')
@@ -77,9 +120,27 @@ async def get_consistency_rules(user=Depends(get_current_user)):
     return {'status': 'ok', **rules.rules_payload()}
 
 
-@router.get('/audit/{project_id}')
+# BUG-FIX 2026-10-13（P1 · 带写副作用的 GET）：本端点名为 `GET /consistency/audit/{id}`，
+# 但它**不是读操作**——`run_full_audit` 内部会 `DELETE` 全部未解决冲突、
+# 重新 `INSERT` 本次快照、并追加一行 `consistency_audit_log`
+# （`consistency_auditor._save_conflicts` / `_save_audit_log`）。
+# 副作用 GET 的实际代价（都不是理论问题）：
+#   * 浏览器/代理的**链接预取**、页面刷新、监控探针的周期 GET，都会静默触发一次
+#     全量正文重扫 + 一次 DELETE/INSERT 事务；
+#   * 中间代理或 CDN 对 GET 的自动重试会把「幂等」假设坐实，重扫一次全库；
+#   * 响应不可缓存，语义与 HTTP 方法约定相反。
+# 现按 REST 语义补上规范动词 `POST`，**GET 保留**（不破坏任何既有调用方、
+# 脚本与前端 api/index.ts），仅在文档中标注 legacy。前端已切到 POST。
+@router.api_route(
+    '/audit/{project_id}',
+    methods=['GET', 'POST'],
+    summary='运行全文一致性审计（POST 为规范入口；GET 为向后兼容保留）',
+)
 async def run_audit(project_id: int, user=Depends(get_current_user)):
     """运行完整一致性审计
+
+    ⚠️ 该操作会**改写** `consistency_conflicts` 与 `consistency_audit_log`，
+    属写操作。请使用 `POST`；`GET` 仅为向后兼容保留。
 
     Args:
         project_id: 项目ID
@@ -282,6 +343,12 @@ async def apply_autofix(
         修复报告（changed_sections / total_replacements / sections / skipped / message）
     """
     await enforce_project_access(project_id, user)
+    # BUG-FIX 2026-10-13（L2 · 旁路写正文无守卫）：autofix 是裸 SQL 改写
+    # sections.content 的旁路链路。目录生成进行中落文会被收尾的
+    # DELETE+INSERT 静默覆盖（冲突被标已解决但正文实际被还原）。
+    # 按内容类写入口径防护：目录生成中 409，正文生成中放行（与手写编辑同性质）。
+    # 放在项目操作锁**之前**：被拒请求不应占锁排队。
+    reject_if_generation_running(project_id, allow_content_edit=True)
     # BUG-FIX 2026-10-09（P1·空值/超长值把正文改坏）：`new_value` 是**替换目标值**，
     # 后端此前完全不校验。前端虽然做了 `newValue.trim()` 的提示，但开放 API / 脚本
     # 调用不受此约束：
@@ -349,6 +416,9 @@ async def repair_with_ai(
         修复报告（patches / applied / rejected / sections / unresolved / conflict_states）
     """
     await enforce_project_access(project_id, user)
+    # BUG-FIX 2026-10-13（L2 · 旁路写正文无守卫）：AI 修复同样改写正文，
+    # 与 autofix 同一口径防护（目录生成中 409，正文生成中放行）。
+    reject_if_generation_running(project_id, allow_content_edit=True)
     from ..services.consistency_repair import repair_with_ai as _repair
 
     parsed_ids: list[int] | None = None
@@ -392,6 +462,11 @@ async def agent_mode_repair(
         max_turns: Agent 最大往返轮数
     """
     await enforce_project_access(project_id, user)
+    # BUG-FIX 2026-10-13（L2 · 旁路写正文无守卫）：Agent 修复同样改写正文
+    # （非 dry_run），与 autofix / AI 修复同一口径防护。
+    # dry_run 预览不写库，无需守卫（避免预览也被 409 挡掉）。
+    if not dry_run:
+        reject_if_generation_running(project_id, allow_content_edit=True)
     from ..services.agent_repair import run_agent_repair
 
     # ENHANCE 2026-10-09：与 audit/autofix/repair 共享同一项目级写锁，避免
@@ -515,7 +590,14 @@ async def get_audit_summary(project_id: int, user=Depends(get_current_user)):
 @router.get('/scoring-compliance/{project_id}')
 async def scoring_compliance(
     project_id: int,
-    persist: bool = Query(True, description='是否把本次结果写入审计历史'),
+    # BUG-FIX 2026-10-13（P1·带写副作用的 GET 默认落库）：`persist` 此前默认为
+    # True，于是「只是想看一眼」的普通 GET 每次都往 `scoring_compliance_audit`
+    # 插一行历史。前端 `ScoringComplianceTab` 恰恰显式传了 `persist:false`
+    # 来规避（说明这个默认值已经 inconvenient 到要专门绕开），而任何脚本 /
+    # curl / 第三方调用方会无界地把该表灌大。改为默认 False：**要看结果就别写
+    # 历史，要留档显式传 persist=true**。向前兼容——响应体完全不变，只有副作用
+    # 收敛；依赖隐式落档的调用方需补一个查询参数。
+    persist: bool = Query(False, description='是否把本次结果写入审计历史（默认不写）'),
     # BUG-FIX 2026-10-08（P1·阈值前后端/配置不一致）：此处此前硬编码
     # `Query(0.10, ...)`，而服务层 `scoring_compliance.COVERAGE_WEAK` 早已按实测
     # 标定上调到 0.25 —— 且该常量的注释里明确写着「初版取 0.10 过于宽松，实测被
@@ -546,8 +628,9 @@ async def scoring_compliance(
 
     Args:
         project_id: 项目ID
-        persist: 是否落库到 scoring_compliance_audit 审计历史
-        coverage_weak: 低于该覆盖率判 weak（默认 0.10，刻意保守以零假阳性优先）
+        persist: 是否落库到 scoring_compliance_audit 审计历史（默认 False）
+        coverage_weak: 低于该覆盖率判 weak（默认取服务层标定值 `COVERAGE_WEAK`；
+            注意旧文档曾写「默认 0.10」，该硬编码已 BUG-FIX 2026-10-08 移除）
 
     Returns:
         {status, project_id, audit_time, total_points, unmapped, empty, weak,

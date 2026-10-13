@@ -510,11 +510,23 @@ class TestScoringCompliance:
         app.dependency_overrides[get_current_user] = lambda: User(uid, "u", "owner")
         try:
             with TestClient(app) as client:
-                resp = client.get(f"/api/v1/consistency/scoring-compliance/{pid}")
+                # BUG-FIX 2026-10-13（P1·带写副作用的 GET）：`persist` 默认值由
+                # True 改为 False —— 普通 GET 不再往 `scoring_compliance_audit`
+                # 插历史（前端本来就显式传 false 来规避，说明该默认值已不方便到
+                # 要专门绕开；脚本/curl/第三方调用方则会无界灌大该表）。
+                # 本用例断言的是「落库」这条链路，故显式声明 persist=true —— 这也
+                # 正是所有依赖隐式落档的调用方需要做的迁移（补一个查询参数）。
+                resp = client.get(
+                    f"/api/v1/consistency/scoring-compliance/{pid}",
+                    params={"persist": "true"},
+                )
+                # 顺带钉住新默认：不带参数时不落库
+                plain = client.get(f"/api/v1/consistency/scoring-compliance/{pid}")
         finally:
             app.dependency_overrides.clear()
 
         assert resp.status_code == 200, resp.text
+        assert plain.status_code == 200, plain.text
         body = resp.json()
         assert body["status"] == "ok"
         assert body["total_points"] == 1
@@ -528,6 +540,14 @@ class TestScoringCompliance:
             ).fetchone()
         assert row is not None, "审计结果未落库"
         assert row["total_points"] == 1 and row["empty"] == 1
+
+        # 默认（不带 persist）的普通 GET 不得再新增落库行
+        with get_db(readonly=True) as conn:
+            cnt = conn.execute(
+                "SELECT COUNT(*) as c FROM scoring_compliance_audit WHERE project_id = ?",
+                (pid,),
+            ).fetchone()["c"]
+        assert cnt == 1, "普通 GET 不应写审计历史（BUG-FIX 2026-10-13：persist 默认改 False）"
 
 
 # ===========================================================================

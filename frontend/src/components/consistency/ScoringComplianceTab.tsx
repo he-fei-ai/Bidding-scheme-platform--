@@ -6,17 +6,9 @@ import {
 import { FileSearchOutlined, ReloadOutlined } from "@ant-design/icons";
 import { getScoringCompliance } from "../../api";
 import type { ScoringComplianceResult, ScoringGap } from "../../api";
-import { extractApiError } from "../../utils";
+import { extractApiError, mapConsistencyScoringStatus } from "../../utils";
 
 const { Text, Paragraph } = Typography;
-
-/** 评分达标状态 → 展示文案/配色。与后端 `consistency_rules.SCORING_STATUS_META` 对齐。 */
-const STATUS_META: Record<string, { label: string; color: string }> = {
-  unmapped: { label: "未挂载章节", color: "red" },
-  empty: { label: "正文过短", color: "orange" },
-  weak: { label: "疑似未答到点", color: "gold" },
-  covered: { label: "已达标", color: "green" },
-};
 
 /** 缺口表只展示非 covered 项；covered 数量在统计卡片里体现 */
 const GAP_PAGE_SIZE = 10;
@@ -46,6 +38,13 @@ export interface ScoringComplianceTabProps {
  *
  * 覆盖率是字符三元组重合度，零 AI 花费、零超时、结果可复现；原始 coverage 数字
  * 始终返回，用户可按更严标准自行解读。
+ *
+ * BUG-FIX 2026-10-13（P1 · 状态文案硬编码副本）：本文件此前自带一份写死的
+ * `STATUS_META`，与后端 `consistency_rules.SCORING_STATUS_META` 各写一份。
+ * `ConsistencyPage` 虽然拉了 `GET /consistency/rules`，却只 apply 了
+ * `severity.meta`，评分状态的这份副本等于从未与后端对齐过 —— 后端改文案或新增
+ * 一档状态，本 Tab 完全无感知。现改走 `utils.mapConsistencyScoringStatus`
+ * （静态兜底 + 运行时对齐，与严重度同一套机制）。
  */
 export default function ScoringComplianceTab({ projectId }: ScoringComplianceTabProps) {
   const navigate = useNavigate();
@@ -101,7 +100,7 @@ export default function ScoringComplianceTab({ projectId }: ScoringComplianceTab
       key: "status",
       width: 130,
       render: (v: string) => {
-        const meta = STATUS_META[v] || { label: v || "未知", color: "default" };
+        const meta = mapConsistencyScoringStatus(v);
         return <Tag color={meta.color}>{meta.label}</Tag>;
       },
     },

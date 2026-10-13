@@ -58,8 +58,12 @@ def _get_cached_chart_render(payload_str: str, chart_type: str) -> tuple[BytesIO
         stream, size, ts = entry
         if time.time() - ts < _chart_render_cache_ttl:
             _chart_render_cache_hits += 1
-            stream.seek(0)
-            return stream, size
+            # BUG-FIX 2026-10-13（P1·L1 缓存共享流竞态）：原实现直接把缓存条目里的
+            # BytesIO 对象返回给调用方，多项目并发命中同一条目时两个调用方交替
+            # seek(0)/read()，共享光标互相打断 → 一方读到空/半截字节 → 图片插入
+            # 失败 → 正文留占位符且图号虚跳。改为返回独立副本，缓存条目保持只读
+            # （getvalue 不推进其光标，后续命中无需再 seek）。
+            return BytesIO(stream.getvalue()), size
         # TTL 过期
         with _chart_render_cache_lock:
             _chart_render_cache.pop(cache_key, None)
@@ -263,6 +267,44 @@ def _rewind_figure_number(parent_section: str, project_id: int | None = None) ->
                 _figure_counter_state[bucket] = cur - 1
 
 
+def _snapshot_figure_counter() -> dict[str, int]:
+    """快照当前图号计数器状态（供失败回滚后原地还原）。
+
+    BUG-FIX 2026-10-13（P1·图号断档）：
+      章节渲染失败时正文元素会被整体回滚（含已渲染出的图表与图题），但图号
+      计数器只在**单张图表**渲染失败时通过 _rewind_figure_number 逐张回退。
+      整节点失败走的是「删除已加入 body 的元素」路径，计数器不会回退 →
+      重试时从新号继续 → 成品图号断档（图1-1 之后直接跳到 图1-3）。
+
+    Returns:
+        桶字典副本（bucket -> 已分配序号）。**不做深拷贝到 None**：调用方
+        在快照后再分配号码，还原必须回到快照时的空桶状态，因此空桶也返回
+        空 dict（而非 None）。
+    """
+    ctx = _fig_counter_ctx_var.get()
+    if ctx is not None:
+        return dict(ctx)
+    with _figure_counter_lock:
+        return dict(_figure_counter_state)
+
+
+def _restore_figure_counter(snapshot: dict[str, int]) -> None:
+    """把图号计数器原地还原到 _snapshot_figure_counter 的快照状态。
+
+    Args:
+        snapshot: 快照字典；原地 clear + update（不替换容器引用，避免
+            调用方持有的旧引用指向过期状态）。
+    """
+    ctx = _fig_counter_ctx_var.get()
+    if ctx is not None:
+        ctx.clear()
+        ctx.update(snapshot)
+        return
+    with _figure_counter_lock:
+        _figure_counter_state.clear()
+        _figure_counter_state.update(snapshot)
+
+
 # ============================================================
 # 内联图表标记缓存（按 section_detail id 缓存检测结果）
 # ============================================================
@@ -345,6 +387,8 @@ __all__ = [
     "_strip_fig_no_for_cache",
     "_next_figure_number",
     "_rewind_figure_number",
+    "_snapshot_figure_counter",
+    "_restore_figure_counter",
     "_inline_marker_cache_cleanup_loop",
     "_start_inline_marker_cache_cleanup",
 ]

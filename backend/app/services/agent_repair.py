@@ -26,15 +26,17 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 import json
 import logging
-import re
-from datetime import datetime
 from pathlib import Path
+import re
 from typing import Any
 
 from ..db import get_db
 from . import text_patch
+from .ai.prompts import get_prompt
+from .ai.providers.base import AIMessage
 from .consistency_repair import (
     _load_all_project_content,
     _load_project_summary_and_baseline,
@@ -42,8 +44,6 @@ from .consistency_repair import (
     build_facts_text,
     refresh_conflict_states,
 )
-from .ai.prompts import get_prompt
-from .ai.providers.base import AIMessage
 
 
 logger = logging.getLogger(__name__)
@@ -376,17 +376,42 @@ async def run_agent_repair(
         max_turns: 最大往返轮数（默认 8，防止失控烧 token）
 
     Returns:
-        修复报告：turns / applied / rejected / unresolved / changed_sections /
-        conflict_states / message / success。
+        修复报告：turns / max_turns / applied / rejected / unresolved / errors /
+        changed_sections / conflict_states / message / success。
+
+    BUG-FIX 2026-10-13（**P0 · 报告缺字段导致前端整页崩溃**）：本报告 dict 与
+    姊妹链路 ``consistency_repair.repair_with_ai`` 的报告 dict（后者**有**
+    ``errors``）不一致——缺 ``errors``，也缺 ``max_turns``。而前端
+    ``AgentRepairTab.tsx`` 按「与 repair 报告同构」消费这些字段，其中
+    ``report.errors.length`` **无保护**：
+
+        TypeError: Cannot read properties of undefined (reading 'length')
+          at AgentRepairTab.tsx:156:28
+
+    React 18 无错误边界的默认行为是**卸载整棵组件树**，而
+    ``ConsistencyPage.tsx`` 没挂 ErrorBoundary —— 于是「执行修复」只要拿到
+    任何一份真实响应（**包括成功响应**），整个「一致性校核」页直接白屏，用户
+    连 Tab 都切不过去。
+
+    为什么一直没被发现：本模块的组件级测试
+    ``AgentRepairTab.dom.test.tsx`` 的 mock 响应里**手写了** ``errors: []`` 与
+    ``max_turns`` —— 桩数据比真实契约更完整，于是测试永远绿、线上永远崩
+    （典型「测试替身固化了契约」反模式）。已同步修正该测试的桩数据，改为
+    照抄本 dict 的键集，另加一条**真实契约**（缺字段）的回归用例。
+
+    修法取「补齐后端」而非「只改前端可选链」：两条链路报告同构是既有约定，
+    缺的那一侧才是异常；两者都补则前端对历史响应/第三方调用方也保持健壮。
     """
     report: dict = {
         "project_id": project_id,
         "dry_run": dry_run,
         "success": False,
         "turns": 0,
+        "max_turns": max_turns,
         "applied": [],
         "rejected": [],
         "unresolved": [],
+        "errors": [],
         "changed_sections": [],
         "conflict_states": None,
         "message": "",
@@ -395,6 +420,8 @@ async def run_agent_repair(
         ctx = build_agent_workspace(project_id, base)
     except Exception as e:
         report["message"] = f"工作区准备失败：{e!s}"
+        # 与 repair_with_ai 报告同构：异常既进 message（给人读）也进 errors（给 UI 计数）
+        report["errors"].append(f"工作区准备失败：{e!s}")
         logger.error("[Agent修复] 工作区准备失败 project=%s: %s", project_id, e, exc_info=True)
         return report
 
@@ -412,6 +439,7 @@ async def run_agent_repair(
             provider = create_provider(get_ai_config())
         except Exception as e:
             report["message"] = f"AI Provider 创建失败：{e!s}"
+            report["errors"].append(f"AI Provider 创建失败：{e!s}")
             return report
 
     events: list[dict] = []
@@ -420,6 +448,7 @@ async def run_agent_repair(
         result = await _agent_turn(provider, ctx, _format_feedback(events), turn)
         if result is None:
             events.append({"action": "turn", "ok": False, "detail": "模型返回不可解析，终止"})
+            report["errors"].append(f"第 {turn + 1} 轮模型返回不可解析，已提前终止")
             break
         if result.get("unresolved"):
             for item in result["unresolved"]:
@@ -495,8 +524,9 @@ async def run_agent_repair(
                 extra_texts=_load_project_summary_and_baseline(conn, project_id),
             )
     except Exception as e:
-        report["message"] = f"落文失败：{e!s}"
-        logger.error("[Agent修复] 落文失败 project=%s: %s", project_id, e, exc_info=True)
+        report["message"] = f"落库失败：{e!s}"
+        report["errors"].append(f"落库失败：{e!s}")
+        logger.error("[Agent修复] 落库失败 project=%s: %s", project_id, e, exc_info=True)
         return report
 
     # 旁路直写正文 → 失效三层缓存

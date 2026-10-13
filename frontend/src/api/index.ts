@@ -2339,7 +2339,58 @@ export async function exportPdf(projectId: number, exportId: number): Promise<vo
   }
 }
 
-// AI Config
+/**
+ * ENHANCE 2026-10-13：HTML 导出（第二交付格式，后端 2026-10-12 已上线
+ * /export/html 端点，但前端无入口，功能不可达）。复用 DOCX 同款配置对象
+ * （版式/主题/字体/开关），图表按「无降级」原则输出占位符。
+ *
+ * 与 exportPdf 同范式走 fetch+blob：需要读取非 2xx 响应体里的中文 detail
+ * （空文档 400 / 导出冲突 409 / 失败 500）展示给用户；鉴权用 ?token=
+ * 查询参数（JwtAuthMiddleware 支持）。
+ * @throws Error message 为后端 detail，调用方直接 message.error
+ */
+export async function exportHtml(projectId: number, config?: ExportConfig): Promise<void> {
+  const url = _appendAuthToken(`/api/v1/projects/${projectId}/export/html`);
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "text/html" },
+    body: JSON.stringify(config || {}),
+  });
+  if (!resp.ok) {
+    let detail = `HTTP ${resp.status}`;
+    try {
+      const j = await resp.json();
+      detail = j?.detail || detail;
+    } catch {
+      /* ignore */
+    }
+    const err = new Error(detail);
+    (err as any).status = resp.status;
+    throw err;
+  }
+  const blob = await resp.blob();
+  let filename = "导出文档.html";
+  const cd = resp.headers.get("Content-Disposition") || "";
+  const mStar = /filename\*=UTF-8''([^;]+)/i.exec(cd);
+  const mPlain = /filename="?([^";]+)"?/i.exec(cd);
+  try {
+    if (mStar) filename = decodeURIComponent(mStar[1]);
+    else if (mPlain) filename = mPlain[1];
+  } catch {
+    /* ignore */
+  }
+  const objectUrl = URL.createObjectURL(blob);
+  try {
+    const a = document.createElement("a");
+    a.href = objectUrl;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  } finally {
+    URL.revokeObjectURL(objectUrl);
+  }
+}
 export async function getAIConfig(): Promise<AIConfig> {
   const res = await http.get<AIConfig>("/ai/config");
   return res.data;
@@ -3125,7 +3176,12 @@ export interface AuditResult {
 export type ConflictFilter = "open" | "resolved" | "all";
 
 export async function runConsistencyAudit(projectId: number): Promise<AuditResult> {
-  const res = await http.get<AuditResult>(`/consistency/audit/${projectId}`);
+  // BUG-FIX 2026-10-13（P1·带写副作用的 GET）：本端点会 DELETE 未解决冲突 +
+  // 重新 INSERT 快照 + 追加一行审计日志，属**写**操作。此前用 GET 触发，
+  // 浏览器链接预取 / 代理重试都会静默跑一次全量正文重扫。后端已用
+  // `api_route(methods=["GET","POST"])` 补上规范动词并保留 GET 兼容，
+  // 此处切到 POST；响应体一字未变。
+  const res = await http.post<AuditResult>(`/consistency/audit/${projectId}`);
   return res.data;
 }
 
@@ -3165,6 +3221,27 @@ export interface ConsistencyRules {
     base_names: string[];
     critical: string[];
     high_distinct_threshold: number;
+    low_max_sections: number;
+    amount_units: string[];
+    /**
+     * BUG-FIX 2026-10-13：本接口此前只声明了 3 个键，而后端
+     * `consistency_rules.rules_payload()` 早已在 `facts` 下下发自动修复的
+     * 防护口径（window / scope / keyword 表）。前端「类型是对齐的」这一错觉让
+     * 「为什么有些位置没改」这类用户疑问在 UI 上永远无法解释。现按后端真实
+     * 返回补齐。**注意窗口值是「配置生效值」而非模块常量** —— 后端已修
+     * （原先下发常量 12/6，运维改 env 后快照仍返回旧值）。
+     */
+    autofix_keywords: Record<string, string[]>;
+    autofix_keyword_window_before: number;
+    autofix_keyword_window_after: number;
+    autofix_keyword_min_len: number;
+    /** "source_sections"（仅改冲突来源章节）| "all_sections"（全文扫描） */
+    autofix_scope: string;
+    autofix_require_keyword: boolean;
+    /** `new_value` 的长度上限；超限后端回 400 */
+    autofix_value_max_chars: number;
+    personnel_generic_keywords: string[];
+    personnel_role_prefixes: string[];
   };
   audit_status: {
     success: string[];
@@ -3173,7 +3250,11 @@ export interface ConsistencyRules {
     no_conflicts: string;
   };
   conflict_state: { open: string; resolved: string };
-  scoring_status: { meta: Record<string, { label: string; color: string }> };
+  scoring_status: {
+    meta: Record<string, { label: string; color: string }>;
+    coverage_weak: number;
+  };
+  rejection_coverage: { coverage_weak: number };
 }
 
 export async function getConsistencyRules(): Promise<ConsistencyRules> {
@@ -3211,6 +3292,17 @@ export interface AutoFixReport {
   changed_sections: number;
   total_replacements: number;
   skipped: { section_id: number; title: string; reason: string }[];
+  /**
+   * BUG-FIX 2026-10-13：以下三块后端**一直在返回**，但类型里没有、UI 也从不
+   * 展示，于是「就地校验拦下了 3 处」「已限定在冲突来源章节内」这些**决定
+   * 替换结果的关键信息**对用户完全不可见——用户只能看到「改了 N 处」，
+   * 不知道哪些没改、为什么没改。现补进类型并在 ConflictListTab 展示。
+   */
+  filtered?: { section_id: number; title: string; occurrences: number; reason: string }[];
+  /** 被限定到的章节 id（闸门一生效即出现） */
+  scoped_section_ids?: number[];
+  /** 无章节来源、闸门无法生效时的回退说明 */
+  scope_fallback_reason?: string;
   message: string;
 }
 
@@ -3356,13 +3448,22 @@ export interface AgentRepairReport {
   dry_run: boolean;
   project_id: number;
   turns: number;
-  max_turns: number;
+  /**
+   * BUG-FIX 2026-10-13（P0）：与 services/agent_repair.py 的报告 dict 对齐。
+   * max_turns / errors / pplied / 
+ejected / unresolved 此前被声明为
+   * 必填，但后端**从未返回** errors，前端无保护取 .length 直接把整个页面
+   * 打成白屏。现后端补齐、前端全部改可选链，故这几个字段按「可能缺失」建模，
+   * 组件必须写成 
+eport.errors?.length。
+   */
+  max_turns?: number;
   conflict_states: { resolved: number; still_open: number } | null;
-  changed_sections: { id: number; title: string }[];
-  applied: unknown[];
-  rejected: unknown[];
-  unresolved: { section_id: string; reason: string }[];
-  errors: string[];
+  changed_sections?: { id: number; title: string }[];
+  applied?: unknown[];
+  rejected?: unknown[];
+  unresolved?: { section_id: string; reason: string }[];
+  errors?: string[];
   message: string;
 }
 
@@ -3429,13 +3530,27 @@ export async function acceptFactProposals(
 // 废标条款应答覆盖率（E-6，后端 GET /consistency/rejection-coverage/{id}）
 // ---------------------------------------------------------------------------
 
+/**
+ * BUG-FIX 2026-10-13（前后端契约不一致）：本接口此前声明成
+ * `{clause_id: string, section_hits: string[]}`，而后端
+ * `services/rejection_coverage.py` 实际返回的是
+ * `{id: string, section_hits: [{section_id, matched_bigrams}]}`。
+ *
+ * 后果（两条都是用户可见缺陷，不是纯类型问题）：
+ *  1. `RejectionCoverageTab` 用 `rowKey="clause_id"` → 全部行 rowKey 为
+ *     undefined，antd Table 行标识失效（重复 key 警告 / 选择、展开行为异常）；
+ *  2. `section_hits` 声明成 `string[]` 并直接 `{h}` 渲染 → 页面渲染出
+ *     `[object Object]`。
+ * 此处按**后端真实返回**建模；组件侧同步改为按对象渲染并接上章节深链。
+ */
 export interface RejectionCoverageItem {
-  clause_id: string;
+  /** 条款标识；对应后端 `_extract_clauses` 归一后的 `id`（**不是** clause_id） */
+  id: string;
   name: string;
   text: string;
   status: "covered" | "weak" | "empty";
   coverage: number;
-  section_hits: string[];
+  section_hits: { section_id: number; matched_bigrams: number }[];
 }
 
 export interface RejectionCoverageResult {

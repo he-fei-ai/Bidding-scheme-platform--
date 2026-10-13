@@ -47,6 +47,33 @@ import AgentRepairTab from "./AgentRepairTab";
 // 变体就会被误判为类型错误。
 const { repairMock } = vi.hoisted(() => ({ repairMock: vi.fn() }));
 
+// BUG-FIX 2026-10-13（P0 回归防护 · 关键）：本文件此前的桩数据**手写了契约里
+// 根本不存在**的 `errors: []` 与 `max_turns`。后端 `run_agent_repair` 的报告 dict
+// 两个键都没有，于是真实响应会打爆 `AgentRepairTab.tsx` 里无保护的
+// `report.errors.length` → React 卸载整棵树 → 整个一致性校核页白屏；而测试因为
+// 桩数据比真实契约**更完整**，永远绿。这就是「测试替身固化了契约」的典型反模式。
+//
+// 现做两件事：
+//   1. `REAL_BACKEND_REPORT_KEYS` 显式列出后端报告 dict 的真实键集，
+//      `test_stub_matches_real_backend_contract` 断言桩数据与之一致 ——
+//      今后后端加/删键而测试不同步，会在这里直接红掉；
+//   2. `test_survives_missing_optional_fields` 用**缺字段**的响应挂载组件，
+//      断言不抛错且仍能渲染（真正的健壮性回归用例）。
+const REAL_BACKEND_REPORT_KEYS = [
+  "project_id",
+  "dry_run",
+  "success",
+  "turns",
+  "max_turns",
+  "applied",
+  "rejected",
+  "unresolved",
+  "errors",
+  "changed_sections",
+  "conflict_states",
+  "message",
+] as const;
+
 const DEFAULT_REPAIR = async (
   _pid: number,
   opts?: { dryRun?: boolean; maxTurns?: number },
@@ -85,6 +112,8 @@ vi.mock("../../utils", async (importOriginal) => {
 });
 
 describe.skipIf(!hasDom)("AgentRepairTab", () => {
+  // 超时统一由 `vitest.config.ts` 的 `testTimeout`（20000ms）治理 —— 此前这里
+  // 逐用例传 `{ timeout }` 打补丁，既治标又容易漏（见 vitest.config.ts 的注释）。
   afterEach(() => {
     cleanup();
     repairMock.mockReset();
@@ -149,5 +178,51 @@ describe.skipIf(!hasDom)("AgentRepairTab", () => {
       expect(screen.getAllByText(/已解决 2/).length).toBeGreaterThan(0);
       expect(screen.getAllByText(/4\/8 轮/).length).toBeGreaterThan(0);
     });
+  });
+
+  // ── BUG-FIX 2026-10-13（P0 回归防护）─────────────────────────────
+
+  it("桩数据与后端报告 dict 的真实键集一致", async () => {
+    const res = (await DEFAULT_REPAIR(1)) as unknown as Record<string, unknown>;
+    // 路由层 `{'status': ..., **report}` 额外加一个 status
+    expect(Object.keys(res).sort()).toEqual(
+      [...REAL_BACKEND_REPORT_KEYS, "status"].sort(),
+    );
+  });
+
+  it("响应缺 errors/max_turns/rejected 等可选字段时不崩溃、不白屏", async () => {
+    // 这是修复前的**真实**响应形态：后端报告 dict 里没有 errors / max_turns。
+    repairMock.mockImplementation(async () => ({
+      status: "ok",
+      project_id: 1,
+      dry_run: false,
+      success: true,
+      turns: 3,
+      applied: [],
+      unresolved: [],
+      changed_sections: [{ id: 3, title: "施工方案" }],
+      conflict_states: { resolved: 1, still_open: 0 },
+      message: "Agent 执行 3 轮",
+    }));
+
+    // React 渲染期抛出的 TypeError 不会冒泡到 click()，而是被 React 捕获后
+    // 卸载组件树（无 ErrorBoundary）——所以必须断言「组件仍在树上」，
+    // 而不是只断言 click 没抛。控制台里的渲染期报错是本次修复前的现场证据。
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+
+    render(<AgentRepairTab projectId={1} />);
+    screen.getByRole("button", { name: /执行修复/ }).click();
+
+    await waitFor(() => {
+      expect(screen.getAllByText(/Agent 执行 3 轮/).length).toBeGreaterThan(0);
+    });
+    // 仍能看到 Tab 的操作区 ⇒ 整棵树没有被卸载
+    expect(screen.getByRole("button", { name: /执行修复/ })).toBeTruthy();
+    // 且没有任何 "reading 'length'" 型的渲染期 TypeError
+    const renderErrors = errSpy.mock.calls
+      .map((c) => String(c[0]))
+      .filter((m) => m.includes("reading 'length'") || m.includes("TypeError"));
+    expect(renderErrors).toEqual([]);
+    errSpy.mockRestore();
   });
 });

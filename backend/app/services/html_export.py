@@ -16,15 +16,18 @@ import hashlib
 import html
 import json
 import logging
+import os
 import time
+import uuid
 from pathlib import Path
 
 from ..config import PROJECTS_DATA_DIR
 from ..db import get_db
 from ..models import ExportConfig
+from .ai.heading_standard import HeadingNumberingGeneratorV2
 from .content_cleaning import parse_content
 from .export_presets import resolve_export_config
-from .sections import build_tree, list_sections
+from .sections import build_tree
 
 
 logger = logging.getLogger(__name__)
@@ -209,7 +212,15 @@ def build_html(project_id: int, config: ExportConfig | None = None,
     cfg = resolve_export_config(config or ExportConfig())
 
     sections = _load_sections_for_html(project_id)
-    tree = build_tree(sections)
+    # BUG-FIX 2026-10-13（P0·上线即 500）：原实现 `build_tree(sections)` 把
+    # list[dict] 当成 project_id 传入 —— build_tree 的签名是
+    # (project_id: int)，其内部用该参数做 `_build_tree_cache.get(project_id)`，
+    # list 不可哈希 → `TypeError: cannot use 'list' as a dict key`，
+    # /export/html 自 2026-10-12 上线起 100% 返回 500。
+    tree = build_tree(project_id)
+
+    # 惰性 import：export.py 不反向依赖本模块，但避免模块加载顺序耦合
+    from .export import _should_skip_section
 
     # 取项目名做标题
     with get_db(readonly=True) as conn:
@@ -227,29 +238,37 @@ def build_html(project_id: int, config: ExportConfig | None = None,
         content_parts.append(f"<p>投标单位：{html.escape(bidder, quote=False)}</p>")
     content_parts.append("</header>\n<hr>\n")
 
+    # 与 DOCX 同源的章节编号器（第X节 / 一、 / 1、 / 1.1 …）
+    numbering_tracker = HeadingNumberingGeneratorV2()
+    sections_by_id = {s["id"]: s for s in sections}
+
     # 扁平遍历所有章节（树的 pre-order）
-    def _walk(node_list, parent_num: str = ""):
-        for idx, node in enumerate(node_list):
-            section_id = node.get("id")
-            if section_id is None:
+    # BUG-FIX 2026-10-13（P0·AttributeError）：build_tree 返回 pydantic
+    # SectionTreeNode（属性访问），原实现用 dict 风格 node.get("id") /
+    # node.get("children") → AttributeError: 'SectionTreeNode' has no attribute 'get'。
+    def _walk(node_list, parent_id: int | None = None):
+        for node in node_list:
+            section_id = node.id
+            # 业务过滤：与 DOCX 同口径，模板占位章节（如「（涉及项目有关）」）
+            # 不输出，且连同整棵子树一起跳过
+            if _should_skip_section(node.title):
                 continue
-            # 在 sections 列表里找完整 dict
-            full = next((s for s in sections if s["id"] == section_id), None)
+            full = sections_by_id.get(section_id)
             if not full:
                 continue
 
             level = full.get("level", 1) or 1
-            section_title = html.escape(full.get("title", "") or "", quote=False)
+            section_title = html.escape(node.title or "", quote=False)
 
-            # 标题 + 编号（按项目已有层级）
-            if parent_num:
-                section_num = f"{parent_num}.{idx + 1}"
-            else:
-                section_num = str(idx + 1)
+            # 标题编号：与 DOCX _write_tree_content_with_progress 完全同源。
+            # update_counter 对 L5+（不受控层级）返回空串 → 不加顿号，
+            # 避免渲染成「、施工组织设计」（BUG-FIX 2026-10-09 同口径）。
+            raw_number = numbering_tracker.update_counter(level, str(parent_id))
+            section_num = f"{raw_number}、" if raw_number else ""
 
             level_clamped = max(1, min(level, 7))
             content_parts.append(
-                f"<h{level_clamped}>{section_num} {section_title}</h{level_clamped}>\n"
+                f"<h{level_clamped}>{section_num}{section_title}</h{level_clamped}>\n"
             )
 
             # 章节正文
@@ -257,10 +276,9 @@ def build_html(project_id: int, config: ExportConfig | None = None,
             if body_html.strip():
                 content_parts.append(body_html)
 
-            # 递归子节点
-            children = node.get("children") or []
-            if children:
-                _walk(children, section_num)
+            # 递归子节点（传 node.id 让下级编号重置计数器）
+            if node.children:
+                _walk(node.children, node.id)
 
     _walk(tree)
 
@@ -282,7 +300,32 @@ def build_html(project_id: int, config: ExportConfig | None = None,
         safe_name = "".join(c for c in proj_name if c not in r"\/*?\"<>|:")
         output_path = str(out_dir / f"{safe_name}_{ts}.html")
 
-    Path(output_path).write_text(html_doc, encoding="utf-8")
+    # BUG-FIX 2026-10-13（P1·原子写盘）：原实现 `Path(output_path).write_text`
+    # 直写最终路径 —— ① 写盘中途失败会留下半截 .html 供用户下载；② 同项目并发
+    # 导出按秒级时间戳撞名时两个写入者互相截断。改为「同目录临时件 + os.replace
+    # 原子替换」，与 export.py 的 _atomic_save_docx 同一模式：
+    #   1. 临时件名带 pid + uuid 段，并发写入互不覆盖；
+    #   2. 非零字节才替换（零字节半成品不进最终路径）；
+    #   3. os.replace 在 Windows/POSIX 均为原子操作 → 最终文件要么旧版完整版
+    #      要么新版完整版，不存在半截中间态；
+    #   4. 失败即清理临时件，不污染 exports/ 目录。
+    tmp_path = ""
+    try:
+        tmp_path = f"{output_path}.tmp.{os.getpid()}.{uuid.uuid4().hex[:8]}"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            f.write(html_doc)
+        if html_doc and os.path.getsize(tmp_path) == 0:
+            raise RuntimeError("HTML 临时文件大小为 0，拒绝原子替换")
+        os.replace(tmp_path, output_path)
+        tmp_path = ""
+    except Exception:
+        if tmp_path:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+        raise
+
     logger.info("HTML 导出完成: %s (%d bytes)", output_path, len(html_doc))
 
     return str(Path(output_path).resolve()), fingerprint

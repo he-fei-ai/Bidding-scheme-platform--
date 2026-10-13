@@ -9,6 +9,17 @@
   2. 提供完整的标题样式配置（字号/字体/加粗/无倾斜）
   3. 支持从已有文本反向检测层级（用于 DOCX 导出）
   4. 提供 7 种层级的批量格式化能力
+
+STATUS 2026-10-13（L6 · 死代码评估结论，**有意保留不删**）：
+  - `HeadingNumberingGenerator.normalize_content` /
+    `workflows_base._fix_level4_heading_numbering` 当前**无生产调用方**，
+    由 `tests/test_heading_numbering_fix_2026_10_06.py` 覆盖（下级计数器重置
+    范围、deep 层级归一化等真实缺陷的回归保护）。
+  - `services/sections.py::_strip_body_heading_numbering`（正文编号净化）已评估
+    **不宜**在此接入：该链路的契约是「剥离 DB 编号语义变化后残留的内嵌编号」，
+    与 normalize_content 的「按层级规范重编号」目标不同，接入会把用户手写的
+    L5+ 编号一并改写（`HEADING_MANAGED_LEVELS` 只管 L1~L4 但归一化会动结构）。
+    保留为导出侧可选的规范步骤，不在正文净化链调用。
 """
 
 from __future__ import annotations

@@ -99,6 +99,8 @@ from .export_cache import (  # noqa: F401
     _strip_fig_no_for_cache,
     _next_figure_number,
     _rewind_figure_number,
+    _snapshot_figure_counter,
+    _restore_figure_counter,
     _inline_marker_cache_cleanup_loop,
     _start_inline_marker_cache_cleanup,
 )
@@ -3709,6 +3711,12 @@ def _write_tree_content_with_progress(
             # 现于失败分支回滚本节点已写入的全部元素（标题之后），只留占位符，
             # 使重试从干净状态开始。
             _node_body_mark: int | None = None
+            # BUG-FIX 2026-10-13（P1·图号断档）：正文元素回滚不还原图号计数器。
+            # _rewind_figure_number 只在**单张图表**渲染失败时逐张回退；整节点
+            # 失败走的是下方「删除已写入元素」路径，计数器不回退 → 重试从新号
+            # 继续 → 成品图号断档（图1-1 之后直接跳到 图1-3）。渲染前快照，
+            # 失败回滚时连同正文一起还原，使重试从同一号码继续。
+            _fig_counter_snapshot = _snapshot_figure_counter()
             try:
                 _add_section_heading(doc, node.title, node.level, config, numbering=numbering)
                 # 必须用 `_body_insertion_mark` 而不是 `len(list(body))`：python-docx
@@ -3770,6 +3778,14 @@ def _write_tree_content_with_progress(
                         _remove_body_elements(list(doc.element.body)[_node_body_mark:])
                     except Exception:
                         logger.warning("回滚失败章节的半截内容失败，忽略: node=%s", node.id)
+                # BUG-FIX 2026-10-13（P1·图号断档）：正文回滚后同步还原图号计数器，
+                # 保证重试复用被回滚图表的号码（回滚的图不占号）。
+                try:
+                    _restore_figure_counter(_fig_counter_snapshot)
+                except Exception:
+                    logger.warning(
+                        "还原失败章节的图号计数器失败，忽略: node=%s", node.id
+                    )
                 _ph = None
                 try:
                     _ph = doc.add_paragraph()

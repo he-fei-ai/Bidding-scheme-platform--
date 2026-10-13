@@ -325,8 +325,9 @@ def test_consistency_audit_first_group_serial_then_concurrent(monkeypatch):
     results = [{"id": i, "status": "completed", "content": "甲" * 40} for i in range(1, 10)]
     sections = {i: {"title": f"章节{i}"} for i in range(1, 10)}
     provider = _FakeAuditProvider({}, delay=0.02)
+    pid = _new_project("一致性审计并发测试")
 
-    out = asyncio.run(wf.consistency_audit_content(provider, results, sections, "事实", "", None))
+    out = asyncio.run(wf.consistency_audit_content(pid, provider, results, sections, "事实", "", None))
 
     assert out is results, "审计必须原地返回同一列表，调用方依赖它继续落库"
     assert len(provider.audit_prompts) == 5
@@ -352,8 +353,9 @@ def test_consistency_audit_applies_repair(monkeypatch):
         {1: [{"section_id": "2", "issue": "工期不一致", "suggestion": "统一为 450 天"}]},
         repair_text="乙" * 200,
     )
+    pid = _new_project("一致性审计修复测试")
 
-    asyncio.run(wf.consistency_audit_content(provider, results, sections, "事实", "", None))
+    asyncio.run(wf.consistency_audit_content(pid, provider, results, sections, "事实", "", None))
 
     assert results[0]["content"] == "甲" * 200
     assert results[1]["content"] == "乙" * 200
@@ -373,8 +375,9 @@ def test_consistency_audit_rejects_truncated_repair(monkeypatch):
         {1: [{"section_id": "1", "issue": "x", "suggestion": "y"}]},
         repair_text="乙" * 50,
     )
+    pid = _new_project("一致性审计截断修复测试")
 
-    asyncio.run(wf.consistency_audit_content(provider, results, sections, "事实", "", None))
+    asyncio.run(wf.consistency_audit_content(pid, provider, results, sections, "事实", "", None))
     assert results[0]["content"] == "甲" * 200
 
 
@@ -394,9 +397,10 @@ def test_consistency_audit_isolates_group_failure(monkeypatch):
         repair_text="乙" * 200,
         fail_group=2,
     )
+    pid = _new_project("一致性审计组隔离测试")
 
     # 第 2 组抛错不应影响第 1 组的修复结果
-    asyncio.run(wf.consistency_audit_content(provider, results, sections, "事实", "", None))
+    asyncio.run(wf.consistency_audit_content(pid, provider, results, sections, "事实", "", None))
     assert results[0]["content"] == "乙" * 200
     assert results[1]["content"] == "甲" * 200
 
@@ -408,9 +412,10 @@ def test_consistency_audit_skips_when_cancelled(monkeypatch):
     cancel.set()
     results = [{"id": 1, "status": "completed", "content": "甲" * 200}]
     provider = _FakeAuditProvider({})
+    pid = _new_project("一致性审计取消测试")
 
     out = asyncio.run(
-        wf.consistency_audit_content(provider, results, {1: {}}, "事实", "", cancel)
+        wf.consistency_audit_content(pid, provider, results, {1: {}}, "事实", "", cancel)
     )
     assert out is results
     assert provider.audit_prompts == []
@@ -425,10 +430,11 @@ def test_consistency_audit_logs_oversized_section_truncation(monkeypatch, caplog
 
     results = [{"id": 1, "status": "completed", "content": "甲" * 500}]
     provider = _FakeAuditProvider({})
+    pid = _new_project("一致性审计超长节截断测试")
 
     with caplog.at_level("WARNING"):
         asyncio.run(
-            wf.consistency_audit_content(provider, results, {1: {"title": "长章"}}, "事实", "", None)
+            wf.consistency_audit_content(pid, provider, results, {1: {"title": "长章"}}, "事实", "", None)
         )
 
     assert any("超出单节送审上限" in record.message for record in caplog.records)
