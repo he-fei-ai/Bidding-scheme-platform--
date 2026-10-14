@@ -27,15 +27,18 @@ from ..services.facts_service import (
     dict_to_fact_items,
     extract_schedule_value,
     fact_extract_system_prompt,
+    facts_segment_token_cap,
     group_fact_conflicts,
     is_placeholder_value,
     mark_placeholders,
     normalize_fact_items,
     normalize_facts_policy,
+    outline_input_enabled,
     parse_stored_items,
     policy_rule_text,
     resolve_category,
     schedule_fallback_value,
+    segmented_extraction_enabled,
 )
 from ..services.content_field_contract import (
     compute_affected_section_ids,
@@ -607,9 +610,50 @@ async def generate_facts(project_id: int, body: FactsGenerateRequest | None = No
         except json.JSONDecodeError:
             pass
 
+    # P1-2（facts-ns 2026-10-14，对齐易标「先目录后事实」）：目录标题树作为提取
+    # 输入——目录只约束事实的大项覆盖范围，不是取值来源（取值仍以上述文档为准）。
+    # 开关 FACTS_OUTLINE_INPUT_ENABLED 默认关=不读目录，行为不变。
+    outline_block = ""
+    if outline_input_enabled():
+        def _read_outline_titles():
+            with get_db() as conn:
+                return conn.execute(
+                    "SELECT title, level FROM sections WHERE project_id = ? "
+                    "ORDER BY sort_order, id",
+                    (project_id,),
+                ).fetchall()
+        try:
+            _outline_rows = await asyncio.to_thread(_read_outline_titles)
+            _o_lines: list[str] = []
+            _o_budget = 1200  # 字符预算：目录行信息密度低，超预算截断
+            for _or in _outline_rows or []:
+                _title = str(_or["title"] or "").strip()
+                if not _title:
+                    continue
+                try:
+                    _lvl = max(1, int(_or["level"] or 3))
+                except (TypeError, ValueError):
+                    _lvl = 3
+                _line = f"{'  ' * (_lvl - 1)}- {_title[:60]}"
+                if _o_budget - len(_line) < 0:
+                    break
+                _o_budget -= len(_line)
+                _o_lines.append(_line)
+            if _o_lines:
+                outline_block = (
+                    "\n\n### 技术方案目录（事实大项覆盖范围参考，不是取值来源）\n"
+                    + "\n".join(_o_lines)
+                    + "\n（事实的分组与覆盖应能支撑目录各大章的正文写作；"
+                    "目录中需要事实支撑的大项（如工期/人员/质保）应输出对应事实；"
+                    "事实取值仍以上述文档为唯一依据，不得从目录标题反推具体值）"
+                )
+        except Exception as _ol_e:
+            logger.warning("[AI事实] 目录输入加载失败（跳过，不影响提取）: %s", _ol_e)
+
     extract_user = f"""请从以下项目文档中提取全局事实变量：
 
 {source_text}
+{outline_block}
 """
     if step02_parts:
         extract_user += (
@@ -624,6 +668,11 @@ async def generate_facts(project_id: int, body: FactsGenerateRequest | None = No
     extract_user += """
 
 请提取所有可确定的事实变量，输出 JSON 对象（dict）。"""
+    # 尾部补充来源（Step02/摘要/评分点+输出指令）单独抽出：分段提取时
+    # 每个分段复用同一段尾部，与单段路径的提示词尾部完全一致。
+    _tail_start = extract_user.index("\n\n以下是 Step02") if step02_parts else extract_user.index(
+        "\n\n请提取所有可确定的事实变量")
+    extract_tail = extract_user[_tail_start:]
 
     # BUG-FIX 2026-09-14（中·可信度）：原先无论 AI 成功还是异常降级为正则启发式，
     # 接口都返回同一形态的结果，前端一律提示"事实变量已提取"——用户以为这些
@@ -631,27 +680,98 @@ async def generate_facts(project_id: int, body: FactsGenerateRequest | None = No
     # 这里显式记录来源，并在返回值里带上 mode / warning 供前端区分展示。
     extraction_mode = "ai"
     extraction_note = ""
-    try:
-        # R-2 2026-10-12：改走统一 runner（provider 由调用方预构造传入）。
-        result, _ = await run_json_extraction(
-            [
-                AIMessage(role="system", content=extract_sys),
-                AIMessage(role="user", content=extract_user),
-            ],
-            provider=provider,
-            temperature=0.3,
-            max_retries=2,
-        )
-        if isinstance(result, dict):
-            items = _dict_to_fact_items(result)
-        else:
-            items = result if isinstance(result, list) else []
 
-        if not items:
-            logger.info("[AI事实] AI 提取返回空结果，使用启发式规则兜底")
-            items = _generate_default_facts(summary, scoring_points)
-            extraction_mode = "heuristic"
-            extraction_note = "AI 未提取到事实，以下为规则启发式结果，请逐条人工确认后再使用。"
+    # P1-1（facts-ns 2026-10-14，对齐易标分段提取管线）：超预算的招标全文按 token
+    # 上限分段逐段提取、跨段归并，消除单次调用被静默截断导致后文事实丢失。
+    # 开关 FACTS_SEGMENTED_EXTRACTION_ENABLED 默认关 → segments 恒为单元素 →
+    # 走下方原有单次调用路径，提示词与行为逐字不变。
+    segments = [source_text]
+    if segmented_extraction_enabled():
+        from ..services.ai.prompts import split_into_token_capped_chunks
+        segments = split_into_token_capped_chunks(source_text, facts_segment_token_cap())
+
+    try:
+        if len(segments) > 1:
+            # 分段路径：每段复用与单段路径完全一致的尾部补充来源（extract_tail），
+            # 并显式告知「本分段没有提及不代表整份没有提及」，防止模型因段内
+            # 未见某项而放弃提取。失败段跳过，全段失败则抛出走既有启发式兜底。
+            items = []
+            seen_keys: dict[str, int] = {}
+            _failed_segments = 0
+            for _idx, _seg in enumerate(segments, 1):
+                _seg_user = (
+                    f"请从以下项目文档中提取全局事实变量（这是第 {_idx}/{len(segments)} 个分段，"
+                    "只提取本分段有明确依据的事实；本分段没有提及不代表整份文档没有提及，"
+                    f"不要因某项信息未在本段出现而放弃提取）：\n\n{_seg}\n{outline_block}\n{extract_tail}"
+                )
+                try:
+                    _seg_result, _ = await run_json_extraction(
+                        [
+                            AIMessage(role="system", content=extract_sys),
+                            AIMessage(role="user", content=_seg_user),
+                        ],
+                        provider=provider,
+                        temperature=0.3,
+                        max_retries=2,
+                    )
+                    if isinstance(_seg_result, dict):
+                        _seg_items = _dict_to_fact_items(_seg_result)
+                    else:
+                        _seg_items = _seg_result if isinstance(_seg_result, list) else []
+                except Exception as _seg_e:
+                    _failed_segments += 1
+                    logger.warning(
+                        "[AI事实] 第 %d/%d 分段提取失败（跳过该段，继续其余分段）: %s",
+                        _idx, len(segments), _seg_e,
+                    )
+                    continue
+                # 跨段归并：同 key 首次出现保留；已存在但值为占位符、新段给出
+                # 实值时替换（占位符让位于有依据的确定值，与后处理去重口径一致）。
+                for _it in _seg_items:
+                    if not isinstance(_it, dict):
+                        continue
+                    _k = dedup_key(_it)
+                    if _k in seen_keys:
+                        _pos = seen_keys[_k]
+                        _old = items[_pos]
+                        if is_placeholder_value(_old.get("value", "")) and not is_placeholder_value(_it.get("value", "")):
+                            items[_pos] = _it
+                    else:
+                        seen_keys[_k] = len(items)
+                        items.append(_it)
+            if _failed_segments == len(segments):
+                raise RuntimeError(f"全部 {len(segments)} 个分段提取均失败")
+            if _failed_segments:
+                extraction_note = (
+                    f"共 {len(segments)} 个分段，其中 {_failed_segments} 个分段提取失败已跳过，"
+                    "结果可能不完整，请人工核对。"
+                )
+            if not items:
+                logger.info("[AI事实] 分段提取归并后为空，使用启发式规则兜底")
+                items = _generate_default_facts(summary, scoring_points)
+                extraction_mode = "heuristic"
+                extraction_note = "AI 未提取到事实，以下为规则启发式结果，请逐条人工确认后再使用。"
+        else:
+            # R-2 2026-10-12：改走统一 runner（provider 由调用方预构造传入）。
+            result, _ = await run_json_extraction(
+                [
+                    AIMessage(role="system", content=extract_sys),
+                    AIMessage(role="user", content=extract_user),
+                ],
+                provider=provider,
+                temperature=0.3,
+                max_retries=2,
+            )
+            if isinstance(result, dict):
+                items = _dict_to_fact_items(result)
+            else:
+                items = result if isinstance(result, list) else []
+
+            if not items:
+                logger.info("[AI事实] AI 提取返回空结果，使用启发式规则兜底")
+                items = _generate_default_facts(summary, scoring_points)
+                extraction_mode = "heuristic"
+                extraction_note = "AI 未提取到事实，以下为规则启发式结果，请逐条人工确认后再使用。"
 
     except Exception as e:
         logger.warning("[AI事实] 提取异常，使用启发式规则兜底: %s", e)

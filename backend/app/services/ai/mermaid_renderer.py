@@ -583,6 +583,18 @@ def render_mermaid_to_bytes(
                     repaired = _repair_timeline_data(parsed)
                     if repaired:
                         _level2_result = _render_timeline_image_v2(repaired)
+            else:
+                # BUG-FIX 2026-10-14：纯 Mermaid `timeline` 语法代码（非 JSON 载荷）
+                # 在 HTTP Service 不可用时的 PIL 兜底：解析为同构数据后交 v2 渲染器，
+                # 与数据型 timeline 一致；无事件时 _parse_mermaid_timeline 返回 None，
+                # 渲染仍失败→上层按“宁缺毋假”跳过（不伪造事件）。
+                _tl_data = _parse_mermaid_timeline(code)
+                if _tl_data:
+                    logger.info(
+                        "[渲染] 时间轴: 解析 Mermaid 语法为 v2 数据 (milestones=%d)",
+                        len(_tl_data.get("milestones", [])),
+                    )
+                    _level2_result = _render_timeline_image_v2(_tl_data)
 
     except Exception as e:
         logger.debug("PIL v2 渲染失败 (%s): %s", chart_type, e)
@@ -982,6 +994,7 @@ from .mermaid_layout import (  # noqa: F401
     _repair_layout_data,
 )
 from .mermaid_timeline import (  # noqa: F401
+    _parse_mermaid_timeline,
     _render_milestone_flowchart_image_v2,
     _render_timeline_image_v2,
     _repair_timeline_data,

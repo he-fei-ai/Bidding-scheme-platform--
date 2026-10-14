@@ -5,7 +5,7 @@ import {
 } from "antd";
 import { FileSearchOutlined, ReloadOutlined } from "@ant-design/icons";
 import { getScoringCompliance } from "../../api";
-import type { ScoringComplianceResult, ScoringGap } from "../../api";
+import type { ConsistencyRules, ScoringComplianceResult, ScoringGap } from "../../api";
 import { extractApiError, mapConsistencyScoringStatus } from "../../utils";
 
 const { Text, Paragraph } = Typography;
@@ -15,6 +15,12 @@ const GAP_PAGE_SIZE = 10;
 
 export interface ScoringComplianceTabProps {
   projectId: number;
+  /**
+   * 审核规则快照（页面壳从 GET /consistency/rules 拉取后下发）。
+   * ENHANCE 2026-10-13（第六轮·G7）：弱覆盖阈值改从这里取，不再前端硬编码——
+   * 后端调标定值时 UI 提示自动跟随。为 null 时回退静态兜底值。
+   */
+  rules?: ConsistencyRules | null;
 }
 
 /**
@@ -46,7 +52,7 @@ export interface ScoringComplianceTabProps {
  * 一档状态，本 Tab 完全无感知。现改走 `utils.mapConsistencyScoringStatus`
  * （静态兜底 + 运行时对齐，与严重度同一套机制）。
  */
-export default function ScoringComplianceTab({ projectId }: ScoringComplianceTabProps) {
+export default function ScoringComplianceTab({ projectId, rules }: ScoringComplianceTabProps) {
   const navigate = useNavigate();
 
   const [report, setReport] = useState<ScoringComplianceResult | null>(null);
@@ -54,6 +60,12 @@ export default function ScoringComplianceTab({ projectId }: ScoringComplianceTab
   const seqRef = useRef(0);
 
   const isValidProject = Number.isFinite(projectId) && projectId > 0;
+
+  // 弱覆盖阈值：优先取规则快照的生效值（后端标定），快照未就绪时回退静态兜底。
+  // BUG-FIX 2026-10-13（第六轮·G7）：此前前端只展示判定结果、从不说明「weak
+  // 是在什么阈值下判的」，用户看到「疑似未答到点」无法自行复核；且评分达标
+  // （三元组）与废标应答（二元组）两个同名指标在 UI 上无从区分。
+  const coverageWeak = rules?.scoring_status?.coverage_weak ?? 0.25;
 
   const runAudit = useCallback(async () => {
     if (!isValidProject) return;
@@ -110,7 +122,9 @@ export default function ScoringComplianceTab({ projectId }: ScoringComplianceTab
       key: "coverage",
       width: 150,
       render: (v: number) => (
-        <Tooltip title="评分标准用词在该评分项已挂载章节正文中的字符三元组重合度（确定性计算，非 AI 判断）">
+        <Tooltip
+          title={`评分标准用词在该评分项已挂载章节正文中的字符三元组重合度（确定性计算，非 AI 判断）；低于 ${Math.round(coverageWeak * 100)}% 判「疑似未答到点」`}
+        >
           <Progress percent={Math.round((v || 0) * 100)} size="small" />
         </Tooltip>
       ),
@@ -167,7 +181,12 @@ export default function ScoringComplianceTab({ projectId }: ScoringComplianceTab
         showIcon
         style={{ marginBottom: 16 }}
         message="评分标准「达标性」对齐：检查每个评分项挂载到的章节正文里，是否真的答到了评分标准要求的内容。"
-        description="与导出预检的评分点检查分工不同——导出预检只判「有没有挂载章节」（存在性），本 Tab 判「挂载的那一章到底写没写」（达标性）。判定为确定性的字符三元组重合度，不调用 AI、可复现。"
+        description={
+          <>
+            与导出预检的评分点检查分工不同——导出预检只判「有没有挂载章节」（存在性），本 Tab 判「挂载的那一章到底写没写」（达标性）。判定为确定性的字符三元组重合度，不调用 AI、可复现；覆盖率低于{" "}
+            <Text strong>{Math.round(coverageWeak * 100)}%</Text>（服务层标定阈值）判「疑似未答到点」，原始覆盖率数字始终返回，可按更严标准自行解读。
+          </>
+        }
       />
 
       <div style={{ marginBottom: 16, display: "flex", justifyContent: "flex-end" }}>

@@ -5,13 +5,19 @@ import {
 } from "antd";
 import { ReloadOutlined, SafetyOutlined } from "@ant-design/icons";
 import { getRejectionCoverage } from "../../api";
-import type { RejectionCoverageItem } from "../../api";
-import { extractApiError } from "../../utils";
+import type { ConsistencyRules, RejectionCoverageItem } from "../../api";
+import { extractApiError, mapConsistencyRejectionStatus } from "../../utils";
 
 const { Text, Paragraph } = Typography;
 
 export interface RejectionCoverageTabProps {
   projectId: number;
+  /**
+   * 审核规则快照（页面壳从 GET /consistency/rules 拉取后下发）。
+   * ENHANCE 2026-10-13（第六轮·统一命名空间）：三档状态文案与弱覆盖阈值改从
+   * 这里取，不再本地硬编码（statusLabel/statusColor 两张写死表 + 0.25 魔法数）。
+   */
+  rules?: ConsistencyRules | null;
 }
 
 /**
@@ -35,7 +41,7 @@ export interface RejectionCoverageTabProps {
  * 现按后端真实结构渲染，并顺手把「命中最强章节」接成可点击深链（与冲突 Tab 同款
  * 定位能力）——这一列此前即使修好也只能显示乱码，等于废列。
  */
-export default function RejectionCoverageTab({ projectId }: RejectionCoverageTabProps) {
+export default function RejectionCoverageTab({ projectId, rules }: RejectionCoverageTabProps) {
   const navigate = useNavigate();
 
   const [loading, setLoading] = useState(false);
@@ -44,7 +50,8 @@ export default function RejectionCoverageTab({ projectId }: RejectionCoverageTab
     status: string;
     scannedClauses: number;
     fullChars: number;
-    threshold: number;
+    /** 后端响应下发的阈值；缺省时为 null，展示层回退 rules 快照值 */
+    threshold: number | null;
     weakCount: number;
     emptyCount: number;
   } | null>(null);
@@ -53,6 +60,11 @@ export default function RejectionCoverageTab({ projectId }: RejectionCoverageTab
   const loadSeqRef = useRef(0);
 
   const isValidProject = Number.isFinite(projectId) && projectId > 0;
+
+  // 弱覆盖阈值兜底：优先规则快照生效值，快照未就绪时回退静态默认（与后端
+  // rejection_coverage.COVERAGE_WEAK 初始标定值一致）。响应体里的 threshold
+  // 仍是第一来源（load 时按实际返回值展示），这里只兜「响应缺字段」。
+  const fallbackThreshold = rules?.rejection_coverage?.coverage_weak ?? 0.25;
 
   const load = useCallback(async () => {
     if (!isValidProject) return;
@@ -66,7 +78,11 @@ export default function RejectionCoverageTab({ projectId }: RejectionCoverageTab
         status: res.status,
         scannedClauses: res.scanned_clauses || 0,
         fullChars: res.full_chars || 0,
-        threshold: res.threshold || 0,
+        // BUG-FIX 2026-10-13（第六轮）：旧写法 `res.threshold || 0` 会把
+        // 「响应缺 threshold」压成 0，而展示层用 `?? fallback` 兜底时
+        // **0 不是 nullish**——兜底永远不生效，页面显示「阈值 0.00（0%）」。
+        // 这里缺省即存 null，把兜底决策完整交给展示层。
+        threshold: typeof res.threshold === "number" ? res.threshold : null,
         weakCount: res.weak_count || 0,
         emptyCount: res.empty_count || 0,
       });
@@ -83,17 +99,7 @@ export default function RejectionCoverageTab({ projectId }: RejectionCoverageTab
     load();
   }, [load]);
 
-  const statusColor: Record<string, string> = {
-    covered: "green",
-    weak: "orange",
-    empty: "red",
-  };
-
-  const statusLabel: Record<string, string> = {
-    covered: "已覆盖",
-    weak: "覆盖较弱",
-    empty: "未应答",
-  };
+  const statusMeta = (status: string) => mapConsistencyRejectionStatus(status);
 
   const columns = [
     {
@@ -115,11 +121,10 @@ export default function RejectionCoverageTab({ projectId }: RejectionCoverageTab
       dataIndex: "status",
       key: "status",
       width: 110,
-      render: (v: string) => (
-        <Tag color={statusColor[v] || "default"}>
-          {statusLabel[v] || v}
-        </Tag>
-      ),
+      render: (v: string) => {
+        const meta = statusMeta(v);
+        return <Tag color={meta.color}>{meta.label}</Tag>;
+      },
     },
     {
       title: "应答强度",
@@ -183,8 +188,8 @@ export default function RejectionCoverageTab({ projectId }: RejectionCoverageTab
         description={
           <>
             统计项目正文对招标废标条款的应答覆盖率：每个条款返回「已覆盖 / 覆盖较弱 / 未应答」三档状态。判定口径为条款字符二元组与全文正文字符二元组的重合率，低于阈值（默认{" "}
-            {(summary?.threshold ?? 0.25).toFixed(2)}，即{" "}
-            {Math.round((summary?.threshold ?? 0.25) * 100)}%）视为覆盖较弱。此端点
+            {fallbackThreshold.toFixed(2)}，即{" "}
+            {Math.round(fallbackThreshold * 100)}%）视为覆盖较弱。此端点
             <Text strong>确定性</Text>（不调 AI），仅依赖已有的大数据废标检查结果。
           </>
         }
@@ -222,8 +227,8 @@ export default function RejectionCoverageTab({ projectId }: RejectionCoverageTab
               <Tag color="red">未应答 {summary.emptyCount}</Tag>
               <Tag>应答正文总字数 {summary.fullChars}</Tag>
               <Tag>
-                覆盖率阈值 {(summary.threshold ?? 0.25).toFixed(2)}（
-                {Math.round((summary.threshold ?? 0.25) * 100)}%）
+                覆盖率阈值 {(summary.threshold ?? fallbackThreshold).toFixed(2)}（
+                {Math.round((summary.threshold ?? fallbackThreshold) * 100)}%）
               </Tag>
             </Space>
 

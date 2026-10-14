@@ -60,40 +60,64 @@ service = AIProviderService()
 
 @pytest.fixture(autouse=True)
 def clean_history():
-    """每个测试前备份配置与历史记录，测试结束后恢复原状
+    """每个测试前备份配置/历史/厂商配置/Profile，测试结束后恢复原状
 
     BUG 修复：原实现仅 DELETE provider_history 且不恢复 ai_config，
     测试内的 DELETE+INSERT ai_config（如 '空配置'/'None' 测试值）会直接
     污染真实数据库，导致用户"最后保存并应用的厂商平台"被覆盖，
     目录生成读取到错误配置（历史故障根因之一）。
     现改为：测试前备份 → 测试后恢复（而非清空）。
+
+    TEST-ISO 修复（2026-10-14）：降级链 `get_provider_priority_order` 的第 1.5 层
+    来自 `text_provider_configs`（带 key 的备选厂商）、第 2 层来自 `ai_profiles`
+    （默认 Profile）、第 1 层来自 `ai_config` 主配置。本文件多条断言按「主配置=内置
+    默认 agnes + 无备选 → 链长恰为 6（去重 agnes 后 1 主 + 5 内置）」写死，但原
+    fixture 只隔离 provider_history/ai_config —— 全量运行时有其它测试文件（
+    test_text_model_config_*、test_text_config_*）先写入 text_provider_configs /
+    ai_profiles 且不回滚，这些残留行进入降级链后被计成「无 last_used_at」条目，
+    使链长变为 15，15 条断言红（单独运行本文件却全绿）。补齐：对这四张表统一
+    备份→清空→恢复，令降级链在任意运行顺序下都确定，且不破坏真实用户数据。
     """
+    import sqlite3
+
+    _ISOLATED_TABLES = ("provider_history", "text_provider_configs", "ai_profiles")
+    backup: dict[str, list[dict]] = {}
     with get_db() as conn:
-        conn.row_factory = __import__("sqlite3").Row
-        _backup_history = [dict(r) for r in conn.execute("SELECT * FROM provider_history").fetchall()]
+        conn.row_factory = sqlite3.Row
+        for tbl in _ISOLATED_TABLES:
+            backup[tbl] = [dict(r) for r in conn.execute(f"SELECT * FROM {tbl}").fetchall()]
+        # ai_config 主配置：备份并在测试期清空，使 get_ai_config 回落内置默认（agnes），
+        # 从而与内置兜底 agnes 去重、链长确定为 6；测试结束后按原值恢复。
         _backup_config = None
         row = conn.execute("SELECT * FROM ai_config WHERE id = 1").fetchone()
         if row is not None:
             _backup_config = dict(row)
-        conn.execute("DELETE FROM provider_history")
+        for tbl in _ISOLATED_TABLES:
+            conn.execute(f"DELETE FROM {tbl}")
+        conn.execute("DELETE FROM ai_config")
         conn.commit()
+    # 清缓存：避免上一测试/其它文件残留的内存配置污染本测试看到的降级链
+    clear_ai_config_cache()
     yield
     with get_db() as conn:
-        conn.execute("DELETE FROM provider_history")
-        if _backup_history:
-            cols = list(_backup_history[0].keys())
-            placeholders = ", ".join("?" * len(cols))
-            col_names = ", ".join(cols)
-            conn.executemany(
-                f"INSERT INTO provider_history ({col_names}) VALUES ({placeholders})",
-                [tuple(h[c] for c in cols) for h in _backup_history],
-            )
+        conn.row_factory = sqlite3.Row
+        for tbl in _ISOLATED_TABLES:
+            conn.execute(f"DELETE FROM {tbl}")
+            rows = backup.get(tbl) or []
+            if rows:
+                cols = list(rows[0].keys())
+                placeholders = ", ".join("?" * len(cols))
+                col_names = ", ".join(cols)
+                conn.executemany(
+                    f"INSERT INTO {tbl} ({col_names}) VALUES ({placeholders})",
+                    [tuple(r[c] for c in cols) for r in rows],
+                )
         # 恢复 ai_config（若测试期间被修改/删除）
+        conn.execute("DELETE FROM ai_config")
         if _backup_config is not None:
             cols = list(_backup_config.keys())
             placeholders = ", ".join("?" * len(cols))
             col_names = ", ".join(cols)
-            conn.execute("DELETE FROM ai_config")
             conn.execute(
                 f"INSERT INTO ai_config ({col_names}) VALUES ({placeholders})",
                 tuple(_backup_config[c] for c in cols),

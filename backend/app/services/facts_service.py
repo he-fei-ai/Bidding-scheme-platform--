@@ -30,6 +30,7 @@ consistency_repair 真实 import，不会再退化为死模块。
 
 import json
 import logging
+import os
 import re
 from typing import Any
 
@@ -885,3 +886,176 @@ def select_facts_for_section(
         seen.add(i)
         result.append(f)
     return result
+
+
+# ============================================================
+# 九、全局事实增强开关与两阶段消费工具（2026-10-14 facts-ns P0/P1）
+# ============================================================
+# 对齐易标（OpenBidKit）全局事实全流程：本节提供
+#   1. 环境变量开关（默认全部保持现有行为，与既有 AUTO_FALLBACK_CHARTS
+#      等开关同一读法；调用时读取而非 import 时固化，便于测试覆盖）；
+#   2. 编排阶段「AI 只看标题选事实」的标题清单与按标题取全文的解析正本；
+#   3. omit/placeholder 模式向正文传播的「完整性指令」正本。
+
+
+def _env_flag(name: str, default: str = "0") -> bool:
+    """布尔环境变量开关：默认关（保持现有行为）；设为 1/true/on/yes 开启。"""
+    raw = str(os.getenv(name, default) or default).strip().lower()
+    return raw not in {"", "0", "false", "off", "no"}
+
+
+def orchestrated_select_enabled() -> bool:
+    """P0：编排阶段 AI 选事实标题通道（FACTS_ORCHESTRATED_SELECT_ENABLED，默认关）。
+
+    开启后编排 plan 增加 facts.titles，正文生成优先按选定标题取全文注入，
+    未选定/未命中时回退 `select_facts_for_section` 确定性打分筛选。
+    """
+    return _env_flag("FACTS_ORCHESTRATED_SELECT_ENABLED")
+
+
+def segmented_extraction_enabled() -> bool:
+    """P1-1：超长招标文件分段提取（FACTS_SEGMENTED_EXTRACTION_ENABLED，默认关）。
+
+    开启后源文本超过 `facts_segment_token_cap()` 时按段提取→归并，
+    不再被 truncate_to_tokens 静默截断丢内容；单段文件行为不变。
+    """
+    return _env_flag("FACTS_SEGMENTED_EXTRACTION_ENABLED")
+
+
+def facts_segment_token_cap() -> int:
+    """P1-1：分段提取的单段 token 预算（FACTS_SEGMENT_TOKEN_CAP，默认 20000）。"""
+    raw = os.getenv("FACTS_SEGMENT_TOKEN_CAP", "20000")
+    try:
+        cap = int(raw)
+    except (TypeError, ValueError):
+        cap = 20000
+    return cap if cap > 0 else 20000
+
+
+def outline_input_enabled() -> bool:
+    """P1-2：目录标题树作为事实提取输入（FACTS_OUTLINE_INPUT_ENABLED，默认关）。
+
+    对齐易标「先目录后事实」：目录只约束事实的大项范围，不反向消费事实。
+    """
+    return _env_flag("FACTS_OUTLINE_INPUT_ENABLED")
+
+
+def completeness_instruction_enabled() -> bool:
+    """P1-3：omit/placeholder 正文完整性指令（FACTS_COMPLETENESS_INSTRUCTION_ENABLED，默认关）。"""
+    return _env_flag("FACTS_COMPLETENESS_INSTRUCTION_ENABLED")
+
+
+def content_repair_max_attempts() -> int:
+    """P1-4：AI 补丁修复失败回喂重试上限（CONSISTENCY_REPAIR_MAX_ATTEMPTS，默认 1=现行为）。"""
+    raw = os.getenv("CONSISTENCY_REPAIR_MAX_ATTEMPTS", "1")
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        n = 1
+    return max(1, min(n, 5))
+
+
+#: 编排标题清单的条数上限（易标：编排只看标题，token 成本≈事实全文 1/10）
+FACTS_TITLES_CATALOG_MAX = 120
+#: 编排单节可选事实标题上限（防止 AI 整单全选把注入预算打爆）
+FACTS_TITLES_PER_SECTION_MAX = 12
+
+
+def fact_title_of(fact: Any) -> str:
+    """取一条事实的「标题」（与正文注入格式同一口径：label 优先，兜底 key/title）。"""
+    if not isinstance(fact, dict):
+        return ""
+    return str(fact.get("label") or fact.get("title") or fact.get("key") or "").strip()
+
+
+def fact_titles_for_orchestration(facts: Any, max_items: int = FACTS_TITLES_CATALOG_MAX) -> list[str]:
+    """事实列表 → 去重保序的标题清单（供编排阶段 AI 选择，不含 value）。
+
+    易标对照：contentGenerationTask.cjs 的 globalFactTitlesText（编排时只能选
+    标题，不输出具体变量内容）。
+    """
+    titles: list[str] = []
+    seen: set[str] = set()
+    for f in facts or []:
+        t = fact_title_of(f)
+        if not t or t in seen:
+            continue
+        seen.add(t)
+        titles.append(t)
+        if len(titles) >= max_items:
+            break
+    return titles
+
+
+def _normalize_title_key(value: str) -> str:
+    """标题匹配用的归一化：去空白（含全角空格）与尾部标点，大小写不敏感。"""
+    return re.sub(r"[\s\u3000]+", "", str(value or "")).strip("：:、,.").lower()
+
+
+def resolve_facts_by_titles(
+    titles: Any,
+    facts: Any,
+    max_items: int = FACTS_SELECT_MAX,
+) -> list:
+    """按编排选定的事实标题取出完整事实条目（两阶段消费的程序侧）。
+
+    易标对照：contentGenerationTask.cjs 的 resolveGlobalFactsByTitles。
+    匹配策略：归一化精确匹配（label/key 任一命中）优先，其次互包含模糊匹配；
+    AI 幻觉出的清单外标题一律丢弃（与 knowledge.item_ids 白名单同一安全思路）。
+    无命中返回空列表，由调用方回退确定性打分筛选。
+    """
+    if not isinstance(titles, list) or not titles or not isinstance(facts, list) or not facts:
+        return []
+    wanted = [str(t).strip() for t in titles if str(t).strip()]
+    if not wanted:
+        return []
+    # 预建归一化索引：title_key -> facts 下标（同一标题只认首条，与标题唯一性约定一致）
+    exact: dict[str, int] = {}
+    norm_facts: list[tuple[str, int]] = []  # (归一化标题, 下标)
+    for i, f in enumerate(facts):
+        t = fact_title_of(f)
+        if not t:
+            continue
+        k = _normalize_title_key(t)
+        if k and k not in exact:
+            exact[k] = i
+        norm_facts.append((k, i))
+
+    picked: list[dict] = []
+    used: set[int] = set()
+    for w in wanted:
+        if len(picked) >= max_items:
+            break
+        kw = _normalize_title_key(w)
+        idx = exact.get(kw)
+        if idx is None and len(kw) >= 2:
+            # 模糊兜底：标题被 AI 抛写成前/后缀变体（如多/少「（日历天）」）时互包含命中
+            cands = [i for k, i in norm_facts if k and (kw in k or k in kw)]
+            idx = cands[0] if cands else None
+        if idx is None or idx in used:
+            continue
+        used.add(idx)
+        picked.append(facts[idx])
+    return picked
+
+
+#: omit/placeholder 模式下追加到正文 system 的「完整性指令」正本
+#: （易标对照：buildContentFactCompletenessInstruction(globalFactsMode)）
+CONTENT_COMPLETENESS_INSTRUCTIONS: dict[str, str] = {
+    "fabricate": "",
+    "omit": (
+        "【缺值口径铁律】本项目采用「不编造」事实策略：事实变量中含“按招标文件要求/按合同约定”"
+        "等笼统承诺表述的条目，正文引用时必须沿用同样笼统口径，严禁自行补出具体工期天数、"
+        "人员姓名、品牌型号、金额日期等具体值；也不得在不同章节给出不同的笼统说法。"
+    ),
+    "placeholder": (
+        "【缺值口径铁律】本项目采用「留占位」事实策略：事实变量中以「【待填写】」开头的条目，"
+        "正文涉及时必须原样写「【待填写：事项名】」占位，严禁编造具体值顶替；"
+        "未涉及的事项不要主动铺占位符。"
+    ),
+}
+
+
+def content_completeness_instruction(policy: Any) -> str:
+    """按缺失值策略返回正文「完整性指令」；fabricate/非法值返回空串（行为不变）。"""
+    return CONTENT_COMPLETENESS_INSTRUCTIONS.get(normalize_facts_policy(policy), "")

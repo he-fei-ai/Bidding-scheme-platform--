@@ -9,16 +9,22 @@ from ...utils.json_parser import extract_json_from_text
 from ...utils.scoring_points import is_scoring_placeholder, strip_scoring_placeholders
 from ..facts_service import (
     DEFAULT_FACTS_POLICY,
+    dedup_key,
     dict_to_fact_items,
     fact_extract_system_prompt,
+    facts_segment_token_cap,
+    is_placeholder_value,
     normalize_fact_items,
     normalize_facts_policy,
+    segmented_extraction_enabled,
 )
 from .prompts import (
     assemble_prompt_context,
+    estimate_tokens,
     get_prompt,
     render_prompt,
     sanitize_prompt_value,
+    split_into_token_capped_chunks,
     truncate_to_tokens,
 )
 
@@ -343,22 +349,93 @@ async def extract_global_facts(
         + extra_context
     )
 
+    # P1-1（facts-ns 2026-10-14，对齐易标分段提取管线）：开关开启且招标原文超过
+    # 分段预算时，不再由 _safe_tender_context 静默截断后单次提取，而是逐段提取、
+    # 跨段归并。开关默认关或原文未超预算 → segments 恒为单元素 → 下方原有单次
+    # 调用路径逐字不变（含与其余解析任务共享的缓存前缀）。
+    _segments = [tender_context]
+    if segmented_extraction_enabled():
+        _seg_cap = facts_segment_token_cap()
+        if estimate_tokens(tender_context) > _seg_cap:
+            _segments = split_into_token_capped_chunks(tender_context, _seg_cap)
+
     try:
-        result = await collect_json_response(
-            provider,
-            [
-                AIMessage(role="system", content=ANALYSIS_SYSTEM),
-                AIMessage(role="user", content=ctx_block),
-                AIMessage(role="user", content=sys_prompt),
-                AIMessage(role="user", content=task_context),
-            ],
-            temperature=0.3,
-            max_retries=1,
-        )
-        if isinstance(result, dict):
-            items = _dict_to_fact_items(result)
+        if len(_segments) > 1:
+            items = []
+            _seen_keys: dict[str, int] = {}
+            _failed_segments = 0
+            for _idx, _seg in enumerate(_segments, 1):
+                _seg_ctx_block = get_prompt(
+                    "ANALYSIS_CONTEXT_BLOCK",
+                    CONTEXT=_safe_tender_context(_seg),
+                    sanitize=True,
+                    desensitize=True,
+                )
+                _seg_task_context = (
+                    f"（注意：上方核心招标原文是全量文件切分后的第 {_idx}/{len(_segments)} 个分段，"
+                    "只提取本分段有明确依据的事实；本分段没有提及不代表整份文档没有提及，"
+                    "不要因某项信息未在本段出现而放弃提取）\n\n" + task_context
+                )
+                try:
+                    _seg_result = await collect_json_response(
+                        provider,
+                        [
+                            AIMessage(role="system", content=ANALYSIS_SYSTEM),
+                            AIMessage(role="user", content=_seg_ctx_block),
+                            AIMessage(role="user", content=sys_prompt),
+                            AIMessage(role="user", content=_seg_task_context),
+                        ],
+                        temperature=0.3,
+                        max_retries=1,
+                    )
+                    if isinstance(_seg_result, dict):
+                        _seg_items = _dict_to_fact_items(_seg_result)
+                    else:
+                        _seg_items = _seg_result if isinstance(_seg_result, list) else []
+                except Exception as _seg_e:
+                    _failed_segments += 1
+                    logger.warning(
+                        "[全局事实] 第 %d/%d 分段提取失败（跳过该段，继续其余分段）: %s",
+                        _idx, len(_segments), _seg_e,
+                    )
+                    continue
+                # 跨段归并：同 key 首次出现保留；已存在但值为占位符、新段给出
+                # 实值时替换（与 routers/facts.py /generate 分段归并同一口径）。
+                for _it in _seg_items:
+                    if not isinstance(_it, dict):
+                        continue
+                    _k = dedup_key(_it)
+                    if _k in _seen_keys:
+                        _pos = _seen_keys[_k]
+                        _old = items[_pos]
+                        if is_placeholder_value(_old.get("value", "")) and not is_placeholder_value(_it.get("value", "")):
+                            items[_pos] = _it
+                    else:
+                        _seen_keys[_k] = len(items)
+                        items.append(_it)
+            if _failed_segments == len(_segments):
+                raise RuntimeError(f"全部 {len(_segments)} 个分段提取均失败")
+            if _failed_segments:
+                logger.warning(
+                    "[全局事实] 共 %d 个分段，其中 %d 个分段提取失败已跳过，结果可能不完整",
+                    len(_segments), _failed_segments,
+                )
         else:
-            items = result if isinstance(result, list) else []
+            result = await collect_json_response(
+                provider,
+                [
+                    AIMessage(role="system", content=ANALYSIS_SYSTEM),
+                    AIMessage(role="user", content=ctx_block),
+                    AIMessage(role="user", content=sys_prompt),
+                    AIMessage(role="user", content=task_context),
+                ],
+                temperature=0.3,
+                max_retries=1,
+            )
+            if isinstance(result, dict):
+                items = _dict_to_fact_items(result)
+            else:
+                items = result if isinstance(result, list) else []
     except Exception as e:
         logger.warning("[全局事实] 提取异常，返回空列表: %s", e)
         items = []

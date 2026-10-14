@@ -1030,6 +1030,25 @@ def ensure_enhancement_tables():
         conn.commit()
         logger.info("[OK] text_provider_configs 表已创建（按厂商隔离的文本模型配置）")
 
+        # 37. text_provider_configs 增补 timeout 列（P1-CFG，2026-10-14）
+        # 缺口：主配置 ai_config 有 timeout 列（db.py `_ensure_column`）且被
+        # provider_factory.create_provider 读取，但 `/ai/config` 请求模型里没有该
+        # 字段、SQL 也不写 → 死列；厂商级配置更是连列都没有。导致「超时」在文本模型
+        # 配置模块完全不可调：无论厂商怎么配，实际都是硬编码的 120s。
+        # 幂等（_ensure_column 语义）：已存在则跳过；旧库首次启动自动补齐，缺列时
+        # 读侧由 `_provider_view`/provider_factory 统一以 120 兜底。
+        try:
+            _tpc_cols = {r[1] for r in conn.execute("PRAGMA table_info(text_provider_configs)")}
+            if "timeout" not in _tpc_cols:
+                conn.execute(
+                    "ALTER TABLE text_provider_configs "
+                    "ADD COLUMN timeout INTEGER NOT NULL DEFAULT 120"
+                )
+                conn.commit()
+                logger.info("[OK] text_provider_configs 新增 timeout 列")
+        except Exception as _e:
+            logger.debug("[silent-except] db_migrations.py: text_provider_configs.timeout - %s", _e)
+
         # 从旧 ai_config 迁移数据到 text_provider_configs（如果存在且尚未迁移）
         existing = conn.execute("SELECT COUNT(*) FROM text_provider_configs").fetchone()[0]
         if existing == 0:

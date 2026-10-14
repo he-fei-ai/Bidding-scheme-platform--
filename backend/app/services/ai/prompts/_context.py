@@ -25,6 +25,12 @@ DEFAULT_PRIORITIES: dict[str, int] = {
     "OUTLINE": 85,                # 目录树
     "CHART_INSTRUCTIONS": 80,     # 图表编排决策/指令
     "INDUSTRY_PROFILE": 75,       # 行业画像
+    # BUG-FIX-PROMPT-G5（优先级缺失 2026-10-14）：PROJECT_SCOPE（承包范围）是
+    # build_context_block 的核心片段之一，却从未列入本表，之前静默回落到
+    # 魔法默认值 50——低于 INDUSTRY_PROFILE/CONTEXT/BOQ_ANALYSIS/CONSTRUCTION_METHOD
+    # 等所有具名片段，导致预算收紧时「界定项目边界」的承包范围反而最先被截断/丢弃。
+    # 显式置于 72（行业画像之下、通用 CONTEXT/BOQ 之上），与其实质重要性对齐。
+    "PROJECT_SCOPE": 72,          # 承包范围：界定项目边界，核心上下文
     "CONTEXT": 70,                # 通用上下文
     "BOQ_ANALYSIS": 70,           # 工程量清单分析
     "WORK_INTERFACE": 65,         # 工作面接口
@@ -34,19 +40,27 @@ DEFAULT_PRIORITIES: dict[str, int] = {
 
 
 def estimate_tokens(text: str) -> int:
-    """粗略 token 估算：CJK 按字符计、其余按 ~4 字符 ≈ 1 token。
+    """Token 估算：tiktoken 精确计数（可用时）→ CJK 启发式回退。
 
-    仅用于预算裁剪，非精确计费；误差在 ±30% 内对截断决策足够。
+    用于预算裁剪与监控指标。
 
-    BUG-FIX-PROMPT-C3（性能）：原用 ``len(re.findall(r"[一-鿿]", text))``。
-    二分截断会对同一段长文本反复调用本函数（O(log n) 次），findall 需要
-    物化全部匹配项，20k 字符实测 3.3ms/次，整轮截断累计数百毫秒。
-    改用 str.translate + 预建删除表（只做长度差，不物化匹配列表），
-    语义完全等价，实测 1.4ms/次，约 2.4x 提速。
+    ENHANCE 2026-10-11（遗留项3）：tiktoken 已安装时使用精确编码器计数，
+    消除 ±30% 启发式误差。tiktoken 不可用时无缝回退到既有启发式
+    （CJK 按字符计、其余 ~4 字符 ≈ 1 token），保证环境间行为一致。
+
+    性能：tiktoken 对 20k 字符编码 ~0.5ms（C 扩展），比启发式 translate
+    (~1.4ms) 更快且精确。短文本（<200 字符）两者差异可忽略，
+    但 tiktoken 精度对预算裁剪决策更可靠（避免过度截断或预算超支）。
     """
     if not text:
         return 0
-    # 预建 CJK 统一表（translate 中映射为 None 即删除该字符）
+    # 优先使用 tiktoken 精确计数（可用时）
+    if _TIKTOKEN_ENCODER is not None:
+        try:
+            return len(_TIKTOKEN_ENCODER.encode(text))
+        except Exception:
+            pass  # 编码异常（如代理字符）→ 回退启发式
+    # 启发式回退：CJK 按字符计、其余 ~4 字符 ≈ 1 token
     non_cjk_len = len(text.translate(_CJK_DELETE_TABLE))
     cjk = len(text) - non_cjk_len
     return cjk + (non_cjk_len + 3) // 4
@@ -57,6 +71,17 @@ _TRUNCATION_MARKER = "\n…（内容因 Token 预算已截断）"
 
 # CJK 统一表删除映射：覆盖 CJK 统一表意文字与扩展 A（与原正则 [一-鿿] 一致）
 _CJK_DELETE_TABLE = {c: None for c in range(0x4E00, 0x9FFF + 1)}
+
+# ENHANCE 2026-10-11（遗留项3）：tiktoken 精确编码器（可用时）。
+# tiktoken 不可用时为 None，estimate_tokens 无缝回退到 CJK 启发式。
+# 使用 cl100k_base 编码（GPT-4/4o 系列），对中英文混合文本计数最准确。
+_TIKTOKEN_ENCODER = None
+try:
+    import tiktoken as _tiktoken_mod
+
+    _TIKTOKEN_ENCODER = _tiktoken_mod.get_encoding("cl100k_base")
+except Exception:
+    _TIKTOKEN_ENCODER = None
 
 # 边界片段被截断后，至少要保留的正文 token 数。
 # 低于此值时「【名称】+ 截断标记」没有信息量，不如整段丢弃，把预算留给下轮。
@@ -211,11 +236,66 @@ def truncate_to_tokens(text: str, max_tokens: int) -> str:
     return _fit_to_token_budget(text, max_tokens, "", "") or ""
 
 
+def split_into_token_capped_chunks(text: str, max_tokens: int) -> list[str]:
+    """把长文本按行边界切分为若干段，每段 estimate_tokens 不超过 max_tokens。
+
+    ENHANCE 2026-10-14（facts-ns P1-1，对齐易标 globalFactsTask.cjs 分段提取管线）：
+    超长招标文件以前被 `truncate_to_tokens` **静默截断**——超出预算的部分直接
+    丢失（尾部章节的售后/培训/质保承诺类事实系统性缺失）。现按段切分后逐段
+    送 AI 提取、程序侧归并，不再丢内容。
+
+    切分策略：
+      - 优先在换行边界断开（保持段落语义完整，Markdown 标题不会被拦腰切）；
+      - 单行超预算时按 token 预算二分硬切（极端长行兜底）；
+      - 文本本身不超预算时原样返回单元素列表（调用方可直接判断 len>1 走分段路径，
+        正常长度文件行为与从前完全一致）。
+    """
+    if not text:
+        return []
+    if estimate_tokens(text) <= max_tokens or max_tokens <= 0:
+        return [text]
+
+    chunks: list[str] = []
+    buf: list[str] = []
+    buf_tokens = 0
+
+    def _flush() -> None:
+        nonlocal buf, buf_tokens
+        if buf:
+            chunks.append("\n".join(buf))
+            buf = []
+            buf_tokens = 0
+
+    for line in text.split("\n"):
+        line_tokens = estimate_tokens(line) + 1  # +1 为换行符成本
+        # 单行自身超预算：先冲掉已缓冲内容，再对该行按预算二分硬切
+        if line_tokens > max_tokens:
+            _flush()
+            remaining = line
+            while remaining and estimate_tokens(remaining) > max_tokens:
+                cut = _fit_to_token_budget(remaining, max_tokens, "", "")
+                if not cut:
+                    break
+                chunks.append(cut)
+                remaining = remaining[len(cut):]
+            if remaining:
+                buf.append(remaining)
+                buf_tokens = estimate_tokens(remaining) + 1
+            continue
+        if buf and buf_tokens + line_tokens > max_tokens:
+            _flush()
+        buf.append(line)
+        buf_tokens += line_tokens
+    _flush()
+    return chunks
+
+
 __all__ = [
     "DEFAULT_PRIORITIES",
     "estimate_tokens",
     "assemble_prompt_context",
     "truncate_to_tokens",
+    "split_into_token_capped_chunks",
     "build_chapter_context",
 ]
 

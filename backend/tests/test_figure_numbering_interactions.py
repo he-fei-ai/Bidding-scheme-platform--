@@ -68,9 +68,15 @@ class TestFigureCounterScoping:
         assert export_mod._next_figure_number("3.2", 7) == "图3-1"
         assert export_mod._next_figure_number("3.2", 7) == "图3-2"
 
-    def test_new_parent_resets_seq_but_keeps_chapter(self):
+    def test_same_chapter_parents_share_continuous_seq(self):
+        """同章不同子节共用一条连续计数器（图号「图{章号}-{序号}」按章连续）。
+
+        BUG-FIX 2026-10-14：旧实现分桶键用完整 parent_section，导致 "3.2"→图3-1
+        后 "3.5"→又图3-1（同章重号，即需求「编号冲突」）。现统一按截断章号分桶，
+        同章恒连续：3.2→图3-1、3.5→图3-2。生产主路径传纯章号，行为不变。
+        """
         assert export_mod._next_figure_number("3.2", 7) == "图3-1"
-        assert export_mod._next_figure_number("3.5", 7) == "图3-1"
+        assert export_mod._next_figure_number("3.5", 7) == "图3-2"
 
     def test_cross_project_isolation(self):
         """并发导出串号回归：项目 7 与项目 8 的计数互不影响"""
@@ -113,7 +119,7 @@ class TestFigureNumberRewind:
     def test_rewind_on_first_number_removes_bucket(self):
         export_mod._next_figure_number("2.1", 5)
         export_mod._rewind_figure_number("2.1", 5)
-        assert "5|2.1" not in export_mod._figure_counter_state
+        assert "5|2" not in export_mod._figure_counter_state
         assert export_mod._next_figure_number("2.1", 5) == "图2-1"
 
     def test_rewind_is_project_scoped(self):
@@ -180,8 +186,8 @@ class TestInlineChartNumberingIntegration:
         # 成功那张图拿到 图3-1（未被失败图占掉）
         caption_lines = [t for t in texts if t.startswith("图3-")]
         assert caption_lines and caption_lines[0].startswith("图3-1"), caption_lines
-        # 计数器最终只推进 1 格（失败图未占号）
-        assert export_mod._figure_counter_state.get("7|3.1") == 1, (
+        # 计数器最终只推进 1 格（失败图未占号）；分桶键按截断章号归一（图3-x→"3"）
+        assert export_mod._figure_counter_state.get("7|3") == 1, (
             export_mod._figure_counter_state
         )
 

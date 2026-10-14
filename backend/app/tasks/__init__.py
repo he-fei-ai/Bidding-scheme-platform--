@@ -37,7 +37,26 @@ def parse_and_extract_file(self, file_path: str, project_id: int, file_id: int, 
             project_id, file_id, str(file_path), Path(file_path).name,
             Path(file_path).suffix.lower(), create_task_row=create_task_row,
         )
-        return {'status': status, 'file_id': file_id, 'text_length': 0}
+        # BUG-FIX 2026-10-14：text_length 此前是硬编码 0（stub 未接线的漏网
+        # 之鱼）。无 broker 环境下 dispatch_task 降级为进程内直调（inline），
+        # 调用方（async-reparse 端点）据返回体 text_length 判断是否真解析出内容，
+        # 恒为 0 会让“解析成功但长度 0”的假终态外泄。改为读回落盘文本的真实
+        # 长度；_persist_file_extraction 仅非空文本才落盘，空文本保持 0，口径一致。
+        text_length = 0
+        try:
+            from ..db import get_db
+            with get_db(readonly=True) as conn:
+                _row = conn.execute(
+                    "SELECT extracted_text_path FROM uploaded_files "
+                    "WHERE id = ? AND project_id = ?",
+                    (file_id, project_id),
+                ).fetchone()
+            _stored = (_row["extracted_text_path"] if _row else "") or ""
+            if _stored and Path(_stored).exists():
+                text_length = len(Path(_stored).read_text(encoding="utf-8"))
+        except Exception as _len_e:
+            logger.debug("回读提取文本长度失败（忽略）file=%s: %s", file_path, _len_e)
+        return {'status': status, 'file_id': file_id, 'text_length': text_length}
     except Exception as exc:
         logger.error('文件解析失败: %s, 错误: %s', file_path, exc, exc_info=True)
         try:
@@ -109,7 +128,9 @@ def generate_section_content(self, project_id: int, section_ids: list[int], writ
             placeholders = ','.join(('?' for _ in section_ids))
             with get_db() as conn:
                 section_rows = conn.execute(f'SELECT id, title, level, section_type, target_words FROM sections WHERE id IN ({placeholders}) AND project_id = ?', (*section_ids, project_id)).fetchall()
-                analysis_row = conn.execute('SELECT summary_json, scoring_points_json, global_facts_json FROM analysis WHERE project_id = ?', (project_id,)).fetchone()
+                # ENHANCE 2026-10-14（facts-ns P1-3）：补读 facts_policy，Celery 生成路径
+                # 与 SSE 主链路同一口径下发缺值策略（开关默认关，行为不变）。
+                analysis_row = conn.execute("SELECT summary_json, scoring_points_json, global_facts_json, COALESCE(facts_policy, 'fabricate') AS facts_policy FROM analysis WHERE project_id = ?", (project_id,)).fetchone()
                 project_row = conn.execute('SELECT industry FROM projects WHERE id = ?', (project_id,)).fetchone()
             if not section_rows:
                 return {'status': 'completed', 'total': 0, 'completed': 0, 'failed': 0}
@@ -189,6 +210,8 @@ def generate_section_content(self, project_id: int, section_ids: list[int], writ
                         "content_type": row["section_type"] or "text",
                         "project_id": project_id,
                         "extract_charts": False,
+                        # ENHANCE 2026-10-14（facts-ns P1-3）：缺值策略透传
+                        "facts_policy": (analysis_row['facts_policy'] if analysis_row and 'facts_policy' in analysis_row.keys() else 'fabricate') or 'fabricate',
                     }
                     result = await _generate(provider, _task_section, _task_context)
                     content = result if isinstance(result, str) else (result or {}).get('content', '')

@@ -265,9 +265,12 @@ class TestFigureNumberGuard:
     def test_normal_numbering_unchanged(self):
         from app.services.export import _next_figure_number
 
+        # 纯章号按章连续递增（生产主路径）
         assert _next_figure_number("3", 90061) == "图3-1"
         assert _next_figure_number("3", 90061) == "图3-2"
-        assert _next_figure_number("3.2", 90061) == "图3-1"
+        # BUG-FIX 2026-10-14：带点子节号同属第 3 章，与上方共用同一计数器
+        # （旧实现会另起新桶重号→图3-1）；现按章连续 → 图3-3。
+        assert _next_figure_number("3.2", 90061) == "图3-3"
 
 
 # ============================================================

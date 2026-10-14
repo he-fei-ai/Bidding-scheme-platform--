@@ -610,6 +610,36 @@ def scoring_status_meta(status: Any) -> dict[str, str]:
 
 
 # ============================================================================
+# 废标条款应答覆盖率状态（rejection_coverage.RejectionItem.status）
+# ============================================================================
+
+REJECTION_STATUS_COVERED = "covered"
+REJECTION_STATUS_WEAK = "weak"
+REJECTION_STATUS_EMPTY = "empty"
+
+#: 状态 → 展示文案/配色。
+#: ENHANCE 2026-10-13（第六轮·统一命名空间）：废标覆盖率的三档状态此前只存在于
+#: 前端 `RejectionCoverageTab.tsx` 的本地 `statusLabel` / `statusColor` 两张
+#: 写死表里，与后端零共享——和 2026-10-08（严重度）、2026-10-13（评分状态）
+#: 修掉的是同一类漂移，这是漏网的第三处。现收敛进命名空间并随
+#: `GET /consistency/rules` 下发，前端经 utils 映射消费。
+REJECTION_STATUS_META: dict[str, dict[str, str]] = {
+    REJECTION_STATUS_COVERED: {"label": "已覆盖", "color": "green"},
+    REJECTION_STATUS_WEAK: {"label": "覆盖较弱", "color": "orange"},
+    REJECTION_STATUS_EMPTY: {"label": "未应答", "color": "red"},
+}
+
+#: 未知废标状态的兜底展示（与评分状态同口径：不回落到真实状态，
+#: 避免把「后端新增了一档」伪装成「已覆盖」）。
+REJECTION_STATUS_UNKNOWN_META: dict[str, str] = {"label": "未知", "color": "default"}
+
+
+def rejection_status_meta(status: Any) -> dict[str, str]:
+    """废标应答状态的文案/配色；未知/空状态安全降级为中性标签。"""
+    return REJECTION_STATUS_META.get(str(status or ""), dict(REJECTION_STATUS_UNKNOWN_META))
+
+
+# ============================================================================
 # 对外暴露的规则快照
 # ============================================================================
 
@@ -715,5 +745,8 @@ def rules_payload() -> dict[str, Any]:
         },
         "rejection_coverage": {
             "coverage_weak": rejection_coverage_weak(),
+            # ENHANCE 2026-10-13（第六轮）：三档状态文案随快照下发，消除前端
+            # 本地硬编码副本（statusLabel / statusColor 两张写死表）。
+            "status_meta": REJECTION_STATUS_META,
         },
     }

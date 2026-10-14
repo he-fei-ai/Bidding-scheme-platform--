@@ -94,7 +94,21 @@ class ConsistencyAuditor:
         # 2026-09-29 修复的「安全标准」正则过宽同类）。现把岗位词一并捕获为前缀，
         # 抽取时按岗位拆分事实名（见 extract_facts_from_text），只有**同岗位**数量
         # 不一致才判冲突；裸「人员」（施工/作业等未列举岗位）仍归入「人员数量」。
-        "人员数量": r"(项目经理|技术负责人|技术人员|管理人员|作业人员|施工人员|人员)\s*[:：]?\s*(\d+)\s*人"
+        #
+        # BUG-FIX 2026-10-13（第六轮·P2·岗位分支两处口径遗漏，均经语料库实测确认）：
+        #   1. **漏报**：标签词与数值之间不允许「为/是/约」——「施工人员约 12 人」
+        #      「管理人员是 5 人」「技术负责人为 2 人」一个都抽不出。工期分支早在
+        #      2026-10-10 就补了 `(?:为|是|约)*`（「合同工期为 450 日历天」），
+        #      人员分支漏了同一处理。中文里「约」是人数表述的高频修饰，漏掉它等于
+        #      整类合法写法静默缺席（写错人数也不报冲突）。
+        #   2. **误报**：数值后缺负向断言——「技术人员 5 人天」「施工人员 3 人次」
+        #      「作业人员 2 人月」被当成人数抽走（人天/人次/人月/人年是**工时
+        #     单位**，不是人数）。总括分支 2026-10-11 已加
+        #      `(?!\s*[天次年月工时受死失遇被])`，岗位分支同样漏网。两处口径
+        #      现已对齐；抽取面放宽仅限「岗位词 + 间隔词 + 数字 + 人」这一形态，
+        #      不影响既有用例（语料库 test_consistency_fact_corpus 全量钉住）。
+        "人员数量": r"(项目经理|技术负责人|技术人员|管理人员|作业人员|施工人员|人员)"
+        r"\s*[:：]?\s*(?:为|是|约)*\s*(\d+)\s*人(?!\s*[天次年月工时受死失遇被])"
         # BUG-FIX 2026-10-11（P2·「本项目共 N 人」整类漏抽）：原式只有「岗位词 + 数字 + 人」
         # 一种写法，于是「本项目共 20 人参与施工」「合计 30 人到岗」这类**总括式**表述
         # 一个都抽不出来（中文里总括词在数字前、没有岗位词）。而自动修复侧的结构校验
@@ -402,8 +416,17 @@ class ConsistencyAuditor:
             )
             conflicts.append(conflict)
 
-        # 保存冲突到数据库
-        self._save_conflicts(project_id, conflicts)
+        # 保存冲突到数据库；`_save_conflicts` 会复用同名「已解决」历史行，
+        # 因此**实际落库的 conflict_id 可能与上面生成的不同**——把映射拿回来
+        # 回写进 Conflict 对象，保证审计响应 / 审计日志里的 ID 与数据库一致
+        # （BUG-FIX 2026-10-13 第六轮：此前复用时响应体里带回的是新生成的 ID，
+        # 客户端拿它调 `/fix-suggestion` / `/autofix` 会 404「未找到」——
+        # 冲突就在眼前，ID 却指向一条不存在的行）。
+        id_map = self._save_conflicts(project_id, conflicts)
+        for conflict in conflicts:
+            actual_id = id_map.get(conflict.fact_name)
+            if actual_id:
+                conflict.conflict_id = actual_id
 
         return conflicts
 
@@ -477,7 +500,7 @@ class ConsistencyAuditor:
             + "，可能存在不一致"
         )
 
-    def _save_conflicts(self, project_id: int, conflicts: list[Conflict]):
+    def _save_conflicts(self, project_id: int, conflicts: list[Conflict]) -> dict[str, str]:
         """保存冲突记录到数据库
 
         BUG-FIX 2026-09-18（高）：原实现是无条件 `INSERT`，配合「跨秒重复审计」
@@ -503,17 +526,31 @@ class ConsistencyAuditor:
         同时移除原 upsert 里的 `resolved = 0` 重置分支 —— 它是埋雷：一旦将来把
         conflict_id 改成稳定值，用户手动标记的「已解决」会在下一次审计被静默
         抹回「未解决」。
+
+        Returns:
+            `{fact_name: 实际落库的 conflict_id}`。复用历史行时该 ID 与传入
+            Conflict 对象里生成的 ID **不同**（BUG-FIX 2026-10-13 第六轮：
+            此前调用方不回写，审计响应与审计日志里带回不存在的 ID）。
         """
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         with get_db() as conn:
             # 1) 清理未解决的旧冲突（本次全量重扫后它们已过期）
+            # BUG-FIX 2026-10-13（第六轮·P1·误删 AI 审计发现）：此前的 DELETE
+            # 不带来源前缀，会把 AI 审计路径（`ai/workflows_expand.
+            # _persist_ai_audit_findings`）写入的 `AI-%` 行一并清掉 —— 而
+            # G1 修复的初衷正是让「生成时 AI 审计查了什么」可事后复查。两侧
+            # 口径不对称（AI 路径只清 `AI-%`，确定性路径却清全部）导致用户
+            # 点一次「开始审计」，生成时的 AI 发现就全部消失。现与 AI 路径
+            # 对齐：**各清各的**，`AI-%` 行由下一轮生成时审计自行轮换。
             conn.execute(
                 "DELETE FROM consistency_conflicts "
-                "WHERE project_id = ? AND COALESCE(resolved, 0) = 0",
+                "WHERE project_id = ? AND COALESCE(resolved, 0) = 0 "
+                "AND conflict_id NOT LIKE 'AI-%'",
                 (project_id,),
             )
 
             # 2) 已解决历史折叠：每个 fact_name 只保留最新一行（避免历史无限累加）
+            # 同上：折叠只作用于确定性路径自己的行，不碰 AI 审计的已解决历史。
             keep_ids = [
                 row[0]
                 for row in conn.execute(
@@ -526,6 +563,7 @@ class ConsistencyAuditor:
                                   ) AS rn
                            FROM consistency_conflicts
                            WHERE project_id = ? AND COALESCE(resolved, 0) = 1
+                                 AND conflict_id NOT LIKE 'AI-%'
                        ) WHERE rn = 1""",
                     (project_id,),
                 ).fetchall()
@@ -538,6 +576,9 @@ class ConsistencyAuditor:
                     f"AND conflict_id NOT IN ({placeholders})",
                     (project_id, *keep_ids),
                 )
+            # {fact_name: 实际落库的 conflict_id} —— 复用行时与生成 ID 不同，
+            # 由调用方回写进 Conflict 对象（见 `detect_conflicts` 的说明）。
+            id_map: dict[str, str] = {}
             for conflict in conflicts:
                 # BUG-FIX 2026-10-08：写库前归一化严重度，杜绝 `severity=''`
                 # 这类脏值（`severity` 列 NOT NULL 但**空串合法**，而
@@ -548,10 +589,13 @@ class ConsistencyAuditor:
                 sources_json = self._json_serialize(conflict.sources)
 
                 # 3) 复用同事实的「已解决」历史行（重新打开），避免重复行累加
+                # 只复用确定性路径自己的历史行：AI 发现的 fact_name 是自由文本
+                # （issue 原文），与事实名（工期/金额/…）理论上不撞，但显式排除
+                # `AI-%` 可从根本上杜绝「AI 已解决历史被确定性冲突重新打开」。
                 reused = conn.execute(
                     "SELECT conflict_id FROM consistency_conflicts "
                     "WHERE project_id = ? AND fact_name = ? AND COALESCE(resolved, 0) = 1 "
-                    "LIMIT 1",
+                    "AND conflict_id NOT LIKE 'AI-%' LIMIT 1",
                     (project_id, conflict.fact_name),
                 ).fetchone()
                 if reused is not None:
@@ -571,6 +615,7 @@ class ConsistencyAuditor:
                             project_id,
                         ),
                     )
+                    id_map[conflict.fact_name] = reused["conflict_id"]
                     continue
 
                 conn.execute(
@@ -589,6 +634,8 @@ class ConsistencyAuditor:
                         now_str,
                     ),
                 )
+                id_map[conflict.fact_name] = conflict.conflict_id
+        return id_map
 
     @staticmethod
     def _json_serialize(data) -> str:
@@ -616,6 +663,16 @@ class ConsistencyAuditor:
         Returns:
             (target_value, suggestion_text)。无可比冲突时两者皆 None。
         """
+        # BUG-FIX 2026-10-13（第六轮·P2·空取值不再走到 IndexError）：
+        # AI 审计发现的 values 恒为 `[]`。旧路径会继续往下走
+        # `Counter([]).most_common(1)[0]` → IndexError → 被
+        # `_load_suggestion_payload` 的兜底 except 吞成 (None, None) →
+        # 路由回 404「未找到修复建议」——冲突明明存在，却说「建议不存在」。
+        # 这里显式短路：空取值推不出目标值，两个都返回 None，由调用方决定
+        # 文案回退（见 `_load_suggestion_payload`）。
+        if not values:
+            return None, None
+
         baseline_value = None
         for value, source in zip(values, sources, strict=False):
             if str(source).startswith("global_facts"):
@@ -696,10 +753,11 @@ class ConsistencyAuditor:
             # 带回块外再取 values_json / sources_json / fact_name，有串列与读到残留内存
             # 的风险。这里在块内立即物化。同类修复：consistency_auditor.
             # _collect_fact_instances、consistency_repair._load_context。
-            raw_values = raw_sources = raw_fact_name = None
+            raw_values = raw_sources = raw_fact_name = raw_description = None
             if row:
                 raw_values = row["values_json"] or "[]"
                 raw_sources = row["sources_json"] or "[]"
+                raw_description = row["description"] if "description" in row.keys() else None
                 raw_fact_name = row["fact_name"] if "fact_name" in row.keys() else None
 
         import json
@@ -712,7 +770,25 @@ class ConsistencyAuditor:
                 sources = json.loads(raw_sources)
             except (json.JSONDecodeError, TypeError):
                 sources = []
-            return self._build_suggestion(values, sources, fact_name=raw_fact_name)
+            target_value, text = self._build_suggestion(
+                values, sources, fact_name=raw_fact_name
+            )
+            if target_value is None and text is None and not values and raw_description:
+                # BUG-FIX 2026-10-13（第六轮·P2·AI 语义发现的建议回退）：
+                # AI 审计写入的冲突没有结构化取值（`values_json='[]'`），
+                # 推不出「统一为 X」的目标值；但它**有**人类可读的 description
+                # （issue + 修复建议，由 `_persist_ai_audit_findings` 落库）。
+                # 旧行为是连文案一起回 (None, None) → 路由 404，用户点
+                # 「修复建议」只看到一句「未找到修复建议」，AI 给的修复方向
+                # 反而看不到。现回退为纯文本建议：`target_value=None` 使前端
+                # 「采纳建议并修复」保持禁用（没有可机器采纳的值），建议正文
+                # 照常展示，用户可据此人工处理。
+                text = (
+                    f"{raw_description}\n\n"
+                    "（该冲突为 AI 语义发现，无结构化取值、无法自动统一，"
+                    "请人工核对上述建议后处理）"
+                )
+            return target_value, text
         except Exception as e:
             logger.error("生成修复建议失败: %s", e)
             return None, None

@@ -15,7 +15,7 @@ import type {
   IndustryReference, AuditLog, OutlineReviewResult, ScoringItem,
   ChartType, ValidationResult,
   AIPProfile, UsageSummary, HealthProvider, DailyTrend, BudgetStatus,
-  TextProviderConfig, ImageProviderConfig,
+  TextProviderConfig, TextProviderSavePayload, ImageProviderConfig,
 } from "../types";
 
 // ========== 认证 Token 管理 ==========
@@ -2527,8 +2527,10 @@ export async function getTextProviderConfig(providerName: string): Promise<TextP
 }
 
 // 文本：保存单个厂商配置
-export async function saveTextProviderConfig(config: TextProviderConfig): Promise<void> {
-  await http.put(`/ai/provider-configs/${encodeURIComponent(config.provider_name)}`, config);
+// 入参用保存载荷类型 TextProviderSavePayload（镜像后端 TextProviderConfigData，
+// 不含服务端状态 is_active），此前误用响应类型 TextProviderConfig 导致调用方需强转、tsc 报错。
+export async function saveTextProviderConfig(payload: TextProviderSavePayload): Promise<void> {
+  await http.put(`/ai/provider-configs/${encodeURIComponent(payload.provider_name)}`, payload);
 }
 
 // 文本：激活厂商配置（同步到主表）
@@ -2559,11 +2561,14 @@ export async function activateImageProviderConfig(providerName: string): Promise
 }
 
 // 模型元数据自动获取（增强版：内置表 + API 获取）
+// provider_id（2026-10-14 新增，可选）：后端厂商目录下发的稳定 id，命中时按 id 查
+// 元数据表；不传则回退 provider（中文展示名），后者对部分厂商会匹配失败。
 export async function fetchModelInfo(data: {
   api_key: string;
   base_url: string;
   model: string;
   provider: string;
+  provider_id?: string;
 }): Promise<ModelInfo> {
   const res = await http.post<ModelInfo>("/ai/model-info", data);
   return res.data;
@@ -2584,13 +2589,21 @@ export async function clearAiConfigApiKey(): Promise<{ status: string }> {
 }
 
 // HARDENING 2026-10-11（G-5 前端集成）：查询配置变更审计日志（支持 action/target 过滤）
+//
+// BUGFIX（2026-10-14 接口契约对齐）：后端 `/ai/config-audit` 返回体是
+// `{ items: [...], total: n }`，而本函数此前把返回值声明成 `Array<...>` 并直接
+// `return res.data` —— 调用方 AIConfigPage.loadAudit 会把一个**对象**塞进 antd
+// `<Table dataSource={...}>`，渲染时抛错（dataSource 无 .map），审计页整块白屏。
+// 现按后端契约取 `items`，并对非预期形状做兜底，保证 dataSource 恒为数组。
 export async function getConfigAudit(params?: {
   limit?: number;
   action?: string;
   target?: string;
 }): Promise<Array<{ actor: string; action: string; target: string; detail: string; created_at: string }>> {
-  const res = await http.get("/ai/config-audit", { params });
-  return res.data;
+  const res = await http.get<{ items?: Array<Record<string, string>>; total?: number } | Array<Record<string, string>> | null>("/ai/config-audit", { params });
+  const data: any = res.data;
+  if (Array.isArray(data)) return data as Array<{ actor: string; action: string; target: string; detail: string; created_at: string }>;
+  return (data?.items ?? []) as Array<{ actor: string; action: string; target: string; detail: string; created_at: string }>;
 }
 
 // ========== AI 快速配置 ==========
@@ -2778,11 +2791,17 @@ export async function fetchPromptAlerts(): Promise<PromptAlertsResponse> {
   return res.data;
 }
 
-/** 同步硬编码提示词到数据库 */
+/** 同步硬编码提示词到数据库
+ * overwrite=true 时：仅新增缺失 key，并把「未被用户编辑过」的已存在行刷新为最新
+ *   硬编码（消除漂移），用户自定义过的行保留（kept_modified，仅刷新 default_content）。
+ * 返回四分类之和恒等于 total（BUG-PROMPT-R8 语义拆分，与后端对齐）。
+ */
 export async function syncHardcodePrompts(overwrite: boolean = false): Promise<{
   status: string;
   message: string;
   synced: string[];
+  refreshed: string[];
+  kept_modified: string[];
   skipped: string[];
   total: number;
 }> {
@@ -3254,7 +3273,15 @@ export interface ConsistencyRules {
     meta: Record<string, { label: string; color: string }>;
     coverage_weak: number;
   };
-  rejection_coverage: { coverage_weak: number };
+  rejection_coverage: {
+    coverage_weak: number;
+    /**
+     * ENHANCE 2026-10-13（第六轮）：废标应答三档状态文案随快照下发
+     * （后端 consistency_rules.REJECTION_STATUS_META），前端经
+     * utils.mapConsistencyRejectionStatus 消费，不再本地硬编码。
+     */
+    status_meta: Record<string, { label: string; color: string }>;
+  };
 }
 
 export async function getConsistencyRules(): Promise<ConsistencyRules> {
@@ -3282,7 +3309,14 @@ export interface AutoFixSection {
 }
 
 export interface AutoFixReport {
-  status: "ok" | "no_change";
+  /**
+   * ok=全部落文成功；partial=部分章节落文成功、个别章节被安全闸门拦下
+   * （冲突保持未解决待人工处理）；no_change=未定位到待替换值、什么都没改。
+   * BUG-FIX 2026-10-13（第六轮）：旧契约只有 ok/no_change 两态，而部分成功
+   * 场景被归进 no_change（「未做任何修改」）——与 message 里「已修改 N 个
+   * 章节」自相矛盾。后端现按 changed_sections 区分，前端同步补 third 态。
+   */
+  status: "ok" | "partial" | "no_change";
   success: boolean;
   dry_run: boolean;
   unified_value: string;
@@ -3393,7 +3427,11 @@ export async function getScoringCompliance(
     `/consistency/scoring-compliance/${projectId}`,
     {
       params: {
-        persist: opts.persist ?? true,
+        // BUG-FIX 2026-10-13（第六轮·客户端默认值与后端对齐）：后端 `persist`
+        // 默认已收敛为 False（带写副作用的 GET 不应默认落历史），而这里仍默认
+        // `true` —— 不传 opts 的调用方会把「看一眼」变成「插一行审计历史」，
+        // 与后端默认自相矛盾。现改为 false；响应体不变，仅副作用收敛。
+        persist: opts.persist ?? false,
         ...(opts.coverageWeak !== undefined ? { coverage_weak: opts.coverageWeak } : {}),
       },
     },

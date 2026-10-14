@@ -364,7 +364,16 @@ async def generate_children(parent_id: str, count: int = 5) -> list[dict]:
     )
 
     messages = [
-        AIMessage(role="system", content="你是专业的工程项目分类专家。"),
+        # BUG-FIX-PROMPT-E5（inline 系统提示词未注册）：原以字面量形式
+        # inline 存在，管理页无法查看/编辑/覆盖。现统一走 get_prompt()
+        # （DB 优先 → 注册表 → 硬编码回退）。
+        AIMessage(
+            role="system",
+            content=(
+                get_prompt("INDUSTRY_CLASSIFY_SYSTEM")
+                or "你是专业的工程项目分类专家。"
+            ),
+        ),
         AIMessage(role="user", content=user_message),
     ]
 
@@ -1341,9 +1350,14 @@ async def match_industry_by_ai(text: str, top_k: int = 5) -> list[dict]:
 """
 
         messages = [
+            # BUG-FIX-PROMPT-E5（inline 系统提示词未注册）：原以字面量形式
+            # inline 存在，管理页无法查看/编辑/覆盖。现统一走 get_prompt()。
             AIMessage(
                 role="system",
-                content="你是专业的工程项目分类专家，擅长从项目描述中识别所属行业。",
+                content=(
+                    get_prompt("INDUSTRY_MATCH_SYSTEM")
+                    or "你是专业的工程项目分类专家，擅长从项目描述中识别所属行业。"
+                ),
             ),
             AIMessage(role="user", content=user_prompt),
         ]

@@ -130,11 +130,27 @@ async def get_consistency_rules(user=Depends(get_current_user)):
 #   * 中间代理或 CDN 对 GET 的自动重试会把「幂等」假设坐实，重扫一次全库；
 #   * 响应不可缓存，语义与 HTTP 方法约定相反。
 # 现按 REST 语义补上规范动词 `POST`，**GET 保留**（不破坏任何既有调用方、
-# 脚本与前端 api/index.ts），仅在文档中标注 legacy。前端已切到 POST。
-@router.api_route(
+# 脚本与前端 api/index.ts），仅在 OpenAPI 中标注 deprecated/legacy。
+# 前端已切到 POST。
+#
+# BUG-FIX 2026-10-13（第六轮·P2·OpenAPI 重复 operation ID）：此前用单个
+# `api_route(methods=['GET','POST'])` 注册，FastAPI 会为同一路由生成**两个**
+# operation 却共用同一个 `operation_id`（`generate_unique_id` 只取
+# `route.name + path + methods[0]`）——实测 `app.openapi()` 报
+#   Duplicate Operation ID run_audit_api_v1_consistency_audit__project_id__get
+# 且 schema 里 GET/POST 两条目的 operationId 相同：Swagger UI 行为异常、
+# 按 OpenAPI 生成客户端的代码会互相覆盖（POST 方法被 GET 顶掉）。
+# 现拆成两个装饰器分别注册（`@router.post` + `@router.get`），FastAPI 为
+# 每条路由取 `methods[0]` 生成唯一 ID（`..._post` / `..._get`），语义不变、
+# 响应体不变，GET 显式标 deprecated 提示 legacy。
+@router.post(
     '/audit/{project_id}',
-    methods=['GET', 'POST'],
-    summary='运行全文一致性审计（POST 为规范入口；GET 为向后兼容保留）',
+    summary='运行全文一致性审计（规范入口）',
+)
+@router.get(
+    '/audit/{project_id}',
+    summary='运行全文一致性审计（legacy GET；规范入口为 POST，此入口将下线）',
+    deprecated=True,
 )
 async def run_audit(project_id: int, user=Depends(get_current_user)):
     """运行完整一致性审计
@@ -385,6 +401,15 @@ async def apply_autofix(
             )
         if not report.get('success'):
             # 未做任何修改（未定位到待替换值 / 有章节无法安全替换）→ 明确告知，不谎报成功
+            # ENHANCE 2026-10-13（第六轮）：区分「什么都没改」与「改了一部分」。
+            # 旧代码只要 success=False 就一律回 `no_change`，但部分章节落文成功、
+            # 仅个别章节被安全闸门拦下的场景下，`no_change`（未做任何修改）与事实
+            # 相反——用户看到状态是 no_change，message 却说「已修改 3 个章节」，
+            # 自相矛盾。现按 changed_sections 区分：有落文 → `partial`（部分完成，
+            # 冲突保持未解决待人工处理）；无落文 → `no_change`。前端对非 ok 状态
+            # 统一按 warning 展示并常驻结果卡片，两种状态都不再被误读为成功。
+            if report.get('changed_sections'):
+                return {'status': 'partial', **report}
             return {'status': 'no_change', **report}
         return {'status': 'ok', **report}
     except Exception as e:

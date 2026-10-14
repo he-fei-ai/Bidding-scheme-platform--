@@ -59,6 +59,10 @@ frontend_vitest_*.txt
 *.tsbuildinfo
 backend/_spec_*.json
 backend/scripts/audit_*.py
+backend/tests/_probe_*.py
 frontend/vite.*.config.ts
+
+# pytest tmp 目录
+backend/tests/.tmp_*/
 
 /_*.txt

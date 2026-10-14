@@ -457,6 +457,11 @@ async def generate_content_impl(
 
             global_facts: list | None = project_data.get("global_facts_items") or None
 
+            # ENHANCE 2026-10-14（facts-ns P1-3）：缺失值策略随正文生成透传，
+            # 供 system 追加 omit/placeholder 缺值口径铁律（开关默认关，
+            # 旧 Redis 缓存无此键时按 fabricate 处理，行为不变）。
+            facts_policy: str = project_data.get("facts_policy") or "fabricate"
+
             # ENHANCE 2026-10-07：构建字段契约（提取项目字段 + 全局数据字典）。
             # 全局数据字典把项目名称/编号/业主/工期/人员数量/设备型号/质保期等
             # 关键一致性字段收敛为唯一权威值，随稳定上下文注入每一章，
@@ -1231,6 +1236,21 @@ async def generate_content_impl(
                     except Exception as _kb_e:
                         logger.warning("知识素材目录加载失败（跳过 knowledge 编排）: %s", _kb_e)
 
+                    # ENHANCE 2026-10-14（facts-ns P0，对齐易标两阶段消费）：
+                    # 编排阶段 AI 只看事实标题清单选出 plan.facts.titles，
+                    # 生成阶段按标题取完整事实注入。开关默认关=不传清单，
+                    # plan.facts.titles 恒为空，行为与今天完全一致。
+                    _fact_titles_for_orch: list = []
+                    try:
+                        from ...services.facts_service import (
+                            fact_titles_for_orchestration,
+                            orchestrated_select_enabled,
+                        )
+                        if orchestrated_select_enabled() and global_facts:
+                            _fact_titles_for_orch = fact_titles_for_orchestration(global_facts)
+                    except Exception as _ft_e:
+                        logger.warning("事实标题清单装配失败（跳过 facts 编排）: %s", _ft_e)
+
 
 
                     # BUG 修复：此前直接 json.dumps(build_tree(...))——build_tree 返回
@@ -1287,6 +1307,8 @@ async def generate_content_impl(
                         section_per_segment=orch_section_per_segment,
 
                         knowledge_catalog=_knowledge_catalog,
+
+                        fact_titles=_fact_titles_for_orch or None,
 
                     )
 
@@ -1531,6 +1553,9 @@ async def generate_content_impl(
                     # 易标 R5/R8：强控覆盖表（空表 = 未强控，下游回落档位逻辑）
                     word_control=_wc_override,
 
+                    # ENHANCE 2026-10-14（facts-ns P1-3）：缺值策略透传
+                    facts_policy=facts_policy,
+
                 )
 
                 # === BUG-C-04 修复：失败章节指数退避重试 ===
@@ -1607,6 +1632,8 @@ async def generate_content_impl(
                                     field_trace=field_trace,
                                     industry=industry,
                                     word_control=_wc_override,
+                                    # ENHANCE 2026-10-14（facts-ns P1-3）：缺值策略透传
+                                    facts_policy=facts_policy,
                                 )
                                 # 更新 results 中对应条目的状态（重试成功的替换掉 failed 条目）
                                 _retry_success_ids = {

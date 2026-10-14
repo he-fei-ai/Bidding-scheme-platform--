@@ -75,6 +75,7 @@ from ._context import (
     build_chapter_context,
     estimate_tokens,
     truncate_to_tokens,
+    split_into_token_capped_chunks,
 )
 from ._registry import (
     _ALL_PROMPTS,
@@ -135,6 +136,7 @@ __all__ = [
     "build_chapter_context",
     "estimate_tokens",
     "truncate_to_tokens",
+    "split_into_token_capped_chunks",
     "build_prompt_with_context",
     "extract_json_body",
     "repair_json_output",

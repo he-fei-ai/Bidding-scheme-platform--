@@ -203,6 +203,206 @@ CHART_FENCE_SCAN_PATTERN = re.compile(
 #: 不再像旧实现那样在收集到 200 行时「半途停止收集并把剩余代码当正文输出」。
 _HARD_CHART_FENCE_LINE_LIMIT = 5000
 
+# ---------------------------------------------------------------------
+# BUG-FIX 2026-10-14（P0·同语言围栏行被误判为闭合行 → 源码泄漏乱码 + 正文被吞）
+#
+# 症状（tests/test_chart_fence_pipeline.py::test_unclosed_fence_does_not_leak_source
+#        复现）：AI 漏写某张图的闭合围栏，紧接着又输出另一张**同语言**图表围栏时——
+#
+#     ```mermaid
+#     graph TD
+#         A --> B
+#     ```mermaid            ← 这一行被 is_fence_close_line 当成第 1 块的闭合行
+#     flowchart TD
+#         X --> Y
+#     ```
+#
+# is_fence_close_line 为兼容「AI 把闭合行也写上语言标记」而放开了 info-string，
+# 于是 ` ```mermaid ` 同时命中「闭合行」与「起始行」两种语义。状态机按闭合行处理：
+#   ① 第 1 块把中间的**正文段落**整段吞进载荷（正文丢失）；
+#   ② 第 2 块的起始行被第 1 块消费掉，剩下的 `flowchart TD / X --> Y`
+#      落到普通围栏剥离路径，**mermaid 源码作为普通段落写进投标正文**（乱码）。
+#
+# 修复：引入行级前瞻判定 `_fence_line_is_new_open`。当候选闭合行携带图表语言
+# info-string、且其后第一个非空行仍是图表载荷起始（mermaid 关键字 / JSON `{`）时，
+# 认定它是**新块的起始行**而非闭合行。仅当其后不再是图表载荷时才按「AI 复读了
+# 语言标记」的闭合行处理，兼容 BUG-FIX 2026-10-09 的既有场景。
+# ---------------------------------------------------------------------
+
+#: Mermaid 图表首行关键字（判定「下一行是否为图表载荷起始」）
+_MERMAID_DIAGRAM_KEYWORD_RE = re.compile(
+    r"^(?:flowchart|graph|gantt|pie|xychart|timeline|journey|mindmap|quadrantChart|"
+    r"requirementDiagram|gitGraph|C4Context|C4Container|C4Component|C4Dynamic|C4Deployment|"
+    r"sankey-beta|block-beta|xychart-beta|kanban|packet-beta|architecture-beta|radar|treemap)"
+    r"\b",
+    re.IGNORECASE,
+)
+
+#: 疑似 mermaid 结构符（判定「一行是否为正文」的反向特征）
+_MERMAID_STRUCT_RE = re.compile(r"[<>{}|\[\]=]|-->|->|\.\.|::|^-\.->|==>")
+
+#: CJK 字符（正文判定）
+_CJK_RE = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
+
+
+def _is_chart_payload_start(line: str) -> bool:
+    """判定一行是否是图表围栏载荷的起始行（mermaid 关键字 或 JSON 对象首行）。"""
+    s = (line or "").strip()
+    if not s:
+        return False
+    if _MERMAID_DIAGRAM_KEYWORD_RE.match(s):
+        return True
+    if s.startswith("{") or s.startswith('"'):
+        return True
+    return False
+
+
+def _fence_line_is_new_open(lines: list[str], idx: int) -> bool:
+    """图表围栏行 `lines[idx]` 是否应判为**新块的起始行**（前瞻判定）。
+
+    仅对「携带图表语言 info-string 的围栏行」有意义：其后第一个非空行仍是
+    图表载荷起始时，说明 AI 漏写了上一块的闭合行、这里是下一张图的开头。
+    """
+    for k in range(idx, len(lines)):
+        s = lines[k].strip()
+        if not s:
+            continue  # 空行不是载荷，继续前瞻
+        return _is_chart_payload_start(s)
+    return False
+
+
+def _looks_like_prose(line: str) -> bool:
+    """判定一行是否形如**自然语言正文**（用于把误吞进围栏体的正文剥离出来）。
+
+    保守口径：含 CJK、无 mermaid 结构符、不是围栏行/图表关键字/JSON 起始。
+    宁可漏判（正文留在载荷里导致渲染失败被丢）也不误判（把 mermaid 源码
+    当正文输出成乱码）。
+    """
+    s = (line or "").strip()
+    if not s:
+        return False
+    if CHART_FENCE_OPEN_PATTERN.match(s) or FENCE_ANY_LINE_PATTERN.match(s):
+        return False
+    if _MERMAID_DIAGRAM_KEYWORD_RE.match(s):
+        return False
+    if s.startswith(("{", '"', "[", "|", "%%")):
+        return False
+    if not _CJK_RE.search(s):
+        return False
+    if _MERMAID_STRUCT_RE.search(s):
+        return False
+    return True
+
+
+def _split_fence_body(body: list[str]) -> tuple[list[str], list[str]]:
+    """把围栏体分离为 (载荷行, 尾随正文行)。
+
+    BUG-FIX 2026-10-14（P1·未闭合围栏吞正文）：AI 漏写闭合标记时，围栏起始行
+    与下一个围栏行之间的**正文段**会被一起扫进载荷整体丢弃。规则：最后一个空行
+    之后的非空行**全部形如正文**时，认定该段是正文而非载荷，剥离后按普通正文输出。
+    """
+    if not body:
+        return [], []
+    last_blank = -1
+    for k in range(len(body) - 1, -1, -1):
+        if not body[k].strip():
+            last_blank = k
+            break
+    if last_blank <= 0:
+        return body, []
+    tail = body[last_blank + 1:]
+    non_blank_tail = [ln for ln in tail if ln.strip()]
+    if non_blank_tail and all(_looks_like_prose(ln) for ln in non_blank_tail):
+        return body[:last_blank], [ln for ln in body[last_blank + 1:]]
+    return body, []
+
+
+#: 围栏行分类（_classify_fence_line 的 kind 取值）
+_FENCE_KIND_NONE = "none"          # 普通行（可能是载荷/正文）
+_FENCE_KIND_OPEN = "open"          # 图表围栏起始行
+_FENCE_KIND_BARE = "bare"          # 纯围栏标记行（无 info-string）→ 恒可作闭合行
+_FENCE_KIND_OTHER = "other"        # 非图表语言的围栏行（python/json/text...）
+
+
+def _classify_fence_line(line: str) -> tuple[str, str]:
+    """把一行分类为 (kind, info-string)。与围栏开启/闭合判定共用同一套正则。"""
+    s = str(line or "").strip()
+    if not s or not FENCE_ANY_LINE_PATTERN.match(s):
+        return _FENCE_KIND_NONE, ""
+    info = fence_info_string(s)
+    if not info:
+        return _FENCE_KIND_BARE, ""
+    if _CHART_FENCE_LANG_RE.fullmatch(info.strip().lower()):
+        return _FENCE_KIND_OPEN, info.strip().lower()
+    return _FENCE_KIND_OTHER, info.strip().lower()
+
+
+def plan_chart_fence_lines(lines: list[str]) -> list[tuple[str, str, list[str], int]]:
+    """**单一权威**的图表围栏行规划器（纯函数，供三处消费方共用）。
+
+    历史上 `_protect_chart_fences` / `parse_content` / `iter_chart_fences`
+    各自维护一份状态机与正则口径，三处一旦分叉就会出现「解析侧删除、检测侧
+    计入、预览侧又渲染」的相互矛盾行为（图表静默丢失或源码泄漏）。
+
+    Args:
+        lines: 已按 "\\n" 切分、且无 "\\r" 的行列表。
+
+    Returns:
+        [(action, lang, lines, consumed), ...]
+          action:  "keep"  普通行，原样保留（lang 为空串）
+                   "block" 图表围栏载荷（lang ∈ {"mermaid","chart-json"}）
+                   "bad"   未闭合/病态坏块的载荷（调用方按需尝试渲染，失败则删除）
+          lines:   该条目的行内容（keep=原文，block/bad=载荷行，不含围栏标记行）
+          consumed: 该条目消耗的**源行数**（keep=len(lines)；block=开+载荷+闭；
+                   bad=开+载荷）。parse_content 据此一次性跳到下一行。
+    """
+    plan: list[tuple[str, str, list[str], int]] = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        m = CHART_FENCE_OPEN_PATTERN.match(lines[i].strip())
+        if not m:
+            plan.append(("keep", "", [lines[i]], 1))
+            i += 1
+            continue
+        lang = _normalize_fence_lang(m.group(1))
+        body: list[str] = []
+        j = i + 1
+        closed = False
+        while j < n:
+            kind, _info = _classify_fence_line(lines[j])
+            if kind == _FENCE_KIND_BARE:
+                closed = True  # 闭合行本身不计入载荷
+                j += 1
+                break
+            if kind == _FENCE_KIND_OPEN:
+                # 同语言图表围栏行：前瞻确认是新块起始还是「复读语言标记的闭合行」
+                if _fence_line_is_new_open(lines, j + 1):
+                    break  # 新块起始 → 当前块未闭合，交给外层重新处理该行
+                closed = True  # 闭合行本身不计入载荷
+                j += 1
+                break
+            if kind == _FENCE_KIND_OTHER:
+                break  # 异语言围栏行 → 当前块未闭合
+            body.append(lines[j])
+            j += 1
+            if j - i > _HARD_CHART_FENCE_LINE_LIMIT:
+                break  # 病态超长围栏：按坏块删除（区域有界）
+        payload, prose = _split_fence_body(body)
+        action = "block" if closed else "bad"
+        # consumed：起始行(1) + 闭合行(1，仅闭合块) + body 行数
+        consumed = 1 + len(body) + (1 if closed else 0)
+        if payload:
+            plan.append((action, lang, payload, consumed))
+        elif prose:
+            # 载荷被清空但尾部仍有正文段：正文按普通行保留，围栏行本身丢弃
+            plan.append(("keep", "", prose, 1 + len(body)))
+        else:
+            # 空载荷 / 纯病态：整块删除
+            plan.append(("bad", lang, [], consumed))
+        i = j
+    return plan
+
 
 def _normalize_fence_lang(lang: str | None) -> str:
     """把围栏语言标记归一为内部口径（'mermaid' / 'chart-json'）。
@@ -292,19 +492,70 @@ def extract_mermaid_title(code: str) -> str:
 
 
 def iter_chart_fences(content: str):
-    """遍历内容中所有**已闭合**的图表围栏代码块，产出 (lang, body, marker_text)。
+    """遍历内容中的图表围栏代码块，产出 (lang, body, marker_text)。
 
-    marker_text 为 None 表示内容非法（坏块）：检测/提取侧应忽略，
-    解析侧（parse_content）会将其从正文删除。
-    与 iter_chart_markers 口径一致：凡本函数识别出的类型，parse_content
-    必产出同类型 chart_marker 块，避免「内联/章末两边都不出图」。
+    marker_text 为 None 表示内容非法（坏块）：调用方应忽略。
+
+    只产出**已闭合**（block）围栏。BUG-FIX 2026-10-14（P0）：口径统一收敛到
+    `plan_chart_fence_lines`——与 `parse_content` / `_protect_chart_fences` 共用同一份
+    状态机，保证「凡本函数识别出的类型，parse_content 必产出同类型 chart_marker 块」。
+    未闭合（bad）围栏在解析侧（_protect_chart_fences）会被删除、不渲染成图，故此处不产出，
+    与解析侧口径一致，避免「解析侧删块、检测侧计入」的分叉（去重侧据此不误判）。
     """
     if not content:
         return
-    for m in CHART_FENCE_SCAN_PATTERN.finditer(content):
-        lang = _normalize_fence_lang(m.group(1))
-        body = m.group(2).strip()
+    for action, lang, blines, _consumed in plan_chart_fence_lines(content.split("\n")):
+        if action != "block":
+            continue
+        body = "\n".join(blines).strip()
         yield lang, body, _fence_payload_to_marker_text(lang, body)
+
+
+def _validate_chart_json_structure(chart_type: str, data: dict) -> None:
+    """对 chart-json 载荷调用 chart_validators v3.1 结构校验（诊断层）。
+
+    ENHANCE 2026-10-11（遗留项2）：激活 chart_validators 在 fence 路径的调用。
+    校验失败仅记 WARNING 日志（诊断），不删块、不阻断——渲染层有完整降级策略。
+
+    与 workflows_sections._validate_chart_data 的区别：
+      - _validate_chart_data（marker 路径）：校验失败 → 降级为配图提示（阻断）
+      - 本函数（fence 路径）：校验失败 → 仅日志（不阻断，交渲染层降级）
+
+    原因：fence 路径的块已经在正文最优位置，删除会破坏图文连贯性；
+    结构问题（如重复 ID、孤立节点）通常不影响渲染，只是质量不够理想。
+    """
+    _VALIDATOR_BY_TYPE = {
+        "flowchart": "validate_flowchart_structure",
+        "gantt": "validate_gantt_plan",
+        "timeline": "validate_timeline_data",
+        "labor": "validate_labor_data",
+        "layout": "validate_layout_data",
+        "architecture": "validate_architecture_tree",
+    }
+    _fn_name = _VALIDATOR_BY_TYPE.get((chart_type or "").strip().lower())
+    if not _fn_name:
+        return  # 未覆盖类型不校验（兼容性）
+    try:
+        import importlib
+
+        _mod = importlib.import_module("app.services.chart_validators")
+        _fn = getattr(_mod, _fn_name, None)
+    except Exception:
+        return  # 校验器不可用 → 静默跳过
+    if _fn is None:
+        return
+    try:
+        _ok, _errors = _fn(data)
+    except Exception:
+        return  # 校验异常 → 静默跳过
+    if isinstance(_ok, bool) and not _ok:
+        _detail = "; ".join(str(x) for x in (list(_errors or [])[:3]))
+        logger.warning(
+            "[图表校验] chart-json 块 v3.1 结构校验未通过 (type=%s): %s",
+            chart_type,
+            _detail or "未知原因",
+        )
+
 
 
 def _fence_payload_to_marker_text(lang: str, body: str) -> str | None:
@@ -334,9 +585,13 @@ def _fence_payload_to_marker_text(lang: str, body: str) -> str | None:
             obj["type"] = inner_type
         else:
             obj["type"] = inner_type
-        # 注意：不在这里调用 validate_chart_payload —— 围栏解析阶段只检查
-        # JSON 可解析 + 类型可推断，数据完整性校验留到 export.py 渲染前
-        # 的 _render_commercial 入口做（那里有完整的降级策略和日志链路）。
+        # ENHANCE 2026-10-11（遗留项2：激活 chart_validators v3.1 校验器）：
+        # 围栏 chart-json 块此前只检查 JSON 可解析 + 类型可推断，从不调用
+        # chart_validators 的 v3.1 结构校验（节点数/深度/ID/依赖/饼图和等），
+        # 导致 1005 行校验资产在 fence 路径零调用。现接入校验器：
+        #   - 校验失败 → 记 WARNING 日志（诊断），不删块（向后兼容，交渲染层降级）；
+        #   - 校验器不可导入 → 静默跳过（不阻断解析主链路）。
+        _validate_chart_json_structure(inner_type, obj)
         return json.dumps(
             {"chart_type": inner_type, "description": json.dumps(obj, ensure_ascii=False)},
             ensure_ascii=False,
@@ -740,60 +995,30 @@ def _protect_chart_fences(text: str) -> str:
 
     - 闭合的 ```mermaid / ```chart-json 块 → 整块替换为占位符（后续普通围栏
       剥离不会破坏其内容），由 _restore_chart_fences 还原后交给 parse_content。
-    - 未闭合（悬挂起始行）：删除起始行及其后直到下一个围栏闭合行/文末的内容
-      （坏块删除，不吞正文：下一个普通 ``` 作为右边界；无则删到文末）。
+    - 未闭合（悬挂起始行）：删除起始行，载荷按坏块删除，但**误吞进围栏体的正文
+      段会还原为普通正文**（见 `_split_fence_body`），不吞后续正文。
 
-    闭合行判定见 `is_fence_close_line`：info-string 必须为空或与开启行同语言。
+    BUG-FIX 2026-10-14（P0）：判定逻辑统一收敛到单一权威规划器
+    `plan_chart_fence_lines`——本函数 / `parse_content` / `iter_chart_fences`
+    共用同一份口径，杜绝「解析侧删块、检测侧计入」的分叉。
     """
-    lines = text.split("\n")
+    plan = plan_chart_fence_lines(text.split("\n"))
     out: list[str] = []
     blocks: list[str] = []
-    i = 0
-    while i < len(lines):
-        m = CHART_FENCE_OPEN_PATTERN.match(lines[i].strip())
-        if not m:
-            out.append(lines[i])
-            i += 1
-            continue
-        # 收集到闭合行。
-        # BUG-FIX 2026-10-08（P1 部分删除泄漏）：旧实现在 `len(body) < 201` 处**停止收集**
-        # 并按「未闭合」处理 → 200 行以上的合法 mermaid 块被截断丢弃，而 `i = _j` 让扫描
-        # 从围栏内部继续，剩余源码（graph TD / 节点定义）被当作**正常正文**写进投标文档。
-        # 现在只在超过 _HARD_CHART_FENCE_LINE_LIMIT（病态输入）时整块判坏，
-        # 闭合行判定用 is_fence_close_line（同时支持 ``` 与 ~~~，且校验语言一致性）。
-        body: list[str] = [lines[i]]
-        _j = i + 1
-        closed = False
-        # 开启行的语言标记（如 mermaid / chart-json）：用于闭合行一致性校验
-        _open_info = m.group(1)
-        while _j < len(lines):
-            _s = lines[_j].strip()
-            # BUG-FIX 2026-10-09（P2）：闭合行必须「空 info-string」或
-            # 「与开启行同语言」，避免异语言起始行（```python 等）被当成闭合行。
-            if is_fence_close_line(_s, _open_info):
-                body.append(lines[_j])
-                closed = True
-                _j += 1
-                break
-            # 遇到另一个围栏起始行：视为原块未闭合（AI 漏写闭合标记）
-            if FENCE_ANY_LINE_PATTERN.match(_s):
-                break
-            body.append(lines[_j])
-            _j += 1
-            if _j - i > _HARD_CHART_FENCE_LINE_LIMIT:
-                break  # 病态超长围栏：按坏块删除（区域有界）
-        if closed:
-            blocks.append("\n".join(body))
+    for action, _lang, blines, _consumed in plan:
+        if action == "keep":
+            out.extend(blines)
+        elif action == "block":
+            # BUG-FIX 2026-10-14（P0 回归修复）：plan_chart_fence_lines 的载荷**不含围栏
+            # 标记行**（见其 docstring「不含围栏标记行」），而占位符经 _restore_chart_fences
+            # 还原后需再次交给 parse_content 识别——后者依赖 CHART_FENCE_OPEN_PATTERN 命中
+            # ```mermaid / ```chart-json 起始行。旧实现此处直接存裸载荷，还原后没有围栏包裹，
+            # parse_content 把 mermaid/chart-json 源码当普通段落逐行输出（闭合图表围栏在解析侧
+            # 丢失、源码泄漏成正文），正是本次 7 项回归根因。补回完整围栏块，与重构前
+            # _protect_chart_fences 存 body（含开/闭行）的口径一致。
+            blocks.append(f"```{_lang}\n" + "\n".join(blines) + "\n```")
             out.append(f"{_FENCE_PLACEHOLDER_PREFIX}{len(blocks) - 1}\x00")
-            i = _j
-        else:
-            # 未闭合：删除坏块（起始行 + 已收集的 body 行），从 _j 继续处理正常正文
-            logger.info(
-                "[图表跳过] 未闭合的图表围栏代码块（坏块 %d 行已删除）: lang=%s",
-                len(body),
-                _normalize_fence_lang(m.group(1)),
-            )
-            i = _j
+        # action == "bad"：未闭合/病态坏块 → 载荷删除（不保护、不输出）
     _fence_cache.blocks.extend(blocks)
     return "\n".join(out)
 
@@ -1484,43 +1709,31 @@ def parse_content(raw: str, base_level: int = 0) -> list[DocumentBlock]:
         # 导致 51 个甘特图标记全部被当成 paragraph 跳过
         # ============ ENHANCE 2026-10-04（D2）：```mermaid / ```chart-json 围栏代码块 ============
         # 与 <<CHART:...>> 标记同构处理：解析为 chart_marker 块（就地渲染）；
-        # 未闭合/内容非法 → 整块删除（绝不把代码原文写进正文形成乱码，不吞后续正文）。
+        # 未闭合/内容非法 → 载荷删除（绝不把代码原文写进正文形成乱码，不吞后续正文）。
+        #
+        # BUG-FIX 2026-10-14（P0）：围栏判定统一走单一权威规划器
+        # `plan_chart_fence_lines`（与 _protect_chart_fences / iter_chart_fences
+        # 同源）。这里只对「从当前位置起到文末」重新规划一次，取首条结果：
+        #   - block：闭合图表围栏 → 尝试转为 chart_marker，失败则删除坏块
+        #   - bad  ：未闭合/病态坏块 → 同样尝试转 marker（载荷合法就渲染），
+        #            失败则删除（绝不把 mermaid 源码当正文输出成乱码）
+        # 依据 consumed 一次性跳到下一行，剩余行继续正常解析。
         if CHART_FENCE_OPEN_PATTERN.match(stripped):
-            _fence_open_i = i
-            _lang = _normalize_fence_lang(CHART_FENCE_OPEN_PATTERN.match(stripped).group(1))
-            # 开启行的原始语言标记：闭合行必须「空 info-string」或与其同语言，
-            # 否则异语言起始行（```python 等）会被误判成闭合行（见 is_fence_close_line）。
-            _open_info = CHART_FENCE_OPEN_PATTERN.match(stripped).group(1)
-            _fence_body: list[str] = []
-            _j = i + 1
-            _closed = False
-            # BUG-FIX 2026-10-08（P1 部分删除泄漏 + 围栏变体）：旧实现的 200 行上限会在
-            # 半途停止收集并按「未闭合」处理，`i = _j` 让扫描从围栏内部继续 →
-            # 超长 mermaid 块的剩余源码被当作**正文段落**输出到投标文档。
-            # 现在统一到 _HARD_CHART_FENCE_LINE_LIMIT 病态上限，闭合判定支持 ~~~。
-            while _j < len(lines):
-                _s = lines[_j].strip()
-                if is_fence_close_line(_s, _open_info):
-                    _closed = True
-                    break
-                if FENCE_ANY_LINE_PATTERN.match(_s):
-                    break
-                _fence_body.append(lines[_j])
-                _j += 1
-                if _j - i > _HARD_CHART_FENCE_LINE_LIMIT:
-                    break
-            if _closed:
-                _marker_text = _fence_payload_to_marker_text(_lang, "\n".join(_fence_body))
+            _fence_action, _lang, _fence_lines, _fence_consumed = plan_chart_fence_lines(
+                lines[i:]
+            )[0]
+            _payload_text = "\n".join(_fence_lines).strip()
+            if _payload_text:
+                _marker_text = _fence_payload_to_marker_text(_lang, _payload_text)
                 if _marker_text is not None:
                     blocks.append(DocumentBlock(type="chart_marker", text=_marker_text))
                 else:
-                    logger.info("[图表跳过] 围栏代码块内容无法识别（坏块已删除）: lang=%s", _lang)
-                i = _j + 1  # 越过闭合围栏行
-                continue
-            # 未闭合围栏：删除围栏行与已收集的内容行（坏块），不影响后续正文
-            logger.info("[图表跳过] 未闭合的图表围栏代码块（%d 行已删除）: lang=%s", len(_fence_body) + 1, _lang)
-            i = _j
-            _ = _fence_open_i  # 保留定位语义（日志排查用）
+                    logger.info(
+                        "[图表跳过] 围栏代码块内容无法识别（坏块已删除）: lang=%s", _lang
+                    )
+            else:
+                logger.info("[图表跳过] 空图表围栏代码块（坏块已删除）: lang=%s", _lang)
+            i += max(1, _fence_consumed)
             continue
 
         if CHART_MARKER_OPEN_PATTERN.match(stripped):

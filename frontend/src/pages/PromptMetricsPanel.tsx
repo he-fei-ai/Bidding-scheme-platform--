@@ -86,7 +86,12 @@ export default function PromptMetricsPanel() {
   const handleSync = async () => {
     setSyncing(true);
     try {
-      const res = await syncHardcodePrompts(false);
+      // BUG-PROMPT-F2：按钮语义为「同步硬编码到 DB」，但此前传 overwrite=false，
+      // 该模式只新增缺失 key、跳过所有已存在行（含漂移行），无法把已改动的硬编码
+      // 同步到 DB，且与后端漂移日志给出的补救指引（overwrite=true）相悖。
+      // 改为 overwrite=true：安全刷新「未被用户编辑过」的漂移行为最新硬编码，
+      // 用户自定义过的行仍保留（kept_modified），不会丢失定制。
+      const res = await syncHardcodePrompts(true);
       message.success(res.message);
       loadData();
     } catch (e) {

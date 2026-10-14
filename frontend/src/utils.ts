@@ -1684,6 +1684,80 @@ export function mapConsistencyScoringStatus(
 }
 
 // ============================================================
+// 废标条款应答状态 —— 与 `services/consistency_rules.REJECTION_STATUS_META` 同源
+// （ENHANCE 2026-10-13 第六轮·统一命名空间）
+//
+// 问题：`RejectionCoverageTab.tsx` 自带本地 `statusLabel` / `statusColor` 两张
+// 写死表（covered/weak/empty → 文案+配色），与后端零共享 —— 与严重度
+// （2026-10-08 修）、评分达标状态（2026-10-13 修）是同一类漂移，这是漏网的
+// 第三处。现按同一套机制补齐：静态兜底 + 运行时对齐。
+// ============================================================
+
+export const DEFAULT_CONSISTENCY_REJECTION_STATUS = "unknown";
+
+const BUILTIN_CONSISTENCY_REJECTION_STATUS_META: Record<
+  string,
+  ConsistencySeverityMeta
+> = {
+  covered: { color: "green", label: "已覆盖" },
+  weak: { color: "orange", label: "覆盖较弱" },
+  empty: { color: "red", label: "未应答" },
+  unknown: { color: "default", label: "未知" },
+};
+
+let CONSISTENCY_REJECTION_STATUS_META: Record<string, ConsistencySeverityMeta> = {
+  ...BUILTIN_CONSISTENCY_REJECTION_STATUS_META,
+};
+
+/** 消费 `GET /consistency/rules` 的 `rejection_coverage.status_meta`；结构不合法时返回 false 且不改动。 */
+export function applyConsistencyRejectionStatusMeta(
+  meta: Record<string, ConsistencySeverityMeta> | null | undefined,
+): boolean {
+  if (!meta || typeof meta !== "object") return false;
+  const entries = Object.entries(meta).filter(
+    ([key, v]) =>
+      !!key &&
+      !!v &&
+      typeof (v as ConsistencySeverityMeta).label === "string" &&
+      typeof (v as ConsistencySeverityMeta).color === "string",
+  );
+  if (!entries.length) return false;
+  CONSISTENCY_REJECTION_STATUS_META = Object.fromEntries(
+    entries.map(([key, v]) => [
+      key,
+      {
+        label: (v as ConsistencySeverityMeta).label,
+        color: (v as ConsistencySeverityMeta).color,
+      },
+    ]),
+  ) as Record<string, ConsistencySeverityMeta>;
+  return true;
+}
+
+/** 恢复内置静态兜底（测试隔离用）。 */
+export function resetConsistencyRejectionStatusMeta(): void {
+  CONSISTENCY_REJECTION_STATUS_META = {
+    ...BUILTIN_CONSISTENCY_REJECTION_STATUS_META,
+  };
+}
+
+/**
+ * 未知状态回落到 `unknown` 中性标签（对应后端 `REJECTION_STATUS_UNKNOWN_META`），
+ * 而不是回落到某个真实状态——后者会把「后端新增了一档」伪装成「已覆盖」。
+ */
+export function mapConsistencyRejectionStatus(
+  status: string,
+): ConsistencySeverityMeta {
+  return (
+    CONSISTENCY_REJECTION_STATUS_META[status] ||
+    CONSISTENCY_REJECTION_STATUS_META[DEFAULT_CONSISTENCY_REJECTION_STATUS] || {
+      color: "default",
+      label: "未知",
+    }
+  );
+}
+
+// ============================================================
 // 审核与预检模块 —— 冲突来源解析（组件级可测化 2026-10-08）
 //
 // 后端 `consistency_auditor._collect_fact_instances` 产出的 source 字符串有三种形态：
@@ -1730,7 +1804,13 @@ export function parseConflictSources(sources: string[] | null | undefined): Conf
 
 // ============================================================
 // 文本模型配置模块 —— 厂商默认元数据（组件级可测化 2026-10-05）
-// 从 TextConfigPage.tsx 抽取，单一事实源防止 base_url/model 键漂移。
+//
+// 定位说明（2026-10-14）：本表是**前端兜底**，不再是「唯一事实源」。
+// 后端 `services/ai/provider_catalog.py` 才是正本，并通过 `/ai/providers`
+// 与 `/ai/provider-configs` 的 `provider_id` 下发稳定机器 id。调用方应优先
+// 用 `config.provider_id` 调用 findProviderMeta；只有拿不到 id 时才退到
+// provider_name —— 而中文展示名与本表键天然对不上（实测 11 个键仅 2 个命中），
+// 这正是本次修复的缺陷。
 // ============================================================
 
 export interface ProviderMeta {
@@ -1740,7 +1820,11 @@ export interface ProviderMeta {
 }
 
 export const TEXT_PROVIDER_META: Record<string, ProviderMeta> = {
-  agnes: { label: "Agnes AI（新加坡）", base_url: "https://api.agnes-ai.cn/v1", model: "agnes-2.5-flash" },
+  // 注意：agnes 的默认模型与后端 config.AGNES_MODEL 保持一致（后端可被
+  // AGNES_MODEL 环境变量覆盖，且 /ai/provider-configs 已直接下发该值，
+  // 本条仅在接口不可用时兜底）。修复前这里是 agnes-2.5-flash，与后端
+  // agnes-2.0-flash 漂移，会让「一键配置」连错模型。
+  agnes: { label: "Agnes AI（新加坡）", base_url: "https://api.agnes-ai.cn/v1", model: "agnes-2.0-flash" },
   dashscope: { label: "阿里云百炼", base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1", model: "qwen-turbo" },
   volcengine: { label: "火山引擎", base_url: "https://ark.cn-beijing.volces.com/api/v3", model: "doubao-pro-32k" },
   hunyuan: { label: "腾讯混元", base_url: "https://api.hunyuan.cloud.tencent.com/v1", model: "hunyuan-pro" },
@@ -1753,10 +1837,12 @@ export const TEXT_PROVIDER_META: Record<string, ProviderMeta> = {
   openai_compatible: { label: "自定义兼容 OpenAI", base_url: "", model: "" },
 };
 
-/** 大小写不敏感查找厂商元数据（后端 provider_name 与前端键大小写可能不一致） */
-export function findProviderMeta(providerName: string): ProviderMeta | null {
+/** 大小写/首尾空白不敏感查找厂商元数据（后端 id 与前端键大小写可能不一致） */
+export function findProviderMeta(providerName: string | null | undefined): ProviderMeta | null {
+  if (!providerName) return null;
+  const target = providerName.trim().toLowerCase();
   const key = Object.keys(TEXT_PROVIDER_META).find(
-    (k) => k.toLowerCase() === providerName.toLowerCase(),
+    (k) => k.toLowerCase() === target,
   );
   return key ? TEXT_PROVIDER_META[key] : null;
 }

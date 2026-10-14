@@ -42,7 +42,12 @@ from .ai.provider_factory import create_provider, get_ai_config
 from .ai.providers.base import AIMessage
 from .ai.workflows import collect_json_response
 from .consistency_auditor import ConsistencyAuditor
-from .facts_service import facts_for_generation, is_placeholder_value, parse_stored_items
+from .facts_service import (
+    content_repair_max_attempts,
+    facts_for_generation,
+    is_placeholder_value,
+    parse_stored_items,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -84,11 +89,17 @@ def build_conflicts_text(conflicts: Any) -> str:
     return "\n".join(lines) if lines else "未提供"
 
 
-def build_repair_user_prompt(*, sections: list[dict], conflicts_text: str, facts_text: str) -> str:
+def build_repair_user_prompt(
+    *, sections: list[dict], conflicts_text: str, facts_text: str, failure_note: str = ""
+) -> str:
     """拼装送审 user prompt：事实变量 + 冲突清单 + 带行号的正文。
 
     带行号是为了让 AI 能填 `start_line/end_line` 作为加速线索；
     `text_patch.normalize_patch_text` 会自动剥掉 AI 抄回来的行号前缀。
+
+    P1-4（facts-ns 2026-10-14，对齐易标失败回喂重试）：`failure_note` 非空时
+    追加「上一轮补丁应用失败」区块，告知失败原因并要求 old_text 从下方
+    最新正文原样摘抄；为空时提示词与历史完全一致。
     """
     allowed_ids = [str(section.get("node_id") or section.get("id") or "") for section in sections]
     blocks = []
@@ -98,13 +109,21 @@ def build_repair_user_prompt(*, sections: list[dict], conflicts_text: str, facts
             f"<section>\n编号：{section_id}\n标题：{section.get('title') or '未命名章节'}\n"
             f"正文：\n{text_patch.format_content_with_line_numbers(section.get('content') or '')}\n</section>"
         )
-    return (
+    prompt = (
         f"事实变量（正文必须与之一致）：\n{facts_text}\n\n"
         f"审计发现的冲突：\n{conflicts_text}\n\n"
         f"待修复小节正文（带行号，patch 的 old_text/new_text 不要包含行号）：\n\n"
         + "\n\n".join(blocks)
         + f"\n\npatches[*].section_id 必须是以下编号之一：{'、'.join(allowed_ids) or '无'}\n请只返回 JSON。"
     )
+    if failure_note:
+        prompt += (
+            "\n\n上一轮修复补丁未能应用，原因清单：\n" + failure_note
+            + "\n请基于上方最新正文重新生成补丁：old_text 必须从正文中原样摘抄"
+            "（逐字一致，不要凭记忆改写），且在正文中能唯一定位；"
+            "若确实无法定位可安全替换的片段，请放进 unresolved 说明，不要硬猜。"
+        )
+    return prompt
 
 
 def plan_batches(sections: list[dict], batch_chars: int = REPAIR_BATCH_CHARS) -> list[list[dict]]:
@@ -134,8 +153,13 @@ async def generate_patches(
     sections: list[dict],
     conflicts_text: str,
     facts_text: str,
+    failure_note: str = "",
 ) -> tuple[list[dict], list[dict], str | None]:
     """调用 AI 生成补丁。
+
+    Args:
+        failure_note: P1-4 失败回喂信息（上一轮 rejected 补丁的失败原因），
+            为空时行为与历史完全一致。
 
     Returns:
         `(patches, unresolved, error)`；出错时 `patches=[]`、`error` 为原因。
@@ -143,7 +167,10 @@ async def generate_patches(
     allowed_ids = {str(s.get("node_id") or s.get("id") or "") for s in sections}
     sys_prompt = get_prompt("CONSISTENCY_PATCH_SYSTEM")
     user_prompt = build_repair_user_prompt(
-        sections=sections, conflicts_text=conflicts_text, facts_text=facts_text
+        sections=sections,
+        conflicts_text=conflicts_text,
+        facts_text=facts_text,
+        failure_note=failure_note,
     )
 
     try:
@@ -385,11 +412,26 @@ def refresh_conflict_states(
             values = []
         if not isinstance(values, list):
             values = []
+        # BUG-FIX 2026-10-13（第六轮·P1·AI 语义发现被误标已解决）：
+        # AI 审计路径（`ai/workflows_expand._persist_ai_audit_findings`）写入的
+        # 冲突 `values_json` 恒为 `'[]'`——自由文本发现（LLM 只给
+        # section_id/issue/suggestion），没有结构化取值。对这类冲突，
+        # 「全文还能找到几个取值」的判据**不可计算**：`present` 恒为空 →
+        # `len(unique_present) <= 1` 恒成立 → 每跑一次 AI 补丁修复 / Agent
+        # 修复，全部未解决的 AI 发现都被静默标成 `resolved=1`：用户看到冲突
+        # 凭空消失，而正文里的问题可能原样存在（实测见
+        # `tests/test_consistency_round6_2026_10_13.py::TestEmptyValueConflictsNotFalselyResolved`）。
+        # 口径：**空取值 = 无法验证 = 保持未解决**（与「宁多报也不漏报」一致）；
+        # AI 发现的收敛由下一轮生成时审计负责——它先删 `AI-%` 旧行再按最新
+        # 正文重写（`_persist_ai_audit_findings` 的既定设计）。
+        verifiable = [str(v) for v in values if str(v).strip()]
+        if not verifiable:
+            still_open += 1
+            continue
         present = [
             str(value)
-            for value in values
-            if str(value)
-            and any(
+            for value in verifiable
+            if any(
                 # BUG-FIX 2026-10-08（判定口径不一致 → 谎报「仍待处理」）：
                 # 原实现用裸子串 `str(value) in content` 找取值，而确定性修复路径
                 # （`consistency_auditor.apply_autofix` → `text_patch.replace_values`）
@@ -525,6 +567,7 @@ async def repair_with_ai(
             (report["applied"] if item.get("applied") else report["rejected"]).append(entry)
         report["errors"].extend(result["errors"])
         if result["changed"]:
+            content_by_id[int(section["id"])] = result["content"]
             report["sections"].append(
                 {
                     "section_id": section_key,
@@ -534,6 +577,90 @@ async def repair_with_ai(
                 }
             )
             planned.append((int(section["id"]), section_key, result["content"]))
+
+    # P1-4（facts-ns 2026-10-14，对齐易标失败回喂重试循环）：被拒绝的补丁
+    # 此前只进报告，AI 无从得知「old_text 定位不到」，用户只能再点一次修复
+    # 从头再生成。现在按小节把「最新正文 + 失败原因」回喂给 AI 重新产出补丁，
+    # 至多 CONSISTENCY_REPAIR_MAX_ATTEMPTS 轮（默认 1 = 不重试，
+    # 与历史行为完全一致）。重试轮只处理本轮含 rejected 的小节，失败仍回写报告。
+    _max_attempts = content_repair_max_attempts()
+    section_by_key = {str(s["node_id"]): s for s in sections}
+    _attempt = 1
+    _round_rejected = list(report["rejected"])
+    while _attempt < _max_attempts and _round_rejected:
+        _rejected_by_section: dict[str, list[dict]] = {}
+        for _e in _round_rejected:
+            _rejected_by_section.setdefault(_e["section_id"], []).append(_e)
+        _next_rejected: list[dict] = []
+        for _key, _rejects in _rejected_by_section.items():
+            _section = section_by_key.get(_key)
+            if _section is None:
+                _next_rejected.extend(_rejects)
+                continue
+            _sid = int(_section["id"])
+            _latest = content_by_id[_sid]
+            _failure_note = "\n".join(
+                f"- old_text「{str(_r.get('old_text') or '')[:60]}」：{_r.get('error') or '未能唯一定位到原文'}"
+                for _r in _rejects
+            )
+            # 先把该小节上一轮的 rejected 移出报告，本轮仍失败的会重新回写
+            report["rejected"] = [e for e in report["rejected"] if e["section_id"] != _key]
+            _retry_patches, _retry_unresolved, _retry_error = await generate_patches(
+                provider,
+                sections=[{**_section, "content": _latest}],
+                conflicts_text=conflicts_text,
+                facts_text=facts_text,
+                failure_note=_failure_note,
+            )
+            if _retry_error:
+                report["errors"].append(_retry_error)
+                report["rejected"].extend(_rejects)
+                continue
+            if not _retry_patches:
+                # AI 认定无法产出可安全定位的补丁（通常随附 unresolved 说明）：
+                # 保留上一轮失败记录，不硬猜。
+                report["unresolved"].extend(_retry_unresolved)
+                report["rejected"].extend(_rejects)
+                continue
+            report["unresolved"].extend(_retry_unresolved)
+            report["patches"].extend(_retry_patches)
+            _result = text_patch.apply_patches(_latest, _retry_patches)
+            for _item in _result["results"]:
+                _index = _item.get("index")
+                _reason = ""
+                if isinstance(_index, int) and 0 <= _index < len(_retry_patches):
+                    _reason = str(_retry_patches[_index].get("reason") or "")
+                _entry = {
+                    "section_id": _key,
+                    "title": _section["title"],
+                    "index": _index,
+                    "reason": _reason,
+                    "old_text": _item.get("old_text"),
+                    "new_text": _item.get("new_text"),
+                    "applied": _item.get("applied"),
+                    "error": _item.get("error"),
+                }
+                if _item.get("applied"):
+                    report["applied"].append(_entry)
+                else:
+                    report["rejected"].append(_entry)
+                    _next_rejected.append(_entry)
+            report["errors"].extend(_result["errors"])
+            if _result["changed"]:
+                content_by_id[_sid] = _result["content"]
+                # planned 后写覆盖前写：落文循环按序 UPDATE，重试轮内容在最后
+                planned.append((_sid, _key, _result["content"]))
+                if all(s["section_id"] != _key for s in report["sections"]):
+                    report["sections"].append(
+                        {
+                            "section_id": _key,
+                            "title": _section["title"],
+                            "applied": _result["applied_count"],
+                            "rejected": _result["rejected_count"],
+                        }
+                    )
+        _round_rejected = _next_rejected
+        _attempt += 1
 
     if not planned:
         report["message"] = (

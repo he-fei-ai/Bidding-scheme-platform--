@@ -25,6 +25,7 @@ from ...config import AGNES_API_KEY, AGNES_BASE_URL, AGNES_MODEL
 # ──────────────────────────────────────────────────────────────────────
 #: 内置默认文本厂商（曾散落于 routers/ai_config.py 与 services/ai/provider_factory.py）
 DEFAULT_TEXT_PROVIDER: dict = {
+    "id": "agnes",
     "name": "agnes",
     "base_url": AGNES_BASE_URL,
     "model": AGNES_MODEL,
@@ -54,45 +55,52 @@ def default_image_model() -> str:
 # ──────────────────────────────────────────────────────────────────────
 #: 已知文本厂商平台。首项为内置默认厂商（由 DEFAULT_TEXT_PROVIDER 派生，
 #: 保证「改默认厂商只需改一处」）。
+#:
+#: P1-ID（2026-10-14）：每条新增稳定机器标识 ``id``。此前条目只有中文 ``name``，
+#: 而 ``text_provider_configs`` / ``ai_config`` 均以 ``name`` 为主键，导致「按机器
+#: 可判定的方式查元数据」无处落脚 —— 前端 `TEXT_PROVIDER_META` 只能自行维护一份
+#: snake_case 键表（11 个键仅 2 个能对上后端 name），`find_model_metadata` 也无法
+#: 按中文名命中（见 `resolve_provider_meta_key`）。``id`` 是**新增字段**，不改变
+#: 任何既有键与取值，向后兼容。
 KNOWN_PROVIDERS: list[dict] = [
     dict(DEFAULT_TEXT_PROVIDER),
-    {"name": "OpenAI", "base_url": "https://api.openai.com/v1", "type": "openai_compatible"},
-    {"name": "DeepSeek", "base_url": "https://api.deepseek.com/v1", "type": "deepseek"},
-    {"name": "硅基流动 SiliconFlow", "base_url": "https://api.siliconflow.cn/v1", "type": "openai_compatible"},
-    {"name": "阿里云百炼（通义千问）", "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1", "type": "openai_compatible"},
-    {"name": "智谱AI (GLM)", "base_url": "https://open.bigmodel.cn/api/paas/v4", "type": "openai_compatible"},
-    {"name": "百度千帆", "base_url": "https://qianfan.baidubce.com/v2", "type": "openai_compatible"},
-    {"name": "腾讯混元", "base_url": "https://api.hunyuan.cloud.tencent.com/v1", "type": "openai_compatible"},
-    {"name": "字节跳动豆包", "base_url": "https://ark.cn-beijing.volces.com/api/v3", "type": "openai_compatible"},
-    {"name": "MiniMax", "base_url": "https://api.minimax.chat/v1", "type": "openai_compatible"},
-    {"name": "Moonshot (Kimi)", "base_url": "https://api.moonshot.cn/v1", "type": "openai_compatible"},
-    {"name": "零一万物 Yi", "base_url": "https://api.lingyiwanwu.com/v1", "type": "openai_compatible"},
-    {"name": "百川智能", "base_url": "https://api.baichuan-ai.com/v1", "type": "openai_compatible"},
-    {"name": "阶跃星辰 StepFun", "base_url": "https://api.stepfun.com/v1", "type": "openai_compatible"},
-    {"name": "昆仑万维天工", "base_url": "https://api.tiangong.cn/v1", "type": "openai_compatible"},
-    {"name": "商汤日日新（SenseTime）", "base_url": "https://token.sensenova.cn/v1", "type": "openai_compatible"},
-    {"name": "Anthropic (Claude)", "base_url": "https://api.anthropic.com", "type": "anthropic_compatible"},
-    {"name": "Google Gemini", "base_url": "https://generativelanguage.googleapis.com/v1beta", "type": "openai_compatible"},
-    {"name": "科大讯飞 Spark (MaaS)", "base_url": "https://maas-api.cn-huabei-1.xf-yun.com/v2", "type": "openai_compatible"},
-    {"name": "讯飞星辰 MaaS (Token Plan)", "base_url": "https://maas-token-api.cn-huabei-1.xf-yun.com/v2", "type": "openai_compatible"},
-    {"name": "NVIDIA NIM API", "base_url": "https://integrate.api.nvidia.com/v1", "type": "openai_compatible"},
-    {"name": "华为云盘古", "base_url": "https://pangu.cn-north-4.myhuaweicloud.com/v1", "type": "openai_compatible"},
-    {"name": "商汤日日新", "base_url": "https://api.sensechao.com/v1", "type": "openai_compatible"},
-    {"name": "中科院紫东太初", "base_url": "https://api.taichu.com/v1", "type": "openai_compatible"},
-    {"name": "中国移动九天", "base_url": "https://jiutian.10086.cn/v1", "type": "openai_compatible"},
-    {"name": "中国电信星辰", "base_url": "https://xingchen.ctyun.cn/v1", "type": "openai_compatible"},
-    {"name": "好未来 (MathGPT)", "base_url": "https://www.xueersi.com/api/mathgpt/v1", "type": "openai_compatible"},
-    {"name": "网易有道", "base_url": "https://ai.youdao.com/v1", "type": "openai_compatible"},
-    {"name": "Groq", "base_url": "https://api.groq.com/openai/v1", "type": "openai_compatible"},
-    {"name": "Together AI", "base_url": "https://api.together.xyz/v1", "type": "openai_compatible"},
-    {"name": "Fireworks AI", "base_url": "https://api.fireworks.ai/inference/v1", "type": "openai_compatible"},
-    {"name": "Mistral AI", "base_url": "https://api.mistral.ai/v1", "type": "openai_compatible"},
-    {"name": "xAI (Grok)", "base_url": "https://api.x.ai/v1", "type": "openai_compatible"},
-    {"name": "Perplexity", "base_url": "https://api.perplexity.ai", "type": "openai_compatible"},
-    {"name": "快手万顷 (StreamLake / KAT-Coder)", "base_url": "https://wanqing.streamlakeapi.com/api/gateway/v1/endpoints", "type": "openai_compatible"},
-    {"name": "Cohere", "base_url": "https://api.cohere.com/v1", "type": "openai_compatible"},
-    {"name": "AI21 Labs (Jamba)", "base_url": "https://api.ai21.com/studio/v1", "type": "openai_compatible"},
-    {"name": "自定义兼容 OpenAI 接口", "base_url": "", "type": "openai_compatible"},
+    {"id": "openai", "name": "OpenAI", "base_url": "https://api.openai.com/v1", "type": "openai_compatible"},
+    {"id": "deepseek", "name": "DeepSeek", "base_url": "https://api.deepseek.com/v1", "type": "deepseek"},
+    {"id": "siliconflow", "name": "硅基流动 SiliconFlow", "base_url": "https://api.siliconflow.cn/v1", "type": "openai_compatible"},
+    {"id": "dashscope", "name": "阿里云百炼（通义千问）", "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1", "type": "openai_compatible"},
+    {"id": "zhipu", "name": "智谱AI (GLM)", "base_url": "https://open.bigmodel.cn/api/paas/v4", "type": "openai_compatible"},
+    {"id": "baidu", "name": "百度千帆", "base_url": "https://qianfan.baidubce.com/v2", "type": "openai_compatible"},
+    {"id": "hunyuan", "name": "腾讯混元", "base_url": "https://api.hunyuan.cloud.tencent.com/v1", "type": "openai_compatible"},
+    {"id": "volcengine", "name": "字节跳动豆包", "base_url": "https://ark.cn-beijing.volces.com/api/v3", "type": "openai_compatible"},
+    {"id": "minimax", "name": "MiniMax", "base_url": "https://api.minimax.chat/v1", "type": "openai_compatible"},
+    {"id": "moonshot", "name": "Moonshot (Kimi)", "base_url": "https://api.moonshot.cn/v1", "type": "openai_compatible"},
+    {"id": "lingyi", "name": "零一万物 Yi", "base_url": "https://api.lingyiwanwu.com/v1", "type": "openai_compatible"},
+    {"id": "baichuan", "name": "百川智能", "base_url": "https://api.baichuan-ai.com/v1", "type": "openai_compatible"},
+    {"id": "stepfun", "name": "阶跃星辰 StepFun", "base_url": "https://api.stepfun.com/v1", "type": "openai_compatible"},
+    {"id": "tiangong", "name": "昆仑万维天工", "base_url": "https://api.tiangong.cn/v1", "type": "openai_compatible"},
+    {"id": "sensenova", "name": "商汤日日新（SenseTime）", "base_url": "https://token.sensenova.cn/v1", "type": "openai_compatible"},
+    {"id": "anthropic", "name": "Anthropic (Claude)", "base_url": "https://api.anthropic.com", "type": "anthropic_compatible"},
+    {"id": "gemini", "name": "Google Gemini", "base_url": "https://generativelanguage.googleapis.com/v1beta", "type": "openai_compatible"},
+    {"id": "xfyun_spark", "name": "科大讯飞 Spark (MaaS)", "base_url": "https://maas-api.cn-huabei-1.xf-yun.com/v2", "type": "openai_compatible"},
+    {"id": "xingchen_maas", "name": "讯飞星辰 MaaS (Token Plan)", "base_url": "https://maas-token-api.cn-huabei-1.xf-yun.com/v2", "type": "openai_compatible"},
+    {"id": "nvidia", "name": "NVIDIA NIM API", "base_url": "https://integrate.api.nvidia.com/v1", "type": "openai_compatible"},
+    {"id": "pangu", "name": "华为云盘古", "base_url": "https://pangu.cn-north-4.myhuaweicloud.com/v1", "type": "openai_compatible"},
+    {"id": "sensenova_chat", "name": "商汤日日新", "base_url": "https://api.sensechao.com/v1", "type": "openai_compatible"},
+    {"id": "taichu", "name": "中科院紫东太初", "base_url": "https://api.taichu.com/v1", "type": "openai_compatible"},
+    {"id": "jiutian", "name": "中国移动九天", "base_url": "https://jiutian.10086.cn/v1", "type": "openai_compatible"},
+    {"id": "xingchen", "name": "中国电信星辰", "base_url": "https://xingchen.ctyun.cn/v1", "type": "openai_compatible"},
+    {"id": "mathgpt", "name": "好未来 (MathGPT)", "base_url": "https://www.xueersi.com/api/mathgpt/v1", "type": "openai_compatible"},
+    {"id": "youdao", "name": "网易有道", "base_url": "https://ai.youdao.com/v1", "type": "openai_compatible"},
+    {"id": "groq", "name": "Groq", "base_url": "https://api.groq.com/openai/v1", "type": "openai_compatible"},
+    {"id": "together", "name": "Together AI", "base_url": "https://api.together.xyz/v1", "type": "openai_compatible"},
+    {"id": "fireworks", "name": "Fireworks AI", "base_url": "https://api.fireworks.ai/inference/v1", "type": "openai_compatible"},
+    {"id": "mistral", "name": "Mistral AI", "base_url": "https://api.mistral.ai/v1", "type": "openai_compatible"},
+    {"id": "xai", "name": "xAI (Grok)", "base_url": "https://api.x.ai/v1", "type": "openai_compatible"},
+    {"id": "perplexity", "name": "Perplexity", "base_url": "https://api.perplexity.ai", "type": "openai_compatible"},
+    {"id": "streamlake", "name": "快手万顷 (StreamLake / KAT-Coder)", "base_url": "https://wanqing.streamlakeapi.com/api/gateway/v1/endpoints", "type": "openai_compatible"},
+    {"id": "cohere", "name": "Cohere", "base_url": "https://api.cohere.com/v1", "type": "openai_compatible"},
+    {"id": "ai21", "name": "AI21 Labs (Jamba)", "base_url": "https://api.ai21.com/studio/v1", "type": "openai_compatible"},
+    {"id": "custom", "name": "自定义兼容 OpenAI 接口", "base_url": "", "type": "openai_compatible"},
 ]
 
 
@@ -114,6 +122,27 @@ def find_known_provider(provider_name: str) -> dict | None:
         if str(p.get("name", "")).strip().lower() == target:
             return p
     return None
+
+
+def find_known_provider_by_id(provider_id: str) -> dict | None:
+    """按稳定机器 id 查元数据（大小写/下划线不敏感）。
+
+    P1-ID（2026-10-14）：`/ai/provider-configs` 用它把 `provider_name`（中文展示名）
+    翻译成前端/元数据表都能识别的 `id`，从而消除前端自维护键表带来的漂移。
+    """
+    if not provider_id:
+        return None
+    target = provider_id.strip().lower().replace("-", "_")
+    for p in KNOWN_PROVIDERS:
+        if str(p.get("id", "")).strip().lower().replace("-", "_") == target:
+            return p
+    return None
+
+
+def provider_id_of(provider_name: str) -> str:
+    """把厂商展示名翻译为稳定 id；未收录时返回空串（调用方按原名兜底）。"""
+    p = find_known_provider(provider_name)
+    return str(p.get("id", "")) if p else ""
 
 
 def find_default_base_url_for_provider(provider_name: str) -> str:
@@ -244,23 +273,93 @@ PROVIDER_MODEL_METADATA: dict[str, dict[str, dict]] = {
 }
 
 
+#: 厂商 id/type → PROVIDER_MODEL_METADATA 表键（单一映射表，避免各处重复推导）。
+#: 只有在 PROVIDER_MODEL_METADATA 里**确有条目**的厂商才登记；未登记的走默认表。
+_PROVIDER_ID_TO_META_KEY: dict[str, str] = {
+    "agnes": "openai_compatible",
+    "openai": "openai_compatible",
+    "custom": "openai_compatible",
+    "deepseek": "deepseek",
+    "siliconflow": "siliconflow",
+    "dashscope": "dashscope",
+    "zhipu": "zhipu",
+    "baidu": "baidu",
+    "hunyuan": "hunyuan",
+    "volcengine": "volcengine",
+    "stepfun": "stepfun",
+    "moonshot": "moonshot",
+    "minimax": "minimax",
+    "lingyi": "lingyi",
+    "baichuan": "baichuan",
+}
+
+
+def _normalize_provider_token(token: str) -> str:
+    return (token or "").strip().lower().replace("_", "").replace("-", "")
+
+
+def resolve_provider_meta_key(provider: str) -> str | None:
+    """把「厂商 id / 展示名 / type」统一解析为 PROVIDER_MODEL_METADATA 的表键。
+
+    P1-META（2026-10-14）：`find_model_metadata` 此前只做「去下划线后互相包含」，
+    对 `provider="智谱AI (GLM)"` 这类**中文展示名**永远匹配不上 → `/ai/model-info`
+    对 zhipu / hunyuan / volcengine / dashscope / baidu / moonshot 一律回落默认值
+    （4096 tokens / 并发 4），前端「选模型后自动填充 max_tokens」形同虚设。
+    实测（2026-10-14）38 个厂商名中仅 2 个能命中。
+
+    解析顺序（先精确后模糊，保证零回归）：
+      1. 展示名 → KNOWN_PROVIDERS → ``id`` → 映射表；
+      2. ``id`` 直接查映射表；
+      3. 原「去下划线后互相包含」的模糊匹配（保留既有行为）。
+    空串**必须提前返回 None**：否则 `"" in "deepseek"` 恒真，会把空厂商名错配到
+    第一张表（deepseek），导致 `find_model_metadata("", "gpt-4o")` 行为不可预期。
+    """
+    if not provider or not provider.strip():
+        return None
+
+    # 1) 展示名 → id → 映射表
+    known = find_known_provider(provider)
+    if known:
+        meta_key = _PROVIDER_ID_TO_META_KEY.get(str(known.get("id", "")).lower())
+        if meta_key:
+            return meta_key
+        # 收录厂商但没有专属元数据表 → 按 id 做一次模糊匹配（覆盖 openai_compatible 等）
+        meta_key = _PROVIDER_ID_TO_META_KEY.get("openai_compatible") if known.get("type") == "openai_compatible" else None
+        if meta_key:
+            return meta_key
+
+    # 2) 传入的本身就是 id（前端 TEXT_PROVIDER_META 的键 / provider_type）
+    pid_raw = provider.strip().lower()
+    if pid_raw in _PROVIDER_ID_TO_META_KEY:
+        return _PROVIDER_ID_TO_META_KEY[pid_raw]
+
+    # 3) 既有模糊口径（去下划线后互相包含）
+    pid = _normalize_provider_token(provider)
+    if not pid:
+        return None
+    for key in PROVIDER_MODEL_METADATA:
+        norm = key.replace("_", "")
+        if norm in pid or pid in norm:
+            return key
+    return None
+
+
 def find_model_metadata(provider: str, model: str) -> dict | None:
-    """按厂商（大小写/下划线容错）+ 模型名查元数据，未命中返回 None。
+    """按厂商（id / 展示名 / type，大小写与下划线容错）+ 模型名查元数据，未命中返回 None。
 
     F-8 历史修复的行为在此固化：厂商名与模型名都做大小写容错，
     避免「厂商 /models 回传大小写与元数据表键不一致」导致永远匹配失败。
+    P1-META（2026-10-14）：厂商解析下沉到 `resolve_provider_meta_key`，
+    新增中文展示名 / 稳定 id 的解析能力。
     """
     if not model:
         return None
-    pid = (provider or "").lower().replace("_", "")
-    matched: str | None = None
-    for key in PROVIDER_MODEL_METADATA:
-        if key.replace("_", "") in pid or pid in key.replace("_", ""):
-            matched = key
-            break
+    matched = resolve_provider_meta_key(provider)
     if not matched:
         return None
-    table = PROVIDER_MODEL_METADATA[matched]
+    table = PROVIDER_MODEL_METADATA.get(matched)
+    if not table:
+        return None
     meta = table.get(model)
     if meta:
         return meta

@@ -470,7 +470,9 @@ async def _fetch_project_data_async(project_id: int) -> dict | None:
 
                 row = conn.execute(
 
-                    "SELECT summary_json, scoring_points_json, global_facts_json, construction_method_json, extraction_fields_json FROM analysis WHERE project_id = ?",
+                    # ENHANCE 2026-10-14（facts-ns P1-3）：补读 facts_policy，供正文生成
+                    # 按缺失值策略追加缺值口径铁律（口径同 routers/ai.py::_sync_get_analysis）。
+                    "SELECT summary_json, scoring_points_json, global_facts_json, construction_method_json, extraction_fields_json, COALESCE(facts_policy, 'fabricate') AS facts_policy FROM analysis WHERE project_id = ?",
 
                     (project_id,),
 
@@ -508,7 +510,8 @@ async def _fetch_project_data_async(project_id: int) -> dict | None:
 
                 row = conn.execute(
 
-                    "SELECT summary_json, scoring_points_json, global_facts_json, construction_method_json, extraction_fields_json FROM analysis WHERE project_id = ?",
+                    # ENHANCE 2026-10-14（facts-ns P1-3）：补读 facts_policy（同上）。
+                    "SELECT summary_json, scoring_points_json, global_facts_json, construction_method_json, extraction_fields_json, COALESCE(facts_policy, 'fabricate') AS facts_policy FROM analysis WHERE project_id = ?",
 
                     (project_id,),
 
@@ -630,6 +633,10 @@ async def _fetch_project_data_async(project_id: int) -> dict | None:
         "all_rows": all_rows,
 
         "global_facts_items": _parse_global_facts_items(row["global_facts_json"]),
+
+        # ENHANCE 2026-10-14（facts-ns P1-3）：缺失值策略随数据下发，供正文生成
+        # 按策略追加缺值口径铁律；旧 Redis 缓存无此键时消费方按 fabricate 处理。
+        "facts_policy": (row["facts_policy"] if "facts_policy" in row.keys() else "fabricate") or "fabricate",
 
         # ENHANCE 2026-10-05（P-9）：招标文件已提取的「工程作法/施工方案」原文。
         # 正文生成据此区分「承接既有方案扩写」与「无方案从头拟定」两种流程。

@@ -307,9 +307,18 @@ async def sync_hardcode_to_db(
     changed_by = getattr(current, "username", "") or ""
 
     def _sync():
-        synced = []
-        refreshed = []      # 跟随硬编码刷新的 content
-        kept_modified = []  # 保留了用户自定义
+        # BUG-FIX-PROMPT-R8（同步报告语义模糊）：原实现中 `synced` 变量在
+        # overwrite=True 时**总是**追加每个 key（无论实际是新增、刷新还是保留），
+        # 使 `{len(synced)} 个已处理` 的语义误导——它其实只是「本轮触碰过的 key
+        # 总数」，与 `refreshed + kept_modified + (新增)` 之和相等，读者无法判断
+        # 「真正同步了哪几个」。现拆分语义：
+        #   - `synced`        : 仅新增（DB 中原本不存在、本轮 INSERT）
+        #   - `refreshed`     : content 跟随硬编码刷新的（含用户未改过 或 reset_modified=True）
+        #   - `kept_modified` : 用户改过且未 reset_modified，仅 default_content 更新
+        #   - `skipped`       : overwrite=False 时未做任何动作的
+        synced = []           # 仅新增
+        refreshed = []        # 跟随硬编码刷新的 content
+        kept_modified = []    # 保留用户自定义
         skipped = []
         with get_db() as conn:
             for key, meta in _ALL_PROMPTS.items():
@@ -376,8 +385,6 @@ async def sync_hardcode_to_db(
                     )
                     refreshed.append(key)
 
-                synced.append(key)
-
         return {
             "synced": synced,
             "refreshed": refreshed,
@@ -388,12 +395,14 @@ async def sync_hardcode_to_db(
 
     result = await asyncio.to_thread(_sync)
     reload_prompt_cache()
+    # BUG-FIX-PROMPT-R8：报告语义澄清——新增 / 刷新 / 保留 / 跳过 四项之和恒等于 total
     return {
         "status": "ok",
         "message": (
-            f"同步完成：{len(result['synced'])} 个已处理，"
-            f"其中 {len(result['refreshed'])} 个 content 刷新为硬编码新版本，"
-            f"{len(result['kept_modified'])} 个保留了用户自定义"
+            f"同步完成：新增 {len(result['synced'])} 个，"
+            f"刷新 {len(result['refreshed'])} 个，"
+            f"保留用户自定义 {len(result['kept_modified'])} 个，"
+            f"跳过 {len(result['skipped'])} 个（共 {result['total']} 个提示词）"
         ),
         **result,
     }

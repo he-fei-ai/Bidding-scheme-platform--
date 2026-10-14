@@ -81,6 +81,8 @@ _ORCH_SYSTEM = """你是投标技术方案正文编排专家。请根据章节�
 3. Mermaid 图是否合适（mermaid.needed + priority + reason）
 4. AI 生图是否合适（image.needed + priority + reason）
 5. 本章节应参考哪些知识库素材（knowledge.item_ids，从用户提供的素材清单中选择）
+6. 本章节需要哪些全局事实（facts.titles，只从用户提供的「全局事实标题清单」中选标题，
+   不要输出任何具体事实内容）
 
 核心原则：
 - 克制为美：能文字表达的不配图，不要为了形式硬插
@@ -91,10 +93,13 @@ _ORCH_SYSTEM = """你是投标技术方案正文编排专家。请根据章节�
 - knowledge.item_ids: 只能从「可用知识素材清单」给出的 ID 中选择，只选与本章节
   内容真正相关的条目（通常 0~3 条），没有相关素材就给空数组，不要硬凑；
   素材 ID 必须原样引用，禁止编造清单中不存在的 ID
+- facts.titles: 只能从「全局事实标题清单」中选择标题（通常 0~8 条，涉及工期/人员/
+  质保/服务承诺的章节应选上对应事实），未提供清单或无需要时给空数组；
+  编排判断必须结合事实标题避免时间、地点、人员、设备、标准或服务承诺前后不一致的表达
 
 输出严格 JSON 数组，每个元素包含 section_id, title, recommended_type, confidence, reason,
 以及 plan: {table:{needed,purpose}, mermaid:{needed,priority,reason}, image:{needed,priority,reason},
-knowledge:{item_ids:[...]}}"""
+knowledge:{item_ids:[...]}, facts:{titles:[...]}}"""
 
 
 _ORCH_USER_TEMPLATE = """### 项目概述
@@ -117,7 +122,8 @@ _ORCH_USER_TEMPLATE = """### 项目概述
 
 
 def _render_orch_user(template: str, proj_overview: str, leaf_json: str, scoring: str,
-                      knowledge_catalog: str = "") -> str:
+                      knowledge_catalog: str = "",
+                      fact_titles_text: str = "") -> str:
     """渲染编排用户提示词，兼容两种占位符风格。
 
     BUG-FIX 2026-09-14（高）：编排只认硬编码的 _ORCH_USER_TEMPLATE（{} 风格），
@@ -132,6 +138,8 @@ def _render_orch_user(template: str, proj_overview: str, leaf_json: str, scoring
     单遍替换还顺带消除了旧 `.replace` 链路的跨变量注入隐患。
 
     ENHANCE 2026-10-09（E-2）：新增 knowledge_catalog（可用知识素材清单文本）。
+    ENHANCE 2026-10-14（facts-ns P0）：新增 fact_titles_text（全局事实标题清单，
+    对齐易标 globalFactTitlesText：编排只选标题，不输出事实内容）。
     """
     if not template:
         template = _ORCH_USER_TEMPLATE
@@ -148,6 +156,8 @@ def _render_orch_user(template: str, proj_overview: str, leaf_json: str, scoring
         SCORING_SUMMARY=(scoring or "")[:1000],
         # E-2：知识素材清单（两种占位符风格统一供给）
         KNOWLEDGE_CATALOG=knowledge_catalog or "（无可用知识素材）",
+        # P0（facts-ns）：全局事实标题清单（未提供时给空，模板无此占位符也不报错）
+        FACTS_TITLES=fact_titles_text,
     )
 
     # BUG-FIX 2026-09-14（高·补）：注册的 v2.0 模板只声明了 __OUTLINE__ 与
@@ -167,6 +177,15 @@ def _render_orch_user(template: str, proj_overview: str, leaf_json: str, scoring
             "\n\n### 可用知识素材清单（ID: 标题 — 摘要）\n"
             f"{knowledge_catalog}\n"
             "（knowledge.item_ids 只能从上述清单中选择，无相关素材给空数组）"
+        )
+    # P0（facts-ns 2026-10-14）：同 E-2 思路——自定义模板没有事实标题占位符时
+    # 补一段，保证 facts.titles 通道在管理员自定义提示词场景下不静默失效。
+    if fact_titles_text and "全局事实标题" not in rendered:
+        rendered += (
+            "\n\n### 全局事实标题清单（编排时只能选择标题，不要输出具体事实内容）\n"
+            f"{fact_titles_text}\n"
+            "（plan.facts.titles 只能从上述标题中选择，只选本章节确实需要的，"
+            "通常 0~8 条；无需要给空数组）"
         )
     return rendered
 
@@ -219,6 +238,46 @@ def _extract_knowledge_ids(plan_raw: dict, allowed_ids: set | None) -> list[int]
     return out
 
 
+def _build_fact_titles_text(titles: list | None) -> str:
+    """把事实标题清单渲染成编排提示词用的稳定文本（P0，facts-ns 2026-10-14）。
+
+    稳定性要求与知识素材目录同理：同一项目同一批事实多次请求的文本必须
+    完全一致，不破坏编排请求的 prompt cache 前缀。
+    """
+    if not titles:
+        return ""
+    return "\n".join(f"- {str(t).strip()}" for t in titles if str(t).strip())
+
+
+def _extract_fact_titles(plan_raw: dict, max_items: int = 12) -> list[str]:
+    """从编排 plan 里提取 facts.titles（P0，facts-ns 2026-10-14）。
+
+    容错两种形态：`facts: {titles: [...]}`（标准）与 `facts: [...]`（AI 简写）。
+    去重保序、限长；标题是否真实存在由生成侧 `resolve_facts_by_titles` 统一
+    白名单过滤（事实集本身即白名单，清单外标题一律丢弃）。
+    """
+    facts_raw = plan_raw.get("facts")
+    if isinstance(facts_raw, dict):
+        titles = facts_raw.get("titles")
+    elif isinstance(facts_raw, list):
+        titles = facts_raw
+    else:
+        return []
+    if not isinstance(titles, list):
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for t in titles:
+        s = str(t or "").strip()
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+        if len(out) >= max_items:
+            break
+    return out
+
+
 def _build_leaf_list_json(outline: list, max_items: int = 0) -> str:
     """把 outline 转成精简 JSON（只保留编排必需的字段）"""
     leaves = []
@@ -242,11 +301,13 @@ def _build_leaf_list_json(outline: list, max_items: int = 0) -> str:
 async def _orch_one_section(provider: Any, leaf: dict, sys_prompt: str,
                              proj_overview: str, scoring: str,
                              user_template: str = "",
-                             knowledge_catalog: str = "") -> dict | None:
+                             knowledge_catalog: str = "",
+                             fact_titles_text: str = "") -> dict | None:
     """单章节编排调用（失败降级为 text + 空 plan，不阻塞整体）"""
     leaf_json = json.dumps([leaf], ensure_ascii=False)
     user_prompt = _render_orch_user(user_template, proj_overview, leaf_json, scoring,
-                                    knowledge_catalog=knowledge_catalog)
+                                    knowledge_catalog=knowledge_catalog,
+                                    fact_titles_text=fact_titles_text)
     try:
         messages = [
             AIMessage(role="system", content=sys_prompt),
@@ -280,7 +341,8 @@ async def orchestrate_content(provider: Any, outline: Any,
                                table_ratio: str = "moderate",
                                prefer_mermaid: bool = True,
                                section_per_segment: int = 10,
-                               knowledge_catalog: list | None = None) -> list:
+                               knowledge_catalog: list | None = None,
+                               fact_titles: list | None = None) -> list:
     """完整正文编排（标书智能体六 / 文档三核心流程）
 
     Args:
@@ -295,6 +357,10 @@ async def orchestrate_content(provider: Any, outline: Any,
         knowledge_catalog: 可选知识素材目录（E-2），
             每项 {id:int, title:str, summary:str}；非空时编排提示词附带素材清单，
             AI 从中挑选 knowledge.item_ids，程序侧白名单过滤后写回 plan.knowledge
+        fact_titles: 可选全局事实标题清单（P0，facts-ns 2026-10-14，对齐易标
+            globalFactTitlesText）；非空时编排提示词附带标题清单，AI 输出
+            plan.facts.titles，生成侧按标题取完整事实注入（编排只看标题、
+            不输出事实内容）；缺省/空列表时 facts.titles 恒为空，行为与今天一致
 
     Returns:
         list[dict]: 每个叶子节点的编排结果，含:
@@ -303,6 +369,7 @@ async def orchestrate_content(provider: Any, outline: Any,
           - plan.mermaid {needed:bool, priority:int, reason:str}
           - plan.image  {needed:bool, priority:int, reason:str}
           - plan.knowledge {item_ids:[int]} （E-2；无知识通道时为空列表）
+          - plan.facts {titles:[str]} （P0，facts-ns；无事实通道时为空列表）
           - illustration_type: "ai" | "mermaid" | "none"  （Step 2 裁定后填充）
     """
     # 防御：旧代码可能传 JSON 字符串而非 list
@@ -354,6 +421,9 @@ async def orchestrate_content(provider: Any, outline: Any,
                 except (TypeError, ValueError):
                     continue
 
+    # P0（facts-ns 2026-10-14）：事实标题清单通道（只看标题选事实，同易标）
+    fact_titles_text = _build_fact_titles_text(fact_titles)
+
     # 构建同级索引（传入 AI 能更准确判断不重复配图）
     siblings_by_id: dict[str, list[dict]] = {}
     for leaf in outline:
@@ -384,6 +454,7 @@ async def orchestrate_content(provider: Any, outline: Any,
                 project_overview, scoring_standards,
                 user_template=user_template,
                 knowledge_catalog=knowledge_catalog_text,
+                fact_titles_text=fact_titles_text,
             )
             if orch is None:
                 orch = _fallback_plan(leaf)
@@ -437,6 +508,8 @@ def _fallback_plan(leaf: dict) -> dict:
             "image": {"needed": False, "priority": 0, "reason": ""},
             # E-2：降级路径 knowledge 置空（不阻塞，正文生成按无素材处理）
             "knowledge": {"item_ids": []},
+            # P0（facts-ns）：降级路径 facts 同样置空，正文生成回退确定性打分筛选
+            "facts": {"titles": []},
         },
         "illustration_type": "none",
     }
@@ -474,6 +547,9 @@ def _normalize_plan(orch: dict, leaf: dict,
             "image": _nblock(img_raw),
             # E-2：knowledge.item_ids 白名单过滤后写回；无通道时为空列表
             "knowledge": {"item_ids": _extract_knowledge_ids(plan_raw, allowed_knowledge_ids)},
+            # P0（facts-ns 2026-10-14）：facts.titles 去重限长后写回；标题存在性由
+            # 生成侧 resolve_facts_by_titles 统一白名单过滤（事实集即白名单）
+            "facts": {"titles": _extract_fact_titles(plan_raw)},
         },
         "illustration_type": None,  # Step 2 填充
     }
@@ -739,8 +815,13 @@ async def generate_full_skeleton(provider: Any, outline: list,
         "请为以上每个 section_id 输出一篇 1~2 句的篇章骨架，返回严格 JSON。"
     )
     try:
+        # BUG-FIX-PROMPT-E3（骨架提示词未注册）：原直接引用模块级 _SKELETON_SYSTEM
+        # 硬编码，管理页无法查看/编辑/覆盖，漂移检测也无法比对。现统一走
+        # get_prompt()（DB 优先 → 注册表 → 硬编码回退），保留 _SKELETON_SYSTEM
+        # 作为最小 fallback，行为向后兼容。
+        _skel_sys = get_prompt("CONTENT_SKELETON_SYSTEM") or _SKELETON_SYSTEM
         messages = [
-            AIMessage(role="system", content=_SKELETON_SYSTEM),
+            AIMessage(role="system", content=_skel_sys),
             AIMessage(role="user", content=user_prompt),
         ]
         chat_kwargs: dict[str, Any] = {"max_tokens": max_tokens, "temperature": 0.2}

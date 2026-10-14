@@ -789,9 +789,18 @@ async def _startup():
                 try:
                     from .services.ai.provider_factory import cleanup_old_config_audit
 
-                    _deleted = cleanup_old_config_audit(retention_days=_audit_retention_days)
+                    # BUG-FIX 2026-10-14：cleanup_old_config_audit 是同步 SQLite
+                    # DELETE，会持全局写锁。此前直接在事件循环里执行——首轮清理在
+                    # 应用刚启动即触发，DELETE 期间整个 loop 被冻结、所有并发请求挂
+                    # 起。与兄弟 provider_history 清理（ai_config_service._cleanup_loop
+                    # 早已 asyncio.to_thread 化）口径对齐：派发工作线程。
+                    _deleted = await asyncio.to_thread(
+                        cleanup_old_config_audit, retention_days=_audit_retention_days
+                    )
                     if _deleted:
                         logger.info("配置审计日志清理完成，删除 %d 条过期记录", _deleted)
+                except asyncio.CancelledError:
+                    raise
                 except Exception as _e:
                     logger.warning("配置审计日志清理异常（忽略）: %s", _e)
                 await asyncio.sleep(86400)

@@ -23,7 +23,6 @@ from ._registry import (
     extract_variables,
     has_residual_placeholders,
     render_prompt,
-    validate_prompt_variables,
 )
 from ._context import assemble_prompt_context, estimate_tokens, truncate_to_tokens
 
@@ -817,9 +816,34 @@ def _check_hardcode_drift() -> None:
     取代且文件不存在，照做只会让运维白跑一趟。改为指引真实可用的两条路径：
     启动期 seed_prompt_templates()，或提示词管理页的「同步硬编码」
     （POST /prompts/sync-hardcode）/ 对应提示词的「重置为默认」。
+
+    HARDENING 2026-10-14（漂移误报）：旧实现只要 ``DB content != 硬编码 content``
+    就告警，无法区分两种截然不同的情形——
+      ① 真正的「硬编码更新未同步」（DB 行从未被编辑：``content == default_content``）；
+      ② 管理员**有意**自定义的提示词（``content != default_content``）。
+    情形 ② 每次启动都误报漂移，制造噪声并诱导运维误点「重置为默认」抹掉自定义。
+    现仅对情形 ①（未编辑且与硬编码不一致）告警；情形 ② 静默（属预期内定制）。
+    查询 ``default_content`` 失败时保守回退到旧口径（宁可多报不漏报真实漂移）。
     """
     if not _prompt_cache:
         return
+
+    # 读取 DB 每行的 default_content，用于判定该行是否被用户编辑过。
+    # 查询失败（旧库无该列等）时置 None → 下面按「无法判定=视为未编辑」保守告警。
+    default_by_key: dict[str, str] | None = None
+    try:
+        from ....db import get_db
+
+        with get_db(readonly=True) as conn:
+            _drows = conn.execute(
+                "SELECT key, default_content FROM prompt_templates"
+            ).fetchall()
+        default_by_key = {
+            r["key"]: clean_prompt_text(r["default_content"] or "") for r in _drows
+        }
+    except Exception as e:
+        logger.debug("漂移检测读取 default_content 失败（回退旧口径）: %s", e)
+        default_by_key = None
 
     drifted_keys = []
     for key, meta in _ALL_PROMPTS.items():
@@ -829,14 +853,21 @@ def _check_hardcode_drift() -> None:
         default_content = meta["content"]
         # 清洗后比对（DB加载时已清洗，这里对硬编码也清洗一次）
         default_cleaned = clean_prompt_text(default_content)
-        if db_content != default_cleaned:
-            drifted_keys.append(key)
+        if db_content == default_cleaned:
+            continue  # 与硬编码一致，无漂移
+        # 内容不一致：仅当该行**未被用户编辑**（content == 本行 default_content，
+        # 即 DB 存的仍是旧默认值）才算真实漂移；被有意定制的行不告警。
+        if default_by_key is not None and key in default_by_key:
+            row_default = default_by_key[key]
+            if row_default and db_content != row_default:
+                continue  # 用户已自定义 → 非漂移，静默
+        drifted_keys.append(key)
 
     if drifted_keys:
         logger.warning(
-            "提示词硬编码与DB内容存在差异（共 %d 个）：%s\n"
+            "提示词硬编码与DB内容存在差异（共 %d 个，均为未编辑的过时默认值）：%s\n"
             "如需同步硬编码新版本到DB，请在提示词管理页点击「同步硬编码」"
-            "（POST /prompts/sync-hardcode），或对对应提示词执行「重置为默认」。",
+            "（POST /prompts/sync-hardcode?overwrite=true），或对对应提示词执行「重置为默认」。",
             len(drifted_keys),
             ", ".join(drifted_keys[:10]) + ("..." if len(drifted_keys) > 10 else ""),
         )
@@ -981,6 +1012,15 @@ def get_prompt(key: str, **kwargs) -> str:
 def get_prompt_with_validation(key: str, **kwargs) -> tuple[str, list[str]]:
     """获取提示词并校验变量，返回 (提示词文本, 缺失变量列表)。
 
+    BUG-FIX-PROMPT-G4（校验口径统一 2026-10-14）：原缺失变量取自
+    ``validate_prompt_variables(key, **kwargs)``——即**注册表默认模板**的变量集合，
+    而返回的正文却由 ``get_prompt`` 按**实际生效模板**（DB 优先，可能被用户
+    增删了占位符）渲染。两者口径不一致，正是 get_prompt 内 BUG-FIX-PROMPT-D3
+    已修复、但本函数遗漏的同一问题：
+      - 用户在 DB 里新增的占位符不会被报缺（漏检）；
+      - 用户在 DB 里删除的占位符却被误报为缺失（噪声）。
+    现改为对「实际模板内容」做变量校验与渲染，与 get_prompt 完全同口径。
+
     Args:
         key: 提示词键名
         **kwargs: 变量名和值的映射
@@ -988,8 +1028,23 @@ def get_prompt_with_validation(key: str, **kwargs) -> tuple[str, list[str]]:
     Returns:
         tuple: (渲染后的提示词文本, 缺失的变量名列表)
     """
-    prompt = get_prompt(key, **kwargs)
-    missing = validate_prompt_variables(key, **kwargs)
+    # 先取「未渲染的实际模板」（DB 优先，回退硬编码）以获取真实占位符集合
+    raw = get_prompt(key)
+    if not raw:
+        return "", []
+
+    if kwargs:
+        required_vars = extract_variables(raw)
+        passed_lower = {k.lower() for k, v in kwargs.items() if v is not None}
+        missing = [v for v in required_vars if v.lower() not in passed_lower]
+        if missing:
+            logger.warning(
+                "Prompt '%s' has missing variables (not passed in call): %s", key, missing
+            )
+        prompt = render_prompt(raw, **kwargs)
+    else:
+        missing = []
+        prompt = raw
 
     # 额外检查：渲染后是否有残留占位符
     if not missing and has_residual_placeholders(prompt):

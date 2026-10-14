@@ -8,14 +8,14 @@ import {
   SaveOutlined, ApiOutlined, ReloadOutlined,
   ThunderboltOutlined,
   RocketOutlined, ExperimentOutlined, EyeOutlined, EyeInvisibleOutlined,
-  ThunderboltFilled, UpOutlined, DownOutlined,
+  ThunderboltFilled, UpOutlined, DownOutlined, QuestionCircleOutlined,
 } from "@ant-design/icons";
 import { extractApiError, findProviderMeta } from "../utils";
 import {
   getTextProviderConfigs, saveTextProviderConfig, activateTextProviderConfig,
   fetchModels, quickSetup, fetchModelInfo, testAIConnection, getAIConfig,
 } from "../api";
-import type { TextProviderConfig } from "../types";
+import type { TextProviderConfig, TextProviderSavePayload } from "../types";
 
 // PROVIDER_META 已抽为 utils 单一事实源（TEXT_PROVIDER_META/findProviderMeta，组件级可测化 2026-10-05）
 
@@ -41,7 +41,10 @@ function ProviderCard({
   // 初始化表单
   // BUG 修复：使用 queueMicrotask 延迟一帧，确保 Form 组件已挂载到 DOM
   useEffect(() => {
-    const meta = findProviderMeta(config.provider_name);
+    // P1-ID（2026-10-14）：优先用后端下发的稳定 id 查本地元数据兜底表。
+    // 此前只传中文 provider_name，而兜底表是 snake_case 键（11 项仅 2 项能对上），
+    // 导致 base_url/model 默认值对绝大多数厂商静默失效。
+    const meta = findProviderMeta(config.provider_id || config.provider_name);
     // 切换厂商时清空已缓存的模型选项
     setModelOptions([]);
     queueMicrotask(() => {
@@ -53,30 +56,44 @@ function ProviderCard({
           max_tokens: config.max_tokens ?? undefined,
           concurrency: config.concurrency ?? undefined,
           temperature: config.temperature ?? 0.7,
+          timeout: config.timeout ?? 120,
+          document_profile: config.document_profile || "",
         });
       } catch {
         // Form 未挂载时可能抛异常，忽略即可
       }
     });
-  }, [config.provider_name]);
+  }, [config.provider_name, config.provider_id]);
+
+  /** 组装提交载荷：统一做范围钳制，避免各按钮逻辑漂移 */
+  const buildPayload = (values: any, activate: boolean): TextProviderSavePayload => ({
+    provider_name: config.provider_name,
+    api_key: values.api_key || "",
+    base_url: values.base_url || "",
+    model: values.model || "",
+    max_tokens: Math.min(Math.max(Number(values.max_tokens) || 4096, 256), 65536),
+    // F-12 对齐后端（save_ai_config）：temperature 允许 0（确定性输出），
+    // 此前 `|| 0.7` 会把用户显式设置的 0 静默替换为 0.7；并发补充上限 64。
+    concurrency: Math.min(Number(values.concurrency) || 4, 64),
+    temperature: values.temperature ?? 0.7,
+    // P1-CFG（2026-10-14）：超时此前在库里有列、provider 也读，但既无请求字段
+    // 也无 UI，等于永远 120s。补齐输入 + 提交（后端钳制到 [5, 600]）。
+    timeout: Math.min(Math.max(Number(values.timeout) || 120, 5), 600),
+    // P1-DOC（2026-10-14）：行业画像被后端配图编排消费（sections.py）。原请求模型
+    // 默认 ''，每次保存都会静默清空。现显式提交；未填写时传 ""（=显式清空），
+    // 由表单本身承载真值，不再出现「保存一次丢一次」。
+    document_profile: values.document_profile ?? "",
+    // TD-5：显式声明语义 ——「保存本厂商」不切换主用，「设为当前使用」才切换。
+    // 此前前端从不传该字段，后端默认 True，于是「只改温度」也会把主配置切走。
+    activate_after_save: activate,
+  });
 
   const handleSave = useCallback(async () => {
     try {
       const values = await currentFormRef.current.validateFields();
       setSaving(true);
-      await saveTextProviderConfig({
-        provider_name: config.provider_name,
-        api_key: values.api_key || "",
-        base_url: values.base_url || "",
-        model: values.model || "",
-        max_tokens: Math.min(Math.max(Number(values.max_tokens) || 4096, 256), 65536),
-        // F-12 对齐后端（save_ai_config）：temperature 允许 0（确定性输出），
-        // 此前 `|| 0.7` 会把用户显式设置的 0 静默替换为 0.7；并发补充上限 64。
-        concurrency: Math.min(Number(values.concurrency) || 4, 64),
-        temperature: values.temperature ?? 0.7,
-      } as TextProviderConfig);
-      const msg = values.api_key ? `${config.provider_name} 配置已保存并已自动设为当前使用` : `${config.provider_name} 配置已保存`;
-      message.success(msg);
+      await saveTextProviderConfig(buildPayload(values, false));
+      message.success(`${config.provider_name} 配置已保存`);
       onSaved();
     } catch (err: any) {
       if (err.errorFields) return; // 表单验证失败
@@ -84,24 +101,15 @@ function ProviderCard({
     } finally {
       setSaving(false);
     }
-  }, [config.provider_name, onSaved]);
+  }, [config.provider_name, onSaved, buildPayload]);
 
   const handleActivate = useCallback(async () => {
     try {
       const values = await currentFormRef.current.validateFields();
-      if (!values.api_key) { message.warning("请先填写 API Key 再设为当前使用"); return; }
+      if (!values.api_key && !config.api_key_set) { message.warning("请先填写 API Key 再设为当前使用"); return; }
       setActivating(true);
-      // 如果配置未保存或表单有修改，先自动保存再激活
-      await saveTextProviderConfig({
-        provider_name: config.provider_name,
-        api_key: values.api_key || "",
-        base_url: values.base_url || "",
-        model: values.model || "",
-        max_tokens: Math.min(Math.max(Number(values.max_tokens) || 4096, 256), 65536),
-        // F-12 对齐后端：同 handleSave，0 为合法 temperature，并发上限 64。
-        concurrency: Math.min(Number(values.concurrency) || 4, 64),
-        temperature: values.temperature ?? 0.7,
-      } as TextProviderConfig);
+      // 如果配置未保存或表单有修改，先自动保存再激活（保存阶段不做自动激活）
+      await saveTextProviderConfig(buildPayload(values, false));
       await activateTextProviderConfig(config.provider_name);
       message.success(`已保存并激活「${config.provider_name}」`);
       onSaved();
@@ -111,7 +119,7 @@ function ProviderCard({
     } finally {
       setActivating(false);
     }
-  }, [config.provider_name, onSaved]);
+  }, [config.provider_name, config.api_key_set, onSaved, buildPayload]);
 
   const handleTest = useCallback(async () => {
     setTestResult({ status: "loading", message: "测试中..." });
@@ -151,7 +159,7 @@ function ProviderCard({
         form.setFieldsValue({ model: selected });
         // 自动填充元数据
         try {
-          const info = await fetchModelInfo({ api_key: apiKey, base_url: baseUrl, model: selected, provider: config.provider_name });
+          const info = await fetchModelInfo({ api_key: apiKey, base_url: baseUrl, model: selected, provider: config.provider_name, provider_id: config.provider_id || "" });
           if (info) form.setFieldsValue({ max_tokens: info.max_tokens, concurrency: info.concurrency });
         } catch { /* 忽略 */ }
         message.success(`获取到 ${modelList.length} 个模型，请从下拉菜单选择`);
@@ -171,11 +179,11 @@ function ProviderCard({
     const apiKey = form.getFieldValue("api_key");
     const baseUrl = form.getFieldValue("base_url");
     if (model && apiKey && baseUrl) {
-      fetchModelInfo({ api_key: apiKey, base_url: baseUrl, model, provider: config.provider_name })
+      fetchModelInfo({ api_key: apiKey, base_url: baseUrl, model, provider: config.provider_name, provider_id: config.provider_id || "" })
         .then(info => { if (info) form.setFieldsValue({ max_tokens: info.max_tokens, concurrency: info.concurrency }); })
         .catch(() => {});
     }
-  }, [config.provider_name, form]);
+  }, [config.provider_name, config.provider_id, form]);
 
   return (
     <Col xs={24} sm={12} lg={8} key={config.provider_name}>
@@ -207,7 +215,7 @@ function ProviderCard({
           <div style={{ color: "#666", fontSize: 12, lineHeight: "20px" }}>
             <div>地址：{config.base_url ? `${config.base_url.slice(0, 30)}${config.base_url.length > 30 ? "…" : ""}` : "未填写"}</div>
             <div>模型：{config.model || "未填写"}</div>
-            <div>Token：{config.max_tokens} · 并发：{config.concurrency}</div>
+            <div>Token：{config.max_tokens} · 并发：{config.concurrency} · 超时：{config.timeout ?? 120}s</div>
           </div>
         )}
 
@@ -297,8 +305,39 @@ function ProviderCard({
               </Col>
             </Row>
 
-            <Form.Item name="temperature" label="Temperature">
-              <InputNumber min={0} max={2} step={0.1} precision={1} style={{ width: "100%" }} />
+            <Row gutter={8}>
+              <Col span={12}>
+                <Form.Item name="temperature" label="Temperature">
+                  <InputNumber min={0} max={2} step={0.1} precision={1} style={{ width: "100%" }} />
+                </Form.Item>
+              </Col>
+              <Col span={12}>
+                {/* P1-CFG（2026-10-14）：超时此前既无请求字段也无 UI，恒为 120s */}
+                <Form.Item
+                  name="timeout"
+                  label="请求超时（秒）"
+                  tooltip="单次 AI 请求的超时上限。厂商在配置页单独调大/调小后，激活该厂商时会同步到主配置。"
+                >
+                  <InputNumber min={5} max={600} step={10} style={{ width: "100%" }} suffix="s" />
+                </Form.Item>
+              </Col>
+            </Row>
+
+            {/* P1-DOC（2026-10-14）：行业画像被后端配图编排消费（sections.py
+                generate_illustration_*），此前后端有列、前端无入口，且每次保存
+                厂商配置都会被默认空串清空 */}
+            <Form.Item
+              name="document_profile"
+              label={
+                <Space size={4}>
+                  <span>行业画像</span>
+                  <Tooltip title="本项目所属行业/领域描述，用于提升章节配图的相关性。留空表示不限定行业。">
+                    <QuestionCircleOutlined style={{ color: "#999" }} />
+                  </Tooltip>
+                </Space>
+              }
+            >
+              <Input placeholder="例如：市政公用工程总承包 / 智慧城市信息化" allowClear />
             </Form.Item>
 
             <Space wrap size={8}>
@@ -308,7 +347,7 @@ function ProviderCard({
               <Button icon={<ThunderboltFilled />} loading={activating} onClick={handleActivate} disabled={config.is_active}>
                 {config.is_active ? "当前使用中" : "设为当前使用"}
               </Button>
-              <Button icon={<ApiOutlined />} onClick={handleTest} disabled={!config.api_key} loading={testResult?.status === "loading"}>
+              <Button icon={<ApiOutlined />} onClick={handleTest} loading={testResult?.status === "loading"}>
                 测试连接
               </Button>
             </Space>

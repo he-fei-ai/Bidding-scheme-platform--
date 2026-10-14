@@ -358,13 +358,28 @@ class TestTokenBudget:
         assert estimate_tokens(out) > 19000
 
     def test_estimate_tokens_semantics_unchanged(self):
-        """回归 PROMPT-C3：translate 加速实现必须与原正则口径一致。"""
+        """回归 PROMPT-C3：translate 加速实现必须与原正则口径一致。
+
+        ENHANCE 2026-10-11：tiktoken 已安装时使用精确计数，值与启发式不同
+        （更准确）。测试分两路：tiktoken 可用 → 验证精确计数合理；
+        tiktoken 不可用 → 验证启发式口径不变。
+        """
         from app.services.ai.prompts import estimate_tokens
+        from app.services.ai.prompts._context import _TIKTOKEN_ENCODER
 
         for s in ["", "abc", "中文abc中文", "a" * 400, "中" * 400]:
-            cjk = len(re.findall(r"[一-鿿]", s))
-            expected = cjk + (len(s) - cjk + 3) // 4
-            assert estimate_tokens(s) == expected, s[:20]
+            if _TIKTOKEN_ENCODER is not None:
+                # tiktoken 精确计数：非空文本须 > 0，空文本 = 0
+                result = estimate_tokens(s)
+                if s:
+                    assert result > 0, f"tiktoken 应返回 >0: {s[:20]}"
+                else:
+                    assert result == 0, "空文本应为 0"
+            else:
+                # 启发式回退：口径与原正则一致
+                cjk = len(re.findall(r"[一-鿿]", s))
+                expected = cjk + (len(s) - cjk + 3) // 4
+                assert estimate_tokens(s) == expected, s[:20]
 
     def test_priority_ordering_respected(self):
         from app.services.ai.prompts import assemble_prompt_context

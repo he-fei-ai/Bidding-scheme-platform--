@@ -175,6 +175,26 @@ def _figure_counter_key(parent_section: str, project_id: int | None) -> str:
     return f"{project_id if project_id is not None else '-'}|{parent_section or 'default'}"
 
 
+def _fig_chapter(parent_section: str) -> str:
+    """把传入的章节标识归一为**展示章号**（图号「图{章号}-{序号}」的章号段）。
+
+    BUG-FIX 2026-10-14（P1·同章图号重号）：图号语义是「按章连续编号」，章号取
+    `parent_section` 第一个点号之前的段（如 "3.2" → "3"）。但旧实现分桶键用的是
+    **完整** parent_section，而展示章号用的是**截断后**的章号——两者口径不一致。
+    当调用方仅在未透传 chapter_number、回退用带点号的 parent_section_number 时
+    （如 "3.1"、"3.2" 同属第 3 章的两个子节），两张图落入**不同桶**却都渲染成
+    「图3-x」，各自从 1 计数 → 第 3 章出现两个「图3-1」（编号冲突）。
+    现统一以截断后的章号同时作为**分桶键**与**展示章号**：同章恒共用一条计数器
+    （序号连续且唯一），跨章互不影响。纯章号（生产主路径传入的 "3"）时截断为幂等，
+    行为与原实现完全一致，零回归。
+    空串 / 纯空白 / "default" 哨兵 → 返回空串（调用方据此不分配图号）。
+    """
+    s = str(parent_section or "").strip()
+    if not s or s.lower() == "default":
+        return ""
+    return s.split(".")[0]
+
+
 def _reset_figure_counter(project_id: int | None = None):
     """导出开始时重置图表计数器。
 
@@ -234,7 +254,12 @@ def _next_figure_number(parent_section: str, project_id: int | None = None) -> s
     # 安全兜底：显式传入 "default"（桶名）不生成图号
     if str(parent_section).strip().lower() == "default":
         return ""
-    bucket = _figure_counter_key(parent_section, project_id)
+    # BUG-FIX 2026-10-14（P1·同章图号重号）：分桶键与展示章号统一取截断后的章号
+    # （见 _fig_chapter），保证「同一章的图号连续且唯一」。纯章号输入时与原行为一致。
+    chapter = _fig_chapter(parent_section)
+    if not chapter:
+        return ""
+    bucket = _figure_counter_key(chapter, project_id)
     ctx = _fig_counter_ctx_var.get()
     if ctx is not None:
         ctx[bucket] = ctx.get(bucket, 0) + 1
@@ -243,14 +268,19 @@ def _next_figure_number(parent_section: str, project_id: int | None = None) -> s
         with _figure_counter_lock:
             _figure_counter_state[bucket] = _figure_counter_state.get(bucket, 0) + 1
             seq = _figure_counter_state[bucket]
-    key = parent_section or "default"
-    chapter = key.split(".")[0] if "." in key else key
     return f"图{chapter}-{seq}"
 
 
 def _rewind_figure_number(parent_section: str, project_id: int | None = None) -> None:
-    """回滚刚分配的图号（渲染失败不得占号）。"""
-    bucket = _figure_counter_key(parent_section, project_id)
+    """回滚刚分配的图号（渲染失败不得占号）。
+
+    BUG-FIX 2026-10-14：分桶键必须与 _next_figure_number 严格一致（同取截断后的
+    章号），否则回退找不到分配时写入的桶 → 图号不回退 → 后续图号整体前跳（虚跳）。
+    """
+    chapter = _fig_chapter(parent_section)
+    if not chapter:
+        return
+    bucket = _figure_counter_key(chapter, project_id)
     ctx = _fig_counter_ctx_var.get()
     if ctx is not None:
         cur = ctx.get(bucket, 0)

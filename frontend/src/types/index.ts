@@ -320,6 +320,8 @@ export interface AIConfig {
   concurrency: number;
   temperature: number;
   max_tokens: number;
+  /** 请求超时（秒）。2026-10-14 起 `/ai/config` 真正可写（此前是死列） */
+  timeout?: number;
   is_builtin_default?: boolean;
   current_profile_name?: string;
   /** 配置来源回显（2026-10-04 增强）：env=环境变量覆盖 / database / default */
@@ -327,6 +329,8 @@ export interface AIConfig {
 }
 
 export interface KnownProvider {
+  /** 稳定机器 id（2026-10-14 新增）：跨前后端引用厂商的锚点，避免中文展示名歧义 */
+  id?: string;
   name: string;
   base_url: string;
   type: string;
@@ -340,6 +344,8 @@ export interface KnownProvider {
 
 export interface TextProviderConfig {
   provider_name: string;
+  /** 稳定机器 id（2026-10-14 新增，对应 /ai/providers 的 id）；旧后端不返回时为 undefined */
+  provider_id?: string;
   provider_type: string;
   api_key: string;
   base_url: string;
@@ -348,9 +354,46 @@ export interface TextProviderConfig {
   concurrency: number;
   temperature: number;
   document_profile: string;
+  /** 请求超时（秒），2026-10-14 新增可配置项 */
+  timeout?: number;
   is_active: boolean;
   api_key_set?: boolean;
   updated_at?: string;
+}
+
+/**
+ * 保存厂商文本模型配置的请求载荷（2026-10-14 文本模型配置 BUG 修复轮新增）。
+ * 镜像后端 `TextProviderConfigData` 请求模型：除 provider_name 外均可选/有默认，
+ * **不含** `is_active`（服务端状态，由 activate 端点维护）与响应侧的 `api_key_set`/`updated_at`。
+ * 此前误用响应类型 `TextProviderConfig`（is_active/provider_type 必填）作为保存入参，
+ * 调用方只能 `as TextProviderConfig` 强转，tsc 报 TS2352/TS2345。
+ *
+ * `document_profile` 语义与后端 P1-DOC 对齐：`undefined`/`null` = 保留库内原值，
+ * `""` = 显式清空，非空串 = 写入新值。
+ */
+export interface TextProviderSavePayload {
+  /** 厂商名（text_provider_configs 主键） */
+  provider_name: string;
+  /** 厂商类型，默认 openai_compatible */
+  provider_type?: string;
+  /** API Key；占位符/空串 = 保留原值，非空 = 覆盖 */
+  api_key?: string;
+  /** 模型服务 base_url */
+  base_url?: string;
+  /** 模型名 */
+  model?: string;
+  /** 最大 token 数（后端钳制 [256, 65536]） */
+  max_tokens?: number;
+  /** 并发数（后端钳制 [1, 64]） */
+  concurrency?: number;
+  /** 温度（后端钳制 [0, 2]） */
+  temperature?: number;
+  /** 行业画像：undefined/null=保留原值，""=显式清空 */
+  document_profile?: string | null;
+  /** 请求超时（秒），后端钳制 [5, 600] */
+  timeout?: number;
+  /** 保存后是否自动激活为主配置（后端默认 true；"仅保存不切换"传 false） */
+  activate_after_save?: boolean;
 }
 
 export interface ImageProviderConfig {

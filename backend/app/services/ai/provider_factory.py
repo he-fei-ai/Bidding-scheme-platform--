@@ -460,13 +460,16 @@ def get_configured_providers() -> list[dict]:
         with get_db_with_retry() as conn:
             rows = conn.execute(
                 "SELECT provider_name, provider_type, base_url, api_key, model, "
-                "max_tokens, temperature, concurrency, is_active "
+                "max_tokens, temperature, concurrency, timeout, document_profile, is_active "
                 "FROM text_provider_configs "
                 "WHERE api_key IS NOT NULL AND api_key != '' "
                 "ORDER BY is_active DESC, updated_at DESC"
             ).fetchall()
             for row in rows:
-                name, ptype, url, key, model, max_tokens, temp, concurrency, is_active = row
+                (
+                    name, ptype, url, key, model, max_tokens, temp, concurrency,
+                    timeout, doc_profile, is_active,
+                ) = row
                 norm_url = _normalize_url(url)
                 if not norm_url or norm_url in seen_urls:
                     continue
@@ -487,6 +490,10 @@ def get_configured_providers() -> list[dict]:
                         "max_tokens": max_tokens or 16384,
                         "temperature": temp if temp is not None else 0.7,
                         "concurrency": concurrency or 4,
+                        # P1-CFG（2026-10-14）：把厂商级 timeout 带入降级链条目，
+                        # 否则激活/降级到该厂商时超时退回主配置默认。
+                        "timeout": timeout or 120,
+                        "document_profile": doc_profile or "",
                         "success_rate": 1.0,
                         "is_builtin_default": False,
                         "is_primary": False,
@@ -884,11 +891,17 @@ def create_provider_with_fallback(config: dict | None = None) -> tuple[Any, str]
         # F-4 BUG修复：此前所有降级条目统一用主配置的 key（注释自曝「历史记录中
         # 没有密钥」），但第1.5层 text_provider_configs 备选厂商各有自己的密钥 ——
         # 把 A 厂商的 key 发到 B 厂商 URL 必然 401，降级到带 key 的备选时健检也永远
-        # 失败。现按厂商取自身密钥，无自身密钥（history/兜底）才沿用主配置 key。
-        key = entry.get("api_key") or api_key
-        # TD-3（2026-10-06）：与异步 get_working_provider 语义对齐 —— 条目既无
-        # 自身密钥、又不是内置默认（agnes，自带 AGNES_API_KEY）时，拿主配置 key
-        # 去请求别的厂商 URL 必然 401，白等一次 5s 超时。直接跳过。
+        # 失败。现按厂商取自身密钥。
+        #
+        # P0-SEC-1（2026-10-14 审计修复）：原实现是 `entry.get("api_key") or api_key`
+        # —— 条目自身密钥为空串时会**回落到主配置密钥**，于是把主厂商的密钥作为
+        # `Authorization: Bearer` POST 到 DeepSeek / SiliconFlow / 通义 / 智谱 /
+        # OpenAI 等 5 个毫不相干的第三方端点。既是凭据外泄面，又必然 401、白等
+        # 每次 5s 超时。异步链 get_working_provider 早已是「无自身密钥即跳过」，
+        # 两链行为漂移。现按异步链口径对齐：条目密钥只能用自己的。
+        key = entry.get("api_key") or ""
+        # 条目既无自身密钥、又不是内置默认（agnes，自带 AGNES_API_KEY）时跳过：
+        # 无从得知该用哪把密钥，猜测等于把主密钥发出去。
         if not key and not entry.get("is_builtin_default"):
             logger.debug(
                 "Provider %s 无自身密钥且非内置默认，跳过（与异步链对齐）",
@@ -912,10 +925,21 @@ def create_provider_with_fallback(config: dict | None = None) -> tuple[Any, str]
                     api_key=key,
                     base_url=url,
                     model=model_to_use,
-                    max_tokens=config.get("max_tokens", 32768),
-                    temperature=config.get("temperature", 0.7),
-                    timeout=timeout,
+                    max_tokens=entry.get("max_tokens") or config.get("max_tokens", 32768),
+                    temperature=(
+                        entry["temperature"]
+                        if entry.get("temperature") is not None
+                        else config.get("temperature", 0.7)
+                    ),
+                    timeout=entry.get("timeout") or config.get("timeout", 120),
                     max_retries=2,
+                    # P1-CFG（2026-10-14）：条目自带并发/限流时优先（厂商隔离配置
+                    # 语义），否则沿用主配置。此前此处硬编码丢弃，导致用户在
+                    # Profile / 主配置里设的 rate_limit_per_min 与 concurrency
+                    # 在「走过降级链」的调用上完全失效（而未降级的 create_provider
+                    # 却生效）——同一份配置在不同代码路径上行为不一致。
+                    rate_limit_per_min=entry.get("rate_limit_per_min") or config.get("rate_limit_per_min", 0),
+                    concurrency=entry.get("concurrency") or config.get("concurrency", 0),
                 )
                 is_primary = (url == primary_url) or entry.get("is_primary", False)
                 source = "" if is_primary else entry["name"]
@@ -935,6 +959,8 @@ def create_provider_with_fallback(config: dict | None = None) -> tuple[Any, str]
         temperature=config.get("temperature", 0.7),
         timeout=timeout,
         max_retries=2,
+        rate_limit_per_min=config.get("rate_limit_per_min", 0),
+        concurrency=config.get("concurrency", 0),
     ), ""
 
 
@@ -983,9 +1009,10 @@ async def get_working_provider(primary_config: dict) -> tuple[Any, str]:
     返回:
         (provider, used_fallback_name): provider 为可用的 Provider 实例，
         used_fallback_name 为降级到的 provider 名称（空字符串表示使用主配置）
-    """
-    import httpx
 
+    注：探活 HTTP 调用已抽出到 `_async_quick_health_check` 并复用 `_HEALTH_CACHE`，
+    本函数只负责降级链编排（与同步版 create_provider_with_fallback 同口径）。
+    """
     api_key = primary_config.get("api_key", "")
     if not api_key:
         raise HTTPException(
@@ -1004,7 +1031,9 @@ async def get_working_provider(primary_config: dict) -> tuple[Any, str]:
         url = entry["base_url"]
         if not url:
             continue
-        key = entry.get("api_key", api_key)
+        # 与同步链 create_provider_with_fallback 完全同口径：条目密钥只能用自己的，
+        # 绝不回落到主配置密钥（否则会把主厂商凭据发往第三方 URL）。
+        key = entry.get("api_key", "") or ""
         if not key:
             if not entry.get("is_builtin_default"):
                 continue
@@ -1012,39 +1041,42 @@ async def get_working_provider(primary_config: dict) -> tuple[Any, str]:
         model = entry.get("model") or primary_config.get("model") or _AI_CONFIG_DEFAULTS.get("model", "gpt-4o")
 
         try:
-            async with httpx.AsyncClient(
-                timeout=httpx.Timeout(8, connect=5, read=8), **build_httpx_proxy_settings()
-            ) as client:
-                resp = await client.post(
-                    url.rstrip("/") + "/chat/completions",
-                    headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-                    json={
-                        "model": model,
-                        "messages": [{"role": "user", "content": "hi"}],
-                        "max_tokens": 4,
-                    },
-                )
-                if resp.status_code == 200:
-                    is_primary = (url == primary_url) or entry.get("is_primary", False)
-                    source = "" if is_primary else entry["name"]
-                    logger.info("使用 provider: %s (url=%s)", source or "主配置", url)
-                    provider = _make_provider(
-                        api_key=key,
-                        base_url=url,
-                        model=model,
-                        max_tokens=primary_config.get("max_tokens", 32768),
-                        temperature=primary_config.get("temperature", 0.7),
-                        timeout=timeout,
-                        max_retries=2,
-                    )
-                    return provider, source
-                elif resp.status_code == 429:
-                    # 429 = 限流，这个 provider 当前不可用，跳过尝试下一个
-                    retry_after = resp.headers.get("Retry-After", "?")
-                    logger.warning("Provider %s 返回 429 限流 (Retry-After=%ss)，跳过", entry.get("name", url), retry_after)
+            # P1-PERF（2026-10-14）：异步降级链此前**完全没有**探活缓存，同步链有。
+            # SSE 每次生成都要按链长逐个 POST 探活（8s 超时），主配置瞬断时会放大
+            # 成 N×8s 的串行等待。复用同一份 `_HEALTH_CACHE`（成功 60s / 失败 15s，
+            # 键含 sha256 密钥指纹），配置变更时由 bump_ai_config_version 一并清空。
+            cache_key = _health_cache_key(url, model, key)
+            cached_ok = _health_cache_get(cache_key)
+            if cached_ok is not None:
+                if not cached_ok:
+                    logger.debug("Provider %s 命中探活失败缓存，跳过", entry.get("name", url))
                     continue
-                elif resp.status_code == 401:
-                    logger.info("Provider %s 返回 401，跳过", entry.get("name", url))
+            else:
+                ok = await _async_quick_health_check(url, key, model)
+                _health_cache_put(cache_key, ok)
+                if not ok:
+                    continue
+
+            is_primary = (url == primary_url) or entry.get("is_primary", False)
+            source = "" if is_primary else entry["name"]
+            logger.info("使用 provider: %s (url=%s)", source or "主配置", url)
+            provider = _make_provider(
+                api_key=key,
+                base_url=url,
+                model=model,
+                max_tokens=entry.get("max_tokens") or primary_config.get("max_tokens", 32768),
+                temperature=(
+                    entry["temperature"]
+                    if entry.get("temperature") is not None
+                    else primary_config.get("temperature", 0.7)
+                ),
+                timeout=entry.get("timeout") or timeout,
+                max_retries=2,
+                # P1-CFG（2026-10-14）：与同步链对齐，不再丢弃限流/并发配置。
+                rate_limit_per_min=entry.get("rate_limit_per_min") or primary_config.get("rate_limit_per_min", 0),
+                concurrency=entry.get("concurrency") or primary_config.get("concurrency", 0),
+            )
+            return provider, source
         except Exception as e:
             logger.debug("Provider %s 不可用: %s", entry.get("name", url), type(e).__name__)
             continue
@@ -1059,20 +1091,23 @@ async def get_working_provider(primary_config: dict) -> tuple[Any, str]:
         temperature=primary_config.get("temperature", 0.7),
         timeout=timeout,
         max_retries=2,
+        rate_limit_per_min=primary_config.get("rate_limit_per_min", 0),
+        concurrency=primary_config.get("concurrency", 0),
     ), ""
 
 
-async def try_provider_health_check(config: dict) -> bool:
-    """快速探测 Provider 是否可达（非阻塞，超时极短）"""
-    import httpx
+async def _async_quick_health_check(base_url: str, api_key: str, model: str) -> bool:
+    """异步探活（get_working_provider 专用）。
 
-    api_key = config.get("api_key", "")
-    base_url = config.get("base_url", "")
-    model = config.get("model") or _AI_CONFIG_DEFAULTS.get("model", "gpt-4o")
+    200 = 可用；401/429 = 不可用（与同步链「仅 200 视为健康」的口径一致，
+    此前异步链只在 401/429 时 continue，其余非 200（如 5xx）会 fallthrough 到
+    链尾，浪费一次 5~8s 超时）；异常 = 不可用。
+    """
+    import httpx
 
     try:
         async with httpx.AsyncClient(
-            timeout=httpx.Timeout(5, connect=3, read=5), **build_httpx_proxy_settings()
+            timeout=httpx.Timeout(8, connect=5, read=8), **build_httpx_proxy_settings()
         ) as client:
             resp = await client.post(
                 base_url.rstrip("/") + "/chat/completions",
@@ -1083,6 +1118,15 @@ async def try_provider_health_check(config: dict) -> bool:
                     "max_tokens": 4,
                 },
             )
-            return resp.status_code in (200, 429)
     except Exception:
         return False
+    if resp.status_code == 200:
+        return True
+    if resp.status_code == 429:
+        logger.warning(
+            "Provider %s 返回 429 限流 (Retry-After=%s)，跳过",
+            base_url, resp.headers.get("Retry-After", "?"),
+        )
+    elif resp.status_code == 401:
+        logger.info("Provider %s 返回 401，跳过", base_url)
+    return False

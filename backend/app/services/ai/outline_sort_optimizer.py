@@ -39,6 +39,7 @@ import re
 from typing import Any
 
 from .providers.base import AIMessage
+from .prompts import get_prompt
 
 
 logger = logging.getLogger(__name__)
@@ -294,8 +295,12 @@ class OutlineSortOptimizer:
             f"请返回按新顺序排列的 JSON 数组（仅含 title 字段），核心28章必须保持原始相对顺序。"
         )
 
+        # BUG-FIX-PROMPT-E7（目录排序提示词未注册）：原直接引用模块级
+        # SORT_SYSTEM_PROMPT 硬编码，管理页无法查看/编辑/覆盖。现统一走
+        # get_prompt()（DB 优先 → 注册表 → 硬编码回退）。
+        _sort_sys = get_prompt("OUTLINE_SORT_SYSTEM") or SORT_SYSTEM_PROMPT
         messages = [
-            AIMessage(role="system", content=SORT_SYSTEM_PROMPT),
+            AIMessage(role="system", content=_sort_sys),
             AIMessage(role="user", content=user_prompt),
         ]
 

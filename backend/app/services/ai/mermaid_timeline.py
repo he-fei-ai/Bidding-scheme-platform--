@@ -433,6 +433,68 @@ def _render_milestone_flowchart_image_v2(data: dict, scale: float = 2.5) -> Byte
     return _image_to_stream(img)
 
 
+def _parse_mermaid_timeline(code: str) -> dict | None:
+    """解析 Mermaid `timeline` 语法代码为时间轴数据（供 v2 渲染器 PIL 兜底）。
+
+    BUG-FIX 2026-10-14：`render_mermaid_to_bytes` 的 timeline 分支此前仅对
+    `code` 以 `{` 开头的 **JSON 数据载荷** 做 PIL 渲染，纯 Mermaid `timeline`
+    语法（围栏 ```mermaid 内首行 timeline）在 HTTP Mermaid Service 不可用时被
+    静默丢图（无 PIL 兜底，违背“按需渲染 + 失败降级不丢正文”）。本函数把语法
+    解析为与数据型 timeline **完全同构**的字典后交 `_render_timeline_image_v2`。
+
+    语法：
+        timeline
+            title 里程碑标题
+            section 阶段名
+                2024 : 事件A : 事件B
+                2025 : 事件C
+    仅做**结构解析**，不伪造任何事件（无里程碑 → 返回 None，宁缺毋假）。
+    扩展事件名中的 `::`（Mermaid 事件备注分隔）用“孤立冒号”切分保留为一整体。
+    """
+    if not isinstance(code, str) or not code.strip():
+        return None
+    head = code.strip().split("\n", 1)[0].strip().lower()
+    if not head.startswith("timeline"):
+        return None
+    title = ""
+    group = ""
+    milestones: list[dict] = []
+    for raw in code.split("\n"):
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("%%") or stripped.startswith("//"):
+            continue
+        low = stripped.lower()
+        if low == "timeline":
+            continue
+        if low.startswith("title"):
+            m_title = re.match(r"^title\s+(.+)$", stripped, re.IGNORECASE)
+            if m_title:
+                title = m_title.group(1).strip().strip("\"'")
+            continue
+        if low.startswith("section"):
+            m_sec = re.match(r"^section\s+(.+)$", stripped, re.IGNORECASE)
+            if m_sec:
+                group = m_sec.group(1).strip().strip("\"'")
+            continue
+        # 事件行：period : evt1 : evt2 ...（仅按“孤立冒号”切分，保留 :: 备注）
+        if ":" not in stripped:
+            continue
+        parts = [p.strip() for p in re.split(r"(?<!:):(?!:)", stripped)]
+        period = parts[0] if parts else ""
+        events = [p for p in parts[1:] if p]
+        if not period or not events:
+            continue
+        for evt in events:
+            milestones.append({"name": evt, "date": period, "group": group})
+    if not milestones:
+        return None
+    return {
+        "type": "timeline",
+        "title": title or "关键里程碑时间线",
+        "milestones": milestones,
+    }
+
+
 def _repair_timeline_data(data: dict) -> dict | None:
     """修复时间轴数据：补齐缺失字段，确保渲染器能处理
 

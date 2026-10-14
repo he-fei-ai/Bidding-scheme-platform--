@@ -32,6 +32,7 @@ CHART_BATCH_ARRANGE_SYSTEM = """# 批量图表编排（系统提示词）— V8.
 2. **v2 渲染器适配**：输出数据必须适合 v2 商业级渲染器（递归节点树、多阶段矩阵、标准化坐标）
 3. **无降级妥协**：数据不足时标记 needed=false，而非生成低质量占位图
 4. **评分导向**：评分标准明确要求配图时，强制对应图表 needed=true
+5. **无降级渲染**：渲染管线仅走 Level 1.5 (HTTP Service 2x) → Level 2 (PIL v2 2x超采样+300 DPI) 双路径，不降级使用 mmdc (~96 DPI) 或 v1 渲染器（无抗锯齿）
 
 ### 输出格式（最高优先级）
 直接返回 JSON 对象，严禁在 JSON 前后附加任何解释文字或 Markdown 围栏。
@@ -136,7 +137,7 @@ CONTENT_ORCHESTRATION_LEGACY_SYSTEM = """你是投标技术方案正文编排专
   内容真正相关的条目（通常 0~3 条），没有相关素材就给空数组，不要硬凑；
   素材 ID 必须原样引用，禁止编造清单中不存在的 ID
 
-输出严格 JSON 数组，每个元素包含 section_id, title, recommended_type, confidence,
+输出严格 JSON 数组，每个元素包含 section_id, title, recommended_type, confidence, reason,
 以及 plan: {table:{needed,purpose}, mermaid:{needed,priority,reason}, image:{needed,priority,reason},
 knowledge:{item_ids:[...]}}"""
 
@@ -176,6 +177,17 @@ CONTENT_ORCHESTRATION_LEGACY_USER = _reg(
 # ──────────────────────────────────────────────────────────────────────
 # 3) Agent 一致性修复 user 模板（原 agent_repair.py 行 68-89，完整版）
 # ──────────────────────────────────────────────────────────────────────
+# BUG-FIX-PROMPT-F1（花括号口径不一致 / 畸形格式示例）：收编前该模板以
+# `_AGENT_USER_HDR.format(...)` 使用，JSON 示例按 str.format 约定写成双花括号
+# `{{ }}`。收编进注册表后，主渲染路径改为 get_prompt -> render_prompt，而
+# render_prompt 是**单遍 re.sub**、并不做 str.format 的 `{{`→`{` 反转义——于是
+# 双花括号被**原样**发给模型，AI 看到的输出格式示例是 `{{"done": ...}}`（畸形），
+# 与 DB 不可用时 `_AGENT_USER_HDR.format` fallback 产出的单花括号**不一致**，
+# 且可能诱导模型回显双花括号，触发 _parse_agent_json 的 json.loads 失败。
+# 修正：按注册表既有惯例（参见 TEMPLATE_EXTRACT_SYSTEM 等，JSON 示例一律单花
+# 括号）把示例改为单花括号。四个变量占位符 {global_facts} 等仍被正常替换；
+# `"key"` 形态的裸花括号不匹配 \{[A-Za-z_]\w{1,}\} 变量正则，不会被误当占位符，
+# 也不会引入新的 required 变量。
 CONSISTENCY_AGENT_USER = """## 全局事实（事实底稿，冲突以它为准）
 {global_facts}
 
@@ -189,11 +201,11 @@ CONSISTENCY_AGENT_USER = """## 全局事实（事实底稿，冲突以它为准�
 {prev_feedback}
 
 请继续。输出严格 JSON：
-{{"done": bool, "actions": [
-  {{"action": "search", "keyword": "..."}},
-  {{"action": "read", "section_id": "5", "start_line": 1, "end_line": 20}},
-  {{"action": "replace", "section_id": "5", "old_text": "...", "new_text": "...", "reason": "..."}}
-], "unresolved": [{{"section_id": "5", "reason": "..."}}]}}
+{"done": bool, "actions": [
+  {"action": "search", "keyword": "..."},
+  {"action": "read", "section_id": "5", "start_line": 1, "end_line": 20},
+  {"action": "replace", "section_id": "5", "old_text": "...", "new_text": "...", "reason": "..."}
+], "unresolved": [{"section_id": "5", "reason": "..."}]}
 - search：在全部正文里检索关键词，宿主返回命中的 section_id + 命中次数
 - read：读取某章节指定行范围（行号从 1 开始），宿主返回该片断文本
 - replace：精确替换。old_text 必须在目标章节唯一命中，否则宿主拒绝并反馈
@@ -239,6 +251,150 @@ TEMPLATE_EXTRACT_SYSTEM = _reg(
     "文件解析",
     "模板目录结构提取（系统提示词）",
     TEMPLATE_EXTRACT_SYSTEM,
+)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# 5) 全篇叙事骨架（原 workflows_orchestration.py 行 670，_SKELETON_SYSTEM）
+# ──────────────────────────────────────────────────────────────────────
+# 用途：一次性为目录中每个 L1/L2 章节生成 1~2 句「篇章骨架」，供正文生成阶段
+#       作为章节衔接参考。原文以 _SKELETON_SYSTEM 硬编码存在，未注册到
+#       _ALL_PROMPTS，导致：
+#         - 管理页无法查看/编辑/覆盖；
+#         - _check_hardcode_drift 无法比对；
+#         - DB 版本与硬编码版本漂移时不可察觉。
+# 变量：OUTLINE_SKELETON_LIST_JSON, PROJECT_OVERVIEW
+CONTENT_SKELETON_SYSTEM = """你是投标技术方案的全篇叙事骨架规划师。请为目录中的每个一级/二级章节各写 1~2 句「篇章骨架」，说明该章在整个方案中的定位、要回答什么问题、与前后章节如何承接。
+
+硬性要求：
+1. 骨架只约束行文衔接与章节定位，禁止出现任何具体数据（工期、人数、价格、设备型号等由全局事实统一口径，骨架一律不写）
+2. 语言朴实具体，不写「本章节将详细介绍」这类空话，直接说明该章要论证什么、怎么衔接
+3. 只输出严格 JSON：{"skeleton": {"<section_id>": "<1~2 句骨架>", ...}}
+4. skeleton 的键必须与输入清单中的 section_id 一一对应，一个都不能少，也不要多造
+5. 除 JSON 外不要输出任何解释或 Markdown"""
+
+CONTENT_SKELETON_SYSTEM = _reg(
+    "CONTENT_SKELETON_SYSTEM",
+    "正文生成",
+    "全篇叙事骨架（系统提示词，存量）",
+    CONTENT_SKELETON_SYSTEM,
+)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# 6) 正文质量评估（原 workflows_quality.py 行 273，inline）
+# ──────────────────────────────────────────────────────────────────────
+# 用途：对已生成的正文片段做质量评分（structure/professional/relevance），
+#       由 workflow_quality.py 中的 evaluate_section_quality 调用。原文以
+#       `AIMessage(role="system", content="...")` inline 存在，未注册。
+QUALITY_EVAL_SYSTEM = """你是一个标书内容质量评估专家，擅长客观评估标书章节的质量。"""
+
+QUALITY_EVAL_SYSTEM = _reg(
+    "QUALITY_EVAL_SYSTEM",
+    "正文生成",
+    "正文质量评估（系统提示词，存量）",
+    QUALITY_EVAL_SYSTEM,
+)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# 7) 行业树子节点分类（原 industry_tree.py 行 367，inline）
+# ──────────────────────────────────────────────────────────────────────
+# 用途：行业树模块根据父节点分类子节点时使用。原文 inline 存在，未注册。
+INDUSTRY_CLASSIFY_SYSTEM = """你是专业的工程项目分类专家。"""
+
+INDUSTRY_CLASSIFY_SYSTEM = _reg(
+    "INDUSTRY_CLASSIFY_SYSTEM",
+    "行业画像",
+    "行业树子节点分类（系统提示词，存量）",
+    INDUSTRY_CLASSIFY_SYSTEM,
+)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# 7b) 行业树行业识别（原 industry_tree.py 行 1355，inline）
+# ──────────────────────────────────────────────────────────────────────
+# 用途：根据项目描述识别所属行业，返回置信度排序的候选列表。
+INDUSTRY_MATCH_SYSTEM = """你是专业的工程项目分类专家，擅长从项目描述中识别所属行业。"""
+
+INDUSTRY_MATCH_SYSTEM = _reg(
+    "INDUSTRY_MATCH_SYSTEM",
+    "行业画像",
+    "行业树行业识别（系统提示词，存量）",
+    INDUSTRY_MATCH_SYSTEM,
+)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# 8) 知识库补漏提取（原 knowledge_refill.py 行 29，_EXTRACT_SYSTEM_PROMPT）
+# ──────────────────────────────────────────────────────────────────────
+# 用途：知识库两轮补漏的第一轮提取（知识条目抽取）。原文以
+#       _EXTRACT_SYSTEM_PROMPT 硬编码存在，未注册到 _ALL_PROMPTS：
+#         - 管理页无法查看/编辑/覆盖；
+#         - _check_hardcode_drift 无法比对。
+# 说明：与 prompts/knowledge.py 的 KB_EXTRACT_ITEMS_SYSTEM（知识库构建专家）
+#       语义不同——本提示词专用于「招标文件关键知识条目提取」，
+#       两者不应合并。
+KB_REFILL_EXTRACT_SYSTEM = """你是一个专业的工程招标文件分析专家。请从给定的招标文件内容中提取关键知识条目。
+
+提取要求：
+1. 识别项目基本信息（项目名称、规模、地点、工期、投资额等）
+2. 识别技术要求（技术标准、规范、参数、指标等）
+3. 识别商务要求（付款方式、结算方式、违约责任等）
+4. 识别评分标准（评分项、权重、评分细则等）
+5. 识别关键时间节点（开标时间、投标截止时间、合同履行期限等）
+6. 识别参与方信息（招标人、代理机构、联系人等）
+
+输出格式：JSON 数组，每个元素包含：
+- title: 知识条目标题（简短，10-20 字）
+- content: 知识条目详细内容（100-300 字）
+- category: 分类（"项目信息" | "技术要求" | "商务要求" | "评分标准" | "时间节点" | "参与方" | "其他"）
+- keywords: 关键词数组（3-5 个）
+
+只返回 JSON 数组，不要包含任何解释或 markdown 围栏。"""
+
+KB_REFILL_EXTRACT_SYSTEM = _reg(
+    "KB_REFILL_EXTRACT_SYSTEM",
+    "知识库",
+    "知识补漏·条目提取（系统提示词，存量）",
+    KB_REFILL_EXTRACT_SYSTEM,
+)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# 9) 目录智能排序（原 outline_sort_optimizer.py 行 149，SORT_SYSTEM_PROMPT）
+# ──────────────────────────────────────────────────────────────────────
+# 用途：V6.0 智能排序优化器调用 AI 对合并目录做全局排序（核心28章顺序
+#       固定，补充章按逻辑分区插入间隙）。原文以 SORT_SYSTEM_PROMPT 硬编码
+#       存在，未注册到 _ALL_PROMPTS。
+OUTLINE_SORT_SYSTEM = """### 角色
+你是标书编制专家，擅长根据工程逻辑对目录进行全局排序优化。
+
+### 核心铁律（违反即为严重错误）
+1. **核心28章顺序绝对不变**：标题在【核心28章标题集合】中的章节，其相对顺序必须严格保持升序（按"宏观→技术→管理→进度→资源→预案→协调→收尾"叙事流）。你可以将补充章节插入它们之间的任何位置（包括最前面和最后面），但绝不能改变核心28章的先后次序。
+2. **逻辑分区聚类**：请参考【工程逻辑分区】标签，尽量将同一分区的章节（如"核心技术"、"管理保障"）排列在一起，形成清晰的叙事段落。
+3. **从宏观到微观**：总体顺序应遵循"宏观总览 → 前期准备 → 核心技术 → 管理保障 → 进度管控 → 资源保障 → 专项预案 → 协调配合 → 收尾优化"的递进逻辑。
+4. **事实关联度**：与同一事实（如同一风险或工艺）相关的章节应尽量靠近，减少读者跳跃。
+
+### 输入格式
+你会收到一个包含"核心28章+补充章节"的列表。每个条目包含：
+- `title`：章节标题
+- `is_core`：是否为固定核心章（true/false）
+- `zone`：工程逻辑分区（若补充章节无分区，已自动推断）
+
+### 输出格式
+返回一个重新排序后的 JSON 数组，元素仅包含 `title` 字段（按新顺序排列）。
+核心章必须保持原始顺序。
+补充章根据逻辑优化重新分配到合适的间隙位置。
+**不要**改变、合并、删除任何标题，只调整顺序。
+
+直接返回 JSON 数组，不包含任何解释。"""
+
+OUTLINE_SORT_SYSTEM = _reg(
+    "OUTLINE_SORT_SYSTEM",
+    "目录生成",
+    "目录智能排序（系统提示词，存量）",
+    OUTLINE_SORT_SYSTEM,
 )
 
 

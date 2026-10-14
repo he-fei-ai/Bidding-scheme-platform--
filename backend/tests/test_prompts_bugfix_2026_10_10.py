@@ -58,7 +58,8 @@ class TestContextAssemblyBudgetAccounting:
         from app.services.ai.prompts import assemble_prompt_context
 
         parts = {"GLOBAL_FACTS": "事实A", "SUMMARY": "概述" * 50}
-        out = assemble_prompt_context(parts, max_tokens=30)
+        # ENHANCE 2026-10-11：tiktoken CJK 计数高于启发式，预算需增大
+        out = assemble_prompt_context(parts, max_tokens=60)
 
         assert "【GLOBAL_FACTS】" in out
         assert "【SUMMARY】" in out, "边界片段被整段丢弃而非截断"

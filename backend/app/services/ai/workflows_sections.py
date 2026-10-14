@@ -853,6 +853,19 @@ def build_chapter_content_messages(chapter_info: dict, facts: Any = None,
     # CONTENT_SECTION_SYSTEM，提示词管理页可编辑。
     # FIX 2026-10-08（遗留9）：注册表不可用时明确报错，不再回落到矛盾口径的兜底文案。
     sys_prompt = _resolve_section_system_prompt()
+    # ENHANCE 2026-10-14（facts-ns P1-3，对齐易标 buildContentFactCompletenessInstruction）：
+    # omit/placeholder 模式下追加「缺值口径铁律」——正文引用笼统承诺/【待填写】
+    # 事实时沿用口径不得自行补具体值。fabricate 模式指令为空串，行为不变；
+    # 另受 FACTS_COMPLETENESS_INSTRUCTION_ENABLED 开关控制（默认关）。
+    # 追加发生在 [0] system 层：同一项目同一策略下文本稳定，不破坏缓存前缀。
+    try:
+        from ..facts_service import completeness_instruction_enabled, content_completeness_instruction
+        if completeness_instruction_enabled():
+            _instr = content_completeness_instruction(kwargs.get("facts_policy"))
+            if _instr:
+                sys_prompt = f"{sys_prompt}\n{_instr}"
+    except Exception as e:  # pragma: no cover - 防御性（与事实筛选同一兜底策略）
+        logger.debug("缺值口径指令不可用，跳过: %s", e)
     messages.append(AIMessage(role="system", content=sys_prompt))
 
     # --- [1] 项目稳定上下文（同项目内完全不变 → 缓存命中区间）---
@@ -891,7 +904,21 @@ def build_chapter_content_messages(chapter_info: dict, facts: Any = None,
         # 2000 字符截断」。旧实现在事实条目多（>100 条）时，早期章节占满预算、
         # 尾部章节拿不到；且与易标规格三.4「按章节标题选择最相关事实并注入」
         # 不符。此处保留 2000 字符截断作为安全上限。
-        _chapter_facts = _select_facts_for_section(facts, title, section_summary)
+        _chapter_facts = None
+        # ENHANCE 2026-10-14（facts-ns P0，对齐易标两阶段消费）：编排阶段 AI 只按
+        # 标题清单选出 plan.facts.titles，这里按标题取完整事实注入（AI 语义选择
+        # 优于字符打分）；开关默认关 / 未选定 / 标题全未命中时回退确定性打分，
+        # 行为与今天完全一致。
+        try:
+            from ..facts_service import orchestrated_select_enabled, resolve_facts_by_titles
+            if orchestrated_select_enabled() and isinstance(facts, list):
+                _sel_titles = ((chapter_info.get("plan") or {}).get("facts") or {}).get("titles") or []
+                if _sel_titles:
+                    _chapter_facts = resolve_facts_by_titles(_sel_titles, facts) or None
+        except Exception as e:  # pragma: no cover - 防御性
+            logger.debug("编排选事实通道不可用，回退打分筛选: %s", e)
+        if not _chapter_facts:
+            _chapter_facts = _select_facts_for_section(facts, title, section_summary)
         if _chapter_facts:
             facts_text = _format_facts_for_prompt(_chapter_facts)
             if len(facts_text) > 2000:
@@ -1296,7 +1323,8 @@ async def orchestrate_content(provider: Any, outline: list,
                                table_ratio: str = "moderate",
                                prefer_mermaid: bool = True,
                                section_per_segment: int = 10,
-                               knowledge_catalog: list | None = None) -> list:
+                               knowledge_catalog: list | None = None,
+                               fact_titles: list | None = None) -> list:
     """编排正文生成任务（标书智能体六完整实现）
 
     主实现见 workflows_orchestration.orchestrate_content()。
@@ -1305,6 +1333,7 @@ async def orchestrate_content(provider: Any, outline: list,
     ENHANCE 2026-10-05（P-11）：新增 max_ai_images / table_ratio /
     prefer_mermaid / section_per_segment 透传，见 workflows_orchestration 同名参数。
     ENHANCE 2026-10-09（E-2）：新增 knowledge_catalog 透传（知识素材通道）。
+    ENHANCE 2026-10-14（facts-ns P0）：新增 fact_titles 透传（编排选事实标题通道）。
     """
     return await _orch_impl(
         provider, outline,
@@ -1319,6 +1348,7 @@ async def orchestrate_content(provider: Any, outline: list,
         prefer_mermaid=prefer_mermaid,
         section_per_segment=section_per_segment,
         knowledge_catalog=knowledge_catalog,
+        fact_titles=fact_titles,
     )
 
 
@@ -2249,6 +2279,9 @@ async def generate_sections(
         # 易标 R5/R8（2026-10-12）：强控覆盖表（{section_id: {...}}），由
         # sse_content 按快照装配后透传；空表/缺省时下游回落既有档位逻辑。
         "word_control": "word_control",
+        # ENHANCE 2026-10-14（facts-ns P1-3）：缺失值策略透传，供正文 system
+        # 追加 omit/placeholder 缺值口径铁律（fabricate/缺省不追加，行为不变）。
+        "facts_policy": "facts_policy",
     }
     # P0-TEXT-FLOW: 注入同级/上级章节映射（防车轱辘话、承上启下）
     # 从 sections_by_id + children_map 计算，每个 _gen_one 时按需取用

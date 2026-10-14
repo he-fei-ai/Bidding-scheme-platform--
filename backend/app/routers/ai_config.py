@@ -197,10 +197,15 @@ class AIConfigData(BaseModel):
     api_key: str = ''
     model: str = ''
     base_url: str = 'https://api.openai.com/v1'
-    document_profile: str = ''
+    document_profile: str | None = None
     concurrency: int = 4
     temperature: float = 0.7
     max_tokens: int = 4096
+    # P1-CFG（2026-10-14）：timeout 此前**存在于 ai_config 表、也被 provider 工厂
+    # 读取（create_provider 的 config.get('timeout', 120)），但请求模型里压根没有这个
+    # 字段、SQL 也不写它 → 一个永远等于默认 120s 的「死列」。本字段补齐后主配置
+    # 的超时才真正可调；范围与 Profile 的 timeout 口径对齐 [5, 600]。
+    timeout: int = 120
     is_builtin_default: bool = False
 
 @router.get('/providers')
@@ -212,7 +217,9 @@ async def list_known_providers():
 async def get_ai_config():
     from ..services.ai.provider_factory import _load_env_config
     from ..services.ai.provider_factory import get_ai_config as _get_config
-    cfg = _get_config()
+    # PERF（2026-10-14）：get_ai_config 内部持全局写锁做同步 SQLite 读，本端点是
+    # 「AI 配置」/「文本模型配置」两页的加载必经路径，移出事件循环。
+    cfg = await asyncio.to_thread(_get_config)
     # L-4（2026-10-04 遗留闭环）：回显配置来源，便于运维判断环境变量是否
     # 覆盖了库内配置（此前「环境变量优先级最高」对前端完全黑盒）。
     # 新增字段向后兼容：旧前端忽略未知字段即可。
@@ -284,6 +291,10 @@ async def save_ai_config(data: AIConfigData, request: Request = None):
     except (TypeError, ValueError):
         data.concurrency = 4
     data.max_tokens = min(max(int(data.max_tokens or 4096), 256), 65536)
+    try:
+        data.timeout = min(max(int(data.timeout or 120), 5), 600)
+    except (TypeError, ValueError):
+        data.timeout = 120
     # F-1：仅加密「用户新输入的明文」；占位符/空值分支已在上方回填为库内原值。
     data.api_key = _encrypt_fresh_key(data.api_key)
     # PERF（2026-10-05）：写入整段派发 to_thread，全局写锁在 worker 线程阻塞，loop 不受影响
@@ -295,7 +306,15 @@ async def save_ai_config(data: AIConfigData, request: Request = None):
                 "SELECT provider_name, model, base_url FROM ai_config WHERE id = 1"
             ).fetchone()
             before = dict(before_row) if before_row else {}
-            conn.execute("INSERT INTO ai_config (id, provider_name, provider, api_key, model, base_url,\n                document_profile, concurrency, temperature, max_tokens, updated_at)\n               VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now', 'localtime'))\n               ON CONFLICT(id) DO UPDATE SET\n                provider_name=excluded.provider_name, provider=excluded.provider,\n                api_key=excluded.api_key, model=excluded.model,\n                base_url=excluded.base_url,\n                document_profile=excluded.document_profile,\n                concurrency=excluded.concurrency,\n                temperature=excluded.temperature,\n                max_tokens=excluded.max_tokens,\n                updated_at=datetime('now', 'localtime')", (data.provider_name, provider, data.api_key, data.model, data.base_url, data.document_profile, data.concurrency, data.temperature, data.max_tokens))
+            # document_profile 的「未提供即保留」（P1-DOC）：该字段被 sections.py 的
+            # 配图编排消费（industry_profile），但请求模型此前默认 ''，任何一次「只改
+            # 温度」的保存都会静默清空用户已填的行业画像。语义：传 None=保留原值，
+            # 传 ""=显式清空。由于列是 NOT NULL，不能靠 SQL COALESCE（INSERT 路径会
+            # 触发 NOT NULL 约束失败），改为在同一事务内先回读旧值再决定写入值。
+            _dp_row = conn.execute("SELECT document_profile FROM ai_config WHERE id = 1").fetchone()
+            _dp_current = (_dp_row[0] or '') if _dp_row else ''
+            effective_dp = _dp_current if data.document_profile is None else data.document_profile
+            conn.execute("INSERT INTO ai_config (id, provider_name, provider, api_key, model, base_url,\n                document_profile, concurrency, temperature, max_tokens, timeout, updated_at)\n               VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now', 'localtime'))\n               ON CONFLICT(id) DO UPDATE SET\n                provider_name=excluded.provider_name, provider=excluded.provider,\n                api_key=excluded.api_key, model=excluded.model,\n                base_url=excluded.base_url,\n                document_profile=excluded.document_profile,\n                concurrency=excluded.concurrency,\n                temperature=excluded.temperature,\n                max_tokens=excluded.max_tokens,\n                timeout=excluded.timeout,\n                updated_at=datetime('now', 'localtime')", (data.provider_name, provider, data.api_key, data.model, data.base_url, effective_dp, data.concurrency, data.temperature, data.max_tokens, data.timeout))
             return before
     before = await asyncio.to_thread(_write_ai_config)
     # L-3：版本号递增（含本进程缓存清除），跨进程 ≤5s 收敛
@@ -510,8 +529,13 @@ async def check_ai_health():
     """
     import time
     from ..services.ai.provider_factory import _clear_ai_config_cache, get_ai_config
-    _clear_ai_config_cache()
-    cfg = get_ai_config()
+    # PERF（2026-10-14）：强制清缓存 + 重新读库都是同步 SQLite 操作，整段落线程，
+    # 避免「点一次测试连通性」把整个事件循环冻住。
+    def _reload():
+        _clear_ai_config_cache()
+        return get_ai_config()
+
+    cfg = await asyncio.to_thread(_reload)
     api_key = cfg.get('api_key', '')
     if not api_key:
         return {'status': 'error', 'code': 'NO_API_KEY', 'message': '未配置 AI API Key，请先在设置页面配置', 'config': {'provider': cfg.get('provider'), 'model': cfg.get('model')}, 'suggest_alternatives': _get_china_accessible_providers()}
@@ -955,7 +979,9 @@ async def get_provider_history():
       2. provider_history 中记录的最近配置厂商（第2优先）
       3. 内置兜底提供商（第3优先）
     """
-    priority_list = get_provider_priority_order()
+    # PERF（2026-10-14）：get_provider_priority_order 内部走 get_ai_config()，
+    # 会做同步 SQLite 读；整段移出事件循环。
+    priority_list = await asyncio.to_thread(get_provider_priority_order)
     items = []
     for entry in priority_list:
         is_builtin = entry.get('is_builtin_default', False)
@@ -998,6 +1024,8 @@ async def get_config_audit(limit: int = 50, action: str | None = None, target: s
     必须拉全量再本地过滤；运维在 500 条截断前无法看到历史事件。
     过滤语义：``action`` 精确匹配；``target`` 前缀匹配（LIKE 'target%'），
     便于按厂商/Profile 名过滤。
+
+    PERF（2026-10-14）：整段读移出事件循环（本文件既有 PERF 口径的延续）。
     """
     limit = min(max(int(limit or 50), 1), 500)
     clauses = []
@@ -1010,15 +1038,23 @@ async def get_config_audit(limit: int = 50, action: str | None = None, target: s
         params.append(target + '%')
     where = (' WHERE ' + ' AND '.join(clauses)) if clauses else ''
     params.append(limit)
-    with get_db_with_retry(readonly=True) as conn:
-        rows = conn.execute(
-            f' SELECT actor, action, target, detail, created_at FROM ai_config_audit{where} ORDER BY id DESC LIMIT ? ',
-            params,
-        ).fetchall()
+
+    def _read_audit():
+        with get_db_with_retry(readonly=True) as conn:
+            return conn.execute(
+                f' SELECT actor, action, target, detail, created_at FROM ai_config_audit{where} ORDER BY id DESC LIMIT ? ',
+                params,
+            ).fetchall()
+
+    rows = await asyncio.to_thread(_read_audit)
     items = []
     for r in rows:
         d = dict(r) if hasattr(r, 'keys') else dict(zip(['actor', 'action', 'target', 'detail', 'created_at'], r, strict=False))
         items.append(d)
+    # P0-CONTRACT（2026-10-14）：返回体固定为 {items, total}（文档化契约）。
+    # 前端 `getConfigAudit` 曾按 `Array<...>` 声明并直接 `res.data` 塞进 antd Table
+    # 的 dataSource —— 形状不匹配导致审计表格页运行时崩溃（对象无 .map）。此处补
+    # `items` 为空时也保证是 list，调用方 `res.data.items ?? []` 即可安全消费。
     return {'items': items, 'total': len(items)}
 
 class ProfileCreateRequest(BaseModel):
@@ -1085,7 +1121,8 @@ class ProfileResponse(BaseModel):
 async def list_profiles():
     """获取所有 AI Profile 列表（不含 api_key）"""
     from ..services.ai.profile_service import list_profiles as _list
-    profiles = _list(active_only=True)
+    # PERF（2026-10-14）：同步 SQLite 读移出事件循环
+    profiles = await asyncio.to_thread(_list, active_only=True)
     result = []
     for p in profiles:
         result.append({'id': p['id'], 'name': p['name'], 'display_name': p.get('display_name', p['name']), 'description': p.get('description', ''), 'provider_name': p.get('provider_name', 'agnes'), 'provider': p.get('provider', 'openai_compatible'), 'model': p.get('model', 'gpt-4o'), 'base_url': p.get('base_url', ''), 'max_tokens': p.get('max_tokens', 16384), 'temperature': p.get('temperature', 0.7), 'concurrency': p.get('concurrency', 4), 'timeout': p.get('timeout', 120), 'json_mode': bool(p.get('json_mode', 0)), 'task_type': p.get('task_type', ''), 'rate_limit_per_min': p.get('rate_limit_per_min', 0), 'token_budget_daily': p.get('token_budget_daily', 0), 'is_active': bool(p.get('is_active', 1)), 'is_default': bool(p.get('is_default', 0)), 'created_at': p.get('created_at', ''), 'updated_at': p.get('updated_at', '')})
@@ -1095,7 +1132,7 @@ async def list_profiles():
 async def get_default_profile():
     """获取当前默认/激活的 Profile；不存在时返回空占位，不抛 404"""
     from ..services.ai.profile_service import get_default_profile as _get_default
-    profile = _get_default()
+    profile = await asyncio.to_thread(_get_default)
     if not profile:
         return {'name': 'default', 'display_name': '默认配置', 'description': '', 'provider_name': None, 'provider': None, 'api_key': '', 'model': None, 'base_url': None, 'max_tokens': None, 'temperature': None, 'concurrency': None, 'timeout': None, 'is_active': False, 'is_default': True, 'json_mode': False}
     return {**profile, 'is_default': True, 'is_active': bool(profile.get('is_active', 1)), 'json_mode': bool(profile.get('json_mode', 0))}
@@ -1104,13 +1141,13 @@ async def get_default_profile():
 async def export_profiles():
     """导出所有 Profile（JSON 格式，不含密钥，仅标注 api_key_set）"""
     from ..services.ai.profile_service import export_profiles as _export
-    return _export()
+    return await asyncio.to_thread(_export)
 
 @router.get('/profiles/{profile_name}')
 async def get_profile(profile_name: str):
     """获取单个 Profile 详情（含解密后的 api_key）"""
     from ..services.ai.profile_service import get_profile as _get
-    profile = _get(profile_name)
+    profile = await asyncio.to_thread(_get, profile_name)
     if not profile:
         raise HTTPException(status_code=404, detail=f"Profile '{profile_name}' 不存在")
     return {**profile, 'is_default': bool(profile.get('is_default', 0)), 'is_active': bool(profile.get('is_active', 1)), 'json_mode': bool(profile.get('json_mode', 0))}
@@ -1196,7 +1233,7 @@ async def import_profiles(data: dict):
 async def get_usage_summary(days: int=30, task_type: str | None=None, profile: str | None=None):
     """获取 AI 调用用量汇总"""
     from ..services.ai.usage_stats import get_usage_summary as _get
-    return _get(days=days, task_type=task_type, profile_name=profile)
+    return await asyncio.to_thread(_get, days=days, task_type=task_type, profile_name=profile)
 
 @router.get('/usage/dashboard')
 async def get_usage_dashboard():
@@ -1211,13 +1248,13 @@ async def get_usage_dashboard():
 async def get_health_dashboard():
     """获取 Provider 健康度面板"""
     from ..services.ai.usage_stats import get_health_dashboard as _get
-    return _get()
+    return await asyncio.to_thread(_get)
 
 @router.get('/usage/trend')
 async def get_usage_trend(days: int=7):
     """获取每日调用趋势"""
     from ..services.ai.usage_stats import get_daily_trend as _get
-    return _get(days=days)
+    return await asyncio.to_thread(_get, days=days)
 
 @router.delete('/usage/truncate')
 async def truncate_usage_stats(days: int=90):
@@ -1236,25 +1273,104 @@ class TextProviderConfigData(BaseModel):
     max_tokens: int | None = None
     concurrency: int | None = None
     temperature: float = 0.7
-    document_profile: str = ''
+    # P1-DOC（2026-10-14）：None = 未提供 → 保留库内原值（此前默认 ''，每次保存都
+    # 静默清空）；"" = 显式清空。与 Profile 的 COALESCE 语义对齐。
+    document_profile: str | None = None
+    # P1-CFG：与主配置对齐的可配置超时（迁移 #37 新增列；旧库无该列时见 save 内的
+    # 兼容分支，读侧统一以 120 兜底）。
+    timeout: int = 120
     # TD-5（2026-10-06）：保存后是否自动激活为主配置。默认 True 保持向后兼容；
     # 前端"仅编辑参数不切换主用"场景可显式传 False。
     activate_after_save: bool = True
+
+
+def _row_to_dict(row, col_names: list[str]) -> dict:
+    """sqlite3.Row / tuple → dict（兼容两种 row_factory）。"""
+    if hasattr(row, 'keys'):
+        return dict(row)
+    return dict(zip(col_names, row, strict=False))
+
+
+def _provider_view(row, col_names: list[str], provider_name: str) -> dict:
+    """text_provider_configs 行 → HTTP 响应字典（脱敏 + 补稳定 id）。
+
+    结构化防御：此处**永不**回传库内原始密钥列（只出 `api_key` 占位符 +
+    `api_key_set` 布尔）。内部需要原始值的路径（如 activate 回写主表）走
+    `_row_to_dict`，不复用本函数。
+    """
+    d = _row_to_dict(row, col_names)
+    return {
+        'provider_name': d.get('provider_name', provider_name),
+        # P1-ID（2026-10-14）：新增稳定机器 id。前端此前只能靠中文 provider_name 去
+        # 猜厂商（本地 snake_case 键表 11 项仅 2 项对得上），导致 base_url/model
+        # 默认值回填大面积失效。新增字段，旧前端忽略即可。
+        'provider_id': provider_catalog.provider_id_of(d.get('provider_name', provider_name)),
+        'provider_type': d.get('provider_type') or 'openai_compatible',
+        'api_key': _display_api_key(d.get('api_key') or ''),
+        'api_key_set': bool(d.get('api_key')),
+        'base_url': d.get('base_url') or '',
+        'model': d.get('model') or '',
+        'max_tokens': d.get('max_tokens') or 4096,
+        'concurrency': d.get('concurrency') or 4,
+        'temperature': d.get('temperature') if d.get('temperature') is not None else 0.7,
+        'document_profile': d.get('document_profile') or '',
+        'timeout': d.get('timeout') or 120,
+        'is_active': bool(d.get('is_active', 1)),
+        'updated_at': d.get('updated_at', ''),
+    }
+
+
+_TEXT_PROVIDER_COLS = [
+    'provider_name', 'provider_type', 'api_key', 'base_url', 'model',
+    'max_tokens', 'concurrency', 'temperature', 'document_profile', 'timeout',
+    'is_active', 'updated_at',
+]
+_TEXT_PROVIDER_SELECT = (
+    'SELECT provider_name, provider_type, api_key, base_url, model,\n'
+    '       max_tokens, concurrency, temperature, document_profile, timeout,\n'
+    '       is_active, updated_at\n'
+    'FROM text_provider_configs\n'
+)
 
 @router.get('/provider-configs')
 async def list_text_provider_configs():
     """获取所有厂商的文本模型配置（每个厂商独立保存，互不共享）"""
     configs = []
-    with get_db_with_retry(readonly=True) as conn:
-        rows = conn.execute('\n            SELECT provider_name, provider_type, api_key, base_url, model,\n                   max_tokens, concurrency, temperature, document_profile, is_active,\n                   updated_at\n            FROM text_provider_configs\n            ORDER BY is_active DESC, provider_name\n        ').fetchall()
-        for row in rows:
-            d = dict(row) if hasattr(row, 'keys') else dict(zip(['provider_name', 'provider_type', 'api_key', 'base_url', 'model', 'max_tokens', 'concurrency', 'temperature', 'document_profile', 'is_active', 'updated_at'], row, strict=False))
-            configs.append({'provider_name': d.get('provider_name', ''), 'provider_type': d.get('provider_type', 'openai_compatible'), 'api_key': _display_api_key(d.get('api_key') or ''), 'base_url': d.get('base_url') or '', 'model': d.get('model') or '', 'max_tokens': d.get('max_tokens') or 4096, 'concurrency': d.get('concurrency') or 4, 'temperature': d.get('temperature') or 0.7, 'document_profile': d.get('document_profile') or '', 'is_active': bool(d.get('is_active', 1)), 'updated_at': d.get('updated_at', '')})
+    # PERF（2026-10-14）：整段读移出事件循环（get_db_with_retry 持全局写锁 RLock，
+    # 在 loop 内调用会冻结并发请求）。与本文件其它读端点口径统一。
+    def _read_all():
+        with get_db_with_retry(readonly=True) as conn:
+            return conn.execute(
+                _TEXT_PROVIDER_SELECT + 'ORDER BY is_active DESC, provider_name'
+            ).fetchall()
+
+    rows = await asyncio.to_thread(_read_all)
+    for row in rows:
+        configs.append(_provider_view(row, _TEXT_PROVIDER_COLS, ''))
     configured_names = {c['provider_name'] for c in configs}
     for p in KNOWN_PROVIDERS:
         pname = p['name']
         if pname not in configured_names:
-            configs.append({'provider_name': pname, 'provider_type': p.get('type', 'openai_compatible'), 'api_key': '', 'base_url': p.get('base_url', ''), 'model': '', 'max_tokens': 4096, 'concurrency': 4, 'temperature': 0.7, 'document_profile': '', 'is_active': False, 'updated_at': ''})
+            configs.append({
+                'provider_name': pname,
+                # P1-ID：与「已配置」行同构，保证前端两种卡片字段一致
+                'provider_id': p.get('id', ''),
+                'provider_type': p.get('type', 'openai_compatible'),
+                'api_key': '',
+                'api_key_set': False,
+                'base_url': p.get('base_url', ''),
+                # P1-ID（2026-10-14）：默认模型取自厂商目录正本
+                # （DEFAULT_TEXT_PROVIDER.model 由 AGNES_MODEL 派生，可被环境变量
+                # 覆盖），前端据此预填；目录未收录时留空，由前端本地键表/手填兜底。
+                'model': p.get('model', ''),
+                'max_tokens': 4096,
+                'concurrency': 4,
+                'temperature': 0.7,
+                'document_profile': '',
+                'timeout': 120,
+                'is_active': False,
+                'updated_at': '',
+            })
     return {'configs': configs}
 
 @router.put('/provider-configs/{provider_name}')
@@ -1286,6 +1402,10 @@ async def save_text_provider_config(provider_name: str, data: TextProviderConfig
         data.temperature = min(max(float(data.temperature if data.temperature is not None else 0.7), 0.0), 2.0)
     except (TypeError, ValueError):
         data.temperature = 0.7
+    try:
+        data.timeout = min(max(int(data.timeout or 120), 5), 600)
+    except (TypeError, ValueError):
+        data.timeout = 120
     # BUG-FIX：读接口改为脱敏后，前端「只改模型/URL、不动密钥」时会把占位符或空串
     # 原样提交回来。此前直接写入会把已保存的密钥清空。这里与 `/ai/config` 保持
     # 同一语义：占位符 / 空串 = 保持原值；只有真正的非空新密钥才覆盖。
@@ -1296,7 +1416,16 @@ async def save_text_provider_config(provider_name: str, data: TextProviderConfig
     # PERF（2026-10-05）：写入整段派发 to_thread，全局写锁在 worker 线程阻塞，loop 不受影响
     def _write_text_provider_config():
         with get_db_with_retry() as conn:
-            conn.execute("\n            INSERT INTO text_provider_configs\n                (provider_name, provider_type, api_key, base_url, model,\n                 max_tokens, concurrency, temperature, document_profile, is_active)\n            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)\n            ON CONFLICT(provider_name) DO UPDATE SET\n                provider_type=excluded.provider_type,\n                api_key=excluded.api_key,\n                base_url=excluded.base_url,\n                model=excluded.model,\n                max_tokens=excluded.max_tokens,\n                concurrency=excluded.concurrency,\n                temperature=excluded.temperature,\n                document_profile=excluded.document_profile,\n                is_active=text_provider_configs.is_active,\n                updated_at=datetime('now', 'localtime')\n        ", (data.provider_name, data.provider_type, data.api_key, data.base_url, data.model, data.max_tokens, data.concurrency, data.temperature, data.document_profile))
+            # document_profile：None=未提供→保留原值 / ""=显式清空（P1-DOC）。
+            # 列是 NOT NULL，INSERT 路径不能用 SQL COALESCE（NULL 会触发约束失败），
+            # 故在同一事务内先回读旧值再决定写入值（与 save_ai_config 同口径）。
+            _dp_row = conn.execute(
+                'SELECT document_profile FROM text_provider_configs WHERE provider_name = ?',
+                [provider_name],
+            ).fetchone()
+            _dp_current = (_dp_row[0] or '') if _dp_row else ''
+            effective_dp = _dp_current if data.document_profile is None else data.document_profile
+            conn.execute("\n            INSERT INTO text_provider_configs\n                (provider_name, provider_type, api_key, base_url, model,\n                 max_tokens, concurrency, temperature, document_profile, timeout, is_active)\n            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)\n            ON CONFLICT(provider_name) DO UPDATE SET\n                provider_type=excluded.provider_type,\n                api_key=excluded.api_key,\n                base_url=excluded.base_url,\n                model=excluded.model,\n                max_tokens=excluded.max_tokens,\n                concurrency=excluded.concurrency,\n                temperature=excluded.temperature,\n                document_profile=excluded.document_profile,\n                timeout=excluded.timeout,\n                is_active=text_provider_configs.is_active,\n                updated_at=datetime('now', 'localtime')\n        ", (data.provider_name, data.provider_type, data.api_key, data.base_url, data.model, data.max_tokens, data.concurrency, data.temperature, effective_dp, data.timeout))
             conn.commit()
     await asyncio.to_thread(_write_text_provider_config)
     # L-3/L-5：降级链第二层来源变化也要跨进程失效 + 审计
@@ -1313,15 +1442,30 @@ async def save_text_provider_config(provider_name: str, data: TextProviderConfig
 @router.get('/provider-configs/{provider_name}')
 async def get_text_provider_config(provider_name: str):
     """获取单个厂商的文本模型配置"""
-    with get_db_with_retry(readonly=True) as conn:
-        row = conn.execute('\n            SELECT provider_name, provider_type, api_key, base_url, model,\n                   max_tokens, concurrency, temperature, document_profile, is_active, updated_at\n            FROM text_provider_configs WHERE provider_name = ?\n        ', [provider_name]).fetchone()
+    def _read_one():
+        with get_db_with_retry(readonly=True) as conn:
+            return conn.execute(
+                _TEXT_PROVIDER_SELECT + 'WHERE provider_name = ?', [provider_name]
+            ).fetchone()
+
+    row = await asyncio.to_thread(_read_one)
     if not row:
         known = next((p for p in KNOWN_PROVIDERS if p['name'] == provider_name), None)
         # G-3（2026-10-11）：补 api_key_set 布尔提示，与 /image-provider-configs 单查口径一致
-        return {'provider_name': provider_name, 'provider_type': known.get('type', 'openai_compatible') if known else 'openai_compatible', 'api_key': '', 'api_key_set': False, 'base_url': known.get('base_url', '') if known else '', 'model': '', 'max_tokens': 4096, 'concurrency': 4, 'temperature': 0.7, 'document_profile': '', 'is_active': False, 'updated_at': ''}
-    d = dict(row) if hasattr(row, 'keys') else dict(zip(['provider_name', 'provider_type', 'api_key', 'base_url', 'model', 'max_tokens', 'concurrency', 'temperature', 'document_profile', 'is_active', 'updated_at'], row, strict=False))
+        # P1-ID：未收录于目录的厂商 provider_id 为空串（前端据此回退按名查找）
+        return {
+            'provider_name': provider_name,
+            'provider_id': known.get('id', '') if known else '',
+            'provider_type': known.get('type', 'openai_compatible') if known else 'openai_compatible',
+            'api_key': '', 'api_key_set': False,
+            'base_url': known.get('base_url', '') if known else '',
+            'model': known.get('model', '') if known else '',
+            'max_tokens': 4096, 'concurrency': 4, 'temperature': 0.7,
+            'document_profile': '', 'timeout': 120,
+            'is_active': False, 'updated_at': '',
+        }
     # G-3：api_key_set 前端可据它显示「已配置/未配置」，无需再判字符串
-    return {'provider_name': d.get('provider_name', ''), 'provider_type': d.get('provider_type', 'openai_compatible'), 'api_key': _display_api_key(d.get('api_key') or ''), 'api_key_set': bool(d.get('api_key')), 'base_url': d.get('base_url') or '', 'model': d.get('model') or '', 'max_tokens': d.get('max_tokens') or 4096, 'concurrency': d.get('concurrency') or 4, 'temperature': d.get('temperature') or 0.7, 'document_profile': d.get('document_profile') or '', 'is_active': bool(d.get('is_active', 1)), 'updated_at': d.get('updated_at', '')}
+    return _provider_view(row, _TEXT_PROVIDER_COLS, provider_name)
 
 # F-13：单厂商 GET 与列表接口口径不一致（列表有 updated_at，单查无），
 # 前端刷新单卡时拿不到更新时间。补列保持两接口同构，新增字段向后兼容。
@@ -1375,13 +1519,16 @@ async def activate_text_provider_config(provider_name: str, request: Request = N
         # 是 asyncio.Lock（非 threading.Lock），跨 await 持有安全；回读的 d 是物化 dict。
         def _activate_text_write():
             with get_db_with_retry() as conn:
-                row = conn.execute('\n            SELECT provider_name, provider_type, api_key, base_url, model,\n                   max_tokens, concurrency, temperature, document_profile\n            FROM text_provider_configs WHERE provider_name = ?\n        ', [provider_name]).fetchone()
+                row = conn.execute(_TEXT_PROVIDER_SELECT + 'WHERE provider_name = ?', [provider_name]).fetchone()
                 if not row:
                     raise HTTPException(status_code=404, detail=f"厂商 '{provider_name}' 的配置不存在，请先保存")
-                d = dict(row) if hasattr(row, 'keys') else dict(zip(['provider_name', 'provider_type', 'api_key', 'base_url', 'model', 'max_tokens', 'concurrency', 'temperature', 'document_profile'], row, strict=False))
+                d = _row_to_dict(row, _TEXT_PROVIDER_COLS)
                 conn.execute('UPDATE text_provider_configs SET is_active = 0')
                 conn.execute('UPDATE text_provider_configs SET is_active = 1 WHERE provider_name = ?', [provider_name])
-                conn.execute("INSERT INTO ai_config (id, provider_name, provider, api_key, model, base_url,\n                document_profile, concurrency, temperature, max_tokens, updated_at)\n               VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now', 'localtime'))\n               ON CONFLICT(id) DO UPDATE SET\n                provider_name=excluded.provider_name, provider=excluded.provider,\n                api_key=excluded.api_key, model=excluded.model,\n                base_url=excluded.base_url,\n                document_profile=excluded.document_profile,\n                concurrency=excluded.concurrency,\n                temperature=excluded.temperature,\n                max_tokens=excluded.max_tokens,\n                updated_at=datetime('now', 'localtime')", (d.get('provider_name', provider_name), d.get('provider_type', 'openai_compatible'), d.get('api_key') or '', d.get('model') or '', d.get('base_url') or '', d.get('document_profile') or '', d.get('concurrency') or 4, d.get('temperature') or 0.7, d.get('max_tokens') or 4096))
+                # P1-CFG（2026-10-14）：激活时把厂商级 timeout 同步到主配置 —— 否则
+                # 「某厂商专门调了超时」在激活后不生效（主配置保持上一次的值/默认 120s）。
+                # P1-DOC：document_profile 用 COALESCE 保留语义（激活不覆盖「未提供」）。
+                conn.execute("INSERT INTO ai_config (id, provider_name, provider, api_key, model, base_url,\n                document_profile, concurrency, temperature, max_tokens, timeout, updated_at)\n               VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now', 'localtime'))\n               ON CONFLICT(id) DO UPDATE SET\n                provider_name=excluded.provider_name, provider=excluded.provider,\n                api_key=excluded.api_key, model=excluded.model,\n                base_url=excluded.base_url,\n                document_profile=excluded.document_profile,\n                concurrency=excluded.concurrency,\n                temperature=excluded.temperature,\n                max_tokens=excluded.max_tokens,\n                timeout=excluded.timeout,\n                updated_at=datetime('now', 'localtime')", (d.get('provider_name', provider_name), d.get('provider_type', 'openai_compatible'), d.get('api_key') or '', d.get('model') or '', d.get('base_url') or '', d.get('document_profile') or '', d.get('concurrency') or 4, d.get('temperature') or 0.7, d.get('max_tokens') or 4096, d.get('timeout') or 120))
                 conn.commit()
             return d
         try:
@@ -1511,6 +1658,9 @@ class ModelInfoRequest(BaseModel):
     base_url: str = ''
     model: str = ''
     provider: str = ''
+    # P1-ID（2026-10-14）：新增可选稳定机器 id（对应 /ai/providers 的 id 字段）。
+    # 前端传 id 时按 id 查元数据表，避免中文展示名匹配失败；不传则回退 provider。
+    provider_id: str = ''
 
 @router.post('/model-info')
 async def fetch_model_info(data: ModelInfoRequest):
@@ -1523,8 +1673,12 @@ async def fetch_model_info(data: ModelInfoRequest):
     """
     result = {'model': data.model, 'max_tokens': _DEFAULT_MAX_TOKENS, 'concurrency': _DEFAULT_CONCURRENCY, 'source': 'default'}
     # D-1：元数据匹配逻辑收敛到 provider_catalog.find_model_metadata（含 F-8 的
-    # 厂商名/模型名大小写容错），本路由只负责「命中 builtin 还是回落默认值」。
-    meta = provider_catalog.find_model_metadata(data.provider, data.model)
+    # 厂商名/模型名大小写容错 + P1-META 的中文展示名/稳定 id 解析），本路由只负责
+    # 「命中 builtin 还是回落默认值」。
+    # 前端传 provider_id（稳定机器 id）时优先，避免中文名 → 名称完全匹配
+    # （即便能匹配也不受大小写/空格影响）。
+    lookup_provider = data.provider_id or data.provider
+    meta = provider_catalog.find_model_metadata(lookup_provider, data.model)
     if not meta and data.base_url:
         # 厂商名匹配不到时，退化为按 base_url 模糊匹配（F-8 口径不变）
         url_lower = data.base_url.lower()

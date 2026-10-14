@@ -6,6 +6,7 @@ import { getConsistencyRules } from "../api";
 import type { ConsistencyRules } from "../api";
 import {
   applyConsistencyScoringStatusMeta, applyConsistencySeverityMeta,
+  applyConsistencyRejectionStatusMeta,
 } from "../utils";
 import ConflictListTab from "../components/consistency/ConflictListTab";
 import ScoringComplianceTab from "../components/consistency/ScoringComplianceTab";
@@ -36,8 +37,9 @@ export default function ConsistencyPage() {
   const navigate = useNavigate();
 
   const [activeTab, setActiveTab] = useState("conflicts");
-  // 规则快照：仅用于一次性对齐严重度映射，不驱动渲染，避免多一次重排
-  const [, setRules] = useState<ConsistencyRules | null>(null);
+  // 规则快照：一次性对齐严重度/评分状态映射，并下传给两个覆盖率 Tab
+  //（ENHANCE 2026-10-13 第六轮·G7：阈值从快照取，不再硬编码 0.25）。
+  const [rules, setRules] = useState<ConsistencyRules | null>(null);
 
   // 审核规则命名空间对齐（ENHANCE 2026-10-08）。
   // 失败**不提示**：静态兜底（utils.ts 内置表）与后端默认值一致，
@@ -53,6 +55,9 @@ export default function ConsistencyPage() {
         // 改了文案/加了新状态，评分 Tab 的写死副本纹丝不动（同一类漂移在
         // 2026-10-08 修过一次严重度，这次是漏网的第二处）。一并对齐。
         applyConsistencyScoringStatusMeta(rules?.scoring_status?.meta);
+        // ENHANCE 2026-10-13（第六轮·统一命名空间）：废标应答三档状态是同一类
+        // 漂移的第三处（本地 statusLabel/statusColor 两张写死表）。一并对齐。
+        applyConsistencyRejectionStatusMeta(rules?.rejection_coverage?.status_meta);
         setRules(rules);
       })
       .catch(() => {
@@ -96,7 +101,7 @@ export default function ConsistencyPage() {
           {
             key: "scoring",
             label: "评分标准达标",
-            children: <ScoringComplianceTab projectId={projectId} />,
+            children: <ScoringComplianceTab projectId={projectId} rules={rules} />,
           },
           {
             key: "agent",
@@ -111,7 +116,7 @@ export default function ConsistencyPage() {
           {
             key: "coverage",
             label: "废标覆盖率",
-            children: <RejectionCoverageTab projectId={projectId} />,
+            children: <RejectionCoverageTab projectId={projectId} rules={rules} />,
           },
         ]}
       />

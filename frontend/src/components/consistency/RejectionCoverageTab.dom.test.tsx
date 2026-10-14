@@ -44,6 +44,10 @@ import { MemoryRouter } from "react-router-dom";
 const hasDom = typeof window !== "undefined" && typeof document !== "undefined";
 
 import RejectionCoverageTab from "./RejectionCoverageTab";
+import {
+  applyConsistencyRejectionStatusMeta,
+  resetConsistencyRejectionStatusMeta,
+} from "../../utils";
 
 // vi.hoisted：mock 实例与 vi.mock 工厂一并提升，规避上面的 TDZ。
 const { coverageMock } = vi.hoisted(() => ({ coverageMock: vi.fn() }));
@@ -93,11 +97,11 @@ vi.mock("../../utils", async (importOriginal) => {
   };
 });
 
-function renderTab(projectId = 1) {
+function renderTab(projectId = 1, rules?: unknown) {
   // useNavigate 需要 Router 上下文（组件侧新增章节深链后引入）
   return render(
     <MemoryRouter>
-      <RejectionCoverageTab projectId={projectId} />
+      <RejectionCoverageTab projectId={projectId} rules={rules as never} />
     </MemoryRouter>,
   );
 }
@@ -105,6 +109,8 @@ function renderTab(projectId = 1) {
 describe.skipIf(!hasDom)("RejectionCoverageTab", () => {
   afterEach(() => {
     cleanup();
+    // 规则映射是模块级状态：用例里改过必须还原，避免污染其它测试文件。
+    resetConsistencyRejectionStatusMeta();
     // mockReset 会连实现一起清掉，必须显式恢复默认实现，
     // 否则前一个用例里的 mockResolvedValue 会污染后续用例。
     coverageMock.mockReset();
@@ -189,5 +195,64 @@ describe.skipIf(!hasDom)("RejectionCoverageTab", () => {
     const messages = errSpy.mock.calls.map((c) => String(c[0]));
     expect(messages.filter((m) => m.includes("same key"))).toEqual([]);
     errSpy.mockRestore();
+  });
+
+  // ── ENHANCE 2026-10-13（第六轮·统一命名空间）：状态文案与阈值从规则快照取 ──
+
+  it("状态标签消费规则快照对齐后的文案（后端改文案前端跟随）", async () => {
+    // 与页面壳同机制：先 apply 快照（ConsistencyPage 在 useEffect 里做的那一步），
+    // 组件经 utils.mapConsistencyRejectionStatus 读模块级状态。
+    // 修复前：组件自带本地 statusLabel/statusColor 两张写死表，后端改文案纹丝不动。
+    const rulesMeta = {
+      covered: { label: "已覆盖(快照)", color: "green" },
+      weak: { label: "覆盖较弱(快照)", color: "orange" },
+      empty: { label: "未应答(快照)", color: "red" },
+    };
+    applyConsistencyRejectionStatusMeta(rulesMeta);
+    renderTab();
+    await waitFor(() => {
+      expect(screen.getByText(/工期承诺/)).toBeTruthy();
+    });
+    expect(screen.getAllByText(/已覆盖\(快照\)/).length).toBeGreaterThan(0);
+    expect(screen.getAllByText(/覆盖较弱\(快照\)/).length).toBeGreaterThan(0);
+  });
+
+  it("无 rules 时回退内置静态兜底（不白屏、不缺标签）", async () => {
+    renderTab(1, null);
+    await waitFor(() => {
+      expect(screen.getByText(/工期承诺/)).toBeTruthy();
+    });
+    expect(screen.getAllByText(/已覆盖/).length).toBeGreaterThan(0);
+    expect(screen.getAllByText(/覆盖较弱/).length).toBeGreaterThan(0);
+  });
+
+  it("响应缺 threshold 时按 rules 的生效值兜底展示", async () => {
+    // 后端漏传 threshold 的响应（历史数据/第三方调用方）：修复前前端硬编码
+    // 0.25，与运维调过的标定值脱节；现在回退到规则快照的 coverage_weak。
+    coverageMock.mockResolvedValue({
+      status: "ok",
+      scanned_clauses: 1,
+      full_chars: 800,
+      // threshold 故意缺省
+      weak_count: 0,
+      empty_count: 0,
+      items: [
+        {
+          id: "r1",
+          name: "工期承诺",
+          text: "总工期不超过365日历天",
+          status: "covered" as const,
+          coverage: 0.9,
+          section_hits: [],
+        },
+      ],
+    });
+    const rules = { rejection_coverage: { coverage_weak: 0.4, status_meta: {} } };
+    renderTab(1, rules);
+    await waitFor(() => {
+      expect(screen.getByText(/工期承诺/)).toBeTruthy();
+    });
+    expect(document.body.textContent || "").toContain("覆盖率阈值 0.40");
+    expect(document.body.textContent || "").toContain("40%");
   });
 });

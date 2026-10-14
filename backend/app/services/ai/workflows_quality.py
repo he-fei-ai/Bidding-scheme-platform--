@@ -269,8 +269,15 @@ class ContentQualityEvaluator:
 """
 
         messages = [
+            # BUG-FIX-PROMPT-E4（inline 系统提示词未注册）：原以字面量形式
+            # inline 存在，管理页无法查看/编辑/覆盖。现统一走 get_prompt()
+            # （DB 优先 → 注册表 → 硬编码回退）。
             AIMessage(
-                role="system", content="你是一个标书内容质量评估专家，擅长客观评估标书章节的质量。"
+                role="system",
+                content=(
+                    get_prompt("QUALITY_EVAL_SYSTEM")
+                    or "你是一个标书内容质量评估专家，擅长客观评估标书章节的质量。"
+                ),
             ),
             AIMessage(role="user", content=prompt),
         ]

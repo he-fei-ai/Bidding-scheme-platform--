@@ -45,6 +45,21 @@ _EXTRACT_SYSTEM_PROMPT = """你是一个专业的工程招标文件分析专家�
 只返回 JSON 数组，不要包含任何解释或 markdown 围栏。"""
 
 
+# ========== 修复提示词 ==========
+
+def _extract_sys_prompt() -> str:
+    """读取知识补漏提取系统提示词：DB 优先 → 注册表 → 硬编码回退。
+
+    BUG-FIX-PROMPT-E6（2026-10-14）：原各调用点直接引用 _EXTRACT_SYSTEM_PROMPT
+    硬编码，管理页无法查看/编辑/覆盖，_check_hardcode_drift 也无法比对。
+    """
+    try:
+        from .prompts import get_prompt as _gp
+        return _gp("KB_REFILL_EXTRACT_SYSTEM") or _EXTRACT_SYSTEM_PROMPT
+    except Exception:
+        return _EXTRACT_SYSTEM_PROMPT
+
+
 @dataclass
 class RefillResult:
     """补漏结果。"""
@@ -130,8 +145,12 @@ async def extract_knowledge_items(
     existing_contents: Set[str] = set()
 
     for i, batch in enumerate(batches):
+        # BUG-FIX-PROMPT-E6（知识补漏提取提示词未注册）：原直接引用模块级
+        # _EXTRACT_SYSTEM_PROMPT 硬编码，管理页无法查看/编辑/覆盖。现统一走
+        # get_prompt()（DB 优先 → 注册表 → 硬编码回退），保留硬编码作为
+        # DB 不可用时的最小 fallback。
         messages = [
-            {"role": "system", "content": _EXTRACT_SYSTEM_PROMPT},
+            {"role": "system", "content": _extract_sys_prompt()},
             {"role": "user", "content": f"请提取以下招标文件内容中的关键知识条目：\n\n{batch}"},
         ]
 
@@ -263,7 +282,8 @@ async def refill_knowledge_gaps(
 
 
     messages = [
-        {"role": "system", "content": _EXTRACT_SYSTEM_PROMPT},
+        # BUG-FIX-PROMPT-E6（同第一轮）：走 get_prompt()，保留硬编码 fallback。
+        {"role": "system", "content": _extract_sys_prompt()},
         {"role": "user", "content": prompt},
     ]
 
