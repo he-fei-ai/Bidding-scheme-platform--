@@ -62,6 +62,7 @@ from ...utils.scoring_points import (
 from . import outline_gate
 from .outline_common import (
     FIXED_28_CHAPTERS,
+    _cap_cross_chapter_repetition,
     _cleanup_placeholder_titles,
     _cn_ordinal,
     _disambiguate_title,
@@ -88,6 +89,7 @@ from .workflows_base import (
 )
 from .workflows_sections import _format_facts_list
 from app.config import (
+    OUTLINE_L3_MAX_PARENT_REUSE,
     OUTLINE_L3_QUALITY_ENHANCE_ENABLED,
     OUTLINE_L3_REPAIR_MAX,
     OUTLINE_L3_REPAIR_MAX_ROUNDS,
@@ -3907,9 +3909,20 @@ def _post_selfcheck_title_safety_net(outline: list[dict]) -> list[dict]:
         outline = _uniquify_outline_titles(outline)
         # 清洗可能与既有兄弟节点撞名，再收一次（幂等）
         _fixed2 = _cleanup_placeholder_titles(outline)
-        if _fixed or _fixed2:
+        # 2026-10-15 新增（B3）：跨章成套复用护栏。同级去重政策（2026-10-11）
+        # 使跨父同名不再被消歧，导致同一批泛化标题被成套复制到几十章；
+        # 护栏按复用广度上限改写超出的节点，改写后再收一次占位（幂等）。
+        outline, _capped = _cap_cross_chapter_repetition(
+            outline, OUTLINE_L3_MAX_PARENT_REUSE
+        )
+        if _capped:
+            outline = _uniquify_outline_titles(outline)
+            _fixed2 += _cleanup_placeholder_titles(outline)
+        if _fixed or _fixed2 or _capped:
             logger.info(
-                "V5.1 自检后标题兜底: 清洗 %d 个占位/泛化三级标题", _fixed + _fixed2
+                "V5.1 自检后标题兜底: 清洗 %d 个占位/泛化三级标题，跨章成套复用改写 %d 个",
+                _fixed + _fixed2,
+                _capped,
             )
         return outline
     except Exception as _e:
@@ -4073,6 +4086,13 @@ async def _apply_l3_quality_closeout(
         # 「总体实施策划（2）」的裸编号挪到标题中间导致清洗失效（与分步路径一致）。
         _cleaned = _cleanup_placeholder_titles(outline)
         outline = _uniquify_outline_titles(outline)
+        # 2026-10-15 新增（B3）：跨章成套复用护栏（与分步路径同一实现、同一上限）
+        outline, _capped_direct = _cap_cross_chapter_repetition(
+            outline, OUTLINE_L3_MAX_PARENT_REUSE
+        )
+        if _capped_direct:
+            outline = _uniquify_outline_titles(outline)
+            _cleaned += _cleanup_placeholder_titles(outline)
         if _cleaned:
             logger.info(
                 "V5.1直出路径 L3质量收口: 清洗 %d 个占位/泛化三级标题", _cleaned
@@ -4406,6 +4426,15 @@ async def generate_outline_v51(
         # 先清洗（把脏标题改写成语义化标题）再去重（解决残留碰撞），两个缺陷同时消除。
         _cleaned_l3 = _cleanup_placeholder_titles(level1)
         level1 = _uniquify_outline_titles(level1)
+        # 2026-10-15 新增（B3）：跨章成套复用护栏 —— AI 逐章按同一套骨架提示词
+        # 填充时，同一批泛化三级标题会被成套复制到几十个章（生产库实测单标题
+        # 25 个父级、跨章重复率 97%）。同级去重不拦这类形态，此处按复用广度收口。
+        level1, _capped_l3 = _cap_cross_chapter_repetition(
+            level1, OUTLINE_L3_MAX_PARENT_REUSE
+        )
+        if _capped_l3:
+            level1 = _uniquify_outline_titles(level1)
+            _cleaned_l3 += _cleanup_placeholder_titles(level1)
         if _cleaned_l3:
             logger.info("V5.1 L3质量收口: 清洗 %d 个占位/泛化三级标题", _cleaned_l3)
         # BUG-FIX 2026-10-12：与审核回灌路径共用同一实现，消除两处内联副本的漂移

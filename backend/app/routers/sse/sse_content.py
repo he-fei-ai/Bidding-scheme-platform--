@@ -3610,8 +3610,15 @@ async def expand_content_impl(
 
                     )
 
-                except Exception:
-
+                except Exception as _tc_e:
+                    # BUG-FIX 2026-10-15（M-2 · 同缺陷不同口径）：与
+                    # sse_utils._extract_project_context 的 2026-09-18 修复对齐，
+                    # 正文生成链路读不到招标正文时必须留告警。
+                    logger.warning(
+                        "正文上下文装配: 招标正文/上下文提取失败，将不带招标上下文继续 "
+                        "project=%d err=%s",
+                        project_id, _tc_e,
+                    )
                     tender_context = ""
 
 

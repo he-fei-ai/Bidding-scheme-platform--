@@ -1251,6 +1251,60 @@ def _l3_dims_for(entity: str, dimensions: tuple[str, ...]) -> tuple[str, ...]:
     return dimensions
 
 
+# 三级标题兜底时从祖先标题切实体词需剥掉的「章名级」虚词尾巴：
+# 「盘扣支撑体系方案」的实体是「盘扣支撑体系」，整段当实体会拼出
+# 「盘扣支撑体系方案质量控制」这类不通顺标题。按长度降序匹配。
+_TITLE_ENTITY_NOISE_SUFFIXES = tuple(
+    sorted(
+        (
+            "专项施工方案", "专项方案", "施工方案", "施工方法", "技术措施",
+            "管理计划", "管理体系", "实施策划", "推进计划", "协调保障", "考核机制",
+            "持续改进", "方案", "计划", "措施", "管理", "要求", "标准",
+            "制度", "预案", "部署", "策划", "体系", "机制", "保障", "设计",
+            "交付", "要点",
+        ),
+        key=len,
+        reverse=True,
+    )
+)
+
+
+def _title_entity_fragments(*titles: str) -> tuple[str, ...]:
+    """从祖先标题切出**本章专属**的工程实体词，供三级标题兜底优先使用。
+
+    2026-10-15 新增，修复实体错配：`_l3_entity_candidates` 此前只按语义域从
+    全局词池取实体，而 `_DOMAIN_KEYWORDS` 缺一大批专业词（悬挑花篮架、盘扣
+    支撑体系、试验计量、资料与 BIM 交付…），这些章被判 generic 后落回 work 池，
+    于是在「悬挑花篮架与盘扣支撑体系方案」章下产出「地下室施工工艺」。
+    实测 21 章 × 5 维度骨架上错配 70/525 个三级标题。
+    本函数直接从祖先标题切实体，使兜底标题与所在章主题对应。
+
+    切分：按连接符（与/及/、/，/／/空格）切段 → 剥首部编号与「第N章」前缀 →
+    剥**一层**尾部章名级虚词 → 保留 ≥3 字且含 CJK 的片段（2 字片段拼维度词后
+    易退化成「质量控制」这类无指代短语）。最多返回 4 个，按出现顺序。
+
+    只剥一层：虚词本身常是复合实体的一部分，剥到不动点会把实体掏空 ——
+    「盘扣支撑体系方案」剥「方案」得「盘扣支撑体系」后再剥「体系」会得到
+    「盘扣支撑」，拼出的「盘扣支撑技术交底」丢了本体指代。
+    """
+    frags: list[str] = []
+    for raw in titles:
+        title = (raw or "").strip()
+        if not title:
+            continue
+        for seg in re.split(r"[与及、，,/／\s　]+", title):
+            seg = re.sub(r"^[0-9一二三四五六七八九十百零]+[、.．)）]", "", seg).strip()
+            seg = re.sub(r"^第[0-9一二三四五六七八九十百零]+[章节部分]", "", seg).strip()
+            for suf in _TITLE_ENTITY_NOISE_SUFFIXES:
+                if seg.endswith(suf) and len(seg) - len(suf) >= 3:
+                    seg = seg[: -len(suf)]
+                    break
+            seg = seg.strip()
+            if len(seg) >= 3 and re.search(r"[一-鿿]", seg) and seg not in frags:
+                frags.append(seg)
+    return tuple(frags[:4])
+
+
 def _l3_entity_candidates(
     parent_title: str,
     idx: int,
@@ -1282,9 +1336,18 @@ def _l3_entity_candidates(
     # 互相拼接会产出「阶段目标总体实施策划」这类不通顺的伪标题。
     if dom == "generic":
         dom = "work"
-    entities = tuple(extra_entities or ()) + _L3_ENTITY_WORDS.get(dom, ())
-    if not entities:
-        entities = _L3_ENTITY_WORDS["work"]
+    # 调用方未显式提供实体词时，以**祖级（L1）标题**切出的本章实体兜底。
+    # 只取 L1 不取 L2：2026-09-04 用户定制规则 3 禁止三级继承二级核心短语。
+    if extra_entities is None and context_title:
+        extra_entities = _title_entity_fragments(context_title)
+    dom_entities = _L3_ENTITY_WORDS.get(dom) or _L3_ENTITY_WORDS["work"]
+    # 调用方提供的实体词（所在章的专属实体，见 `_title_entity_fragments`）
+    # 排在域池之前：先用章内实体组合，耗尽后才落到通用域池。旧实现把两者
+    # 直接拼接成同一个轮转序列，章内实体只有 1/30 的概率被选中，导致
+    # 「悬挑花篮架」章批量产出「地下室施工工艺」这类与本章无关的三级标题。
+    chapter_entities = tuple(
+        e for e in (extra_entities or ()) if e and e not in dom_entities
+    )
     # 维度使用短动作词池（2~4 字），与实体词拼接后读得通；
     # 不用 _L3_SUFFIX_POOL（那里是「施工工艺流程与要点」这类完整短语，
     # 与实体词拼接会产生「样板引路施工工艺流程与要点」伪标题）。
@@ -1293,35 +1356,42 @@ def _l3_entity_candidates(
         dimensions = tuple(_L3_SHORT_ACTIONS["work"])
 
     out: list[str] = []
-    ent_len = len(entities)
     # 过程/制度类实体的维度池（_L3_PROCEDURE_DIMS）与动作池长度不同，
     # 轮转步长取两者上限，保证组合空间不因池切换而缩水。
     dim_cap = max(len(dimensions), len(_L3_PROCEDURE_DIMS))
-    for offset in range(ent_len * dim_cap):
-        # 实体索引步进 (idx*5) 与维度索引步进 (idx) 互质，使同一章的兄弟
-        # 三级标题落在不同实体上；维度索引步进 (offset) 保证同实体的动作也分散。
-        e = entities[(idx * 5 + offset) % ent_len]
-        dims = _l3_dims_for(e, dimensions)
-        if not dims:
+    entity_stages: list[tuple[str, ...]] = []
+    if chapter_entities:
+        entity_stages.append(chapter_entities)
+    entity_stages.append(dom_entities)
+    for entities in entity_stages:
+        ent_len = len(entities)
+        if not ent_len:
             continue
-        d = dims[(idx + offset) % len(dims)]
-        if e in d or d in e:  # 完全叠词
-            continue
-        # 二元组重叠过滤：拦掉「旁站监理+旁站监督」「工序验收+首件验收」
-        # 这类共享核心词、读起来像在说同一件事的伪标题
-        if _has_bigram_overlap(e, d):
-            continue
-        # 双过程词过滤：拦掉「作业指导样板引路」「工序交接实测实量」这类
-        # 两个过程名直接粘在一起、读不出修饰关系的生硬标题。
-        # 过程类实体改由 _l3_dims_for 提供名词性维度，此处为双保险。
-        if e in _L3_PROCEDURE_WORDS and d in _L3_PROCEDURE_WORDS:
-            continue
-        cand = f"{e}{d}"
-        if cand in used or cand in out or _is_dirty_l3_title(cand):
-            continue
-        out.append(cand)
-        if len(out) >= 40:
-            break
+        for offset in range(ent_len * dim_cap):
+            # 实体索引步进 (idx*5) 与维度索引步进 (idx) 互质，使同一章的兄弟
+            # 三级标题落在不同实体上；维度索引步进 (offset) 保证同实体的动作也分散。
+            e = entities[(idx * 5 + offset) % ent_len]
+            dims = _l3_dims_for(e, dimensions)
+            if not dims:
+                continue
+            d = dims[(idx + offset) % len(dims)]
+            if e in d or d in e:  # 完全叠词
+                continue
+            # 二元组重叠过滤：拦掉「旁站监理+旁站监督」「工序验收+首件验收」
+            # 这类共享核心词、读起来像在说同一件事的伪标题
+            if _has_bigram_overlap(e, d):
+                continue
+            # 双过程词过滤：拦掉「作业指导样板引路」「工序交接实测实量」这类
+            # 两个过程名直接粘在一起、读不出修饰关系的生硬标题。
+            # 过程类实体改由 _l3_dims_for 提供名词性维度，此处为双保险。
+            if e in _L3_PROCEDURE_WORDS and d in _L3_PROCEDURE_WORDS:
+                continue
+            cand = f"{e}{d}"
+            if cand in used or cand in out or _is_dirty_l3_title(cand):
+                continue
+            out.append(cand)
+            if len(out) >= 40:
+                return out
     return out
 
 
@@ -1571,8 +1641,17 @@ def _cleanup_placeholder_titles(
 
     def _collect(nodes: list) -> None:
         for _n in nodes:
-            if isinstance(_n, dict) and _n.get("title"):
+            if not isinstance(_n, dict):
+                continue
+            if _n.get("title"):
                 _used.add(_n["title"].strip())
+            # 2026-10-15 修复（B1 遗留 · 播种不完整）：旧实现只收集入参这一层
+            # （即 L2），三级及以下的既有标题从未进入 `_used`。于是
+            # 「悬挑架安装」+「悬挑架安装（2）」这对兄弟被清洗时，剥后缀得到的
+            # 主体不在 used 里 → 直接落成一个与新兄弟同名的标题；同父撞名虽然
+            # 后续 `_uniquify_outline_titles` 能兜住，但清洗链在落库侧位于
+            # 去重**之后**，重复标题会漏到终态。改为整子树递归播种。
+            _collect(_n.get("children") or [])
 
     def _walk(
         nodes: list, parent_title: str = "", grandparent_title: str = "", level: int = 1
@@ -1590,13 +1669,32 @@ def _cleanup_placeholder_titles(
             # 仍为泛化词的形态），见 `_is_dirty_l3_title_deep`。
             _is_placeholder = level >= 3 and _is_dirty_l3_title_deep(_title)
             if _is_placeholder:
-                _new = _semantic_fallback_title(
-                    parent_title or "", _clean_seq, _used, context_title=grandparent_title
-                )
-                _node["title"] = _new
-                _used.add(_new)
-                _clean_seq += 1
-                _fixed += 1
+                # 2026-10-15 修复（B1 · 清洗器过度剥离）：
+                # 「悬挑架安装（2）」这类标题的主体**完全具体**，只是带了个
+                # 冲突后缀；旧实现命中脏判定后整段替换为词池标题（实测变成
+                # 「技术交底要点」），把 AI 生成的项目针对性丢掉了 —— 清洗器
+                # 自己成了泛化标题的来源之一。
+                # 现按「先剥后缀保主体，主体仍泛化才重写」处理，
+                # 与 `_clean_legacy_suffix_tree` 对「（其N）」的处理口径一致。
+                _body = _strip_legacy_redundant_suffix(_strip_ordinal_suffix(_title)).strip()
+                if (
+                    _body
+                    and _body != _title
+                    and not _is_dirty_l3_title_deep(_body)
+                    and _body not in _used
+                ):
+                    _node["title"] = _body
+                    _used.add(_body)
+                    _clean_seq += 1
+                    _fixed += 1
+                else:
+                    _new = _semantic_fallback_title(
+                        parent_title or "", _clean_seq, _used, context_title=grandparent_title
+                    )
+                    _node["title"] = _new
+                    _used.add(_new)
+                    _clean_seq += 1
+                    _fixed += 1
             _sub = _node.get("children")
             if isinstance(_sub, list):
                 _walk(_sub, _title, parent_title, level + 1)
@@ -1754,6 +1852,11 @@ def _uniquify_outline_titles(level1: list[dict]) -> list[dict]:
 
     def _dedupe_siblings(nodes: list[dict], parent_title: str = "") -> None:
         seen: set[str] = set()
+        # 兄弟原始标题：语义化兜底需要按原始字符串判重（`used` 口径），
+        # 而 seen 存的是归一化 core，两者不能混用。
+        sibling_raw = {
+            str(n.get("title") or "").strip() for n in nodes if isinstance(n, dict)
+        } - {""}
         for node in nodes:
             if not isinstance(node, dict):
                 continue
@@ -1770,6 +1873,25 @@ def _uniquify_outline_titles(level1: list[dict]) -> list[dict]:
                         new_title = f"{title}之{_cn_ordinal(_n)}"
                         new_core = _title_core(new_title)
                         _n += 1
+                    # 2026-10-15 修复（B4 · 消歧产物无脏复检）：
+                    # `_disambiguate_title` 的维度词分支会给泛化主体补维度词
+                    # （实测产出「总体实施策划专项方案」），而消歧发生在
+                    # `_cleanup_placeholder_titles` **之后**，脏产物因此直接落库。
+                    # 现补一道统一脏判定：仍脏则改用章内语义化兜底重生成。
+                    if _is_dirty_l3_title_deep(new_title):
+                        _rebuilt = _semantic_fallback_title(
+                            parent_title, len(seen), set(sibling_raw), context_title=""
+                        )
+                        _rebuilt_core = _title_core(_rebuilt)
+                        if _rebuilt_core and _rebuilt_core not in seen:
+                            logger.info(
+                                "同级去重: 消歧产物「%s」仍为泛化标题，改用语义化兜底「%s」（父级=%s）",
+                                new_title,
+                                _rebuilt,
+                                parent_title or "(根)",
+                            )
+                            new_title = _rebuilt
+                            new_core = _rebuilt_core
                     logger.info(
                         "同级去重: 「%s」->「%s」（父级=%s）",
                         title,
@@ -1786,6 +1908,121 @@ def _uniquify_outline_titles(level1: list[dict]) -> list[dict]:
     if isinstance(level1, list):
         _dedupe_siblings(level1)
     return level1
+
+
+# ========== 跨章成套复用护栏 ==========
+
+
+def _cap_cross_chapter_repetition(
+    level1: list[dict], max_reuse: int = 3
+) -> tuple[list[dict], int]:
+    """限制同一个三级标题在**不同父级**下的复用广度，超出部分按所在章重新生成。
+
+    2026-10-15 新增，修复用户反馈的「三级标题大量是占位式泛化名称」。
+
+    与 2026-10-11「同级唯一」政策的关系（不冲突、不覆盖）：
+      该政策取消的是**全树去重**（旧实现会整段删除跨父同名节点 → 章节内容消失，
+      并追加「（其N）」后缀 → 目录污染），因为「3.1 施工组织设计」「4.1 施工组织设计」
+      是两节独立内容，跨父同名合法。但政策落地后**没有任何机制约束复用广度**，
+      于是 AI 按同一套骨架提示词逐章填充时，同一批泛化标题被成套复制到几十章 ——
+      生产库实测单个标题（「智能建造地下室施工工艺」）出现在 25 个互不相关的
+      一级章下，全库三级标题跨章重复率 97%。合法复用的形态是 2~3 个相关章，
+      成套复制的形态是「十几个章共用同一组标题」，分界正是复用广度。
+
+    规则：
+      - 只作用于**三级及以下**；一级/二级是用户的正式章节名，一律不动；
+      - 按 `_title_core` 归一化口径统计出现的**不同父级个数**，保留前 `max_reuse`
+        个出现（先到先得，保证幂等：第二次运行统计已 ≤ 上限，不做任何改名）；
+      - 超出部分用所在章主题重新生成（L1 标题切实体 → `_semantic_fallback_title`），
+        因此新标题既与本章对应，又不会与已有标题撞名；
+      - 永不产出「（N）」/「（其N）」式裸编号后缀（生成侧由 `_is_dirty_l3_title`
+        把关，登记侧由 `used` 集合把关）。
+
+    Args:
+        level1: 一级目录树（就地修改）
+        max_reuse: 同一标题允许出现的不同父级个数上限；<=0 表示关闭护栏（向后兼容）
+
+    Returns:
+        (目录树, 被改写的节点数)
+    """
+    if not isinstance(level1, list) or max_reuse <= 0:
+        return level1, 0
+
+    # 收集三级及以下节点：core -> [(node, parent_key, parent_title, l1_title), ...]
+    occurrences: dict[str, list[tuple[dict, int, str, str]]] = {}
+    all_titles: set[str] = set()
+    # 父级身份必须用**节点实例**而非标题字符串：真实目录里 L2 是通用维度名
+    # （「总体方案与实施策划」在每一章都出现），用标题判「不同父级」会把
+    # 25 个章的同名父级塌缩成 1 个 → 护栏永不触发（2026-10-15 实测回归抓到）。
+    _parent_seq = 0
+
+    def _walk(nodes: list, level: int, parent_key: int, parent_title: str, l1_title: str) -> None:
+        nonlocal _parent_seq
+        for node in nodes:
+            if not isinstance(node, dict):
+                continue
+            title = str(node.get("title") or "").strip()
+            cur_l1 = title if level == 1 else l1_title
+            if title:
+                all_titles.add(title)
+                if level >= 3:
+                    core = _title_core(title)
+                    if core:
+                        occurrences.setdefault(core, []).append(
+                            (node, parent_key, parent_title, cur_l1)
+                        )
+            children = node.get("children")
+            if isinstance(children, list):
+                _parent_seq += 1
+                _walk(children, level + 1, _parent_seq, title or parent_title, cur_l1)
+
+    _walk(level1, 1, 0, "", "")
+
+    used = set(all_titles)
+    fixed = 0
+    for core, items in occurrences.items():
+        if len(items) <= max_reuse:
+            continue
+        # 统计口径是「不同父级实例」：同一父级下的重复由 `_uniquify_outline_titles`
+        # 负责，这里不越界处理，避免两处判据打架。
+        parent_keys = list(dict.fromkeys(k for _, k, _, _ in items))
+        if len(parent_keys) <= max_reuse:
+            continue
+        kept_keys = set(parent_keys[:max_reuse])
+        seq = 0
+        rewritten = 0
+        sample_title = str(items[0][0].get("title") or "").strip()
+        for node, parent_key, parent_title, l1_title in items:
+            if parent_key in kept_keys:
+                continue
+            old_title = str(node.get("title") or "").strip()
+            new_title = _semantic_fallback_title(
+                parent_title, seq, used, context_title=l1_title
+            )
+            # 语义化兜底自会登记 used；此处仅做「确实变更且不再泛化」的收口校验
+            if not new_title or new_title == old_title or _is_dirty_l3_title_deep(new_title):
+                logger.warning(
+                    "跨章复用护栏: 「%s」重生成失败（父级=%s），保留原标题",
+                    old_title,
+                    parent_title or "(根)",
+                )
+                continue
+            node["title"] = new_title
+            rewritten += 1
+            seq += 1
+        if rewritten:
+            logger.info(
+                "跨章复用护栏: 「%s」出现在 %d 个不同父级（上限 %d），改写超出的 %d 个",
+                sample_title,
+                len(parent_keys),
+                max_reuse,
+                rewritten,
+            )
+            fixed += rewritten
+
+    if fixed:
+        logger.info("跨章复用护栏: 共改写 %d 个跨章成套复用的三级标题", fixed)
+    return level1, fixed
 
 
 # ========== 最小子节点保障 ==========
@@ -1859,11 +2096,17 @@ def _ensure_min_children(
                 grandchildren = []
                 for j in range(min_level3):
                     # L3 从 L2 标题派生（used 含全局，避免与兄弟/其他章节重名）
+                    # 2026-10-15 修复（B5）：旧实现传 `set()` —— 注释写「used 含全局」
+                    # 但代码是空集，本章新建 L2 下的整批 L3 完全不看全局标题集合，
+                    # 于是同一批派生标题在不同章成套复制（生产库跨章重复的形态）。
+                    # 同时补 `grandparent_title=chapter_title`：L2 恒为通用维度名
+                    # （「总体方案与实施策划」等），不传 L1 就无法取得本章实体词。
                     l3_title = _derive_child_title(
                         l2_title,
                         j,
-                        set(),  # 本 L2 的 L3 列表初始为空
+                        global_used,
                         level=3,
+                        grandparent_title=chapter_title,
                     )
                     global_used.add(l3_title)
                     grandchildren.append(
@@ -1895,7 +2138,11 @@ def _ensure_min_children(
             for gc in grandchildren:
                 if isinstance(gc, dict) and not str(gc.get("title") or "").strip():
                     t = _derive_child_title(
-                        str(child.get("title") or ""), _l3_filled, global_used, level=3
+                        str(child.get("title") or ""),
+                        _l3_filled,
+                        global_used,
+                        level=3,
+                        grandparent_title=chapter_title,
                     )
                     gc["title"] = t
                     global_used.add(t)
@@ -1911,7 +2158,11 @@ def _ensure_min_children(
                 _before_gc = gc_count
                 while len(grandchildren) < min_level3:
                     l3_title = _derive_child_title(
-                        child.get("title", ""), _l3_filled, used_l3 | global_used, level=3
+                        child.get("title", ""),
+                        _l3_filled,
+                        used_l3 | global_used,
+                        level=3,
+                        grandparent_title=chapter_title,
                     )
                     _l3_filled += 1
                     used_l3.add(l3_title)

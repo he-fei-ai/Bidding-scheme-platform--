@@ -7,6 +7,7 @@
  * - shouldNotifySingle：单文件 vs 批量 的逐条提示闸门
  * - formatUploadFailureText / nextFileRole / formatRoleToggleMessage：交互文案
  * - formatParsingStatusText：GET /tasks/files/status 聚合状态的展示映射
+ * - formatClearTextsResult：DELETE /files/texts 的「文本已删但库未重置」告警分级（M-5）
  */
 import { describe, it, expect } from "vitest";
 import {
@@ -19,6 +20,7 @@ import {
   nextFileRole,
   formatRoleToggleMessage,
   formatParsingStatusText,
+  formatClearTextsResult,
   isImageFile,
   EMPTY_BATCH_TOTALS,
 } from "./utils";
@@ -184,5 +186,80 @@ describe("formatParsingStatusText（解析任务状态展示）", () => {
     expect(formatParsingStatusText({ ...base, recent_completed: 2, recent_failed: 1 })).toBe(
       "最近解析完成 2 个，失败 1 个",
     );
+  });
+
+  it("解析成功但有非致命警告时一并播报（M-1 诊断字段消费）", () => {
+    const warn = {
+      status: "completed",
+      filename: "招标文件.docx",
+      file_type: "docx",
+      progress: 100,
+      total_files: 1,
+      completed_files: 1,
+      error_message: "未提取到文本内容（可能为空文件、纯图片扫描件或 OCR 引擎未启用）",
+      started_at: "",
+      updated_at: "",
+    };
+    expect(
+      formatParsingStatusText({
+        status: "completed",
+        processing: 0,
+        recent_completed: 1,
+        recent_failed: 0,
+        total_tasks: 1,
+        latest: warn,
+      }),
+    ).toBe("最近解析完成 1 个（未提取到文本内容（可能为空文件、纯图片扫描件或 OCR 引擎未启用））");
+    // 警告为空串 / 全空白时保持原纯成功文案
+    expect(
+      formatParsingStatusText({
+        status: "completed",
+        processing: 0,
+        recent_completed: 3,
+        recent_failed: 0,
+        total_tasks: 3,
+        latest: { ...warn, error_message: "   " },
+      }),
+    ).toBe("最近解析完成 3 个文件");
+    // 失败行的原因不重复播报（已有独立失败计数）
+    expect(
+      formatParsingStatusText({
+        status: "completed",
+        processing: 0,
+        recent_completed: 2,
+        recent_failed: 1,
+        total_tasks: 3,
+        latest: { ...warn, status: "failed", error_message: "文本提取失败: boom" },
+      }),
+    ).toBe("最近解析完成 2 个，失败 1 个");
+  });
+});
+
+describe("formatClearTextsResult（清空提取的结果分级 · M-5）", () => {
+  it("后端返回 warning 时降级为 warning 级并原样透出原因", () => {
+    const warning =
+      "提取文本已删除，但数据库状态重置失败（database is locked），" +
+      "文件列表仍显示已提取；请对相关文件执行「重新提取」或重新上传。";
+    expect(
+      formatClearTextsResult({ files_reset: 0, tasks_cleared: 0, warning }),
+    ).toEqual({ level: "warning", text: warning });
+  });
+
+  it("无 warning 时按实际重置数量播报成功（不再是「已重置 0 个」的假成功）", () => {
+    expect(
+      formatClearTextsResult({ files_reset: 3, tasks_cleared: 2, warning: "" }),
+    ).toEqual({
+      level: "success",
+      text: "已重置 3 个文件状态为待提取，清理 2 条旧解析记录",
+    });
+  });
+
+  it("字段缺失（旧后端）按 0 计数且不抛错", () => {
+    expect(formatClearTextsResult({})).toEqual({
+      level: "success",
+      text: "已重置 0 个文件状态为待提取，清理 0 条旧解析记录",
+    });
+    // 只有空白警告同样不算失败
+    expect(formatClearTextsResult({ warning: "   " }).level).toBe("success");
   });
 });

@@ -5,6 +5,7 @@
  * 覆盖范围：
  *   1. 基础渲染：状态标签 / 主文件标签 / 后台解析 vs 重新提取按钮
  *   2. Gap-1 2026-10-11：「清空提取」按钮渲染（带 Popconfirm 二次确认）
+ *      + M-5 2026-10-15：清空结果的分级播报（后端 warning → message.warning）
  *   3. 空态渲染 + 上传后列表刷新
  *   4. 角色切换 —— 真实点击并断言 updateFileRole 调用参数 + demoted 级联提示
  *   5. 删除 —— 调用 deleteFile 并如实提示「主文件已被自动提升」
@@ -72,6 +73,17 @@ const CLEARED_RESPONSE = {
   status: "cleared" as const,
   files_reset: 3,
   tasks_cleared: 2,
+  warning: "",
+};
+
+// M-5 2026-10-15：后端「提取文本已删但 DB 状态重置失败」时返回 200 + warning
+const CLEARED_WITH_WARNING = {
+  status: "cleared" as const,
+  files_reset: 0,
+  tasks_cleared: 0,
+  warning:
+    "提取文本已删除，但数据库状态重置失败（database is locked），" +
+    "文件列表仍显示已提取；请对相关文件执行「重新提取」或重新上传。",
 };
 
 // TD6：后端下发的支持格式清单（extensions 带点，accept 为逗号串）
@@ -114,7 +126,14 @@ const API_MOCKS = {
     dispatched: "queued",
     dispatched_via: "celery",
   })),
-  clearProjectTexts: vi.fn(async () => CLEARED_RESPONSE),
+  clearProjectTexts: vi.fn(
+    async (): Promise<{
+      status: string;
+      files_reset: number;
+      tasks_cleared: number;
+      warning?: string;
+    }> => CLEARED_RESPONSE,
+  ),
   // Gap-1 2026-10-11
   fetchSupportedFormats: vi.fn(async () => SUPPORTED_FORMATS),
   // TD6 2026-10-12：此前该 API 在前端零调用方（死链）
@@ -249,6 +268,118 @@ describe.skipIf(!hasDom)("FileUploadPage 组件级交互", () => {
       const clearBtn = rtl.screen.queryByRole("button", { name: /清空提取/ });
       expect(clearBtn).toBeNull();
 
+      rtl.cleanup();
+    },
+  );
+
+  // ─── M-5 2026-10-15：清空提取的结果分级（真点击 Popconfirm 确认） ───
+
+  it(
+    "清空提取：后端返回 warning 时走 message.warning 而非成功提示",
+    { timeout: 120_000 },
+    async () => {
+      const rtl = await loadRtl();
+      if (!rtl) return;
+
+      const { message } = await import("antd");
+      const warnSpy = vi.spyOn(message, "warning").mockImplementation(() => ({} as never));
+      const successSpy = vi
+        .spyOn(message, "success")
+        .mockImplementation(() => ({} as never));
+
+      API_MOCKS.fetchFiles.mockResolvedValue(FILES_MIXED);
+      API_MOCKS.clearProjectTexts.mockResolvedValue(CLEARED_WITH_WARNING);
+
+      const FileUploadPage = (await import("./FileUploadPage")).default;
+      const { container } = rtl.render(<FileUploadPage />);
+      await rtl.waitFor(() =>
+        expect(container.textContent || "").toContain("招标文件.docx"),
+      );
+
+      // Popconfirm 渲染在 body 的 portal 里，且上一个失败用例可能留下旧弹层，
+      // 故触发按钮限定在本用例 container 内，弹层取「最新一个」。
+      const clearBtn = Array.from(container.querySelectorAll("button")).find((b) =>
+        (b.textContent || "").includes("清空提取"),
+      ) as HTMLElement;
+      expect(clearBtn).toBeTruthy();
+      rtl.fireEvent.click(clearBtn);
+
+      await rtl.waitFor(() =>
+        expect(document.querySelectorAll(".ant-popconfirm").length).toBeGreaterThan(0),
+      );
+      const pops = document.querySelectorAll(".ant-popconfirm");
+      const pop = pops[pops.length - 1] as HTMLElement;
+      const okBtn = Array.from(pop.querySelectorAll("button")).find((b) =>
+        (b.textContent || "").includes("确认清空"),
+      ) as HTMLElement;
+      expect(okBtn).toBeTruthy();
+      rtl.fireEvent.click(okBtn);
+
+      await rtl.waitFor(() => {
+        expect(API_MOCKS.clearProjectTexts).toHaveBeenCalledWith(1);
+      });
+      // 修复前这里一律 message.success，用户看到「已重置 0 个」的误导性成功
+      await rtl.waitFor(() => {
+        expect(warnSpy).toHaveBeenCalledWith(CLEARED_WITH_WARNING.warning);
+      });
+      expect(successSpy).not.toHaveBeenCalled();
+
+      warnSpy.mockRestore();
+      successSpy.mockRestore();
+      rtl.cleanup();
+    },
+  );
+
+  it(
+    "清空提取：正常清空时按实际数量播报成功",
+    { timeout: 120_000 },
+    async () => {
+      const rtl = await loadRtl();
+      if (!rtl) return;
+
+      const { message } = await import("antd");
+      const warnSpy = vi.spyOn(message, "warning").mockImplementation(() => ({} as never));
+      const successSpy = vi
+        .spyOn(message, "success")
+        .mockImplementation(() => ({} as never));
+
+      API_MOCKS.fetchFiles.mockResolvedValue(FILES_MIXED);
+      API_MOCKS.clearProjectTexts.mockResolvedValue(CLEARED_RESPONSE);
+
+      const FileUploadPage = (await import("./FileUploadPage")).default;
+      const { container } = rtl.render(<FileUploadPage />);
+      await rtl.waitFor(() =>
+        expect(container.textContent || "").toContain("招标文件.docx"),
+      );
+
+      // Popconfirm 渲染在 body 的 portal 里，且上一个失败用例可能留下旧弹层，
+      // 故触发按钮限定在本用例 container 内，弹层取「最新一个」。
+      const clearBtn = Array.from(container.querySelectorAll("button")).find((b) =>
+        (b.textContent || "").includes("清空提取"),
+      ) as HTMLElement;
+      expect(clearBtn).toBeTruthy();
+      rtl.fireEvent.click(clearBtn);
+
+      await rtl.waitFor(() =>
+        expect(document.querySelectorAll(".ant-popconfirm").length).toBeGreaterThan(0),
+      );
+      const pops = document.querySelectorAll(".ant-popconfirm");
+      const pop = pops[pops.length - 1] as HTMLElement;
+      const okBtn = Array.from(pop.querySelectorAll("button")).find((b) =>
+        (b.textContent || "").includes("确认清空"),
+      ) as HTMLElement;
+      expect(okBtn).toBeTruthy();
+      rtl.fireEvent.click(okBtn);
+
+      await rtl.waitFor(() => {
+        expect(successSpy).toHaveBeenCalledWith(
+          "已重置 3 个文件状态为待提取，清理 2 条旧解析记录",
+        );
+      });
+      expect(warnSpy).not.toHaveBeenCalled();
+
+      warnSpy.mockRestore();
+      successSpy.mockRestore();
       rtl.cleanup();
     },
   );

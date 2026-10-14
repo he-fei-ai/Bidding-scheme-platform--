@@ -43,6 +43,7 @@ import {
   nextFileRole,
   formatRoleToggleMessage,
   formatParsingStatusText,
+  formatClearTextsResult,
   isImageFile,
   EMPTY_BATCH_TOTALS,
   resolveAccept,
@@ -369,9 +370,14 @@ export default function FileUploadPage() {
     setClearing(true);
     try {
       const result = await clearProjectTexts(projectId);
-      message.success(
-        `已重置 ${result.files_reset} 个文件状态为待提取，清理 ${result.tasks_cleared} 条旧解析记录`
-      );
+      // M-5 2026-10-15：后端在「文本已删但 DB 未重置」时返回 200 + warning，
+      // 此前这里一律 message.success，用户看到的是误导性成功。
+      const clearOutcome = formatClearTextsResult(result);
+      if (clearOutcome.level === "warning") {
+        message.warning(clearOutcome.text);
+      } else {
+        message.success(clearOutcome.text);
+      }
       await loadFiles();
     } catch (err) {
       const detail = err instanceof Error ? err.message : String(err);

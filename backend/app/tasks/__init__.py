@@ -141,7 +141,14 @@ def generate_section_content(self, project_id: int, section_ids: list[int], writ
             try:
                 full_text = await latest_extracted_text(project_id)
                 tender_context = await extract_tender_context_async(full_text) if full_text else ''
-            except Exception:
+            except Exception as _tc_e:
+                # BUG-FIX 2026-10-15（M-2 · 同缺陷不同口径）：批量正文任务与
+                # SSE 链路读同一份招标正文，此前这里静默塌空，事后无从判断
+                # 正文偏离标书是解析失败还是模型问题。
+                logger.warning(
+                    '批量正文: 招标正文/上下文提取失败，将不带招标上下文继续 project=%d err=%s',
+                    project_id, _tc_e,
+                )
                 tender_context = ''
             global_facts = None
             if analysis_row and analysis_row['global_facts_json']:

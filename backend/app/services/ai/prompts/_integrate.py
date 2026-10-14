@@ -126,6 +126,8 @@ CONTENT_ORCHESTRATION_LEGACY_SYSTEM = """你是投标技术方案正文编排专
 3. Mermaid 图是否合适（mermaid.needed + priority + reason）
 4. AI 生图是否合适（image.needed + priority + reason）
 5. 本章节应参考哪些知识库素材（knowledge.item_ids，从用户提供的素材清单中选择）
+6. 本章节需要哪些全局事实（facts.titles，只从用户提供的「全局事实标题清单」中选标题，
+   不要输出任何具体事实内容）
 
 核心原则：
 - 克制为美：能文字表达的不配图，不要为了形式硬插
@@ -136,10 +138,13 @@ CONTENT_ORCHESTRATION_LEGACY_SYSTEM = """你是投标技术方案正文编排专
 - knowledge.item_ids: 只能从「可用知识素材清单」给出的 ID 中选择，只选与本章节
   内容真正相关的条目（通常 0~3 条），没有相关素材就给空数组，不要硬凑；
   素材 ID 必须原样引用，禁止编造清单中不存在的 ID
+- facts.titles: 只能从「全局事实标题清单」中选择标题（通常 0~8 条，涉及工期/人员/
+  质保/服务承诺的章节应选上对应事实），未提供清单或无需要时给空数组；
+  编排判断必须结合事实标题避免时间、地点、人员、设备、标准或服务承诺前后不一致的表达
 
 输出严格 JSON 数组，每个元素包含 section_id, title, recommended_type, confidence, reason,
 以及 plan: {table:{needed,purpose}, mermaid:{needed,priority,reason}, image:{needed,priority,reason},
-knowledge:{item_ids:[...]}}"""
+knowledge:{item_ids:[...]}, facts:{titles:[...]}}"""
 
 CONTENT_ORCHESTRATION_LEGACY_SYSTEM = _reg(
     "CONTENT_ORCHESTRATION_LEGACY_SYSTEM",

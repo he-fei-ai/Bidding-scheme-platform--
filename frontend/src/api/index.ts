@@ -600,6 +600,8 @@ export async function clearProjectTexts(projectId: number): Promise<{
   status: "cleared";
   files_reset: number;
   tasks_cleared: number;
+  /** M-5 2026-10-15：非空 == 文本已删但 DB 状态未重置成功，必须降级为告警 */
+  warning?: string;
 }> {
   const res = await http.delete(`/projects/${projectId}/files/texts`);
   return res.data;

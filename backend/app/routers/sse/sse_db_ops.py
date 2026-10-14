@@ -359,8 +359,15 @@ async def _extract_project_context(project_id: int) -> dict:
 
         scoring_points = json.loads(scoring_points_str) if scoring_points_str else []
 
-    except json.JSONDecodeError:
-
+    except json.JSONDecodeError as _sp_e:
+        # BUG-FIX 2026-10-15（M-3 · 静默降级不可见）：坏 JSON 塌成空评分点后，
+        # 目录生成照常出结果，用户完全无从得知「评分点覆盖」这一路输入是空的。
+        # 行为不变（不阻塞生成），只补可排查的告警。
+        logger.warning(
+            "目录上下文装配: scoring_points_json 不可解析，已降级为空列表 "
+            "project=%d err=%s 前50字=%r",
+            project_id, _sp_e, str(scoring_points_str)[:50],
+        )
         scoring_points = []
 
 
@@ -381,8 +388,18 @@ async def _extract_project_context(project_id: int) -> dict:
 
         tender_context = await extract_tender_context_async(full_text) if full_text else ""
 
-    except Exception:
-
+    except Exception as _tc_e:
+        # BUG-FIX 2026-10-15（M-2 · 同缺陷不同口径）：2026-09-18 给
+        # `sse_utils._extract_project_context` 的同一段裸吞补了告警，本函数与
+        # `sse_content` / Celery 任务里的另外三份副本一直是
+        # `except Exception: tender_context = ""`。招标正文读取失败时目录仍照常
+        # 生成，事后既无日志也无法判断「目录为何与招标文件脱节」。
+        # 现四处统一为「不阻塞 + 必留告警」。
+        logger.warning(
+            "目录上下文装配: 招标正文/上下文提取失败，将不带招标上下文继续 "
+            "project=%d err=%s",
+            project_id, _tc_e,
+        )
         tender_context = ""
 
 
@@ -602,6 +619,32 @@ def _clear_and_save_outline(project_id: int, outline: list) -> list:
     except Exception as _uq_exc:
         logger.warning(
             "_clear_and_save_outline: 同级消歧跳过（不阻塞落库）: %s", _uq_exc
+        )
+
+    # 2026-10-15 收口补齐（B3 跨章成套复用护栏 + B4 消歧产物复检）：
+    # 此前落库侧只有 cleanup→uniquify 单向，与 workflows_outline_v51 的
+    # `_post_selfcheck_title_safety_net`（cleanup→uniquify→cleanup）不同构，
+    # 消歧/护栏改写产物若仍泛化会直接落库。人工编辑章节与审核回灌路径
+    # 完全绕开 V5.1 生成链，这里是它们唯一的防线。
+    try:
+        from ...config import OUTLINE_L3_MAX_PARENT_REUSE
+        from ...services.ai.outline_common import (
+            _cap_cross_chapter_repetition,
+            _cleanup_placeholder_titles as _cleanup_after_cap,
+        )
+
+        outline, _capped = _cap_cross_chapter_repetition(
+            outline, OUTLINE_L3_MAX_PARENT_REUSE
+        )
+        if _capped:
+            logger.info(
+                "_clear_and_save_outline: 跨章成套复用护栏改写 %d 个三级标题 project=%d",
+                _capped, project_id,
+            )
+        _ph_fixed_after_uniquify += _cleanup_after_cap(outline)
+    except Exception as _cap_exc:
+        logger.warning(
+            "_clear_and_save_outline: 跨章复用护栏跳过（不阻塞落库）: %s", _cap_exc
         )
 
     # 2026-10-12 收尾闭环：cleanup 内部已用 global_used 防跨父撞名，

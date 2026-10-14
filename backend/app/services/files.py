@@ -343,13 +343,23 @@ def _update_parse_task(
 
         with get_db() as conn:
             if status == "completed":
+                # BUG-FIX 2026-10-15（M-1 · 解析警告静默丢弃）：completed 分支的
+                # SQL 从不写 error_message，而调用方（save_upload / re_extract /
+                # _persist_file_extraction）在「解析成功但正文为空」时算出的
+                # EMPTY_TEXT_MESSAGE 正是按第四参数传进来的 —— 于是这条警告
+                # 只落到文件行，任务行永远显示「completed 且无信息」。
+                # GET /tasks/files/status 的聚合口径（recent_completed 全部
+                # 无提示）与前端状态条因此在同一缺陷上失明。
+                # 说明：`error_message` 是本表唯一的消息通道，非致命警告也走它；
+                # 无提示时写入空串，保持「行内无消息 == 一切正常」的读法一致。
                 conn.execute(
                     f"""UPDATE file_parse_tasks
                        SET status = ?, progress = ?, completed_files = 1,
+                           error_message = ?,
                            completed_at = datetime('now', 'localtime'),
                            updated_at = datetime('now', 'localtime')
                        WHERE {where}""",
-                    (status, progress, *tail),
+                    (status, progress, error_message[:500], *tail),
                 )
             elif status == "failed":
                 conn.execute(
@@ -540,7 +550,10 @@ def save_upload(project_id: int, filename: str, content: bytes, file_role: str =
             # 现在如实写入提示信息（status 保持 success，不改变主文件选择/缓存语义）。
             if not extracted_text.strip():
                 message = EMPTY_TEXT_MESSAGE
-            _update_parse_task(project_id, "completed", 100, filename=filename)
+            # M-1 2026-10-15：把警告一并写进任务行（此前只写文件行）
+            _update_parse_task(
+                project_id, "completed", 100, error_message=message, filename=filename
+            )
     except Exception as e:
         extracted_text = ""
         status = "failed"
@@ -827,6 +840,27 @@ def _save_upload_image_async(
                 )
             except Exception as _pe:
                 logger.error("图片同步回退解析失败: %s", _pe)
+                # BUG-FIX 2026-10-15（M-4 · 假 processing 终态丢失）：此前这里只
+                # logger.error，行仍以 status='processing' 落库且无人改写终态。
+                # 下面 `_read_uploaded_file_status` 读回的就是 'processing'，
+                # POST /files 于是返回 200 + status='processing'：
+                #   · 前端 classifyUploadResult 判为「解析中」，进度条永久卡住；
+                #   · 文件行的 message 为空，用户看不到失败原因；
+                #   · 该状态也不再被任何清洗逻辑回收（区别于启动期的
+                #     _recover_stale_tasks，进程存活期间永不回收）。
+                # 现与 save_upload 同步路径的 `文本提取失败: {e}` 口径对齐，
+                # 同时把失败写进文件行与任务行。
+                _fail_msg = f"文本提取失败: {_pe}"[:500]
+                try:
+                    with get_db() as conn:
+                        conn.execute(
+                            "UPDATE uploaded_files SET status = 'failed', message = ? "
+                            "WHERE id = ? AND project_id = ?",
+                            (_fail_msg, file_id, project_id),
+                        )
+                except Exception as _fe:
+                    logger.error("图片回退失败状态落库失败 file=%s: %s", file_id, _fe)
+                _update_parse_task(project_id, "failed", 50, _fail_msg, filename)
         status, message = _read_uploaded_file_status(file_id)
         return {
             "id": file_id,
@@ -1724,7 +1758,10 @@ def clear_project_texts(project_id: int) -> dict:
     """清理项目的提取文本（用于重新上传后重置）
 
     返回值（Gap-1 2026-10-11 新增）：
-      {status: 'cleared', files_reset: N, tasks_cleared: M}
+      {status: 'cleared', files_reset: N, tasks_cleared: M, warning: ''}
+
+    M-5 2026-10-15：`warning` 非空表示「文本已删但 DB 状态重置失败」，
+    前端必须显式告警，不能继续播报「已重置 0 个文件」这种误导性成功。
 
     BUG-FIX 2026-10-05（B6 数据链断裂）：原实现只删 ``texts/`` 目录与合并文本缓存，
     完全不动 ``uploaded_files`` —— 记录仍显示 ``status='success'`` 且
@@ -1769,6 +1806,7 @@ def clear_project_texts(project_id: int) -> dict:
 
         files_reset = 0
         tasks_cleared = 0
+        reset_warning = ""
         try:
             with get_db() as conn:
                 cur = conn.execute(
@@ -1786,7 +1824,18 @@ def clear_project_texts(project_id: int) -> dict:
                 )
                 tasks_cleared = cur2.rowcount or 0
         except Exception as e:
-            logger.warning("清理项目文本后重置文件状态失败 project=%d: %s", project_id, e)
+            # BUG-FIX 2026-10-15（M-5 · 破坏性操作假成功）：texts/ 目录此刻已经
+            # 真删（不可回滚），但 DB 行仍停在 status='success' 且
+            # extracted_text_path 指向刚被删掉的文件 —— 磁盘与库不一致。
+            # 此前这里 logger.warning 后照常返回 {'status': 'cleared',
+            # files_reset: 0}，前端弹「已重置 0 个文件状态为待提取」，用户以为
+            # 清空完成，实际列表仍显示「已提取」且取文为空（悬空路径）。
+            # 现把失败如实透出到响应体（新增 warning 字段），由前端显式告警。
+            logger.error("清理项目文本后重置文件状态失败 project=%d: %s", project_id, e)
+            reset_warning = (
+                f"提取文本已删除，但数据库状态重置失败（{str(e)[:80]}），"
+                "文件列表仍显示已提取；请对相关文件执行「重新提取」或重新上传。"
+            )
 
     # 文本已清空，使合并文本缓存失效
     _text_cache_clear(project_id)
@@ -1795,7 +1844,13 @@ def clear_project_texts(project_id: int) -> dict:
         "clear_project_texts project=%d: 重置 %d 个文件状态为 pending，清理 %d 条解析任务终态行",
         project_id, files_reset, tasks_cleared,
     )
-    return {"status": "cleared", "files_reset": files_reset, "tasks_cleared": tasks_cleared}
+    return {
+        "status": "cleared",
+        "files_reset": files_reset,
+        "tasks_cleared": tasks_cleared,
+        # M-5 2026-10-15：仅在「文本已删但 DB 重置失败」时非空，前端据此告警
+        "warning": reset_warning,
+    }
 
 
 def re_extract_text(project_id: int, file_id: int) -> dict:
@@ -1858,7 +1913,9 @@ def re_extract_text(project_id: int, file_id: int) -> dict:
             # 用户误以为已修复（解析结果丢失无感知）。
             if not extracted_text.strip():
                 message = EMPTY_TEXT_MESSAGE
-            _update_parse_task(project_id, "completed", 100, filename=filename)
+            _update_parse_task(
+                project_id, "completed", 100, error_message=message, filename=filename
+            )
     except Exception as e:
         extracted_text = ""
         status = "failed"

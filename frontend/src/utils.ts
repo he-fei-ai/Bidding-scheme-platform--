@@ -1269,6 +1269,27 @@ export function formatReExtractResultText(
   return "重新提取成功";
 }
 
+/**
+ * 「清空已提取文本」结果文案与提示级别（M-5 2026-10-15）。
+ *
+ * 后端 DELETE /files/texts 在「texts/ 已真删、但 DB 状态重置失败」时仍返回
+ * HTTP 200 + `status:'cleared'`，此前前端无条件 `message.success` 弹
+ * 「已重置 0 个文件状态为待提取」—— 磁盘与库已经不一致，用户却看到成功，
+ * 且列表继续显示「已提取」。现在 warning 非空即降级为告警并透出后端原因。
+ */
+export function formatClearTextsResult(r: {
+  files_reset?: number | null;
+  tasks_cleared?: number | null;
+  warning?: string | null;
+}): { level: "success" | "warning"; text: string } {
+  const warning = (r?.warning || "").trim();
+  if (warning) return { level: "warning", text: warning };
+  return {
+    level: "success",
+    text: `已重置 ${r?.files_reset ?? 0} 个文件状态为待提取，清理 ${r?.tasks_cleared ?? 0} 条旧解析记录`,
+  };
+}
+
 /** 图片类扩展名（走 OCR 链路，解析耗时长，适合后台异步解析） */
 export const IMAGE_FILE_TYPES: readonly string[] = [
   "png", "jpg", "jpeg", "bmp", "tiff", "webp",
@@ -1306,6 +1327,12 @@ export function formatRoleToggleMessage(
 /**
  * 解析状态 → 展示文案（纯函数，组件级可测）。
  * 无实质信息（idle / 无任务）时返回 null，由调用方决定不渲染。
+ *
+ * 2026-10-15（M-1 · 诊断字段消费）：`latest.error_message` 此前在类型里声明、
+ * 接口里返回，却**没有任何消费方**。「解析成功但零文本」（空文件 / 纯图片扫描件
+ * 且 OCR 未启用）这类非致命警告只落在文件行的 message 上，聚合状态条一律显示
+ * 纯成功口径 —— 后端诊断字段静默失效，前端给出误导性成功。现按 latest 的
+ * status/message 追加警告；failed 已有独立计数，不在此重复播报失败原因。
  */
 export function formatParsingStatusText(
   s: FileParsingStatus | null | undefined,
@@ -1316,7 +1343,11 @@ export function formatParsingStatusText(
   }
   const { recent_completed: done, recent_failed: bad } = s;
   if (done === 0 && bad === 0) return null;
-  if (bad === 0) return `最近解析完成 ${done} 个文件`;
+  const warning =
+    s.latest && s.latest.status === "completed" ? (s.latest.error_message || "").trim() : "";
+  if (bad === 0) {
+    return warning ? `最近解析完成 ${done} 个（${warning}）` : `最近解析完成 ${done} 个文件`;
+  }
   return `最近解析完成 ${done} 个，失败 ${bad} 个`;
 }
 
