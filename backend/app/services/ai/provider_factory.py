@@ -12,6 +12,7 @@ import logging
 import os
 import threading
 import time
+from datetime import datetime
 from typing import Any
 
 from fastapi import HTTPException
@@ -75,6 +76,76 @@ def bump_ai_config_version() -> None:
             conn.commit()
     except Exception as e:
         logger.debug("递增 ai_config 版本号失败（退化为 TTL 失效）: %s", e)
+
+
+def get_ai_config_version() -> int:
+    """璇诲彇褰撳嶇疆鐗堟湰鍙凤紱(If-Match / ETag 鍙傚墠绯诲垪鍙?)。
+
+    鍐欏叆鍚庨€掑鏃?bump_ai_config_version() 鍚庡悓鏍烽€掑+1锛屼簨浠跺彲浠ユ彁绀猴紝
+    浠庢湁涓€涓暟鎹?瀵?-1鈥?杩斿洖 0(涓嶈祫婧愭垨鍐欏叆涔嬪悗杩斿洖 1)。
+    """
+    try:
+        v = _read_config_version()
+        return v if v > 0 else 0
+    except Exception:
+        return 0
+
+
+_KEY_ROTATED_AT_STATE_KEY = 'ai_config_key_rotated_at'
+
+
+def get_key_rotated_at() -> str | None:
+    """璇诲彇 API Key 鐢?鐨?鏃犵骇鏃堕暱(ISO-8601, 鍐欑幇鍔?ai_config_state)"""
+    try:
+        with get_db(readonly=True) as conn:
+            row = conn.execute(
+                "SELECT value FROM ai_config_state WHERE key = ?",
+                (_KEY_ROTATED_AT_STATE_KEY,),
+            ).fetchone()
+        return row[0] if row else None
+    except Exception:
+        return None
+
+
+def set_key_rotated_at(ts: str) -> None:
+    """璁哄API Key 鏃犵骇鏃堕暱"""
+    try:
+        with get_db() as conn:
+            conn.execute(
+                "INSERT INTO ai_config_state (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (_KEY_ROTATED_AT_STATE_KEY, ts),
+            )
+            conn.commit()
+    except Exception as e:
+        logger.debug("璁哄 API Key 鏃犵骇鏃堕暱澶辰触: %s", e)
+
+
+def get_key_rotation_status(interval_days: int | None = None) -> dict:
+    """API Key 鏃犵骇鏃ユ湰鏁?澶勭悊(鍙栧嵄绀猴紝 鏃犵骇缁欎簨/鏄?鍙栧嵄)。
+
+    鈻?锛?interval_days 涓嶈兘杩斿洖鍒嗘壘鍙?鐨勫墠绔犵粰鏄?AI_KEY_ROTATION_DAYS(榛樿 90 鏃?)锛?
+    """
+    try:
+        interval = int(interval_days or os.getenv('AI_KEY_ROTATION_DAYS', '90'))
+    except (TypeError, ValueError):
+        interval = 90
+    rotated_at = get_key_rotated_at()
+    days_since: int | None = None
+    rotation_due = False
+    if rotated_at:
+        try:
+            rotated_dt = datetime.fromisoformat(rotated_at)
+            days_since = (datetime.now() - rotated_dt).days
+            rotation_due = days_since >= interval
+        except ValueError:
+            days_since = None
+    return {
+        'key_rotated_at': rotated_at,
+        'rotation_interval_days': interval,
+        'days_since_rotation': days_since,
+        'rotation_due': rotation_due,
+    }
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -789,6 +860,18 @@ def get_ai_config() -> dict:
 
         # 前端不再接收 is_builtin_default，始终允许自由编辑配置
         config.pop("is_builtin_default", None)
+
+        # KEY-ROTATION WARNING (2026-10-16): log once per config cache TTL when the API key is past its rotation interval
+        try:
+            _rot = get_key_rotation_status()
+            if _rot.get('rotation_due'):
+                logger.warning(
+                    'API key rotation due: last rotated at %s, interval %s days',
+                    _rot.get('key_rotated_at'),
+                    _rot.get('rotation_interval_days'),
+                )
+        except Exception:
+            pass
 
         _ai_config_cache = config
         _ai_config_cache_time = time.time()

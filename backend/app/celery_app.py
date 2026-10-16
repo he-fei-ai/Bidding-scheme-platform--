@@ -161,6 +161,9 @@ def make_celery(app_name: str = "bid_assistant"):
         broker_url=celery_config,
         # Result backend
         result_backend=celery_config.replace("/1", "/2"),
+        # BUG-FIX 2026-10-16：socket 级连接超时（防 send_task 底层连接因网络
+        # 黑洞长时间挂起；localhost 拒连本身很快，但跨机/防火墙场景必须给上限）。
+        broker_transport_options={"socket_connect_timeout": 3, "socket_timeout": 5},
         # 序列化配置
         task_serializer="json",
         result_serializer="json",
@@ -451,6 +454,16 @@ def dispatch_task(
 
     if CELERY_AVAILABLE and not force_inline:
         try:
+            # BUG-FIX 2026-10-16（Web 进程 send_task 挂死·测试基线中
+            # test_async_reparse_dispatches 无限挂起即此因）：celery 已安装但
+            # broker（Redis）未运行时，`send_task` 内部 kombu 的 ensure_connection
+            # 处于无限重试循环（默认 broker_connection_retry=True、
+            # max_retries=None），把「立即返回」的请求线程永久卡死。
+            # 现先做一次禁用重试的连接预检（max_retries=0，连接建立超时由
+            # broker_transport_options.socket_connect_timeout 兜底），broker
+            # 不可达立即抛 → 落到 except 的进程内直调兜底，请求不再挂死。
+            with celery_app.connection_for_write() as _conn:
+                _conn.ensure_connection(max_retries=0)
             async_result = celery_app.send_task(name, args=args, kwargs=kwargs)
             return {
                 "status": "queued",

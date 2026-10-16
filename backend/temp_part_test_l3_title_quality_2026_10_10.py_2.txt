@@ -1,0 +1,241 @@
+    class _FakeProvider:
+        def __init__(self, replies):
+            self._replies = list(replies)
+            self.calls = 0
+
+        async def chat(self, messages, **kwargs):
+            self.calls += 1
+            return self._replies.pop(0) if self._replies else "兜底标题"
+
+    def _tree_with_placeholder(self):
+        return [
+            {"title": "总体施工部署", "children": [
+                {"title": "总体方案与实施策划", "children": [
+                    {"title": "总体实施策划（2）"},
+                    {"title": "样板区质量控制"},
+                ]}
+            ]}
+        ]
+
+    @pytest.mark.asyncio
+    async def test_rejects_placeholder_ai_reply(self):
+        """AI 复读占位标题时必须改用规则兜底，不得把占位结果写进目录。
+
+        BUG-FIX 2026-10-12：旧行为是「拒绝 AI 结果 + 原样保留脏标题」，
+        于是「总体实施策划（2）」「专项6」原封不动流到最终审核与落库。
+        现在 AI 不可用时回落到 `_semantic_fallback_title`（工程实体 × 专业维度），
+        保证任何分支下都不会留下占位标题。
+        """
+        from app.services.ai.workflows_outline_utils import repair_l3_generic_titles
+
+        provider = self._FakeProvider(["专项7", "总体实施策划（3）"])
+        tree = self._tree_with_placeholder()
+        out = await repair_l3_generic_titles(
+            provider, tree, "", "", "", "", "", max_repair=2
+        )
+        titles = [c["title"] for c in out[0]["children"][0]["children"]]
+        assert not any(_is_dirty_l3_title(t) for t in titles), f"仍有占位标题: {titles}"
+        assert titles[1] == "样板区质量控制", "未脏标题不得被误改"
+        assert titles[0] != "总体实施策划（2）", f"脏标题被保留: {titles}"
+
+    @pytest.mark.asyncio
+    async def test_accepts_concrete_ai_reply(self):
+        from app.services.ai.workflows_outline_utils import repair_l3_generic_titles
+
+        provider = self._FakeProvider(["地下室结构实测实量方案"])
+        tree = self._tree_with_placeholder()
+        out = await repair_l3_generic_titles(
+            provider, tree, "", "", "", "", "", max_repair=2
+        )
+        titles = [c["title"] for c in out[0]["children"][0]["children"]]
+        assert titles[0] == "地下室结构实测实量方案", titles
+        assert titles[1] == "样板区质量控制"
+        assert provider.calls >= 1
+
+    @pytest.mark.asyncio
+    async def test_no_warnings_returns_deepcopy_untouched(self):
+        from app.services.ai.workflows_outline_utils import repair_l3_generic_titles
+
+        provider = self._FakeProvider([])
+        tree = self._tree_with_placeholder()
+        tree[0]["children"][0]["children"][0]["title"] = "样板区质量控制"
+        out = await repair_l3_generic_titles(
+            provider, tree, "", "", "", "", "", max_repair=2
+        )
+        assert out is not tree, "必须返回深拷贝而非原对象"
+        assert out[0]["children"][0]["children"][0]["title"] == "样板区质量控制"
+        assert provider.calls == 0
+
+    @pytest.mark.asyncio
+    async def test_provider_exception_does_not_raise(self):
+        """AI 异常不得向上传播（增强环节，不能阻断目录生成）。
+
+        BUG-FIX 2026-10-12：异常同样走规则兜底，绝不把脏标题留给用户。
+        """
+        from app.services.ai.workflows_outline_utils import repair_l3_generic_titles
+
+        class _BoomProvider:
+            async def chat(self, messages, **kwargs):
+                raise RuntimeError("provider down")
+
+        tree = self._tree_with_placeholder()
+        out = await repair_l3_generic_titles(
+            _BoomProvider(), tree, "", "", "", "", "", max_repair=2
+        )
+        titles = [c["title"] for c in out[0]["children"][0]["children"]]
+        assert not any(_is_dirty_l3_title(t) for t in titles), f"异常后仍是脏标题: {titles}"
+
+    @pytest.mark.asyncio
+    async def test_concurrency_is_bounded_by_config(self):
+        """2026-10-10 遗留建议 4：旧实现 asyncio.gather 全量并发，
+        实际并发数等于待修复条数，会瞬时打出数十个长上下文请求。"""
+        import asyncio as _asyncio
+
+        from app.services.ai.workflows_outline_utils import repair_l3_generic_titles
+
+        in_flight = 0
+        peak = 0
+        counter = 0
+
+        class _SlowProvider:
+            async def chat(self, messages, **kwargs):
+                nonlocal in_flight, peak, counter
+                counter += 1
+                in_flight += 1
+                peak = max(peak, in_flight)
+                await _asyncio.sleep(0.02)
+                in_flight -= 1
+                return f"工序交接流程{counter}"
+
+        dirty = [
+            "总体实施策划（2）", "专项6", "实施要点", "总体实施策划（3）",
+            "专项7", "实施要点（2）", "专项8", "总体实施策划（4）",
+        ]
+        tree = [
+            {"title": "总体施工部署", "children": [
+                {"title": "总体方案与实施策划", "children": [
+                    {"title": t} for t in dirty
+                ]}
+            ]}
+        ]
+        out = await repair_l3_generic_titles(
+            _SlowProvider(), tree, "", "", "", "", "", max_repair=24
+        )
+        assert counter >= 2, f"待修复任务不足，无法验证并发: counter={counter}"
+        # 硬上限：任一时刻在飞请求数不得超过配置并发上限
+        assert peak <= OUTLINE_L3_REPAIR_CONCURRENCY, (
+            f"并发超出上限: peak={peak} > {OUTLINE_L3_REPAIR_CONCURRENCY}"
+        )
+        # 反向验证：信号量不得过度限流（否则会退化成串行）
+        assert peak == min(counter, OUTLINE_L3_REPAIR_CONCURRENCY), (
+            f"并发数异常: peak={peak}, counter={counter}, "
+            f"上限={OUTLINE_L3_REPAIR_CONCURRENCY}"
+        )
+        titles = [c["title"] for c in out[0]["children"][0]["children"]]
+        assert len(titles) == len(dirty)
+        for t in titles:
+            assert not _is_dirty_l3_title(t), f"修复后仍是脏标题: {t}"
+
+    @pytest.mark.asyncio
+    async def test_concurrency_cap_of_one_serializes(self):
+        """并发上限为 1 时应严格串行（供低速率 provider 使用）。"""
+        import asyncio as _asyncio
+
+        from app.services.ai.workflows_outline_utils import repair_l3_generic_titles
+        import app.services.ai.workflows_outline_utils as uo
+
+        in_flight = 0
+        peak = 0
+        counter = 0
+
+        class _SlowProvider:
+            async def chat(self, messages, **kwargs):
+                nonlocal in_flight, peak, counter
+                counter += 1
+                in_flight += 1
+                peak = max(peak, in_flight)
+                await _asyncio.sleep(0.01)
+                in_flight -= 1
+                return f"工序交接要点{counter}"
+
+        old = uo.OUTLINE_L3_REPAIR_CONCURRENCY
+        uo.OUTLINE_L3_REPAIR_CONCURRENCY = 1
+        try:
+            tree = self._tree_with_placeholder()
+            tree[0]["children"][0]["children"] = [
+                {"title": "总体实施策划（2）"},
+                {"title": "总体实施策划（3）"},
+            ]
+            await repair_l3_generic_titles(
+                _SlowProvider(), tree, "", "", "", "", "", max_repair=2
+            )
+        finally:
+            uo.OUTLINE_L3_REPAIR_CONCURRENCY = old
+        assert peak == 1, f"并发上限 1 时仍出现并发: peak={peak}"
+
+
+class TestLocateByPath:
+    """O-5 修复依赖的路径递归定位助手：必须支持任意深度，不得硬编码 3 层。"""
+
+    def _tree(self):
+        return [
+            {"title": "L1", "children": [
+                {"title": "L2", "children": [
+                    {"title": "L3", "children": [
+                        {"title": "L4"},
+                    ]},
+                ]},
+            ]},
+        ]
+
+    def test_three_level_path(self):
+        from app.services.ai.workflows_outline_utils import _locate_by_path
+
+        node, parent_title, ancestors = _locate_by_path(self._tree(), "1.1.1")
+        assert node["title"] == "L3"
+        assert parent_title == "L2"
+        assert ancestors == ["L1", "L2"]
+
+    def test_four_level_path_is_supported(self):
+        """核心回归：L4 节点可定位（旧实现 `len(parts) != 3` 会跳过）。"""
+        from app.services.ai.workflows_outline_utils import _locate_by_path
+
+        node, parent_title, ancestors = _locate_by_path(self._tree(), "1.1.1.1")
+        assert node["title"] == "L4"
+        assert parent_title == "L3"
+        assert ancestors == ["L1", "L2", "L3"]
+
+    def test_illegal_or_out_of_range_path_returns_none(self):
+        from app.services.ai.workflows_outline_utils import _locate_by_path
+
+        assert _locate_by_path(self._tree(), "9.9.9") == (None, "", [])
+        assert _locate_by_path(self._tree(), "1.1.1.1.1") == (None, "", [])
+        assert _locate_by_path(self._tree(), "not-a-path") == (None, "", [])
+        assert _locate_by_path(self._tree(), "") == (None, "", [])
+        assert _locate_by_path([], "1.1.1") == (None, "", [])
+
+
+class TestL3RepairHandlesDeepNesting:
+    """O-5 回归：L4+ 嵌套下的脏 L3 标题必须被修复，不得被 `len(parts) != 3` 跳过。"""
+
+    class _FakeProvider:
+        def __init__(self, replies):
+            self._replies = list(replies)
+            self.calls = 0
+
+        async def chat(self, messages, **kwargs):
+            self.calls += 1
+            return self._replies.pop(0) if self._replies else "合规兜底标题"
+
+    @pytest.mark.asyncio
+    async def test_l4_nested_dirty_title_is_repaired(self):
+        """AI 在 L3 下挂了 L4 子节点并显式标记 level=3 时，
+        validate 会产出 4 段 path（如 1.1.1.1）。旧实现硬编码 3 层会静默漏修。"""
+        from app.services.ai.workflows_outline_utils import repair_l3_generic_titles
+
+        tree = [
+            {"title": "总体施工部署", "level": 1, "children": [
+                {"title": "总体方案与实施策划", "level": 2, "children": [
+                    {"title": "总体实施策划(2)", "level": 3, "children": [
+                        {"title": "地下室监测实施要点", "level": 4, "children": []},
+                    ]},

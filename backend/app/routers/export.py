@@ -91,9 +91,34 @@ def _register_stream_journal(journal: _StreamJournal) -> None:
             _STREAM_JOURNALS.pop(sid, None)
         # MODULARIZATION 2026-10-12（遗留加固）：超量淘汰补充日志，便于生产观察
         # 高频导出是否触发 journal 容量上限。
+        #
+        # X-4（2026-10-16，N-1 新发现）：容量淘汰优先选终态流。
+        # 原实现在 TTL 淘汰后直接 `while len > MAX: popitem(last=False)`——
+        # 「最早注册优先」淘汰策略会命中仍在跑的大型标书 journal。若并发导出
+        # 频繁（≥50 条流/5 分钟），最早注册的活动流可能被淘汰 → 客户端
+        # resume 404 → 降级同步 → 撞组锁 → 409。
+        # 现改为：容量淘汰**优先淘汰终态流**（保留活动流防止 resume 404）；
+        # 仅当全部为活动流时（罕见，通常因活动流本身堆积）回退到原「最早
+        # 注册优先」硬闸，防止活动流无限堆积导致内存无界增长。
+        # 兼容 F-1 已确立的「容量上限仍是最早注册优先淘汰的硬闸」测试契约。
         while len(_STREAM_JOURNALS) > _STREAM_JOURNAL_MAX:
+            # 先找最早的**终态** journal 淘汰
+            target_key: str | None = None
+            for k, j in _STREAM_JOURNALS.items():
+                if j.terminal:
+                    target_key = k
+                    break
+            if target_key is not None:
+                _STREAM_JOURNALS.pop(target_key, None)
+                logger.info("SSE journal 超量淘汰终态流 %s（容量上限 %d）", target_key, _STREAM_JOURNAL_MAX)
+                continue
+            # 全部是活动流：回退到「最早注册优先」硬闸，防内存无界增长
             evicted_key, evicted_journal = _STREAM_JOURNALS.popitem(last=False)
-            logger.info("SSE journal 超量淘汰流 %s（容量上限 %d）", evicted_key, _STREAM_JOURNAL_MAX)
+            logger.warning(
+                "SSE journal 全部为活动流仍超上限 %d，强制淘汰最早活动流 %s "
+                "（可能导致 resume 404；建议增大 _STREAM_JOURNAL_MAX）",
+                _STREAM_JOURNAL_MAX, evicted_key,
+            )
 
 
 def _drain_queue_to_journal(journal: _StreamJournal) -> None:
@@ -175,6 +200,61 @@ def _record_export_failure(project_id: int, config: ExportConfig, error: str) ->
         record_failed_export(project_id, error, config)
     except Exception as e:  # pragma: no cover - record 内部已兜底
         logger.warning('[文档导出] 写入失败导出历史异常 project=%s: %s', project_id, e)
+
+
+async def _rollback_export_step(project_id: int) -> None:
+    """X-2（2026-10-16，T-3 遗留）：导出失败时把项目步骤从 6 回滚到 5。
+
+    背景：SSE 流式导出分支（`export_docx_stream`）在失败时已调用
+    `await asyncio.to_thread(update_step, project_id, 5)`（见 routers/export.py
+    对应 except 块），但**同步** `POST /docx` 分支的三个 except 都漏了这一步
+    → 前端「方案状态」进度条卡在 6（构建完成），实际项目并未导出成功，误导用户。
+
+    本函数抽出公共实现，同步/SSE 分支可复用，避免口径分歧再次出现。
+    任何异常都仅告警——回滚步骤失败不该阻断 500 响应返回。
+    """
+    try:
+        await asyncio.to_thread(update_step, project_id, 5)
+    except Exception as e:  # pragma: no cover - update_step 内部有兜底
+        logger.warning('[文档导出] 导出失败时回滚项目步骤到 5 失败 project=%s: %s', project_id, e)
+
+
+def _record_html_export(project_id: int, path: str, config: ExportConfig) -> int | None:
+    """O-4（2026-10-16）：HTML 导出产物写入 exports 历史表。
+
+    背景：HTML 导出（2026-10-12 新增）此前只返回 FileResponse，不落 exports
+    表 → 前端导出历史页看不到 HTML 产物记录，用户想再下载就得重新走导出流程。
+
+    本函数在 `POST /html` 落盘成功后调用；写入 status='completed'，
+    file_path 指向 HTML 文件；filename 使用 HTML 文件名；config_json 保存
+    导出配置 JSON（与 DOCX 分支同口径，便于后续审计/回放）。任何异常仅告警，
+    不影响 FileResponse 返回（HTML 文件已可下载，落库只是历史可查）。
+
+    Returns:
+        新插入的 export_id（落库失败返回 None）。
+    """
+    try:
+        p = Path(path)
+        if not p.exists():
+            logger.warning('[HTML 导出] 落库前文件不存在: %s', path)
+            return None
+        file_size = p.stat().st_size
+        filename = p.name
+        # config.model_dump_json 可能抛异常（Pydantic 序列化问题），兜底为 '{}'
+        try:
+            config_json = config.model_dump_json()
+        except Exception:
+            config_json = '{}'
+        with get_db() as conn:
+            cur = conn.execute(
+                'INSERT INTO exports (project_id, file_path, filename, file_size, config_json, '
+                'status) VALUES (?, ?, ?, ?, ?, ?)',
+                (project_id, str(p), filename, file_size, config_json, 'completed'),
+            )
+            return cur.lastrowid
+    except Exception as e:
+        logger.warning('[HTML 导出] 写入历史表异常 project=%s: %s', project_id, e)
+        return None
 
 async def verify_auth(request: Request, api_key: str=Security(api_key_header)):
     """验证用户对项目有访问权限
@@ -276,14 +356,20 @@ async def export_docx(project_id: int, config: ExportConfig=Body(default_factory
     except FileNotFoundError as e:
         logger.error('导出文件丢失: %s', e)
         _record_export_failure(project_id, config, f'导出文件生成后丢失: {e}')
+        # X-2（2026-10-16，T-3 遗留）：与 SSE 分支同口径，失败回滚项目步骤到 5
+        await _rollback_export_step(project_id)
         raise HTTPException(status_code=500, detail=f'导出文件生成后丢失: {e}') from e
     except PermissionError as e:
         logger.error('导出权限错误: %s', e)
         _record_export_failure(project_id, config, f'文件系统权限错误: {e}')
+        # X-2：失败回滚项目步骤到 5
+        await _rollback_export_step(project_id)
         raise HTTPException(status_code=500, detail=f'文件系统权限错误: {e}') from e
     except Exception as e:
         logger.exception('DOCX 导出失败')
         _record_export_failure(project_id, config, f'{type(e).__name__}: {str(e)[:200]}')
+        # X-2：失败回滚项目步骤到 5
+        await _rollback_export_step(project_id)
         raise HTTPException(status_code=500, detail=f'导出失败: {type(e).__name__}: {str(e)[:200]}') from e
     finally:
         _stop_keepalive()
@@ -320,6 +406,12 @@ async def export_html(project_id: int, config: ExportConfig=Body(default_factory
         _p = Path(path)
         if not _p.exists():
             raise HTTPException(status_code=500, detail="HTML 导出产物落盘失败")
+        # O-4（2026-10-16）：HTML 导出产物落库，写入 exports 历史表。
+        # 前端导出历史页即可看到 HTML 记录，配合 download_export 白名单扩展
+        # 支持从历史页直接重新下载 HTML 产物。落库失败仅告警，不影响本次下载。
+        _html_export_id = _record_html_export(project_id, str(_p), config)
+        if _html_export_id is None:
+            logger.warning('HTML 导出落库失败（不影响本次下载）project=%s path=%s', project_id, _p)
         return FileResponse(path=str(_p), filename=_p.name, media_type="text/html; charset=utf-8")
     except Exception as e:
         # HTTPException 直接上抛，保持 400/409/500 语义不被「导出失败」包装
@@ -590,13 +682,29 @@ async def export_docx_stream_resume(request: Request, project_id: int, stream_id
 
 @router.get('/download/{export_id}', dependencies=[limit_per_endpoint])
 async def download_export(project_id: int, export_id: int, identity=Depends(verify_auth)):
-    """下载指定导出文件，带权限验证和路径安全检查"""
+    """下载指定导出文件，带权限验证和路径安全检查
+
+    O-4（2026-10-16，跨模块契约调整）：白名单由 {'.docx', '.dotx'} 扩展到
+    {'.docx', '.dotx', '.doc', '.html', '.pdf'}，配合 `download_latest` 与
+    孤儿清理白名单 `_EXPORT_ARTIFACT_SUFFIXES` 保持一致。
+    若 HTML 导出被写入 exports 历史表（见 `_record_html_export`），前端可
+    直接从历史页下载 HTML 产物；PDF 转换产物同样支持。
+    media_type 按扩展名动态判定，避免 .html/.pdf 被当成 Word 文档返回。
+    """
     # ENHANCE 2026-09-29（P1 IDOR 收口）：下方 SQL 已用 project_id 限定 export_id
     # 归属（跨项目取不到行），但 project_id 本身仍未验属权——需先验调用者有权访问该项目
     await enforce_project_access(project_id, identity)
 
     # PERF（2026-10-05）：纯读 readonly + to_thread（含 resolve/exists 文件 I/O），
     # 不再在事件循环内抢全局写锁
+    _MEDIA_TYPES = {
+        '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        '.dotx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.template',
+        '.doc':  'application/msword',
+        '.html': 'text/html; charset=utf-8',
+        '.pdf':  'application/pdf',
+    }
+
     def _locate_file():
         with get_db(readonly=True) as conn:
             row = conn.execute('SELECT file_path, filename, status FROM exports WHERE id = ? AND project_id = ?', (export_id, project_id)).fetchone()
@@ -612,9 +720,10 @@ async def download_export(project_id: int, export_id: int, identity=Depends(veri
             return ('forbidden', '非法文件路径访问')
         if not actual_path.exists():
             return ('not_found', '文件已被删除')
-        if actual_path.suffix.lower() not in {'.docx', '.dotx'}:
+        suffix = actual_path.suffix.lower()
+        if suffix not in _MEDIA_TYPES:
             return ('bad_type', '文件类型不支持')
-        return ('ok', str(actual_path), row['filename'])
+        return ('ok', str(actual_path), row['filename'], _MEDIA_TYPES[suffix])
 
     result = await asyncio.to_thread(_locate_file)
     if result[0] == 'not_found':
@@ -623,7 +732,7 @@ async def download_export(project_id: int, export_id: int, identity=Depends(veri
         raise HTTPException(status_code=403, detail=result[1])
     if result[0] == 'bad_type':
         raise HTTPException(status_code=400, detail=result[1])
-    return FileResponse(path=result[1], filename=result[2], media_type='application/vnd.openxmlformats-officedocument.wordprocessingml.document')
+    return FileResponse(path=result[1], filename=result[2], media_type=result[3])
 
 @router.get('/latest', dependencies=[limit_per_endpoint])
 async def download_latest(project_id: int, identity=Depends(verify_auth)):
@@ -640,20 +749,31 @@ async def download_latest(project_id: int, identity=Depends(verify_auth)):
     def _locate_latest():
         file_path = get_latest_export(project_id, readonly=True)
         if not file_path:
-            return ('not_found', None)
+            return ('not_found', None, None)
         path_obj = Path(file_path).resolve()
         base_dir = PROJECTS_DATA_DIR.resolve()
         if not path_obj.is_relative_to(base_dir):
-            return ('forbidden', None)
+            return ('forbidden', None, None)
         if not path_obj.exists():
-            return ('gone', None)
+            return ('gone', None, None)
         # ENHANCE 2026-10-04（P2 口径对齐）：与 download_export 同口径限制后缀，
         # 避免 exports 表历史脏行（指向任意文件）时本端点被当作任意文件读取入口。
-        if path_obj.suffix.lower() not in {'.docx', '.dotx'}:
-            return ('bad_type', None)
-        return ('ok', str(path_obj))
+        #
+        # O-4（2026-10-16，跨模块契约调整）：与 download_export 同步扩展到
+        # {'.docx', '.dotx', '.doc', '.html', '.pdf'}，media_type 按扩展名动态判定。
+        _MEDIA_TYPES = {
+            '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+            '.dotx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.template',
+            '.doc':  'application/msword',
+            '.html': 'text/html; charset=utf-8',
+            '.pdf':  'application/pdf',
+        }
+        suffix = path_obj.suffix.lower()
+        if suffix not in _MEDIA_TYPES:
+            return ('bad_type', None, None)
+        return ('ok', str(path_obj), _MEDIA_TYPES[suffix])
 
-    kind, located = await asyncio.to_thread(_locate_latest)
+    kind, located, media_type = await asyncio.to_thread(_locate_latest)
     if kind == 'not_found':
         raise HTTPException(status_code=404, detail='暂无导出记录')
     if kind == 'forbidden':
@@ -662,7 +782,7 @@ async def download_latest(project_id: int, identity=Depends(verify_auth)):
         raise HTTPException(status_code=404, detail='文件已被删除')
     if kind == 'bad_type':
         raise HTTPException(status_code=400, detail='文件类型不支持')
-    return FileResponse(path=located, filename=Path(located).name, media_type='application/vnd.openxmlformats-officedocument.wordprocessingml.document')
+    return FileResponse(path=located, filename=Path(located).name, media_type=media_type)
 
 @router.get('/pdf/{export_id}', dependencies=[limit_per_endpoint])
 async def export_pdf(project_id: int, export_id: int, identity=Depends(verify_auth)):

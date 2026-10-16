@@ -89,7 +89,7 @@ describe.skipIf(!hasDom)("FileUploadPage → 要点提取 流程入口（Tab 级
     }
   });
 
-  it("有文件时展示「下一步：要点提取」并跳转到 /review", { timeout: 120_000 }, async () => {
+  it("有文件时展示「下一步：要点提取」并跳转到 /review", async () => {
     const rtl = await loadRtl();
     if (!rtl) return;
 
@@ -106,7 +106,7 @@ describe.skipIf(!hasDom)("FileUploadPage → 要点提取 流程入口（Tab 级
     rtl.cleanup();
   });
 
-  it("无文件时不展示「下一步：要点提取」入口", { timeout: 120_000 }, async () => {
+  it("无文件时不展示「下一步：要点提取」入口", async () => {
     const rtl = await loadRtl();
     if (!rtl) return;
 

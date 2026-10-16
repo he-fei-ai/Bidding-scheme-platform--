@@ -17,6 +17,7 @@ import {
 } from "@ant-design/icons";
 import type { UploadProps } from "antd";
 import { useParams, useNavigate } from "react-router-dom";
+import { taskStore } from "@/services/taskStore";
 import {
   uploadFile,
   fetchFiles,
@@ -122,6 +123,65 @@ export default function FileUploadPage() {
   // 先发的请求可能后到，把 A 文件的正文显示在 B 文件的标题下。
   // 用请求序号守卫，只接受最后一次发起的请求结果。
   const previewSeqRef = useRef(0);
+  // HARDENING 2026-10-16（TD-4 闭环）：taskStore.TaskType 与 TaskStatusBar 的
+  // TASK_LABEL/TASK_ROUTE 早已收录 'file_parse'，但**没有任何生产端调用** ——
+  // 顶栏「后台任务实时显示栏」永远看不到文件解析进度，用户离开上传页即失明。
+  // 这里把异步解析任务接入全局 taskStore：列表出现未终态文件时注册，终态落库
+  // 时完成，卸载时统一 stopTracking（未完成任务不悬挂在顶栏 —— completeTask
+  // 的 30s 清理只回收终态任务；返回页面时轮询重启会重新注册）。
+  const parseTaskRegistry = useRef<Map<number, string>>(new Map());
+
+  // 与 loadFiles 刷新的 files 同步：注册新出现的未终态文件、完成已终态文件
+  useEffect(() => {
+    if (!projectId) return;
+    const registry = parseTaskRegistry.current;
+    for (const f of files) {
+      const inFlight =
+        f.status === "processing" || f.status === "queued" || f.status === "pending";
+      if (inFlight && !registry.has(f.id)) {
+        const taskId = `file_parse_${f.id}`;
+        registry.set(f.id, taskId);
+        taskStore.startTask({
+          taskId,
+          projectId: Number(projectId),
+          taskType: "file_parse",
+          status: "running",
+          progress: 0,
+          message: `正在解析：${f.filename}`,
+          startedAt: Date.now(),
+          lastUpdated: Date.now(),
+        });
+      }
+    }
+    for (const [fileId, taskId] of [...registry.entries()]) {
+      const f = files.find((x) => x.id === fileId);
+      const settled =
+        !f || (f.status !== "processing" && f.status !== "queued" && f.status !== "pending");
+      if (settled) {
+        taskStore.completeTask(
+          taskId,
+          f?.status === "failed" ? "failed" : "completed",
+          f
+            ? f.status === "failed"
+              ? `解析失败：${f.filename}`
+              : `已完成：${f.filename}`
+            : undefined,
+        );
+        registry.delete(fileId);
+      }
+    }
+  }, [files, projectId]);
+
+  // 卸载时停止追踪本页注册的全部 file_parse 任务（防悬挂）
+  useEffect(
+    () => () => {
+      for (const taskId of parseTaskRegistry.current.values()) {
+        taskStore.stopTracking(taskId);
+      }
+      parseTaskRegistry.current.clear();
+    },
+    [],
+  );
 
   useEffect(() => {
     if (!projectId) return;
@@ -165,6 +225,14 @@ export default function FileUploadPage() {
 
   // 解析状态轮询：进入页面时取一次（展示上次结果），上传在途期间每 1.5s 刷新，
   // 全部结束后自然停止（依赖 uploading 变化重建 effect）。
+  // BUG-FIX 2026-10-16（异步解析进度缺口）：R-3 起图片等 OCR 耗时格式走后台
+  // 异步解析，上传响应即时返回 status='processing'。若图片恰是本批最后一个
+  // 文件，pendingRef 归零 → uploading 立即变 false → 轮询随之停止，而 OCR
+  // 还要跑几十秒：文件行会一直显示「提取中」直到用户手动点刷新（轮询注释里
+  // 「否则 UI 会一直显示解析中直到手动刷新」想防的场景，在图片入口复现）。
+  // 轮询条件扩展为「上传在途 或 仍有 processing 文件」：终态落库并经
+  // loadFiles 刷新进 files 后 hasProcessingFiles 转 false，轮询自然收敛。
+  const hasProcessingFiles = files.some((f) => f.status === "processing");
   useEffect(() => {
     if (!projectId) return;
     let cancelled = false;
@@ -177,7 +245,7 @@ export default function FileUploadPage() {
       }
     };
     void fetchOnce();
-    if (!uploading) {
+    if (!uploading && !hasProcessingFiles) {
       return () => {
         cancelled = true;
       };
@@ -194,11 +262,20 @@ export default function FileUploadPage() {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [projectId, uploading, loadFiles]);
+  }, [projectId, uploading, hasProcessingFiles, loadFiles]);
 
   const handleUpload = async (options: UploadRequestOptions) => {
     const { file, onSuccess, onError } = options;
-    if (!projectId) return;
+    // BUG-FIX 2026-10-16：此前这里直接 return 而不调用 onError —— antd 的
+    // customRequest 契约要求必须回调 onSuccess/onError 之一，否则该上传项
+    // 永远停留在「上传中」态（showUploadList=false 时用户看不到列表，但
+    // rc-upload 内部状态与后续 disabled 判断仍被污染）。路由参数异常
+    // （/projects/undefined/files）时可达该分支，现如实报错并结束请求。
+    if (!projectId) {
+      message.error("项目 ID 无效，无法上传文件");
+      onError?.(new Error("项目 ID 无效"));
+      return;
+    }
 
     // BUG-FIX 2026-10-08：客户端文件大小校验，避免超大文件先读入内存再被后端拒绝
     // TD6 2026-10-12：上限改由后端 supported-formats 端点下发（默认仍是 50MB），
@@ -236,7 +313,11 @@ export default function FileUploadPage() {
       if (outcome === "parse_failed") {
         message.error(formatUploadFailureText(fileName, "parse_failed", result?.message));
       } else if (shouldNotifySingle(pendingRef.current, batchRef.current)) {
-        message.success(`${fileName} 上传成功`);
+        // HARDENING 2026-10-16：单张图片等异步解析文件如实提示「后台解析中」，
+        // 与批尾汇总的 pending 口径一致（此前一律「上传成功」，OCR 失败时误导）
+        message.success(
+          outcome === "pending" ? `${fileName} 上传成功，正在后台解析` : `${fileName} 上传成功`,
+        );
       }
       onSuccess?.({}, new XMLHttpRequest());
     } catch (err: any) {
@@ -257,13 +338,21 @@ export default function FileUploadPage() {
     try {
       const res = await deleteFile(projectId, fileId);
       setFiles((prev) => prev.filter((f) => f.id !== fileId));
-      // ENHANCE 2026-10-05（B5）：删掉主文件后后端会自动把下一个文件提升为主文件，
-      // 如实告知用户，避免"我明明还留着文件，却没有主文件"的困惑。
+      // BUG-FIX 2026-10-16（前后端状态不同步）：删除后后端可能已经改变**其它
+      // 文件**的状态 —— 删掉主文件时 delete_file 会调 _promote_next_main 把
+      // 剩余文件中最合适的一个提升为 main。此前这里只做本地乐观删除、
+      // **不重新拉取列表**，于是被提升的文件在界面上仍显示「辅助文件」，
+      // 整个列表一个「主文件」金色标签都不剩 —— 与紧接着弹出的提示
+      // 「系统已自动将下一个文件设为主文件」自相矛盾，用户随后的角色切换
+      // 也基于陈旧数据。同模块其余四条变更路径（上传 finally / 切角色 /
+      // 重提取 / 清空）都调了 loadFiles，删除是唯一的漏网之鱼。
+      // 乐观删除保留（即时响应），loadFiles 紧随其后同步服务端权威状态。
       if (res?.promoted_file_id) {
         message.info("已删除主文件，系统已自动将下一个文件设为主文件");
       } else {
         message.success("文件已删除");
       }
+      await loadFiles();
     } catch (err: any) {
       message.error(err.message || "删除失败");
     }
@@ -348,8 +437,10 @@ export default function FileUploadPage() {
 
   // 成功后端状态为 "success"（兼容历史 "extracted"）；计数逻辑抽取为纯函数 countExtractedFiles
   const extractedCount = countExtractedFiles(files);
-  // 解析任务状态文案（来自 GET /tasks/files/status，仅在上传在途且有实质信息时展示）
-  const parseStatusText = uploading ? formatParsingStatusText(parseStatus) : null;
+  // 解析任务状态文案（来自 GET /tasks/files/status，仅在上传在途或有文件
+  // 仍在后台解析时展示；与轮询条件的口径一致，见上方 useEffect 注释）
+  const parseStatusText =
+    uploading || hasProcessingFiles ? formatParsingStatusText(parseStatus) : null;
   // 遗留修复 2026-10-06（L4）：ProgressPanel 的数据源。文件落库后即出现在列表里，
   // 已完成的按 success/failed 映射，其余视为「解析中」；在途数计入总数，
   // 使批量上传时进度条能随文件逐个落库增长。

@@ -379,17 +379,25 @@ class TestCachedImageFont:
             pytest.skip("No system font available for testing")
 
         # 预热：第一次调用，可能涉及 I/O
-        cached_image_font(size=14, bold=False, font_paths=[available])
+        warm = cached_image_font(size=14, bold=False, font_paths=[available])
 
-        # 第二次调用：应命中缓存
+        # 第二次调用：应命中缓存——确定性行为断言：同一 key 必返回同一对象
+        # （这才是「instant」的真正保证：命中即跳过字体 I/O，与挂钟无关）。
+        again = cached_image_font(size=14, bold=False, font_paths=[available])
+        assert again is warm, "缓存命中应返回同一字体对象，而非重新加载"
+
         iterations = 1000
         start = time.perf_counter()
         for _ in range(iterations):
             cached_image_font(size=14, bold=False, font_paths=[available])
         elapsed = time.perf_counter() - start
 
-        # 1000 次缓存命中应 < 5ms（包含 Python 函数调用开销）
-        assert elapsed < 0.005, f"Font cache hit too slow: {elapsed:.6f}s for {iterations} calls"
+        # 缓存命中 1000 次仅含字典查找 + 函数调用开销；真正未命中（每次 PIL
+        # 打开 .ttc）需秒级。取一个既能检出真回归、又能吸收全量并发下
+        # 调度抖动的宽松上限（遗留项：原绝对 5ms 挂钟断言高负载偶发假红）。
+        assert elapsed < 0.05, (
+            f"Font cache hit unexpectedly slow: {elapsed:.6f}s for {iterations} calls"
+        )
 
     def test_different_params_miss_cache(self):
         from app.services.perf_optimizations import cached_image_font, _font_cache

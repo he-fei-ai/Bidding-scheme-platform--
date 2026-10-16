@@ -2368,7 +2368,13 @@ def _validate_document_structure(doc, project_id: int, output_path: str) -> list
     检查项：
     1. 是否有空章节（无内容的段落）
     2. 图片链接是否有效（本地文件是否存在）
-    3. 文档保存后校验文件大小 > 0
+
+    注意：文件大小校验已在 build_docx 中 `_atomic_save_docx` + `_verify_docx_integrity`
+    环节执行（含 ZIP EOCD 校验），本函数只在 `doc.save()` **之前**被调用，无法校验
+    落盘后的文件大小。
+
+    X-3（2026-10-16，T-4 遗留）：删除原 docstring 中「检查 3」条目（对应实现是
+    死代码，从未被真正执行；doc.save 之前的函数无法校验落盘大小）。
 
     Args:
         doc: Document 对象
@@ -2419,9 +2425,9 @@ def _validate_document_structure(doc, project_id: int, output_path: str) -> list
         except Exception as e:
             logger.warning("检查图片文件时出错: %s", e)
 
-    # 检查 3: 文档保存后校验文件大小
-    # 注意：此函数在 doc.save() 之前调用，因此不在此处检查文件是否存在。
-    # 文件大小校验已在 build_docx 中 doc.save() 之后执行（line 2532-2540）。
+    # X-3（2026-10-16，T-4 遗留）：原「检查 3」块为死代码——doc.save() 之前的函数
+    # 无法校验文件是否存在或大小是否 > 0，且 build_docx 中 `_atomic_save_docx` 已
+    # 完成大小 + ZIP EOCD 校验。此处删除无实现注释块，避免误导后续维护者。
     return warnings
 
 
@@ -2674,6 +2680,15 @@ def _atomic_save_docx(doc, output_path: str) -> None:
     替换」：任一步失败都只留下 .tmp.* 临时件并被清理，最终 .docx 要么不存在、要么完整。
     与本文件 _save_export_cache_index 的原子写口径一致。
     """
+    # X-5（2026-10-16，N-2 新发现）：参数校验兜底。
+    # 若调用方误传 None 或空字符串，直接 raise TypeError；否则 tmp_save_path 会被拼成
+    # "None.tmp.123.xxxx" 或 ".tmp.123.xxxx" 落到当前工作目录，产生隐蔽的垃圾文件
+    # 且调用方拿不到明确错误。当前唯一调用点（build_docx:3095）已保证非空，此处
+    # 仅做防御性兜底，不改变正常调用行为。
+    if not output_path or not isinstance(output_path, str):
+        raise TypeError(
+            f"_atomic_save_docx: output_path 必须是非空字符串，实际={output_path!r}"
+        )
     # BUG-FIX 2026-10-09（P2·临时件互踩 + 截断件放行）：原临时名固定为
     # `<output>.tmp.<pid>` —— 同一进程内若有两个导出写同一目标路径（组锁失效
     # 窗口 / 单测并发 / `output_path` 显式传入同一路径），两者共用同一个临时名，
@@ -3141,6 +3156,13 @@ _EXPORT_CACHE_INDEX_CORRUPTED = False
 # 孤儿文件只清理「最后修改超过 7 天」的，保护正在写入/刚导出的产物。
 _EXPORT_ORPHAN_MIN_AGE_SECONDS = 7 * 24 * 3600
 
+# X-1（2026-10-16，T-1 遗留）：孤儿清理白名单从仅 .docx/.doc 扩展到 .html/.pdf。
+# 背景：HTML（2026-10-12 新增）与 PDF（2026-10-04 新增）产物同样落在
+# `<数据目录>/<pid>/exports/`，但此前 `_is_safe_export_artifact` 只认 .docx/.doc、
+# `_iter_export_artifacts` 只 glob *.docx → HTML/PDF 孤儿文件永不清理，长期运行
+# 磁盘只增不减。此处统一为后缀白名单常量，两处判据保持同源。
+_EXPORT_ARTIFACT_SUFFIXES = (".docx", ".doc", ".html", ".pdf")
+
 
 def _is_safe_export_artifact(p: Path) -> bool:
     """判断路径是否为「可安全删除的导出产物」。
@@ -3151,7 +3173,10 @@ def _is_safe_export_artifact(p: Path) -> bool:
     缓存索引虽限制 8 条，磁盘上的 DOCX 却只增不减，长期运行必然占满磁盘。
     同理 `_cleanup_orphaned_export_files` 只 glob `_exports/*.docx`，也扫不到真实产物。
 
-    改为实质校验：必须位于项目数据目录内，且后缀是 .docx/.doc（避免误删用户上传件）。
+    改为实质校验：必须位于项目数据目录内，且后缀在 `_EXPORT_ARTIFACT_SUFFIXES`
+    白名单内（避免误删/uploads 内用户上传件）。
+
+    X-1（2026-10-16，T-1 遗留）：白名单由 .docx/.doc 扩展到 .html/.pdf。
     """
     try:
         rp = p.resolve()
@@ -3159,13 +3184,16 @@ def _is_safe_export_artifact(p: Path) -> bool:
         rp.relative_to(base)
     except (ValueError, OSError):
         return False
-    return rp.suffix.lower() in (".docx", ".doc")
+    return rp.suffix.lower() in _EXPORT_ARTIFACT_SUFFIXES
 
 
 def _iter_export_artifacts() -> list[Path]:
-    """枚举所有真实导出产物：`<数据目录>/<project_id>/exports/*.docx`。
+    """枚举所有真实导出产物：`<数据目录>/<project_id>/exports/` 下的白名单后缀。
 
     BUG-FIX 2026-09-18（中）：与 `_is_safe_export_artifact` 同一处缺陷的配套修复。
+
+    X-1（2026-10-16，T-1 遗留）：glob 由 `*.docx` 扩展为 `_EXPORT_ARTIFACT_SUFFIXES`
+    里的每个后缀，覆盖 HTML/PDF 产物。
     """
     found: list[Path] = []
     try:
@@ -3175,8 +3203,9 @@ def _iter_export_artifacts() -> list[Path]:
             exp_dir = proj_dir / "exports"
             if not exp_dir.is_dir():
                 continue
-            for f in exp_dir.glob("*.docx"):
-                found.append(f)
+            for suffix in _EXPORT_ARTIFACT_SUFFIXES:
+                for f in exp_dir.glob(f"*{suffix}"):
+                    found.append(f)
     except OSError as e:
         logger.warning("[导出缓存] 枚举导出产物失败: %s", e)
     return found
@@ -3716,7 +3745,21 @@ def _write_tree_content_with_progress(
             # 失败走的是下方「删除已写入元素」路径，计数器不回退 → 重试从新号
             # 继续 → 成品图号断档（图1-1 之后直接跳到 图1-3）。渲染前快照，
             # 失败回滚时连同正文一起还原，使重试从同一号码继续。
-            _fig_counter_snapshot = _snapshot_figure_counter()
+            #
+            # X-8（2026-10-16，N-5 新发现）：兜底初始化 + 异常保护。
+            # 原实现无异常分支——若 `_snapshot_figure_counter` 因 ContextVar
+            # 未初始化 / 内部错误抛错，`_fig_counter_snapshot` 变量将未定义，
+            # 后续失败回滚路径调 `_restore_figure_counter(_fig_counter_snapshot)`
+            # 会触发 UnboundLocalError。现改为先赋空 dict 兜底，异常时仅告警，
+            # 回滚路径退化为「不回滚图号」而非抛二次异常。
+            _fig_counter_snapshot: dict[str, int] = {}
+            try:
+                _fig_counter_snapshot = _snapshot_figure_counter() or {}
+            except Exception as _snap_err:
+                logger.warning(
+                    "快照图号计数器失败（回滚将跳过图号还原）: node=%s err=%s",
+                    getattr(node, "id", "?"), _snap_err,
+                )
             try:
                 _add_section_heading(doc, node.title, node.level, config, numbering=numbering)
                 # 必须用 `_body_insertion_mark` 而不是 `len(list(body))`：python-docx

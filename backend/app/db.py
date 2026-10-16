@@ -1931,23 +1931,8 @@ def _migrate(conn: sqlite3.Connection):
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_audit_project ON consistency_audit_log(project_id)"
     )
-    # T2 根治（2026-10-16）：老库补列 + 历史行回填。
-    # `consistency_audit_log` 此前无来源列，摘要接口靠 `conflicts_json` 侧信道
-    # （conflict_id 前缀：AI 路径恒 `AI-`，确定性路径恒 `conflict_`）推断审计
-    # 来源。现给日志表加 `source_kind` 列，两条写入路径直接写入，摘要直接读取。
-    # 历史行回填按 JSON 内 `"conflict_id": "AI-` 模式标记为 'ai'（json.dumps
-    # 默认分隔符产 `: `，故该模式确定性匹配 AI 路径写入的行）；无 findings 的
-    # AI 行（conflicts_json='[]'）无法确定性区分，保持默认 'rule'——属历史数据
-    # 极端边角，此后新写入一律由写入路径正确标注。
-    if "source_kind" not in _get_column_names(conn, "consistency_audit_log"):
-        conn.execute(
-            "ALTER TABLE consistency_audit_log "
-            "ADD COLUMN source_kind TEXT NOT NULL DEFAULT 'rule'"
-        )
-        conn.execute(
-            "UPDATE consistency_audit_log SET source_kind = 'ai' "
-            "WHERE conflicts_json LIKE '%\"conflict_id\": \"AI-%'"
-        )
+    # T2 根治（2026-10-16）：老库补列 + 历史行回填（独立函数，可被迁移测试直接调用）。
+    _migrate_consistency_audit_log(conn)
 
     # ========== 评分标准达标对齐（ENHANCE 2026-10-06）==========
     # 缺口：导出预检的 uncovered_scoring_points 只判「评分点有没有被章节挂载」，
@@ -2171,6 +2156,29 @@ def _ensure_column(conn: sqlite3.Connection, table_name: str, col_name: str, col
 def _get_column_names(conn: sqlite3.Connection, table: str) -> set[str]:
     cursor = conn.execute(f"PRAGMA table_info({table})")
     return {row["name"] for row in cursor.fetchall()}
+
+
+def _migrate_consistency_audit_log(conn: sqlite3.Connection) -> None:
+    """T2 根治（2026-10-16）：`consistency_audit_log` 老库补 `source_kind` 列 + 历史行回填。
+
+    `consistency_audit_log` 此前无来源列，摘要接口靠 `conflicts_json` 侧信道
+    （conflict_id 前缀：AI 路径恒 `AI-`，确定性路径恒 `conflict_`）推断审计
+    来源。现给日志表加 `source_kind` 列，两条写入路径直接写入，摘要直接读取。
+    历史行回填按 JSON 内 `"conflict_id": "AI-` 模式标记为 'ai'（json.dumps
+    默认分隔符产 `: `，故该模式确定性匹配 AI 路径写入的行）；无 findings 的
+    AI 行（conflicts_json='[]'）无法确定性区分，保持默认 'rule'——属历史数据
+    极端边角，此后新写入一律由写入路径正确标注。
+    幂等：列已存在时跳过，可安全重复调用。
+    """
+    if "source_kind" not in _get_column_names(conn, "consistency_audit_log"):
+        conn.execute(
+            "ALTER TABLE consistency_audit_log "
+            "ADD COLUMN source_kind TEXT NOT NULL DEFAULT 'rule'"
+        )
+        conn.execute(
+            "UPDATE consistency_audit_log SET source_kind = 'ai' "
+            "WHERE conflicts_json LIKE '%\"conflict_id\": \"AI-%'"
+        )
 
 
 def seed_prompt_templates():

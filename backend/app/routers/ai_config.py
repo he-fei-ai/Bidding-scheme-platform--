@@ -1,11 +1,15 @@
 import asyncio
+import json
 import logging
 import os
 import re
 import sqlite3
 import threading
+import time
+from datetime import datetime
 from urllib.parse import urlparse
 from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import JSONResponse, StreamingResponse
 import httpx
 from pydantic import BaseModel
 
@@ -16,7 +20,18 @@ from ..services.ai import provider_catalog
 from ..services.ai.cache_metrics import snapshot
 from ..services.ai.image_providers.registry import ProviderRegistry
 from ..services.ai.image_styles import list_image_styles
-from ..services.ai.provider_factory import _clear_ai_config_cache, bump_ai_config_version, detect_provider_type, get_provider_priority_order, mask_key_for_audit, record_config_audit, record_provider_usage
+from ..services.ai.provider_factory import (
+    _clear_ai_config_cache,
+    bump_ai_config_version,
+    detect_provider_type,
+    get_ai_config_version,
+    get_key_rotation_status,
+    get_provider_priority_order,
+    mask_key_for_audit,
+    record_config_audit,
+    record_provider_usage,
+    set_key_rotated_at,
+)
 from ..services.ai.provider_factory import create_provider as _create_shared_provider
 from ..services.crypto import decrypt_api_key, encrypt_api_key, is_encrypted
 from ..utils.proxy_config import build_httpx_proxy_settings
@@ -49,6 +64,28 @@ def _display_api_key(key: str) -> str:
     if not key:
         return ''
     return API_KEY_MASK
+
+
+def _current_user_of(request: Request | None) -> dict | None:
+    """鑾峰彇褰撳鐢ㄦ埛鍙傛暟鍙?JwtAuthMiddleware 鍐呭彨(request.state.current_user) 鍚?get_current_user 鍙傚墠绯诲垪锛屾墍鏈夶粠鍙傛暟鑷?"""
+    if request is None:
+        return None
+    cu = getattr(request.state, 'current_user', None)
+    if isinstance(cu, dict):
+        return cu
+    u = get_current_user(request)
+    if u is None:
+        return None
+    return {'id': getattr(u, 'id', None), 'username': getattr(u, 'username', None), 'role': getattr(u, 'role', None)}
+
+
+def _require_admin(request: Request) -> dict:
+    """RBAC: 鏄?admin浠ュ悄杩斿洗鐢ㄦ埛鍙傛暟鍙?涓嶅彲鍦?admin鍐欏叆 HTTP 403"""
+    user = _current_user_of(request)
+    if not user or user.get('role') != 'admin':
+        raise HTTPException(status_code=403, detail='P0-RBAC: 鍙傚墠绌€')
+    return user
+
 
 def _existing_provider_api_key(provider_name: str) -> str:
     """读取某厂商已保存的 api_key（库内原值，可能是 ENC: 密文），不存在返回空串。"""
@@ -238,7 +275,8 @@ async def get_ai_config():
     # BUG-FIX（安全 P0）：读接口一律返回脱敏占位符，不再解密回传明文。
     # 前端回显掩码并在保存时原样提交，`_resolve_api_key` 会把它解析为库内真实密钥。
     # 注意：env 来源时 cfg.api_key 是环境变量明文，同样必须脱敏。
-    return {**cfg, 'api_key': _display_api_key(cfg.get('api_key', '')), 'config_source': config_source}
+    current_version = get_ai_config_version()
+    return {**cfg, 'api_key': _display_api_key(cfg.get('api_key', '')), 'config_source': config_source, 'version': current_version, 'etag': str(current_version)}
 
 @router.put('/config')
 async def save_ai_config(data: AIConfigData, request: Request = None):
@@ -272,6 +310,23 @@ async def save_ai_config(data: AIConfigData, request: Request = None):
             raise HTTPException(status_code=400, detail='无法解析已保存的 API Key，请重新填写真实密钥')
     else:
         pass
+    # 乐观锁（If-Match / etag）：客户端需携带上次 GET /ai/config 返回的 etag，服务端写前校验是否与当前版本一致；
+    # 缺失/不合法 → 400；与当前版本不符 → 409（配置已被他处修改，拒绝覆盖写，避免丢失更新）。
+    if request is not None:
+        # 乐观锁仅在 HTTP 层面强制；进程内直接调用(request=None)不受影响。
+        if_match = request.headers.get('if-match')
+        if if_match is None:
+            raise HTTPException(status_code=400, detail='缺失 If-Match 请求头(etag)，请先 GET /ai/config 获取当前版本后再保存')
+        try:
+            expected_version = int(if_match.strip().strip('"'))
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail='If-Match 请求头值非法')
+        current_version = get_ai_config_version()
+        if expected_version != current_version:
+            raise HTTPException(
+                status_code=409,
+                detail='配置版本已冲突(etag=%s，当前=%s)，请刷新后重试' % (expected_version, current_version),
+            )
     # 增强 2026-09-29（配置校验·范围/安全）：此前仅 max_tokens 做范围钳制，
     # temperature / concurrency 原样落库 —— 传入 -5 / 999 / 0 会导致模型产出行
     # 为乱码或直接报错，concurrency=0 更可能拖垮并发生成。现统一钳制到合法区间。
@@ -298,14 +353,23 @@ async def save_ai_config(data: AIConfigData, request: Request = None):
     # F-1：仅加密「用户新输入的明文」；占位符/空值分支已在上方回填为库内原值。
     data.api_key = _encrypt_fresh_key(data.api_key)
     # PERF（2026-10-05）：写入整段派发 to_thread，全局写锁在 worker 线程阻塞，loop 不受影响
+    key_changed = False
+
     def _write_ai_config():
+        nonlocal key_changed
         with get_db_with_retry() as conn:
             # TD-7（2026-10-06）：写前先读旧值，供审计记录 before→after，
             # 排障时能追溯「从哪家厂商切到了哪家」。
             before_row = conn.execute(
-                "SELECT provider_name, model, base_url FROM ai_config WHERE id = 1"
+                "SELECT provider_name, model, base_url, api_key FROM ai_config WHERE id = 1"
             ).fetchone()
             before = dict(before_row) if before_row else {}
+            # 仅在「真实明文密钥」且「与库内已解密值不同」时判定为轮转（避免占位符回写/相同密钥重复保存触发）
+            _before_api_key = before.get('api_key') or ''
+            _before_plain = decrypt_api_key(_before_api_key) if is_encrypted(_before_api_key) else _before_api_key
+            _new_plain = decrypt_api_key(data.api_key) if is_encrypted(data.api_key) else (data.api_key or '')
+            if _new_plain and _new_plain != _before_plain:
+                key_changed = True
             # document_profile 的「未提供即保留」（P1-DOC）：该字段被 sections.py 的
             # 配图编排消费（industry_profile），但请求模型此前默认 ''，任何一次「只改
             # 温度」的保存都会静默清空用户已填的行业画像。语义：传 None=保留原值，
@@ -319,6 +383,19 @@ async def save_ai_config(data: AIConfigData, request: Request = None):
     before = await asyncio.to_thread(_write_ai_config)
     # L-3：版本号递增（含本进程缓存清除），跨进程 ≤5s 收敛
     bump_ai_config_version()
+    new_version = get_ai_config_version()
+    # API Key 轮转：写入审计事件 + 记录轮转时间戳(用于 /ai/config/rotation-status 到期提醒)
+    if key_changed:
+        def _rotation_events():
+            try:
+                _audit('key_rotation', data.provider_name or provider, 'API key rotated', request)
+            except Exception as _e:
+                logger.debug('record key_rotation audit 失败: %s', _e)
+            try:
+                set_key_rotated_at(datetime.now().isoformat())
+            except Exception as _e:
+                logger.debug('set key_rotated_at 失败: %s', _e)
+        await asyncio.to_thread(_rotation_events)
     # F-NEW-4（2026-10-06）：审计写库 + provider_history 写库均为 best-effort
     # 同步 SQLite 操作，此前在事件循环内直接执行会阻塞请求处理；与主配置写
     # 一样统一派发到 worker 线程。两者各自内部已 try/except，不阻断主流程。
@@ -333,7 +410,90 @@ async def save_ai_config(data: AIConfigData, request: Request = None):
                f"key={mask_key_for_audit(data.api_key)}", request)
         record_provider_usage(data.provider_name, data.provider, data.base_url, success=True)
     await asyncio.to_thread(_post_save_bookkeeping)
-    return {'status': 'ok'}
+    return JSONResponse(
+        content={'status': 'ok', 'version': new_version},
+        headers={'ETag': str(new_version), 'Version': str(new_version)},
+    )
+
+
+@router.get('/config/export')
+async def export_ai_config(include_secret: bool = False, request: Request = None):
+    """閰嶇疆鍙戣疆鍙峰紩(JSON)。
+
+    include_secret=true 鍒欐垨鍔犲瘑鐨?api_key 鍐欏叆(鍐欑幇鍚庡彲鍦ㄥぇ灏?admin)，
+    鍐欏叆鏃?涓嶈祫婧愯幇鍦?403。鏋勯€犳湰寮忎繑鍥炲彲浠?璇锋眰(include_secret=false)鍏ㄥ悗鑷?03。
+    """
+    from ..services.ai.provider_factory import get_ai_config as _get_config
+
+    cfg = await asyncio.to_thread(_get_config)
+    version = get_ai_config_version()
+    api_key_raw = cfg.get('api_key') or ''
+    export = {
+        'format': 'ai-config-v1',
+        'exported_at': datetime.now().isoformat(),
+        'config_version': version,
+        'config': {
+            'provider_name': cfg.get('provider_name', ''),
+            'provider': cfg.get('provider', ''),
+            'model': cfg.get('model', ''),
+            'base_url': cfg.get('base_url', ''),
+            'document_profile': cfg.get('document_profile', ''),
+            'concurrency': cfg.get('concurrency', 4),
+            'temperature': cfg.get('temperature', 0.7),
+            'max_tokens': cfg.get('max_tokens', 16384),
+            'timeout': cfg.get('timeout', 120),
+        },
+        'api_key_set': bool(api_key_raw),
+        'keys_included': False,
+    }
+    if include_secret:
+        _require_admin(request)
+        export['config']['api_key'] = api_key_raw  # provider_factory.get_ai_config 已解密(库内)或回退 env
+        export['keys_included'] = True
+    _audit('export_config', 'ai_config', 'include_secret=%s keys_included=%s' % (include_secret, export['keys_included']), request)
+    return export
+
+
+@router.get('/config/rotation-status')
+async def config_rotation_status(request: Request = None):
+    """API Key 鏃犵骇鏃ユ湰鏁?澶勭悊(鍙栧嵄绀猴紝 鏃犵骇缁欎簨/鏄?鍙栧嵄)。
+
+    鍐欏叆缁欎簨锛?days_since_rotation(鍒?缁欎簨涓嶅悓鍒?null)、rotation_due(鏄?鍙栧嵄)、
+    rotation_interval_days(鍦?AI_KEY_ROTATION_DAYS, 榛樿 90 鏃?)。
+    """
+    from ..services.ai.provider_factory import get_ai_config as _get_config
+
+    cfg = await asyncio.to_thread(_get_config)
+    status = get_key_rotation_status()
+    status['api_key_set'] = bool((cfg.get('api_key') or ''))
+    return status
+
+
+@router.get('/config/stream')
+async def stream_ai_config(request: Request):
+    """SSE: 閰嶇疆鍐欏叆鍚庨€掑鐗堟湰鍙?。
+
+    EventSource 涓嶆敮鎸佽嚜瀹氫箍, 鍏ㄩ€夋嫨鍙傛暟 `?token=` 鍐欏叆(鍚庣灞?Vite 浠ｇ悊),
+    灞℃牸 /api/v1/ 鍙傛暟浠?Authorization 鍙傛暟鍐欏叆。
+    鍐欑粰鍙?event: config-changed (data: {event, version, ts}) 鍙栧嵄鍐欏叆(2s 蹇?娉?)。
+    """
+
+    async def _event_generator():
+        last_version = get_ai_config_version()
+        while True:
+            if await request.is_disconnected():
+                break
+            version = get_ai_config_version()
+            if version != last_version:
+                yield 'data: %s\n\n' % json.dumps({'event': 'config-changed', 'version': version, 'ts': time.time()})
+                last_version = version
+            await asyncio.sleep(2.0)
+
+    return StreamingResponse(
+        _event_generator(),
+        media_type='text/event-stream',
+        headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'},
+    )
 
 
 @router.post('/config/clear-api-key')
@@ -1123,9 +1283,10 @@ async def list_profiles():
     from ..services.ai.profile_service import list_profiles as _list
     # PERF（2026-10-14）：同步 SQLite 读移出事件循环
     profiles = await asyncio.to_thread(_list, active_only=True)
+    config_version = get_ai_config_version()
     result = []
     for p in profiles:
-        result.append({'id': p['id'], 'name': p['name'], 'display_name': p.get('display_name', p['name']), 'description': p.get('description', ''), 'provider_name': p.get('provider_name', 'agnes'), 'provider': p.get('provider', 'openai_compatible'), 'model': p.get('model', 'gpt-4o'), 'base_url': p.get('base_url', ''), 'max_tokens': p.get('max_tokens', 16384), 'temperature': p.get('temperature', 0.7), 'concurrency': p.get('concurrency', 4), 'timeout': p.get('timeout', 120), 'json_mode': bool(p.get('json_mode', 0)), 'task_type': p.get('task_type', ''), 'rate_limit_per_min': p.get('rate_limit_per_min', 0), 'token_budget_daily': p.get('token_budget_daily', 0), 'is_active': bool(p.get('is_active', 1)), 'is_default': bool(p.get('is_default', 0)), 'created_at': p.get('created_at', ''), 'updated_at': p.get('updated_at', '')})
+        result.append({'id': p['id'], 'name': p['name'], 'display_name': p.get('display_name', p['name']), 'description': p.get('description', ''), 'provider_name': p.get('provider_name', 'agnes'), 'provider': p.get('provider', 'openai_compatible'), 'model': p.get('model', 'gpt-4o'), 'base_url': p.get('base_url', ''), 'max_tokens': p.get('max_tokens', 16384), 'temperature': p.get('temperature', 0.7), 'concurrency': p.get('concurrency', 4), 'timeout': p.get('timeout', 120), 'json_mode': bool(p.get('json_mode', 0)), 'task_type': p.get('task_type', ''), 'rate_limit_per_min': p.get('rate_limit_per_min', 0), 'token_budget_daily': p.get('token_budget_daily', 0), 'is_active': bool(p.get('is_active', 1)), 'is_default': bool(p.get('is_default', 0)), 'created_at': p.get('created_at', ''), 'updated_at': p.get('updated_at', ''), 'version': config_version, 'etag': str(config_version)})
     return result
 
 @router.get('/profiles/default')
@@ -1133,9 +1294,10 @@ async def get_default_profile():
     """获取当前默认/激活的 Profile；不存在时返回空占位，不抛 404"""
     from ..services.ai.profile_service import get_default_profile as _get_default
     profile = await asyncio.to_thread(_get_default)
+    config_version = get_ai_config_version()
     if not profile:
-        return {'name': 'default', 'display_name': '默认配置', 'description': '', 'provider_name': None, 'provider': None, 'api_key': '', 'model': None, 'base_url': None, 'max_tokens': None, 'temperature': None, 'concurrency': None, 'timeout': None, 'is_active': False, 'is_default': True, 'json_mode': False}
-    return {**profile, 'is_default': True, 'is_active': bool(profile.get('is_active', 1)), 'json_mode': bool(profile.get('json_mode', 0))}
+        return {'name': 'default', 'display_name': '默认配置', 'description': '', 'provider_name': None, 'provider': None, 'api_key': '', 'model': None, 'base_url': None, 'max_tokens': None, 'temperature': None, 'concurrency': None, 'timeout': None, 'is_active': False, 'is_default': True, 'json_mode': False, 'version': config_version, 'etag': str(config_version)}
+    return {**profile, 'is_default': True, 'is_active': bool(profile.get('is_active', 1)), 'json_mode': bool(profile.get('json_mode', 0)), 'version': config_version, 'etag': str(config_version)}
 
 @router.get('/profiles/export')
 async def export_profiles():
@@ -1150,7 +1312,8 @@ async def get_profile(profile_name: str):
     profile = await asyncio.to_thread(_get, profile_name)
     if not profile:
         raise HTTPException(status_code=404, detail=f"Profile '{profile_name}' 不存在")
-    return {**profile, 'is_default': bool(profile.get('is_default', 0)), 'is_active': bool(profile.get('is_active', 1)), 'json_mode': bool(profile.get('json_mode', 0))}
+    config_version = get_ai_config_version()
+    return {**profile, 'is_default': bool(profile.get('is_default', 0)), 'is_active': bool(profile.get('is_active', 1)), 'json_mode': bool(profile.get('json_mode', 0)), 'version': config_version, 'etag': str(config_version)}
 
 @router.post('/profiles', response_model=ProfileResponse)
 async def create_profile(data: ProfileCreateRequest):
@@ -1169,13 +1332,23 @@ async def create_profile(data: ProfileCreateRequest):
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 @router.put('/profiles/{profile_name}')
-async def update_profile(profile_name: str, data: ProfileUpdateRequest):
-    """更新 AI Profile"""
-    from ..services.ai.profile_service import update_profile as _update
+async def update_profile(profile_name: str, data: ProfileUpdateRequest, request: Request = None):
+    """更新 AI Profile（可选 If-Match/etag 乐观锁；与 ai_config 共享版本号，跨模块并发写互斥）"""
+    from ..services.ai.profile_service import update_profile as _update, ConflictError
+    if_match = request.headers.get('if-match') if request else None
+    if_match_version = None
+    if if_match is not None:
+        try:
+            if_match_version = int(if_match.strip().strip('"'))
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail='If-Match 请求头值非法')
     try:
         update_data = data.model_dump(exclude_none=True)
-        profile = _update(profile_name, update_data)
-        return {**profile, 'is_default': bool(profile.get('is_default', 0)), 'is_active': bool(profile.get('is_active', 1)), 'json_mode': bool(profile.get('json_mode', 0))}
+        profile = _update(profile_name, update_data, if_match=if_match_version)
+        new_version = get_ai_config_version()
+        return {**profile, 'version': new_version, 'etag': str(new_version), 'is_default': bool(profile.get('is_default', 0)), 'is_active': bool(profile.get('is_active', 1)), 'json_mode': bool(profile.get('json_mode', 0))}
+    except ConflictError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     except Exception as e:

@@ -40,7 +40,16 @@ _chart_cache_dir = PROJECTS_DATA_DIR / "_exports" / "charts"
 _chart_cache_dir.mkdir(parents=True, exist_ok=True)
 _chart_cache = ChartCache(cache_dir=str(_chart_cache_dir))
 
-_chart_render_cache: dict[str, tuple[BytesIO, int, float]] = {}  # key -> (stream, size, timestamp)
+# X-9（2026-10-16，N-6 新发现）：缓存条目存 `bytes` 而非 `BytesIO`。
+# 背景：原实现在 `_store_chart_render` 里存 `BytesIO(data)`（可变流对象），
+# 在 `_get_cached_chart_render` 命中时又用 `BytesIO(stream.getvalue())` 复制一份
+# 返回。虽然 2026-10-13 的 F-3 修复通过副本解决了并发读光标互踩，但每次命中都
+# 多做一次 `stream.getvalue()`（对 500KB-2MB 大图表尤其浪费）。
+# 现改为直接存不可变 `bytes`：
+#   1. `bytes` 是 CPython 只读对象，天然线程安全，命中时无需任何复制锁；
+#   2. `BytesIO(data)` 只在返回时构造一次（省掉一次 getvalue 拷贝）；
+#   3. 缓存条目本身不持有可变引用，杜绝任何调用方误写污染的可能。
+_chart_render_cache: dict[str, tuple[bytes, int, float]] = {}  # key -> (raw_bytes, size, timestamp)
 _chart_render_cache_lock = threading.Lock()
 _chart_render_cache_max = 50  # 最多缓存 50 个不同 chart 渲染结果
 _chart_render_cache_ttl = 300  # TTL: 5 分钟
@@ -49,21 +58,25 @@ _chart_render_cache_misses = 0
 
 
 def _get_cached_chart_render(payload_str: str, chart_type: str) -> tuple[BytesIO, int] | None:
-    """查 L1 内存缓存，hit 则返回 (BytesIO, size)。"""
+    """查 L1 内存缓存，hit 则返回 (BytesIO, size)。
+
+    X-9（2026-10-16）：返回的 BytesIO 每次都是基于缓存 `bytes` 现构造的独立对象，
+    调用方读写不会污染缓存条目（缓存条目本身是 immutable bytes）。
+    """
     global _chart_render_cache_hits, _chart_render_cache_misses
     cache_key = hashlib.sha256(f"{chart_type}|{payload_str}".encode("utf-8")).hexdigest()
     with _chart_render_cache_lock:
         entry = _chart_render_cache.get(cache_key)
     if entry:
-        stream, size, ts = entry
+        data, size, ts = entry
         if time.time() - ts < _chart_render_cache_ttl:
             _chart_render_cache_hits += 1
             # BUG-FIX 2026-10-13（P1·L1 缓存共享流竞态）：原实现直接把缓存条目里的
             # BytesIO 对象返回给调用方，多项目并发命中同一条目时两个调用方交替
             # seek(0)/read()，共享光标互相打断 → 一方读到空/半截字节 → 图片插入
-            # 失败 → 正文留占位符且图号虚跳。改为返回独立副本，缓存条目保持只读
-            # （getvalue 不推进其光标，后续命中无需再 seek）。
-            return BytesIO(stream.getvalue()), size
+            # 失败 → 正文留占位符且图号虚跳。改为返回独立副本，缓存条目保持只读。
+            # X-9 增强：缓存条目直接存 bytes，命中路径只有一次 BytesIO 构造开销。
+            return BytesIO(data), size
         # TTL 过期
         with _chart_render_cache_lock:
             _chart_render_cache.pop(cache_key, None)
@@ -72,7 +85,10 @@ def _get_cached_chart_render(payload_str: str, chart_type: str) -> tuple[BytesIO
 
 
 def _store_chart_render(payload_str: str, stream: BytesIO, chart_type: str = "") -> None:
-    """写入 L1 内存缓存（含 TTL + 容量上限淘汰）。"""
+    """写入 L1 内存缓存（含 TTL + 容量上限淘汰）。
+
+    X-9（2026-10-16）：缓存条目存 `bytes` 而非 `BytesIO`。
+    """
     cache_key = hashlib.sha256(f"{chart_type}|{payload_str}".encode("utf-8")).hexdigest()
     stream.seek(0)
     data = stream.getvalue()
@@ -87,7 +103,7 @@ def _store_chart_render(payload_str: str, stream: BytesIO, chart_type: str = "")
         if len(_chart_render_cache) >= _chart_render_cache_max:
             oldest = min(_chart_render_cache.items(), key=lambda kv: kv[1][2])[0]
             _chart_render_cache.pop(oldest, None)
-        _chart_render_cache[cache_key] = (BytesIO(data), size, now)
+        _chart_render_cache[cache_key] = (data, size, now)
 
 
 # ============================================================

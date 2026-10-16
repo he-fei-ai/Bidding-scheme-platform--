@@ -87,14 +87,15 @@ def _seed_audit_log(
     facts_extracted: int = 3,
     status: str = "completed",
     audit_time: str = "2026-10-08 10:00:00",
+    source_kind: str = "rule",
 ) -> None:
     with get_db() as conn:
         conn.execute(
             "INSERT INTO consistency_audit_log "
             "(project_id, total_sections, facts_extracted, conflicts_found, "
-            " conflicts_json, audit_time, status) "
-            "VALUES (?, 3, ?, 1, ?, ?, ?)",
-            (project_id, facts_extracted, conflicts_json, audit_time, status),
+            " conflicts_json, audit_time, status, source_kind) "
+            "VALUES (?, 3, ?, 1, ?, ?, ?, ?)",
+            (project_id, facts_extracted, conflicts_json, audit_time, status, source_kind),
         )
 def _client(user_id: int = OWNER):
     from fastapi.testclient import TestClient
@@ -230,7 +231,8 @@ class TestConflictsEndpointSourceKind:
 
 
 # ============================================================================
-# C. 最近一次审计来源推断
+# C. 最近一次审计来源（2026-10-16 T2 根治后：直接读 `source_kind` 列，
+#    不再从 conflicts_json 侧信道推断 —— seed 显式带 source_kind 模拟写入路径）
 # ============================================================================
 
 
@@ -241,6 +243,8 @@ class TestAuditSourceInference:
             pid,
             conflicts_json='[{"conflict_id": "AI-9-abc", "fact_name": "发现", "values": [], "severity": "medium"}]',
             facts_extracted=0,
+            # T2 后 AI 写入路径直接标注来源列
+            source_kind="ai",
         )
         summary = _client().get(f"{API}/consistency/summary/{pid}").json()["summary"]
         assert summary["audit_source"] == "ai"
@@ -256,6 +260,21 @@ class TestAuditSourceInference:
 
     def test_empty_project_defaults_rule(self):
         pid = _new_project("C-空项目")
+        summary = _client().get(f"{API}/consistency/summary/{pid}").json()["summary"]
+        assert summary["audit_source"] == "rule"
+
+    def test_source_kind_column_is_authoritative_not_conflicts_json(self):
+        """T2 根治证明：来源以 `source_kind` 列为准，conflicts_json 内容只是载荷。
+
+        刻意构造「列=rule 但 JSON 含 AI 前缀」「列=ai 但 JSON 含规则前缀」两组
+        互相矛盾的行 —— 旧推断分支会按 JSON 前缀判定，新实现必须按列判定。
+        """
+        pid = _new_project("C-列为准")
+        _seed_audit_log(
+            pid,
+            conflicts_json='[{"conflict_id": "AI-9-abc", "fact_name": "发现", "values": [], "severity": "medium"}]',
+            source_kind="rule",
+        )
         summary = _client().get(f"{API}/consistency/summary/{pid}").json()["summary"]
         assert summary["audit_source"] == "rule"
 

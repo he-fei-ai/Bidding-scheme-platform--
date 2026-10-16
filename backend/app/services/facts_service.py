@@ -377,18 +377,23 @@ def dedup_facts(items: list) -> list:
     return dedup
 
 
-def merge_kb_patch_items(base_items: list, patch_items: list) -> list:
-    """知识库补充事实并入基线事实（P2-2，facts-ns 2026-10-15）。
+def merge_patch_items(base_items: list, patch_items: list, source: str = "knowledge") -> list:
+    """补充来源事实并入基线事实（只补不增 + 基线优先）。
 
-    对齐易标 `runKnowledgeGlobalFactPatches` 的「只补不增 + 基线优先」思路：
-    把知识库补充提取的结果拼接到**基线之后**，再交给 `normalize_fact_items`
-    统一去重——
+    对齐易标「补充环节」家族（`runKnowledgeGlobalFactPatches` /
+    `runOriginalPlanGlobalFactPatches` → `mergeGlobalFactPatches`）：把补充提取的
+    结果拼接到**基线之后**，再交给 `normalize_fact_items` 统一去重——
 
     * 同 key/label 的冲突条目：`dedup_facts` 保留首个（基线 = 招标/Step02 优先），
-      仅当基线是空值/占位符而知识库给出实值时用实值替换（保留基线 key/label 命名）；
-    * 基线缺失的新 key/label：追加（补齐基线漏项，如知识库沉淀的型号/参数/承诺）；
-    * 每条知识库来源条目标记 ``source="knowledge"``、去掉 ``verified``，
-      前端可按来源区分「文件实值 / AI 编造 / 知识库参考」。
+      仅当基线是空值/占位符而补充源给出实值时用实值替换（保留基线 key/label 命名）；
+    * 基线缺失的新 key/label：追加（补齐基线漏项，如沉淀的型号/参数/承诺）；
+    * 每条补充来源条目标记 ``source=source``、去掉 ``verified``，
+      前端可按来源区分「文件实值 / AI 编造 / 知识库参考 / 模板参考」。
+
+    Args:
+        base_items: 基线事实（招标文件 / Step02 解析结果提取）。
+        patch_items: 补充来源提取的事实候选。
+        source: 来源标记（"knowledge" 知识库 / "template" 既有方案模板）。
 
     本函数只做拼接与来源标记，不产生 AI 调用、不做规范化
     （规范化与去重由调用方统一走 `normalize_fact_items`）。
@@ -401,11 +406,29 @@ def merge_kb_patch_items(base_items: list, patch_items: list) -> list:
         if not isinstance(item, dict):
             continue
         p = dict(item)
-        p["source"] = "knowledge"
+        p["source"] = source
         p.pop("verified", None)
         p.pop("needs_manual_input", None)
         out.append(p)
     return out
+
+
+def merge_kb_patch_items(base_items: list, patch_items: list) -> list:
+    """知识库补充事实并入基线事实（P2-2，facts-ns 2026-10-15）。
+
+    `merge_patch_items` 的 ``source="knowledge"` 特化，保留历史签名不变。
+    """
+    return merge_patch_items(base_items, patch_items, source="knowledge")
+
+
+def merge_template_patch_items(base_items: list, patch_items: list) -> list:
+    """既有方案（模板）补充事实并入基线事实（P2-4，facts-ns 2026-10-16）。
+
+    对齐易标 `runOriginalPlanGlobalFactPatches`：扩写场景下原方案中已落地的
+    安排、既有承诺、统一配置优先沉淀为全局事实。合并语义与知识库完全一致
+    （基线优先、占位让位实值、缺失追加），仅来源标记为 ``template``。
+    """
+    return merge_patch_items(base_items, patch_items, source="template")
 
 
 # ============================================================
@@ -1044,6 +1067,21 @@ def consistency_patch_repair_enabled() -> bool:
     return _env_flag("CONSISTENCY_PATCH_REPAIR_ENABLED")
 
 
+def consistency_audit_evidence_enabled() -> bool:
+    """引入项 C（2026-10-16，对齐易标 buildConsistencyAuditMessages）：
+    生成收尾 AI 一致性审计冲突结构化开关（CONSISTENCY_AUDIT_EVIDENCE_ENABLED，默认关）。
+
+    开启后 `workflows_expand._audit_one_group` 的审计提示词要求每条冲突额外给出
+    `evidence`（正文冲突原文逐字摘录）、`fact_title`（相背的全局事实标题）、
+    `severity`（high/medium/low）——与易标审计返回结构同款。收益有二：
+    1. `evidence` 作为补丁修复 `old_text` 的原文锚点，显著提高唯一命中率
+       （见 `_repair_conflicts_with_patches`）；
+    2. `severity`/`evidence` 随发现落库，前端可分级展示与原文追溯。
+    默认关 = 审计提示词返回结构与发现字段逐字保持现状（仅 section_id/issue/suggestion）。
+    """
+    return _env_flag("CONSISTENCY_AUDIT_EVIDENCE_ENABLED")
+
+
 def kb_patch_enabled() -> bool:
     """P2-2（facts-ns 2026-10-15）：知识库补充事实开关
     （FACTS_KNOWLEDGE_PATCH_ENABLED，默认关）。
@@ -1053,6 +1091,19 @@ def kb_patch_enabled() -> bool:
     提取提示词与行为历史一致。
     """
     return _env_flag("FACTS_KNOWLEDGE_PATCH_ENABLED")
+
+
+def template_patch_enabled() -> bool:
+    """P2-4（facts-ns 2026-10-16）：既有方案（模板）补充事实开关
+    （FACTS_TEMPLATE_PATCH_ENABLED，默认关）。
+
+    对齐易标 `runOriginalPlanGlobalFactPatches`（扩写场景的「原方案保留」环节）：
+    基线提取后从项目已上传的模板/既有方案文件再做一次「只补不增」的补充提取——
+    原方案中已落地的安排、既有承诺、统一配置优先沉淀为全局事实，与招标基线冲突时
+    仍以基线为准（仅基线占位/空值让位模板实值）。默认关 = 不读模板，
+    提取提示词与行为历史一致；任何异常降级跳过，不阻断基线提取。
+    """
+    return _env_flag("FACTS_TEMPLATE_PATCH_ENABLED")
 
 
 def chapter_scope_enabled() -> bool:

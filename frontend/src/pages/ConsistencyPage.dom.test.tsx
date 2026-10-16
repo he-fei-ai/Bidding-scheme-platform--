@@ -12,8 +12,15 @@
  *
  * ENHANCE 2026-10-08：页面已拆为「页面壳 + ConflictListTab / ScoringComplianceTab」。
  * 本文件聚焦页面壳层（默认 Tab、跨 Tab 挂载、规则对齐）；ConflictListTab 内部的
- * 交互细节（筛选切换、章节深链、已解决行只读）迁到 `ConsistencyPage.tabs.dom.test.tsx`
+ * 交互细节（筛选切换、章节深链、已解决行只读）迁到 `ConsistencyTabs.dom.test.tsx`
  * 单独挂载 —— 更快，也不必为测一个断言把另一个 Tab 的请求一起拉起来。
+ *
+ * ENHANCE 2026-10-16（慢用例分流转·Tab 级单挂载）：本文件原先挂载整个
+ * `<ConsistencyPage>`（页面壳 + 全部 Tab 初始化 + antd Tabs 懒挂载 + 多路 API
+ * mock 解析），在 CI 慢机上单条用例逼近 2 分钟超时。现改为**直接挂载
+ * `<ConflictListTab>`**（与 `ConsistencyTabs.dom.test.tsx` 同一做法）——
+ * 两个被钉住的行为（autofix 纯值提交、空列表空态）都是冲突 Tab 的内部行为，
+ * 页面壳只负责传参与路由，无需整页渲染即可覆盖。
  */
 import { describe, it, expect, vi, beforeAll } from "vitest";
 
@@ -43,8 +50,8 @@ const applyAutoFixMock = vi.fn(
   }),
 );
 
-// 2026-10-08：页面壳会拉规则快照对齐严重度映射；评分达标 Tab 未激活时不请求。
-// 但 mock 工厂必须提供这两个导出，否则模块一加载就是 undefined 调用。
+// ConflictListTab 启动时会拉规则快照对齐严重度映射；
+// mock 工厂必须提供这些导出，否则模块一加载就是 undefined 调用。
 vi.mock("../api", () => ({
   runConsistencyAudit: vi.fn(async () => ({
     status: "ok",
@@ -128,7 +135,7 @@ async function loadRtl() {
   }
 }
 
-describe.skipIf(!hasDom)("ConsistencyPage 组件级交互（BUG-1 防回归）", () => {
+describe.skipIf(!hasDom)("ConflictListTab 组件级交互（BUG-1 防回归·Tab 级单挂载）", () => {
   beforeAll(() => {
     if (!window.matchMedia) {
       Object.defineProperty(window, "matchMedia", {
@@ -147,15 +154,17 @@ describe.skipIf(!hasDom)("ConsistencyPage 组件级交互（BUG-1 防回归）",
     }
   });
 
-  it("采纳建议并修复时，applyAutoFix 收到纯 target_value 而非整段文案", { timeout: 120_000 }, async () => {
+  // 历史即边缘耗时用例（三段弹窗交互 + antd Modal 动画）；Tab 级单挂载已比整页
+  // 渲染省掉页面壳 + 全 Tab 初始化开销，但慢机上仍需放宽到 120s。
+  it("采纳建议并修复时，applyAutoFix 收到纯 target_value 而非整段文案", async () => {
     const rtl = await loadRtl();
     if (!rtl) return;
 
     applyAutoFixMock.mockClear();
-    const Page = (await import("./ConsistencyPage")).default;
-    rtl.render(<Page />);
+    const Tab = (await import("../components/consistency/ConflictListTab")).default;
+    rtl.render(<Tab projectId={1} />);
 
-    // ① 默认 Tab 是「一致性冲突」，冲突表格已渲染（事实项列有"工期"）
+    // ① 冲突表格已渲染（事实项列有"工期"）
     expect(await rtl.screen.findByText("工期")).toBeTruthy();
 
     // ② 点第一行的「修复建议」按钮 → 弹窗出现建议文案
@@ -187,7 +196,7 @@ describe.skipIf(!hasDom)("ConsistencyPage 组件级交互（BUG-1 防回归）",
     rtl.cleanup();
   });
 
-  it("无冲突时冲突列表为空、不渲染冲突表格行", { timeout: 120_000 }, async () => {
+  it("无冲突时冲突列表为空、不渲染冲突表格行", { timeout: 60_000 }, async () => {
     const rtl = await loadRtl();
     if (!rtl) return;
 
@@ -196,8 +205,8 @@ describe.skipIf(!hasDom)("ConsistencyPage 组件级交互（BUG-1 防回归）",
       conflicts: [], count: 0, filter: "open",
     });
 
-    const Page = (await import("./ConsistencyPage")).default;
-    rtl.render(<Page />);
+    const Tab = (await import("../components/consistency/ConflictListTab")).default;
+    rtl.render(<Tab projectId={1} />);
 
     // 空态提示出现
     expect(await rtl.screen.findByText(/暂无冲突数据/)).toBeTruthy();

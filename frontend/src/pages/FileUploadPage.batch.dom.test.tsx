@@ -151,7 +151,6 @@ describe.skipIf(!hasDom)("FileUploadPage 批量上传状态机（TD-E2）", () =
 
   it(
     "三份并发：在途期间拖拽区保持禁用，全部完成后才恢复，批尾汇总只提示一次",
-    { timeout: 120_000 },
     async () => {
       const rtl = await loadRtl();
       if (!rtl) return;
@@ -225,7 +224,6 @@ describe.skipIf(!hasDom)("FileUploadPage 批量上传状态机（TD-E2）", () =
 
   it(
     "单文件上传：逐条提示成功且不出现批尾汇总（shouldNotifySingle/formatBatchSummary 接线）",
-    { timeout: 120_000 },
     async () => {
       const rtl = await loadRtl();
       if (!rtl) return;

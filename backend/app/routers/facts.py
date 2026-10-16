@@ -35,6 +35,7 @@ from ..services.facts_service import (
     kb_patch_enabled,
     mark_placeholders,
     merge_kb_patch_items,
+    merge_template_patch_items,
     normalize_fact_items,
     normalize_facts_policy,
     outline_input_enabled,
@@ -44,6 +45,7 @@ from ..services.facts_service import (
     resolve_category,
     schedule_fallback_value,
     segmented_extraction_enabled,
+    template_patch_enabled,
 )
 from ..services.content_field_contract import (
     compute_affected_section_ids,
@@ -572,6 +574,10 @@ async def generate_facts(project_id: int, body: FactsGenerateRequest | None = No
     历史实现只有一档语义（资料没给值就由 AI 编一个"合理值"），而虚构的人名、
     工期、金额会作为确定性事实被注入全篇正文 —— 对投标这种要担责的文书风险很大。
     现在可由用户显式选择"不编造"的两档。
+
+    ENHANCE 2026-10-16（P2-4）：`FACTS_TEMPLATE_PATCH_ENABLED` 开启时，基线提取后
+    再从项目已上传的模板/既有方案文件做一次「只补不增」的补充提取（对齐易标
+    `runOriginalPlanGlobalFactPatches`），结果计入 `template_patches_applied`。
     """
     policy = normalize_facts_policy(body.missing_value_policy if body else None)
     await _ensure_project_access(project_id, current_user)
@@ -900,6 +906,100 @@ async def generate_facts(project_id: int, body: FactsGenerateRequest | None = No
         except Exception as _kb_e:
             logger.warning("[AI事实] 知识库补充失败（跳过，不影响基线提取）: %s", _kb_e)
 
+    # P2-4（facts-ns 2026-10-16，对齐易标 runOriginalPlanGlobalFactPatches）：
+    # 基线提取后从项目已上传的模板/既有方案文件再做一次「只补不增」的补充提取。
+    # 开关 FACTS_TEMPLATE_PATCH_ENABLED 默认关 = 不读模板，行为与历史一致；
+    # 开启且基线 items 非空时：读项目模板文件正文（预算截断）→ 二次提取 →
+    # merge_template_patch_items 拼到基线之后 → 由下方 _normalize_facts 统一去重
+    # （基线优先、基线占位/空值让位模板实值，来源标记 source=template）。
+    # 任何异常都降级跳过，不阻断基线提取。
+    template_patch_tried = False
+    if template_patch_enabled() and items:
+        try:
+            from ..services.files import extract_text_from_path as _extract_tpl_text
+
+            def _read_ready_templates():
+                with get_db() as conn:
+                    return conn.execute(
+                        "SELECT id, filename, file_path FROM project_templates "
+                        "WHERE project_id = ? AND status = 'ready' AND file_path != '' "
+                        "ORDER BY id",
+                        (project_id,),
+                    ).fetchall()
+
+            _tpl_rows = await asyncio.to_thread(_read_ready_templates)
+
+            def _render_template_material(rows):
+                _lines: list[str] = []
+                _budget = 6000
+                for _i, _tr in enumerate(rows or [], 1):
+                    _fp = str(_tr["file_path"] or "").strip()
+                    if not _fp:
+                        continue
+                    try:
+                        _text = _extract_tpl_text(_fp)
+                    except Exception as _tx_e:
+                        logger.warning(
+                            "[AI事实] 模板 %s 正文提取失败（跳过）: %s", _fp, _tx_e
+                        )
+                        continue
+                    _text = str(_text or "").strip()
+                    if not _text:
+                        continue
+                    _name = str(_tr["filename"] or f"模板{_i}").strip()
+                    _block = f"[模板{_i}] 文件名：{_name}\n正文：{_text[:4000]}"
+                    if len(_block) > _budget:
+                        _block = _block[:_budget]
+                    _budget -= len(_block)
+                    _lines.append(_block)
+                    if _budget <= 0:
+                        break
+                return "\n\n".join(_lines)
+
+            _tpl_material = _render_template_material(_tpl_rows)
+            if _tpl_material:
+                _tpl_sys = (
+                    "你是招投标方案全局事实变量补充助手。请从『既有方案/历史标书模板』"
+                    "素材中提取『技术方案正文需要统一采用』的确定性事实（人员、工期、"
+                    "设备型号、质保期、响应时间、服务承诺、技术参数、统一配置口径等）。"
+                    "既有方案中已经落地的安排、既有承诺、统一配置优先沉淀为事实；"
+                    "只提取素材中有明确依据的事实；素材未提到的严禁编造；"
+                    "只返回 JSON 对象（dict），key 用英文驼峰，value 为字符串。"
+                )
+                _tpl_user = f"""以下是项目已上传的既有方案/模板素材（仅作事实补源）：
+
+{_tpl_material}
+
+请从上述既有方案素材中补充提取全局事实变量：
+1. 只提取素材中有明确依据的确定性事实；原方案已写成的实际安排、既有承诺优先；
+2. 与招标文件/Step02 解析结果冲突时，不要覆盖已确认的值（基线以招标为准）；
+3. 素材没有明确值时严禁编造；没有可补充内容时返回空 JSON 对象 {{}}；
+4. 输出 JSON 对象（dict），严禁附加解释。"""
+                _tpl_result, _ = await run_json_extraction(
+                    [
+                        AIMessage(role="system", content=_tpl_sys),
+                        AIMessage(role="user", content=_tpl_user),
+                    ],
+                    provider=provider,
+                    temperature=0.3,
+                    max_retries=2,
+                )
+                if isinstance(_tpl_result, dict):
+                    _tpl_patch = _dict_to_fact_items(_tpl_result)
+                elif isinstance(_tpl_result, list):
+                    _tpl_patch = _tpl_result
+                else:
+                    _tpl_patch = []
+                if _tpl_patch:
+                    items = merge_template_patch_items(items, _tpl_patch)
+                    logger.info(
+                        "[AI事实] 既有方案补充候选 %d 条已并入基线（去重后以最终清单为准）",
+                        len(_tpl_patch),
+                    )
+                template_patch_tried = True
+        except Exception as _tpl_e:
+            logger.warning("[AI事实] 既有方案补充失败（跳过，不影响基线提取）: %s", _tpl_e)
+
     # 值规范化后处理：去重 + 必须有工期规则（缺值兜底文案按策略生成）
     items = _normalize_facts(
         items, fallback_text=(summary or "") + (scoring_points or ""), policy=policy
@@ -913,6 +1013,16 @@ async def generate_facts(project_id: int, body: FactsGenerateRequest | None = No
             for _it in items
             if isinstance(_it, dict)
             and str(_it.get("source") or "").strip() == "knowledge"
+        )
+
+    # P2-4：既有方案（模板）补充实际生效条数（规范化去重后 source=template 的条目数）
+    template_patches_applied = 0
+    if template_patch_tried:
+        template_patches_applied = sum(
+            1
+            for _it in items
+            if isinstance(_it, dict)
+            and str(_it.get("source") or "").strip() == "template"
         )
 
     # placeholder 策略下逐条打标，前端可高亮「这条还等着人工填」。
@@ -973,6 +1083,8 @@ async def generate_facts(project_id: int, body: FactsGenerateRequest | None = No
         "warning": extraction_note,
         # ENHANCE 2026-10-15（P2-2）：知识库补充实际生效条数（0=未启用或未补充）
         "knowledge_patches_applied": knowledge_patches_applied,
+        # ENHANCE 2026-10-16（P2-4）：既有方案（模板）补充实际生效条数（0=未启用或未补充）
+        "template_patches_applied": template_patches_applied,
         # ENHANCE 2026-09-15：回传本次采用的缺失值策略
         "missing_value_policy": policy,
         "placeholder_count": count_placeholders(items),

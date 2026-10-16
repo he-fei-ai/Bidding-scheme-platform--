@@ -85,8 +85,12 @@ def test_ai_config_with_encryption():
 
     client = TestClient(app)
 
-    # 写入测试密钥
+    # 写入测试密钥（新契约：PUT 必须携带 If-Match，先 GET 取当前 etag/version）
     test_key = "sk-integration-test-key-12345"
+    etag_resp = client.get("/api/v1/ai/config")
+    assert etag_resp.status_code == 200
+    current_etag = etag_resp.json().get("etag")
+    assert current_etag is not None, "GET /ai/config 应返回 etag"
     save_resp = client.put("/api/v1/ai/config", json={
         "provider_name": "测试AI",
         "provider": "openai_compatible",
@@ -96,7 +100,7 @@ def test_ai_config_with_encryption():
         "concurrency": 4,
         "temperature": 0.7,
         "max_tokens": 4096,
-    })
+    }, headers={"If-Match": str(current_etag)})
     assert save_resp.status_code == 200, f"保存 AI 配置失败: {save_resp.text}"
 
     # 验证数据库中已加密存储
@@ -124,6 +128,10 @@ def test_ai_config_with_encryption():
     assert cfg.get("api_key") == API_KEY_MASK, f"GET 应返回脱敏占位符,但得到 {cfg.get('api_key')}"
 
     # 契约的另一半：把占位符原样提交回去，库内真实密钥不能被清空
+    # 同样需携带最新 etag（首次保存后版本已推进）
+    etag_resp2 = client.get("/api/v1/ai/config")
+    assert etag_resp2.status_code == 200
+    current_etag2 = etag_resp2.json().get("etag")
     resave_resp = client.put("/api/v1/ai/config", json={
         "provider_name": "测试AI",
         "provider": "openai_compatible",
@@ -133,7 +141,7 @@ def test_ai_config_with_encryption():
         "concurrency": 4,
         "temperature": 0.7,
         "max_tokens": 4096,
-    })
+    }, headers={"If-Match": str(current_etag2)})
     assert resave_resp.status_code == 200, f"回写占位符失败: {resave_resp.text}"
     with get_db() as conn:
         row2 = conn.execute("SELECT api_key FROM ai_config WHERE id = 1").fetchone()

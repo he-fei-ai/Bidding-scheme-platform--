@@ -1,0 +1,189 @@
+                    ]},
+                ]},
+            ]},
+        ]
+        provider = self._FakeProvider(["基坑支护监测方案"])
+        out = await repair_l3_generic_titles(
+            provider, tree, "", "", "", "", "", max_repair=2
+        )
+        assert provider.calls == 1, "L4 场景下 LLM 未被调用，说明脏标题被跳过了"
+        new_title = out[0]["children"][0]["children"][0]["title"]
+        assert new_title == "基坑支护监测方案", f"脏标题未被修复: {new_title}"
+
+    @pytest.mark.asyncio
+    async def test_illegal_path_is_skipped_safely(self):
+        """路径越界不得抛异常、不得写坏树，其余合法项仍应正常修复。"""
+        from app.services.ai.workflows_outline_utils import repair_l3_generic_titles
+
+        tree = [
+            {"title": "总体施工部署", "children": [
+                {"title": "总体方案与实施策划", "children": [
+                    {"title": "总体实施策划（2）"},
+                ]},
+            ]},
+        ]
+        # 手工注入一个越界 path，模拟 validate 结果与树不一致的极端情况。
+        import app.services.ai.workflows_outline_utils as _u
+
+        real_validate = _u.validate_l3_specificity
+        _u.validate_l3_specificity = lambda outline: (
+            [{"path": "9.9.9", "title": "总体实施策划（2）",
+              "parent_title": "总体方案与实施策划", "reason": "generic"}],
+            "",
+        )
+        try:
+            provider = self._FakeProvider(["基坑支护监测方案"])
+            out = await repair_l3_generic_titles(
+                provider, tree, "", "", "", "", "", max_repair=2
+            )
+        finally:
+            _u.validate_l3_specificity = real_validate
+        assert provider.calls == 0, "越界 path 不得触发 AI 调用"
+        assert out[0]["children"][0]["children"][0]["title"] == "总体实施策划（2）"
+
+
+class TestL3QualityNoProviderWiring:
+    """无 AI provider 时规则兜底标题必须显式暴露（遗留建议 3）。
+
+    旧行为：`provider is None` 分支完全沉默，用户在界面上无法区分
+    「标题已由 AI 精化」与「标题为规则组合生成」，只能靠肉眼比对质量。
+    接线类改动若被误删，pytest 不会失败 —— 因此按 test_outline_asyncio.py
+    `test_sse_handlers_no_unused_import` 的既有惯例，用源码断言守住接线。
+    """
+
+    def _block(self) -> str:
+        """主链路收口块 + 被它委托的 `_l3_specificity_closeout` 实现。
+
+        BUG-FIX 2026-10-12：主链路的「具体性校验 → AI 修复」内联逻辑已抽成
+        `_l3_specificity_closeout`（与审核回灌路径共用，消除两份易漂移的副本）。
+        本类断言的语义是「这两个函数确实被调用、且失败不阻断生成」，
+        因此扫描范围必须同时覆盖调用块与被调用函数体，否则会在重构后误报。
+        """
+        from app.services.ai import workflows_outline_v51 as v51
+
+        src = Path(v51.__file__).read_text(encoding="utf-8")
+        start = src.index("L3 标题质量收口")
+        end = src.index("# ===== AI 自检 =====")
+        main_block = src[start:end]
+        h_start = src.index("async def _l3_specificity_closeout(")
+        h_end = src.index("async def _apply_l3_quality_closeout(")
+        return main_block + "\n# ---- 委托实现 ----\n" + src[h_start:h_end]
+
+    def test_dead_code_is_actually_invoked(self):
+        """本轮修复核心：两个函数必须在 v51 主链路里被真正调用。"""
+        from app.services.ai import workflows_outline_v51 as v51
+
+        assert "validate_l3_specificity" in v51.__dict__, "validate 未从 utils 导入"
+        assert "repair_l3_generic_titles" in v51.__dict__, "repair 未从 utils 导入"
+        src = Path(v51.__file__).read_text(encoding="utf-8")
+        assert "_l3_specificity_closeout(" in src, "主链路未调用具体性收口函数"
+        block = self._block()
+        assert "validate_l3_specificity(outline)" in block, "validate 未被调用"
+        assert "repair_l3_generic_titles(" in block, "repair 未被调用"
+
+    def test_quality_block_is_gated_by_config(self):
+        """总开关必须包住整块，false 才能完全回退到历史行为。"""
+        from app.config import OUTLINE_L3_QUALITY_ENHANCE_ENABLED
+
+        assert OUTLINE_L3_QUALITY_ENHANCE_ENABLED is True
+        block = self._block()
+        assert "OUTLINE_L3_QUALITY_ENHANCE_ENABLED" in block, "收口块未受开关控制"
+
+    def test_no_provider_branch_is_not_silent(self):
+        """provider 缺失时必须落 warning 日志并向前端提示，不得静默跳过。"""
+        block = self._block()
+        assert "elif not _passed:" in block, "缺少无 provider 分支（静默跳过）"
+        seg = block[block.index("elif not _passed:"):]
+        assert "logger.warning" in seg, "无 provider 时未落 warning 日志"
+        assert "await phase_callback(" in seg, "无 provider 时未向前端提示"
+
+    def test_exception_never_blocks_generation(self):
+        """质量收口是增强环节，任何异常都不得阻断目录生成。"""
+        block = self._block()
+        assert "except Exception" in block, "缺少异常兜底"
+
+    def test_repair_concurrency_is_bounded(self):
+        """AI 修复并发必须受信号量约束（遗留建议 4）。"""
+        from app.services.ai import workflows_outline_utils as uo
+
+        src = Path(uo.__file__).read_text(encoding="utf-8")
+        assert "asyncio.Semaphore" in src, "未接入信号量限流"
+        assert "OUTLINE_L3_REPAIR_CONCURRENCY" in src
+        assert src.index("asyncio.Semaphore") < src.index("asyncio.gather("), (
+            "信号量必须在 gather 之前创建"
+        )
+
+
+# ===========================================================================
+# 8. 端到端：真实生成链路零脏标题
+# ===========================================================================
+
+
+class TestL3GenerationEndToEnd:
+    """完整规则链路（生成 → 差异化 → 清洗 → 去重）后不得残留任何脏标题。"""
+
+    @pytest.mark.asyncio
+    async def test_no_dirty_titles_after_full_pipeline(self):
+        from app.services.ai.workflows_outline_v51 import (
+            _ensure_l2_l3_differentiation,
+            _generate_level3_v51,
+        )
+
+        tree = build_generic_tree()
+        await _generate_level3_v51(None, tree, "", "")
+        _ensure_l2_l3_differentiation(tree)
+        _cleanup_placeholder_titles(tree)
+        tree = _uniquify_outline_titles(tree)
+
+        total, dirty, bare, generic, dup, l3_vs_l2 = _audit(tree)
+        assert total == 54
+        assert not dirty, f"残留占位标题: {dirty}"
+        assert not bare, f"残留裸编号后缀: {bare}"
+        assert not generic, f"残留纯泛化标题: {generic}"
+        assert not dup, f"残留跨章节重复: {dup}"
+        # L3 不得与任何 L2 标题撞名（否则 L3 读起来像章名而非条目）
+        assert not l3_vs_l2, f"L3 与 L2 撞名: {l3_vs_l2}"
+
+    @pytest.mark.asyncio
+    async def test_all_titles_are_non_empty_and_bounded(self):
+        from app.services.ai.workflows_outline_v51 import (
+            _ensure_l2_l3_differentiation,
+            _generate_level3_v51,
+        )
+
+        tree = build_generic_tree()
+        await _generate_level3_v51(None, tree, "", "")
+        _ensure_l2_l3_differentiation(tree)
+        _cleanup_placeholder_titles(tree)
+        tree = _uniquify_outline_titles(tree)
+        for l1 in tree:
+            for l2 in l1.get("children") or []:
+                for l3 in l2.get("children") or []:
+                    t = l3.get("title") or ""
+                    assert 4 <= len(t) <= 22, f"标题长度越界: {t!r}"
+
+
+# ===========================================================================
+# 8b. 直出路径（短标书直出）同样经过 L3 质量收口（BUG-2026-1009-01/02/03）
+# ===========================================================================
+
+
+class TestDirectPathQualityCloseout:
+    """直出路径在返回前必须执行与分步路径同套的 L3 质量收口。
+
+    背景：短标书直出模式（generate_outline_direct 成功后）此前在
+    generate_outline_v51 中直接 return，绕过分步路径的「清洗 → 去重 →
+    具体性校验 → AI 修复」防线，直出产物仍可能带「专项6」「总体实施策划（2）」
+    这类脏标题。修复：复用 _apply_l3_quality_closeout，先收口再进入最终审核。
+    本类用源码接线断言 + 行为断言双重锁定。
+    """
+
+    def test_direct_branch_invokes_quality_closeout(self):
+        """直出成功分支（return direct 之前）必须调用共用收口函数。"""
+        from app.services.ai import workflows_outline_v51 as v51
+
+        assert callable(v51._apply_l3_quality_closeout), "共用收口函数缺失"
+        # 直出分支在 return 之前调用收口（确保产物经过清洗/去重/校验）
+        src = Path(v51.__file__).read_text(encoding="utf-8")
+        start = src.index("if should_use_direct_outline(scoring_points, outline_mode):")
+        end = src.index('logger.warning("[V5.1] 直出路径未产出结果，回退分步路径")')

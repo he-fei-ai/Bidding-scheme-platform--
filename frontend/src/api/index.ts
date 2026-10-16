@@ -4,7 +4,7 @@ import type {
   Project, ProjectCreate, ProjectUpdate, ProjectList,
   FileInfo, AnalysisResult, UploadResult, FileParsingStatus,
   SectionTreeNode, Section, SectionCreate, SectionUpdate,
-  ExportConfig, DocumentCheckResult, ExportRecord, AIConfig, KnownProvider, PromptTemplate,
+  ExportConfig, DocumentCheckResult, ExportRecord, AIConfig, RotationStatus, KnownProvider, PromptTemplate,
   PromptVersionMeta, PromptVersionDetail,
   ExportPresetCatalog,
   RejectionStartRequest, RejectionCheckTask, RejectionCheckItem,
@@ -2450,8 +2450,127 @@ export async function getAIConfig(): Promise<AIConfig> {
   return res.data;
 }
 
-export async function saveAIConfig(config: AIConfig): Promise<void> {
-  await http.put("/ai/config", config);
+export async function saveAIConfig(config: AIConfig, etag: string): Promise<{ version: number; etag: string }> {
+  const res = await http.put("/ai/config", config, { headers: { "If-Match": etag } });
+  return {
+    version: Number(res.headers["version"] ?? res.data.version),
+    etag: String(res.headers["etag"] ?? res.data.etag),
+  };
+}
+
+/** 获取配置并携带后端版本/ETag，供乐观锁保存使用 */
+export async function getAIConfigWithETag(): Promise<{ config: AIConfig; etag: string; version: number }> {
+  const res = await http.get<AIConfig>("/ai/config");
+  return {
+    config: res.data,
+    etag: String(res.headers["etag"] ?? res.data.etag),
+    version: Number(res.headers["version"] ?? res.data.version),
+  };
+}
+
+/** 导出 AI 配置；include_secret=true 时需要管理员权限（后端 403） */
+export async function exportAIConfig(includeSecret = false): Promise<{
+  format: string;
+  keys_included: boolean;
+  config: AIConfig;
+  config_version: number;
+}> {
+  const res = await http.get(`/ai/config/export?include_secret=${includeSecret}`);
+  return res.data;
+}
+
+/** 查询密钥轮转状态（是否到期提醒） */
+export async function getRotationStatus(): Promise<RotationStatus> {
+  const res = await http.get<RotationStatus>("/ai/config/rotation-status");
+  return res.data;
+}
+
+export interface WatchAIConfigOptions {
+  intervalMs?: number;
+  onError?: (err: unknown) => void;
+}
+
+/**
+ * 监听 AI 配置变更。
+ * 优先使用 SSE（GET /ai/config/stream，收到 config-changed 后拉取最新配置）；
+ * EventSource 不可用或 SSE 断线时自动退回每 2s 短轮询。
+ * 返回取消函数。
+ */
+export function watchAIConfig(
+  onChange: (config: AIConfig) => void,
+  opts: WatchAIConfigOptions = {}
+): () => void {
+  const { intervalMs = 2000, onError } = opts;
+  let cancelled = false;
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  let es: EventSource | null = null;
+  let lastVersion: number | null = null;
+
+  const stop = () => {
+    cancelled = true;
+    if (timer) {
+      clearTimeout(timer);
+      timer = null;
+    }
+    if (es) {
+      es.close();
+      es = null;
+    }
+  };
+
+  const emit = (config: AIConfig) => {
+    if (!cancelled) onChange(config);
+  };
+
+  const poll = () => {
+    if (cancelled) return;
+    getAIConfigWithETag()
+      .then(({ config, version }) => {
+        if (cancelled) return;
+        if (lastVersion === null || version !== lastVersion) {
+          lastVersion = version;
+          emit(config);
+        }
+      })
+      .catch((err) => onError?.(err))
+      .finally(() => {
+        if (!cancelled) timer = setTimeout(poll, intervalMs);
+      });
+  };
+
+  if (typeof EventSource !== "undefined") {
+    try {
+      es = new EventSource("/api/v1/ai/config/stream", { withCredentials: false });
+      es.onmessage = (ev) => {
+        try {
+          const payload = JSON.parse(ev.data);
+          if (
+            payload?.event === "config-changed" &&
+            payload.version != null &&
+            payload.version !== lastVersion
+          ) {
+            lastVersion = payload.version;
+            getAIConfigWithETag()
+              .then(({ config }) => emit(config))
+              .catch((err) => onError?.(err));
+          }
+        } catch {
+          // 忽略畸形 SSE 帧
+        }
+      };
+      es.onerror = () => {
+        es?.close();
+        es = null;
+        if (!cancelled) poll(); // SSE 断线，退回短轮询
+      };
+      return stop;
+    } catch {
+      es = null;
+    }
+  }
+
+  poll();
+  return stop;
 }
 
 // ========== Image Model Config APIs ==========
@@ -3280,6 +3399,28 @@ export async function getConflicts(
     `/consistency/conflicts/${projectId}`,
     { params: { resolved: opts.resolved ?? "open" } },
   );
+  return res.data;
+}
+
+/**
+ * 一致性校核模块运行时指标快照（ENHANCE 2026-10-16 / T5，后端 GET /consistency/metrics）。
+ *
+ * 返回进程内累计计数器（审计次数/失败数、AI 审计/发现/修复数、补丁拒绝数、
+ * 生成守卫拦截数）。纯内存、重启归零，用于实时观测，不作为审计结论来源。
+ */
+export interface ConsistencyMetrics {
+  audit_runs: number;
+  audit_failed: number;
+  ai_audit_runs: number;
+  ai_findings: number;
+  ai_findings_repaired: number;
+  ai_patch_rejected: number;
+  guard_interceptions: number;
+  [key: string]: number;
+}
+
+export async function getConsistencyMetrics(): Promise<{ status: string; metrics: ConsistencyMetrics }> {
+  const res = await http.get<{ status: string; metrics: ConsistencyMetrics }>(`/consistency/metrics`);
   return res.data;
 }
 

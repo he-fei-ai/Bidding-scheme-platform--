@@ -326,6 +326,18 @@ export interface AIConfig {
   current_profile_name?: string;
   /** 配置来源回显（2026-10-04 增强）：env=环境变量覆盖 / database / default */
   config_source?: 'env' | 'database' | 'default';
+  /** 后端配置版本号（乐观锁 etag 所依据），每次保存自增 */
+  version: number;
+  /** 当前配置版本的 ETag，供 `saveAIConfig` 的 `If-Match` 头使用 */
+  etag: string;
+}
+
+/** GET /ai/config/rotation-status 响应形状 */
+export interface RotationStatus {
+  rotation_interval_days: number;
+  days_since_rotation: number | null;
+  rotation_due: boolean;
+  api_key_set: boolean;
 }
 
 export interface KnownProvider {

@@ -200,7 +200,6 @@ describe.skipIf(!hasDom)("FileUploadPage 组件级交互", () => {
 
   it(
     "渲染基础：状态标签 / 主文件标签 / 后台解析 vs 重新提取",
-    { timeout: 120_000 },
     async () => {
       const rtl = await loadRtl();
       if (!rtl) return;
@@ -235,7 +234,6 @@ describe.skipIf(!hasDom)("FileUploadPage 组件级交互", () => {
 
   it(
     "Gap-1 有文件时渲染「清空提取」按钮（danger + Popconfirm）",
-    { timeout: 120_000 },
     async () => {
       const rtl = await loadRtl();
       if (!rtl) return;
@@ -256,7 +254,6 @@ describe.skipIf(!hasDom)("FileUploadPage 组件级交互", () => {
 
   it(
     "Gap-1 无文件时不渲染「清空提取」按钮",
-    { timeout: 120_000 },
     async () => {
       const rtl = await loadRtl();
       if (!rtl) return;
@@ -276,7 +273,6 @@ describe.skipIf(!hasDom)("FileUploadPage 组件级交互", () => {
 
   it(
     "清空提取：后端返回 warning 时走 message.warning 而非成功提示",
-    { timeout: 120_000 },
     async () => {
       const rtl = await loadRtl();
       if (!rtl) return;
@@ -332,7 +328,6 @@ describe.skipIf(!hasDom)("FileUploadPage 组件级交互", () => {
 
   it(
     "清空提取：正常清空时按实际数量播报成功",
-    { timeout: 120_000 },
     async () => {
       const rtl = await loadRtl();
       if (!rtl) return;
@@ -388,7 +383,6 @@ describe.skipIf(!hasDom)("FileUploadPage 组件级交互", () => {
 
   it(
     "角色切换：点击「设为主文件」调用 updateFileRole 并带正确参数",
-    { timeout: 120_000 },
     async () => {
       const rtl = await loadRtl();
       if (!rtl) return;
@@ -434,7 +428,6 @@ describe.skipIf(!hasDom)("FileUploadPage 组件级交互", () => {
 
   it(
     "角色切换：旧主文件被降级时如实提示（demoted_file_ids 透出）",
-    { timeout: 120_000 },
     async () => {
       const rtl = await loadRtl();
       if (!rtl) return;
@@ -466,7 +459,6 @@ describe.skipIf(!hasDom)("FileUploadPage 组件级交互", () => {
 
   it(
     "删除文件调用 deleteFile；删主文件时提示已自动提升新主文件",
-    { timeout: 120_000 },
     async () => {
       const rtl = await loadRtl();
       if (!rtl) return;
@@ -502,7 +494,6 @@ describe.skipIf(!hasDom)("FileUploadPage 组件级交互", () => {
 
   it(
     "重新提取：后端返回 status=failed 时不谎报成功",
-    { timeout: 120_000 },
     async () => {
       const rtl = await loadRtl();
       if (!rtl) return;
@@ -537,7 +528,6 @@ describe.skipIf(!hasDom)("FileUploadPage 组件级交互", () => {
 
   it(
     "批量上传：空态文案正确，上传回调触发后重新拉取文件列表",
-    { timeout: 120_000 },
     async () => {
       const rtl = await loadRtl();
       if (!rtl) return;
@@ -567,7 +557,6 @@ describe.skipIf(!hasDom)("FileUploadPage 组件级交互", () => {
 
   it(
     "TD6：accept 取自后端 supported-formats 端点下发的清单",
-    { timeout: 120_000 },
     async () => {
       const rtl = await loadRtl();
       if (!rtl) return;
@@ -602,7 +591,6 @@ describe.skipIf(!hasDom)("FileUploadPage 组件级交互", () => {
 
   it(
     "TD6：supported-formats 拉取失败时回落到本地常量，上传不受影响",
-    { timeout: 120_000 },
     async () => {
       const rtl = await loadRtl();
       if (!rtl) return;
@@ -634,7 +622,6 @@ describe.skipIf(!hasDom)("FileUploadPage 组件级交互", () => {
 
   it(
     "TD6：点击「预览文本」调用 getFileText 并展示提取正文",
-    { timeout: 120_000 },
     async () => {
       const rtl = await loadRtl();
       if (!rtl) return;
@@ -666,7 +653,6 @@ describe.skipIf(!hasDom)("FileUploadPage 组件级交互", () => {
 
   it(
     "TD6：提取文本为空时给出可行动提示而非空白弹窗",
-    { timeout: 120_000 },
     async () => {
       const rtl = await loadRtl();
       if (!rtl) return;

@@ -16,9 +16,6 @@ import threading
 
 logger = logging.getLogger(__name__)
 
-_LOCK = threading.RLock()
-_counters: dict[str, int] = {}
-
 #: 已知指标键（快照渲染时缺键补 0，前端卡片不出现「undefined」）。
 KNOWN_KEYS: tuple[str, ...] = (
     "audit_runs",            # 确定性规则审计执行次数（成功完成）
@@ -31,28 +28,54 @@ KNOWN_KEYS: tuple[str, ...] = (
 )
 
 
+class _MetricsRegistry:
+    """进程内线程安全计数器（与 prompts 的 ``get_prompt_metrics`` 同构）。"""
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._counters: dict[str, int] = {}
+
+    def inc(self, name: str, n: int = 1) -> None:
+        """递增某个指标计数。"""
+        with self._lock:
+            self._counters[name] = self._counters.get(name, 0) + n
+
+    def snapshot(self) -> dict[str, int]:
+        """返回当前所有指标的深拷贝快照（不含默认键补 0）。"""
+        with self._lock:
+            return dict(self._counters)
+
+    def snapshot_with_defaults(self) -> dict[str, int]:
+        """返回快照，已知键缺省补 0（供前端渲染）。"""
+        with self._lock:
+            base = dict(self._counters)
+        for k in KNOWN_KEYS:
+            base.setdefault(k, 0)
+        return base
+
+    def reset(self) -> None:
+        """清空全部计数（测试用）。"""
+        with self._lock:
+            self._counters.clear()
+
+
+#: 全局唯一实例。调用方 ``from ..services.consistency_metrics import
+#: consistency_metrics`` 后 ``.inc(...)`` 使用。
+consistency_metrics = _MetricsRegistry()
+
+
+# 模块级便捷函数（委托给全局实例，便于单行调用）
 def inc(name: str, n: int = 1) -> None:
-    """递增某个指标计数。"""
-    with _LOCK:
-        _counters[name] = _counters.get(name, 0) + n
+    consistency_metrics.inc(name, n)
 
 
 def snapshot() -> dict[str, int]:
-    """返回当前所有指标的深拷贝快照（不含默认键补 0）。"""
-    with _LOCK:
-        return dict(_counters)
+    return consistency_metrics.snapshot()
 
 
 def snapshot_with_defaults() -> dict[str, int]:
-    """返回快照，已知键缺省补 0（供前端渲染）。"""
-    with _LOCK:
-        base = dict(_counters)
-    for k in KNOWN_KEYS:
-        base.setdefault(k, 0)
-    return base
+    return consistency_metrics.snapshot_with_defaults()
 
 
 def reset() -> None:
-    """清空全部计数（测试用）。"""
-    with _LOCK:
-        _counters.clear()
+    consistency_metrics.reset()

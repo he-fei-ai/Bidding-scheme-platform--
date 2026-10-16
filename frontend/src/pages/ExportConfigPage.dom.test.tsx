@@ -133,7 +133,7 @@ describe.skipIf(!hasDom)("ExportConfigPage 组件级交互（导出链契约）"
     rtl.cleanup();
   });
 
-  it("点「完整性检查」调用 checkDocument 并透传 strictMode，渲染检查结果", { timeout: 120_000 }, async () => {
+  it("点「完整性检查」调用 checkDocument 并透传 strictMode，渲染检查结果", async () => {
     const rtl = await loadRtl();
     if (!rtl) return;
     checkDocumentMock.mockClear();
@@ -196,7 +196,7 @@ describe.skipIf(!hasDom)("ExportConfigPage 组件级交互（导出链契约）"
     rtl.cleanup();
   });
 
-  it("点「导出 DOCX」优先走 SSE 流并透传 preset 配置，完成后渲染下载入口", { timeout: 120_000 }, async () => {
+  it("点「导出 DOCX」优先走 SSE 流并透传 preset 配置，完成后渲染下载入口", async () => {
     const rtl = await loadRtl();
     if (!rtl) return;
     exportDocxStreamMock.mockClear();
@@ -221,7 +221,7 @@ describe.skipIf(!hasDom)("ExportConfigPage 组件级交互（导出链契约）"
     rtl.cleanup();
   });
 
-  it("渲染导出历史记录", { timeout: 120_000 }, async () => {
+  it("渲染导出历史记录", async () => {
     const rtl = await loadRtl();
     if (!rtl) return;
 
@@ -235,7 +235,7 @@ describe.skipIf(!hasDom)("ExportConfigPage 组件级交互（导出链契约）"
 
   // ENHANCE 2026-10-13：HTML 导出入口（后端 /export/html 上线后前端无入口，
   // 功能不可达）。钉住：按钮存在 + 点击调用 exportHtml + 透传同一份配置。
-  it("点「导出 HTML」调用 exportHtml 并透传配置（含 preset_id）", { timeout: 120_000 }, async () => {
+  it("点「导出 HTML」调用 exportHtml 并透传配置（含 preset_id）", async () => {
     const rtl = await loadRtl();
     if (!rtl) return;
     exportHtmlMock.mockClear();
@@ -254,7 +254,7 @@ describe.skipIf(!hasDom)("ExportConfigPage 组件级交互（导出链契约）"
     rtl.cleanup();
   });
 
-  it("HTML 导出失败时展示错误提示（不静默）", { timeout: 120_000 }, async () => {
+  it("HTML 导出失败时展示错误提示（不静默）", async () => {
     const rtl = await loadRtl();
     if (!rtl) return;
     exportHtmlMock.mockClear();
@@ -269,6 +269,68 @@ describe.skipIf(!hasDom)("ExportConfigPage 组件级交互（导出链契约）"
     // antd message.error 文案出现（按钮恢复可点）
     await vi.waitFor(() => expect(exportHtmlMock).toHaveBeenCalled());
     expect(await rtl.screen.findByText("文档为空，无法导出")).toBeTruthy();
+    rtl.cleanup();
+  });
+
+  it("PDF 下载失败且后端返回 501 长安装指引时走 Modal.error 展示（X-7）", async () => {
+    const rtl = await loadRtl();
+    if (!rtl) return;
+    const antd = (await import("antd")) as any;
+    const modalErrorSpy = vi.spyOn(antd.Modal, "error").mockImplementation(() => undefined);
+    const messageErrorSpy = vi.spyOn(antd.message, "error").mockImplementation(() => undefined);
+
+    exportPdfMock.mockClear();
+    exportPdfMock.mockRejectedValueOnce({
+      response: { status: 501, data: { detail: "PDF 转换不可用：未检测到 LibreOffice。请安装 LibreOffice（soffice）或设置环境变量 PDF_SOFFICE_PATH 指向 soffice.exe，详见项目 README。" } },
+    } as any);
+
+    const Page = (await import("./ExportConfigPage")).default;
+    rtl.render(<Page />);
+
+    // 点击历史表格第一行「PDF」按钮
+    const btn = await rtl.screen.findByText("PDF");
+    rtl.fireEvent.click(btn);
+
+    await vi.waitFor(() => expect(exportPdfMock).toHaveBeenCalled());
+    // 关键断言：长错误 + status 501 → 走 Modal.error 而非 message.error
+    await vi.waitFor(() => expect(modalErrorSpy).toHaveBeenCalled());
+    const firstCall = modalErrorSpy.mock.calls[0] as any[];
+    expect(firstCall[0]).toMatchObject({ title: "PDF 转换不可用" });
+    expect(String(firstCall[0].content)).toContain("LibreOffice");
+    expect(String(firstCall[0].content)).toContain("PDF_SOFFICE_PATH");
+
+    modalErrorSpy.mockRestore();
+    messageErrorSpy.mockRestore();
+    rtl.cleanup();
+  });
+
+  it("PDF 下载失败且错误信息较短时走 message.error（X-7 短错误路径）", async () => {
+    const rtl = await loadRtl();
+    if (!rtl) return;
+    const antd = (await import("antd")) as any;
+    const modalErrorSpy = vi.spyOn(antd.Modal, "error").mockImplementation(() => undefined);
+    const messageErrorSpy = vi.spyOn(antd.message, "error").mockImplementation(() => undefined);
+
+    exportPdfMock.mockClear();
+    exportPdfMock.mockRejectedValueOnce({
+      response: { status: 500, data: { detail: "服务暂时不可用" } },
+    } as any);
+
+    const Page = (await import("./ExportConfigPage")).default;
+    rtl.render(<Page />);
+
+    const btn = await rtl.screen.findByText("PDF");
+    rtl.fireEvent.click(btn);
+
+    await vi.waitFor(() => expect(exportPdfMock).toHaveBeenCalled());
+    // 短错误走 message.error，不走 Modal
+    await vi.waitFor(() => expect(messageErrorSpy).toHaveBeenCalled());
+    const firstCall = messageErrorSpy.mock.calls[0] as any[];
+    expect(String(firstCall[0])).toContain("服务暂时不可用");
+    expect(modalErrorSpy).not.toHaveBeenCalled();
+
+    modalErrorSpy.mockRestore();
+    messageErrorSpy.mockRestore();
     rtl.cleanup();
   });
 });

@@ -215,14 +215,14 @@ describe.skipIf(!hasDom)("一致性校核 —— Tab 级与组件级交互", () 
   // Tab 级
   // -------------------------------------------------------------------------
 
-  it("Tab 级：默认落在「一致性冲突」，且不会请求评分达标数据", { timeout: 120_000 }, async () => {
+  it("Tab 级：默认落在「一致性冲突」，且不会请求评分达标数据", async () => {
     render(<ConsistencyPage />);
     await screen.findByText("工期", undefined, { timeout: 60_000 });
     // antd Tabs 懒挂载：非激活 Tab 组件不挂载 → 不应发起评分达标请求
     expect(getScoringMock).not.toHaveBeenCalled();
   });
 
-  it("Tab 级：切到「评分标准达标」才请求并渲染缺口表", { timeout: 120_000 }, async () => {
+  it("Tab 级：切到「评分标准达标」才请求并渲染缺口表", async () => {
     render(<ConsistencyPage />);
     await screen.findByText("工期", undefined, { timeout: 60_000 });
 
@@ -243,7 +243,7 @@ describe.skipIf(!hasDom)("一致性校核 —— Tab 级与组件级交互", () 
     expect(await screen.findByText("评分项总数")).toBeTruthy();
   });
 
-  it("Tab 级：评分达标承载章节可深链到章节编辑器", { timeout: 120_000 }, async () => {
+  it("Tab 级：评分达标承载章节可深链到章节编辑器", async () => {
     render(<ConsistencyPage />);
     await screen.findByText("工期", undefined, { timeout: 60_000 });
     fireEvent.click(await screen.findByText("评分标准达标"));
@@ -256,14 +256,14 @@ describe.skipIf(!hasDom)("一致性校核 —— Tab 级与组件级交互", () 
   // 冲突组件级
   // -------------------------------------------------------------------------
 
-  it("组件级：冲突的 section 来源渲染为可点击标签并深链", { timeout: 120_000 }, async () => {
+  it("组件级：冲突的 section 来源渲染为可点击标签并深链", async () => {
     await renderConflictTab();
     // 后端 sources 里的 "section_12 (第三章 施工方案)" 应渲染成可点的章节标题
     fireEvent.click(await screen.findByText("第三章 施工方案"));
     expect(navigateMock).toHaveBeenCalledWith("/projects/1/sections?section=12");
   });
 
-  it("组件级：非章节来源（摘要/全局事实）不可点、仅作文本展示", { timeout: 120_000 }, async () => {
+  it("组件级：非章节来源（摘要/全局事实）不可点、仅作文本展示", async () => {
     await renderConflictTab();
     expect(await screen.findByText("summary (摘要)")).toBeTruthy();
     expect(await screen.findByText("global_facts (已确认事实基准)")).toBeTruthy();
@@ -271,7 +271,7 @@ describe.skipIf(!hasDom)("一致性校核 —— Tab 级与组件级交互", () 
     expect(navigateMock).not.toHaveBeenCalled();
   });
 
-  it("组件级：切到「已解决」会把 resolved=resolved 传给后端，且行不再有修复入口", { timeout: 120_000 }, async () => {
+  it("组件级：切到「已解决」会把 resolved=resolved 传给后端，且行不再有修复入口", async () => {
     await renderConflictTab();
     fireEvent.click(await screen.findByText("已解决"));
 
@@ -289,7 +289,7 @@ describe.skipIf(!hasDom)("一致性校核 —— Tab 级与组件级交互", () 
     expect(screen.queryByText("自动修复")).toBeNull();
   });
 
-  it("组件级：无未解决冲突时 AI 修复按钮禁用", { timeout: 120_000 }, async () => {
+  it("组件级：无未解决冲突时 AI 修复按钮禁用", async () => {
     getAuditSummaryMock.mockResolvedValue({
       status: "ok",
       summary: {
@@ -317,7 +317,7 @@ describe.skipIf(!hasDom)("一致性校核 —— Tab 级与组件级交互", () 
     expect((previewBtn as HTMLButtonElement).disabled).toBe(true);
   });
 
-  it("组件级：摘要含 low 时渲染「轻微冲突」卡片（low 档可达）", { timeout: 120_000 }, async () => {
+  it("组件级：摘要含 low 时渲染「轻微冲突」卡片（low 档可达）", async () => {
     // ENHANCE 2026-10-09：后端 `_assess_severity` 此前只有 high/medium 两条分支，
     // `SEVERITY_LOW` 是永远取不到值的死档，卡片也就无从展示。判定标准收敛到
     // `consistency_rules.assess_severity` 后该档可达 —— 本用例钉住前端能显示它。
@@ -338,7 +338,7 @@ describe.skipIf(!hasDom)("一致性校核 —— Tab 级与组件级交互", () 
     expect(await screen.findByText("中等冲突（未解决）")).toBeTruthy();
   });
 
-  it("组件级：自动修复未填统一值时不提交（后端另有 400 兜底）", { timeout: 120_000 }, async () => {
+  it("组件级：自动修复未填统一值时不提交（后端另有 400 兜底）", async () => {
     await renderConflictTab();
 
     // 表格行里的「自动修复」按钮（弹窗标题也叫「自动修复」，故取首个匹配）
@@ -349,7 +349,7 @@ describe.skipIf(!hasDom)("一致性校核 —— Tab 级与组件级交互", () 
     await waitFor(() => expect(applyAutoFixMock).not.toHaveBeenCalled(), { timeout: 10_000 });
   });
 
-  it("组件级：审计失败时不弹「审计完成」（BUG-2 前端侧）", { timeout: 120_000 }, async () => {
+  it("组件级：审计失败时不弹「审计完成」（BUG-2 前端侧）", async () => {
     const antd = await import("antd");
     const messages: string[] = [];
     const origSuccess = antd.message.success;

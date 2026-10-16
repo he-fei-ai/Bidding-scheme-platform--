@@ -376,6 +376,10 @@ export default function ExportConfigPage() {
 
   // ENHANCE 2026-10-04（T1）：历史/结果区共用的 PDF 下载处理。
   // 后端 501（未装 LibreOffice）的 detail 已含安装指引，直接展示即可。
+  //
+  // X-7（2026-10-16，N-4 新发现）：改用 extractApiError 与其余 handler
+  // 同口径解析后端错误；501 或长错误信息走 Modal 展示（安装指引通常超过
+  // message.error 一行显示的容量），短错误仍走 message.error。
   const handleDownloadPdf = async (exportId: number) => {
     if (pdfLoadingId !== null) return;
     setPdfLoadingId(exportId);
@@ -383,7 +387,20 @@ export default function ExportConfigPage() {
       await exportPdf(projectId, exportId);
       message.success("PDF 已下载");
     } catch (e: any) {
-      message.error(e?.message || "PDF 转换失败");
+      const detail = extractApiError(e) || "PDF 转换失败";
+      // X-7：501（LibreOffice 未安装）或后端返回较长安装指引时走 Modal 完整展示。
+      // axios 错误对象 status 在 `e.response?.status`；兜底也检查 `e.status` 兼容非 axios 场景。
+      const respStatus = e?.response?.status ?? e?.status;
+      const isServerHint = respStatus === 501 || detail.length > 60;
+      if (isServerHint) {
+        Modal.error({
+          title: "PDF 转换不可用",
+          content: detail,
+          icon: <WarningOutlined />,
+        });
+      } else {
+        message.error(detail);
+      }
     } finally {
       setPdfLoadingId(null);
     }

@@ -36,33 +36,55 @@ describe("classifyUploadResult（上传结果分类）", () => {
   it("缺少 status 字段（旧后端）不再默认为成功，返回 parse_failed", () => {
     expect(classifyUploadResult({} as { status?: string })).toBe("parse_failed");
   });
+
+  it("HARDENING 2026-10-16：status=processing（图片异步解析）单列 pending，不计入 ok", () => {
+    // 此前 processing 落入 ok，批尾汇总把「后台解析中」谎报成「解析成功」；
+    // OCR 随后失败时汇总与终态不一致，用户被误导。
+    expect(classifyUploadResult({ status: "processing" })).toBe("pending");
+  });
 });
 
 describe("accumulateBatchTotals（批量计数累加）", () => {
-  it("三类结果分别累加，且不修改原对象", () => {
+  it("四类结果分别累加，且不修改原对象", () => {
     const t0 = { ...EMPTY_BATCH_TOTALS };
     const t1 = accumulateBatchTotals(t0, "ok");
-    const t2 = accumulateBatchTotals(t1, "parse_failed");
-    const t3 = accumulateBatchTotals(t2, "error");
-    expect(t0).toEqual({ ok: 0, parseFailed: 0, failed: 0 });
-    expect(t3).toEqual({ ok: 1, parseFailed: 1, failed: 1 });
-    expect(totalBatchCount(t3)).toBe(3);
+    const t2 = accumulateBatchTotals(t1, "pending");
+    const t3 = accumulateBatchTotals(t2, "parse_failed");
+    const t4 = accumulateBatchTotals(t3, "error");
+    expect(t0).toEqual({ ok: 0, pending: 0, parseFailed: 0, failed: 0 });
+    expect(t4).toEqual({ ok: 1, pending: 1, parseFailed: 1, failed: 1 });
+    expect(totalBatchCount(t4)).toBe(4);
   });
 });
 
 describe("formatBatchSummary（批尾汇总文案）", () => {
   it("只处理 1 个文件时不重复汇总（返回 null）", () => {
-    expect(formatBatchSummary({ ok: 1, parseFailed: 0, failed: 0 })).toBeNull();
+    expect(formatBatchSummary({ ok: 1, parseFailed: 0, failed: 0, pending: 0 })).toBeNull();
     expect(formatBatchSummary({ ...EMPTY_BATCH_TOTALS })).toBeNull();
   });
 
   it("全部成功：success + 成功计数", () => {
-    const s = formatBatchSummary({ ok: 3, parseFailed: 0, failed: 0 });
+    const s = formatBatchSummary({ ok: 3, parseFailed: 0, failed: 0, pending: 0 });
     expect(s).toEqual({ type: "success", text: "批量上传完成，成功 3 个文件" });
   });
 
+  it("HARDENING 2026-10-16：含后台解析中文件时如实区分，不谎报全部成功", () => {
+    const s = formatBatchSummary({ ok: 1, parseFailed: 0, failed: 0, pending: 2 });
+    expect(s).toEqual({
+      type: "success",
+      text: "批量上传完成，成功 1 个文件，2 个正在后台解析",
+    });
+  });
+
+  it("HARDENING 2026-10-16：pending 与失败并存时进 warning 分支并如实列出", () => {
+    const s = formatBatchSummary({ ok: 1, parseFailed: 1, failed: 0, pending: 1 });
+    expect(s?.type).toBe("warning");
+    expect(s?.text).toContain("后台解析中 1 个");
+    expect(s?.text).toContain("解析失败 1 个");
+  });
+
   it("BUG-FIX B1 回归：HTTP 成功但解析失败不得计入成功，必须告警", () => {
-    const s = formatBatchSummary({ ok: 2, parseFailed: 1, failed: 0 });
+    const s = formatBatchSummary({ ok: 2, parseFailed: 1, failed: 0, pending: 0 });
     expect(s).not.toBeNull();
     expect(s?.type).toBe("warning");
     expect(s?.text).toContain("成功 2 个");
@@ -71,7 +93,7 @@ describe("formatBatchSummary（批尾汇总文案）", () => {
   });
 
   it("请求失败与解析失败分别计数", () => {
-    const s = formatBatchSummary({ ok: 1, parseFailed: 2, failed: 3 });
+    const s = formatBatchSummary({ ok: 1, parseFailed: 2, failed: 3, pending: 0 });
     expect(s?.text).toContain("上传失败 3 个");
     expect(s?.text).toContain("解析失败 2 个");
   });
@@ -79,12 +101,16 @@ describe("formatBatchSummary（批尾汇总文案）", () => {
 
 describe("shouldNotifySingle（单文件提示闸门）", () => {
   it("最后一个在途且本批仅 1 个 → 逐条提示", () => {
-    expect(shouldNotifySingle(1, { ok: 1, parseFailed: 0, failed: 0 })).toBe(true);
+    expect(shouldNotifySingle(1, { ok: 1, parseFailed: 0, failed: 0, pending: 0 })).toBe(true);
   });
 
   it("批量场景不逐条刷屏（在途 >1 或本批 >1）", () => {
-    expect(shouldNotifySingle(3, { ok: 1, parseFailed: 0, failed: 0 })).toBe(false);
-    expect(shouldNotifySingle(1, { ok: 2, parseFailed: 0, failed: 0 })).toBe(false);
+    expect(shouldNotifySingle(3, { ok: 1, parseFailed: 0, failed: 0, pending: 0 })).toBe(false);
+    expect(shouldNotifySingle(1, { ok: 2, parseFailed: 0, failed: 0, pending: 0 })).toBe(false);
+  });
+
+  it("HARDENING 2026-10-16：单张图片（pending）也走逐条提示", () => {
+    expect(shouldNotifySingle(1, { ok: 0, parseFailed: 0, failed: 0, pending: 1 })).toBe(true);
   });
 });
 

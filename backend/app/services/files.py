@@ -2049,7 +2049,13 @@ def re_extract_text(project_id: int, file_id: int) -> dict:
                 "filename": filename,
                 "status": "failed",
                 "message": f"写入提取文本失败: {e}",
-                "text_length": 0,
+                # BUG-FIX 2026-10-16（接口字段不实）：此前写盘失败分支硬编码
+                # text_length=0，而 extracted_text 此时**可能已提取到内容**
+                # （磁盘满/权限拒绝只发生在落盘环节）。字段含义是「本次提取
+                # 到的文本长度」，与落盘成败无关：报 0 会让调用方误以为
+                # 「什么都没提取到」，把一次写入故障误导成内容问题。
+                # 空文本/提取失败路径的 extracted_text 本就是空串，取值不变。
+                "text_length": len(extracted_text),
             }
     else:
         logger.info("重提取未产出文本，不落盘: %s (status=%s)", filename, status)

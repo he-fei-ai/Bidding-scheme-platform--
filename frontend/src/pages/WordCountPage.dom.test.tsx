@@ -99,7 +99,7 @@ describe.skipIf(!hasDom)("WordCountPage 组件级交互", () => {
     }
   });
 
-  it("渲染概览卡片与章节明细表，缺字章节提示「缺 N 字」", { timeout: 120_000 }, async () => {
+  it("渲染概览卡片与章节明细表，缺字章节提示「缺 N 字」", async () => {
     const rtl = await loadRtl();
     if (!rtl) return;
 
@@ -120,7 +120,7 @@ describe.skipIf(!hasDom)("WordCountPage 组件级交互", () => {
     rtl.cleanup();
   });
 
-  it("空数据时不崩，展示空态", { timeout: 120_000 }, async () => {
+  it("空数据时不崩，展示空态", async () => {
     const rtl = await loadRtl();
     if (!rtl) return;
 

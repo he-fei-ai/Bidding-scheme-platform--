@@ -110,7 +110,7 @@ describe.skipIf(!hasDom)("SummaryReviewPage 事实 Tab 组件级交互", () => {
     }
   });
 
-  it("渲染事实表格 + 内部矛盾告警卡片（fact_conflicts 消费）", { timeout: 120_000 }, async () => {
+  it("渲染事实表格 + 内部矛盾告警卡片（fact_conflicts 消费）", async () => {
     const rtl = await loadRtl();
     if (!rtl) return;
 
@@ -135,7 +135,7 @@ describe.skipIf(!hasDom)("SummaryReviewPage 事实 Tab 组件级交互", () => {
     rtl.cleanup();
   });
 
-  it("无冲突时不渲染矛盾告警", { timeout: 120_000 }, async () => {
+  it("无冲突时不渲染矛盾告警", async () => {
     const rtl = await loadRtl();
     if (!rtl) return;
 

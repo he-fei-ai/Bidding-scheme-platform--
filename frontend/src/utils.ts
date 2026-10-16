@@ -1237,17 +1237,19 @@ export function countExtractedFiles(files: { status: string }[]): number {
 // ============================================================
 
 /** 单份文件的上传结果分类 */
-export type UploadOutcome = "ok" | "parse_failed" | "error";
+export type UploadOutcome = "ok" | "pending" | "parse_failed" | "error";
 
-/** 本批次聚合计数：ok=上传并解析成功；parseFailed=HTTP 成功但解析失败；failed=请求失败 */
+/** 本批次聚合计数：ok=上传并解析成功；pending=已入库、后台异步解析中；parseFailed=HTTP 成功但解析失败；failed=请求失败 */
 export interface UploadBatchTotals {
   ok: number;
+  pending: number;
   parseFailed: number;
   failed: number;
 }
 
 export const EMPTY_BATCH_TOTALS: UploadBatchTotals = {
   ok: 0,
+  pending: 0,
   parseFailed: 0,
   failed: 0,
 };
@@ -1266,6 +1268,12 @@ export function classifyUploadResult(
   // 而是返回 "parse_failed" 让用户知情，避免静默丢失解析失败的文件。
   // 注意：后端正常响应总是包含 status 字段，仅旧版本后端可能缺失。
   if (res.status === undefined || res.status === null) return "parse_failed";
+  // HARDENING 2026-10-16（批尾汇总语义差）：图片等 OCR 耗时格式自 R-3 起走后端
+  // 异步解析，上传响应即时返回 status="processing"（文件已入库、Celery worker
+  // 稍后落终态）。此前它落入 "ok"，批尾汇总说「成功 N 个」；若 OCR 随后失败，
+  // 汇总与终态不一致 —— 用户以为这批文件都解析成功了。单列 "pending" 口径，
+  // 让汇总如实区分「解析已完成」与「后台解析中」。
+  if (res.status === "processing") return "pending";
   return "ok";
 }
 
@@ -1280,12 +1288,17 @@ export function accumulateBatchTotals(
   if (outcome === "error") {
     return { ...totals, failed: totals.failed + 1 };
   }
+  // HARDENING 2026-10-16：pending 单独计数，不混入 ok（否则批尾汇总无法区分
+  // 「解析已完成」与「后台解析中」）
+  if (outcome === "pending") {
+    return { ...totals, pending: totals.pending + 1 };
+  }
   return { ...totals, ok: totals.ok + 1 };
 }
 
 /** 本批次已处理文件总数 */
 export function totalBatchCount(totals: UploadBatchTotals): number {
-  return totals.ok + totals.parseFailed + totals.failed;
+  return totals.ok + totals.pending + totals.parseFailed + totals.failed;
 }
 
 /**
@@ -1309,11 +1322,20 @@ export function formatBatchSummary(
 ): { type: "success" | "warning" | "error"; text: string } | null {
   const total = totalBatchCount(totals);
   if (total <= 1) return null;
-  const { ok, parseFailed, failed } = totals;
+  const { ok, pending, parseFailed, failed } = totals;
   if (parseFailed === 0 && failed === 0) {
+    // HARDENING 2026-10-16：含后台解析中的文件时如实说明，不再一律宣称
+    // 「成功 N 个」（OCR 终态尚未落库，见 classifyUploadResult 注释）
+    if (pending > 0) {
+      return {
+        type: "success",
+        text: `批量上传完成，成功 ${ok} 个文件，${pending} 个正在后台解析`,
+      };
+    }
     return { type: "success", text: `批量上传完成，成功 ${ok} 个文件` };
   }
   const parts: string[] = [`成功 ${ok} 个`];
+  if (pending > 0) parts.push(`后台解析中 ${pending} 个`);
   if (parseFailed > 0) parts.push(`解析失败 ${parseFailed} 个`);
   if (failed > 0) parts.push(`上传失败 ${failed} 个`);
   return { type: "warning", text: `批量上传完成：${parts.join("，")}` };

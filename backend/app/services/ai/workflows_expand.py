@@ -59,6 +59,9 @@ AUDIT_GROUP_CHAR_LIMIT = 30000
 AUDIT_SECTION_CHAR_LIMIT = 5000
 #: 组间并发上限。首组仍串行（预热 prompt cache），其余组按该上限并发。
 AUDIT_GROUP_CONCURRENCY = 3
+#: 引入项 C 加固（2026-10-16）：evidence 原文锚点/落库描述的封顶长度，
+#: 防止模型回传整段正文撑爆补丁请求或 DB 字段（超出部分截断，锚点仍具定位力）。
+_AUDIT_EVIDENCE_ANCHOR_MAX = 300
 
 
 async def estimate_total_words_from_probe(
@@ -608,6 +611,12 @@ async def _repair_conflicts_with_patches(
         )
         entry["issues"].append(
             f"- {conflict.get('issue', '')}（修复建议：{conflict.get('suggestion', '')}）"
+            + (
+                f"\n  冲突原文锚点（请以此为准在正文中唯一定位 old_text）："
+                f"「{str(conflict.get('evidence', ''))[:_AUDIT_EVIDENCE_ANCHOR_MAX].strip()}」"
+                if str(conflict.get("evidence", "")).strip()
+                else ""
+            )
         )
         entry["findings"].append(finding)
 
@@ -757,6 +766,32 @@ async def _audit_one_group(
     if completeness_text:
         completeness_block = f"【缺值口径】\n{completeness_text}\n\n"
 
+    # 引入项 C（2026-10-16，对齐易标 buildConsistencyAuditMessages）：
+    # CONSISTENCY_AUDIT_EVIDENCE_ENABLED 开启时，冲突返回结构带
+    # evidence（正文冲突原文逐字摘录）/fact_title/severity，为后续补丁提供
+    # 原文锚点并供前端分级展示；默认关 = 提示词输出结构逐字保持现状。
+    from ..facts_service import consistency_audit_evidence_enabled
+
+    if consistency_audit_evidence_enabled():
+        _conflict_fields = (
+            '{"section_id": "章节ID", "fact_title": "相背的全局事实标题", '
+            '"evidence": "正文冲突原文逐字摘录", "issue": "问题描述", '
+            '"suggestion": "修复建议", "severity": "high|medium|low"}'
+        )
+        _evidence_rule = (
+            "【冲突定位要求】\n"
+            "1. evidence 必须是正文中冲突片段的逐字原文摘录（不要改写、不要加省略号），"
+            "以便后续按原文精确定位修复；\n"
+            "2. fact_title 填与之相背的全局事实标题；正文未涉及的事实不要报告缺失；\n"
+            "3. severity：工期/人员数量/设备型号/质保/响应时间等明确口径冲突记 high，"
+            "跨章节描述不一致记 medium，轻微措辞差异记 low。\n\n"
+        )
+    else:
+        _conflict_fields = (
+            '{"section_id": "章节ID", "issue": "问题描述", "suggestion": "修复建议"}'
+        )
+        _evidence_rule = ""
+
     audit_prompt = (
         f"你是一个标书一致性审计专家。请检查以下正文内容是否与项目事实变量存在冲突或不一致。\n\n"
         f"{facts_block}{completeness_block}"
@@ -767,11 +802,12 @@ async def _audit_one_group(
         f"2. 技术参数、标准编号是否合理\n"
         f"3. 不同章节之间对同一事项的描述是否一致\n"
         f"4. 是否存在明显的矛盾或冲突\n\n"
+        f"{_evidence_rule}"
         f"【输出格式】\n"
         f"返回 JSON 对象: {{\n"
         f'  "has_conflicts": true/false,\n'
         f'  "conflicts": [\n'
-        f'    {{"section_id": "章节ID", "issue": "问题描述", "suggestion": "修复建议"}}\n'
+        f"    {_conflict_fields}\n"
         f"  ]\n"
         f"}}\n"
         f'如果没有冲突，返回 {{"has_conflicts": false, "conflicts": []}}\n'
@@ -825,6 +861,9 @@ async def _audit_one_group(
                 "section_id": section_id,
                 "issue": issue,
                 "suggestion": suggestion,
+                "evidence": conflict.get("evidence", ""),
+                "fact_title": conflict.get("fact_title", ""),
+                "severity": conflict.get("severity", ""),
                 "repaired": False,
             }
             findings.append(finding)
@@ -858,6 +897,9 @@ async def _audit_one_group(
             "section_id": section_id,
             "issue": issue,
             "suggestion": suggestion,
+            "evidence": conflict.get("evidence", ""),
+            "fact_title": conflict.get("fact_title", ""),
+            "severity": conflict.get("severity", ""),
             "repaired": False,
         }
         findings.append(finding)
@@ -974,11 +1016,24 @@ def _persist_ai_audit_findings(
             issue = str(finding.get("issue") or "").strip()
             section_id = str(finding.get("section_id") or "")
             suggestion = str(finding.get("suggestion") or "").strip()
+            evidence = str(finding.get("evidence") or "").strip()[:_AUDIT_EVIDENCE_ANCHOR_MAX]
+            fact_title = str(finding.get("fact_title") or "").strip()[:100]
             repaired = bool(finding.get("repaired"))
             fact_name = issue[:100] or "AI 一致性发现"
             description = issue + (f"（修复建议：{suggestion}）" if suggestion else "")
+            if fact_title:
+                # 引入项 C（2026-10-16）：记录被违反的全局事实标题，前端可直接
+                # 定位口径来源；无 fact_title（默认关/模型未返回）时描述逐字不变。
+                description = f"【相背事实：{fact_title}】{description}"
+            if evidence:
+                # 引入项 C（2026-10-16）：审计带 evidence 时随描述落库，供前端
+                # 原文追溯；无 evidence（默认关/模型未返回）时描述逐字不变。
+                description = f"冲突原文：「{evidence}」\n{description}"
             conflict_id = f"AI-{project_id}-{uuid.uuid4().hex[:12]}"
-            severity = rules.SEVERITY_DEFAULT
+            # 引入项 C：尊重 AI 判定的 severity（合法值 high/medium/low），
+            # 非法/缺失一律回落 SEVERITY_DEFAULT（与确定性路径口径一致）。
+            _sev = str(finding.get("severity") or "").strip().lower()
+            severity = _sev if _sev in rules.SEVERITY_ORDER else rules.SEVERITY_DEFAULT
             conn.execute(
                 """INSERT INTO consistency_conflicts
                    (project_id, conflict_id, fact_name, values_json,

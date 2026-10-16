@@ -144,7 +144,7 @@ describe.skipIf(!hasDom)("冲突来源（rule/ai）区分展示", () => {
     cleanup();
   });
 
-  it("AI 发现行：紫色「AI 发现」标签 + 冲突数值列不再是空洞", { timeout: 120_000 }, async () => {
+  it("AI 发现行：紫色「AI 发现」标签 + 冲突数值列不再是空洞", async () => {
     render(<ConflictListTab projectId={1} />);
     // rc-table 在 jsdom 下渲染极慢：先等表格行里的短标签，再断言其余不变式。
     // AI 发现的 issue 原文被 UI 截断为「前 24 字 + …」，但悬浮 title 保留全文
@@ -157,7 +157,7 @@ describe.skipIf(!hasDom)("冲突来源（rule/ai）区分展示", () => {
     expect(screen.getByText(/无结构化取值/)).toBeTruthy();
   });
 
-  it("AI 发现行的「自动修复」被禁用，规则冲突行的可用", { timeout: 120_000 }, async () => {
+  it("AI 发现行的「自动修复」被禁用，规则冲突行的可用", async () => {
     render(<ConflictListTab projectId={1} />);
     await screen.findByText("AI 发现", undefined, { timeout: 60_000 });
     const buttons = Array.from(document.querySelectorAll("button"));
@@ -171,7 +171,7 @@ describe.skipIf(!hasDom)("冲突来源（rule/ai）区分展示", () => {
     expect((ruleButton as HTMLButtonElement).disabled).toBe(false);
   });
 
-  it("AI 发现的「修复建议」给出原文，且「采纳建议并修复」被禁用", { timeout: 120_000 }, async () => {
+  it("AI 发现的「修复建议」给出原文，且「采纳建议并修复」被禁用", async () => {
     render(<ConflictListTab projectId={1} />);
     await screen.findByText("AI 发现", undefined, { timeout: 60_000 });
     // 两行各有「修复建议」按钮 —— 点第一个（列表序默认 AI 行在前）
@@ -183,7 +183,7 @@ describe.skipIf(!hasDom)("冲突来源（rule/ai）区分展示", () => {
     expect((adoptBtn as HTMLButtonElement).disabled).toBe(true);
   });
 
-  it("摘要卡片标注「其中 N 条为 AI 语义发现」", { timeout: 120_000 }, async () => {
+  it("摘要卡片标注「其中 N 条为 AI 语义发现」", async () => {
     render(<ConflictListTab projectId={1} />);
     expect(await screen.findByText(/其中 1 条为 AI 语义发现/, undefined, { timeout: 60_000 })).toBeTruthy();
   });
