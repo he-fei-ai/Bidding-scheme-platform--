@@ -588,14 +588,22 @@ class TestContextInjection:
         from app.services.ai import workflows_outline_utils
 
         src = inspect.getsource(workflows_outline_utils)
-        fn = next(
-            (
-                inspect.getsource(f)
-                for n, f in vars(workflows_outline_utils).items()
-                if inspect.isfunction(f) and "repair" in n.lower() and "L3" in inspect.getsource(f)
-            ),
-            "",
-        )
+        # BUG-FIX 2026-10-15：原实现用 next(...) 取「定义序第一个」名字含 repair
+        # 且源码含 L3 的函数。后引入的配置读取小函数 `_repair_quota_by_task`
+        # （docstring 含 OUTLINE_L3_REPAIR_QUOTA_BY_TASK）定义在真正的入口
+        # `repair_l3_generic_titles` 之前，启发式误中小函数导致假红。
+        # 改为：名字含 l3 的候选优先；否则取候选中最长者（入口必然大于 helper）。
+        candidates = [
+            inspect.getsource(f)
+            for n, f in vars(workflows_outline_utils).items()
+            if inspect.isfunction(f) and "repair" in n.lower() and "L3" in inspect.getsource(f)
+        ]
+        l3_named = [
+            inspect.getsource(f)
+            for n, f in vars(workflows_outline_utils).items()
+            if inspect.isfunction(f) and "repair" in n.lower() and "l3" in n.lower()
+        ]
+        fn = next(iter(l3_named), max(candidates, key=len, default=""))
         body = fn or src
         assert "sanitize_prompt_value" in body, "L3 修复上下文未脱敏"
         assert "assemble_prompt_context" in body, "L3 修复上下文未走 Token 预算"

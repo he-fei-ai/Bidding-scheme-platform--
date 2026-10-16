@@ -48,26 +48,62 @@ def _char_bigrams(text: str) -> set[str]:
     return {compact[i:i + 2] for i in range(len(compact) - 1)}
 
 
-def _extract_clauses(results: Any) -> list[dict]:
-    """从 rejection_checks.results 的多种形态里提取条款文本（防御式解析）。"""
+def _extract_clauses(results: Any, check_items: Any = None) -> list[dict]:
+    """从 rejection_checks 的 check_items / results 中提取条款文本（防御式解析）。
+
+    BUG-FIX 2026-10-15（D7 · P1）：原实现只从 ``results`` 提取，而标准
+    results 结构是 ``{"rejection": [...issues], "spelling": [...], "logic": [...]}``
+    ——键名不匹配任何预期 key（"items"/"clauses"/"findings" 等），且兜底
+    ``for v in results.values()`` 只处理 dict 值、跳过 list → **永远提取
+    到 0 条条款** → 覆盖率端点对已跑过检查的项目恒返回 "no_checks"。
+
+    修复：
+      1. 优先从 ``check_items``（任务原始废标条款）提取——这是条款的
+         唯一权威来源（results 是"发现的问题"，不是"检查条款"本身）；
+      2. ``_push`` 补充 ``description`` 字段（废标条款的标准描述字段）；
+      3. 兜底遍历时对 list 值递归展开（兼容 ``{"rejection": [...]}`` 结构）。
+    """
     clauses: list[dict] = []
 
-    def _push(raw: dict) -> None:
+    def _push(raw: Any) -> None:
         if not isinstance(raw, dict):
             return
+        # BUG-FIX 2026-10-15（D7）：补充 description —— 废标条款的标准字段
         text = (
-            str(raw.get("clause") or raw.get("standard") or raw.get("requirement")
-               or raw.get("name") or raw.get("title") or raw.get("item") or "").strip()
-        )
+            str(
+                raw.get("clause")
+                or raw.get("standard")
+                or raw.get("requirement")
+                or raw.get("description")
+                or raw.get("name")
+                or raw.get("title")
+                or raw.get("item")
+                or ""
+            )
+        ).strip()
         if len(text) < 4:
             return
-        clauses.append({
-            "id": str(raw.get("id") or raw.get("item_id") or len(clauses) + 1),
-            "name": str(raw.get("name") or raw.get("title") or "")[:120],
-            "text": text,
-            "raw": raw,
-        })
+        clauses.append(
+            {
+                "id": str(raw.get("id") or raw.get("item_id") or len(clauses) + 1),
+                "name": str(raw.get("name") or raw.get("title") or text[:60])[:120],
+                "text": text,
+                "raw": raw,
+            }
+        )
 
+    # 优先从 check_items（任务原始条款）提取
+    if check_items:
+        if isinstance(check_items, list):
+            for item in check_items:
+                _push(item)
+        elif isinstance(check_items, dict):
+            for v in check_items.values():
+                _push(v)
+        if clauses:
+            return clauses
+
+    # 兜底：从 results 结构提取
     if isinstance(results, list):
         for item in results:
             _push(item)
@@ -78,20 +114,21 @@ def _extract_clauses(results: Any) -> list[dict]:
             value = results.get(key)
             if isinstance(value, list):
                 for item in value:
-                    if isinstance(item, dict):
-                        _push(item)
+                    _push(item)
                 if clauses:
                     return clauses
             elif isinstance(value, dict):
                 for v in value.values():
-                    if isinstance(v, dict):
-                        _push(v)
+                    _push(v)
                 if clauses:
                     return clauses
-        # 再兜底：直接是 {item_id: {…}} 形态
+        # 再兜底：直接是 {item_id: {...}} 或 {dimension: [...]} 形态
         for v in results.values():
             if isinstance(v, dict):
                 _push(v)
+            elif isinstance(v, list):
+                for item in v:
+                    _push(item)
     return clauses
 
 
@@ -111,7 +148,7 @@ def rejection_answer_coverage(
     """
     with get_db() as conn:
         row = conn.execute(
-            "SELECT results FROM rejection_checks "
+            "SELECT results, check_items FROM rejection_checks "
             "WHERE project_id = ? AND status = 'completed' ORDER BY id DESC LIMIT 1",
             (project_id,),
         ).fetchone()
@@ -147,7 +184,20 @@ def rejection_answer_coverage(
     except json.JSONDecodeError:
         results = {}
 
-    clauses = _extract_clauses(results)
+    # BUG-FIX 2026-10-15（D7）：同时传入 check_items —— 这是条款的唯一
+    # 权威来源。results 里存的是"发现的问题"而非"检查条款本身"。
+    check_items_raw = None
+    if row is not None:
+        try:
+            check_items_raw = row["check_items"]
+        except (IndexError, KeyError):
+            check_items_raw = None
+    try:
+        check_items = json.loads(check_items_raw or "[]")
+    except json.JSONDecodeError:
+        check_items = []
+
+    clauses = _extract_clauses(results, check_items)
     if not clauses:
         return {"status": "no_checks", "scanned_clauses": 0,
                 "message": "废标检查结果中没有可解析的检查条款"}

@@ -26,7 +26,11 @@ from .providers.base import AIMessage
 # 2026-10-10：三级标题 AI 修复的条数上限改为可配置。
 # 旧实现硬编码 `warnings[:10]` —— 大目录（数百三级节点）必然残留未修复脏标题，
 # 而该上限此前既无法调、也无法观测。
-from app.config import OUTLINE_L3_REPAIR_CONCURRENCY, OUTLINE_L3_REPAIR_MAX  # noqa: E402
+from app.config import (  # noqa: E402
+    OUTLINE_L3_REPAIR_CONCURRENCY,
+    OUTLINE_L3_REPAIR_MAX,
+    OUTLINE_L3_REPAIR_MAX_ROUNDS,
+)
 
 # 2026-10-10：AI 修复结果需经统一脏标题判定，避免把占位标题写回去。
 # outline_common 无任何本包内导入，不会形成循环。
@@ -930,6 +934,17 @@ def _locate_by_path(tree: list, path: str, ancestors: list | None = None):
     )
 
 
+def _repair_quota_by_task() -> bool:
+    """惰性读取 config.OUTLINE_L3_REPAIR_QUOTA_BY_TASK（支持测试打桩/热更新）。
+
+    本模块其它配置项均为 import 时值绑定，但该开关用于回退/对照历史行为，
+    需要能被 monkeypatch 即时生效，故单独走惰性读取。
+    """
+    from app.config import OUTLINE_L3_REPAIR_QUOTA_BY_TASK  # noqa: PLC0415
+
+    return OUTLINE_L3_REPAIR_QUOTA_BY_TASK
+
+
 async def repair_l3_generic_titles(
     provider: Any,
     outline: list[dict],
@@ -1004,8 +1019,21 @@ async def repair_l3_generic_titles(
     # 4 段 path（如 `1.1.2.1`），原实现必漏修 —— 脏标题原样流出。
     # 现改为路径递归定位 `_locate_by_path`：任意深度均支持，写入直接改节点引用，
     # 无需再算 i/j/k（`repaired` 在本函数内已 deepcopy，持引用直改安全）。
+    #
+    # ★ 2026-10-15 修复（D3 · 配额泄漏）：旧实现先 `warnings[:max_repair]` 切片、
+    # 再在循环里 `continue` 跳过空标题节点 —— 被跳过的条目**仍消耗配额**，
+    # 实际修复数显著小于 max_repair，且靠后位置的脏标题永远进不了任务队列。
+    # 现改为「凑满 max_repair 个可执行任务为止」，配额按可执行任务计。
+    # 由 config.OUTLINE_L3_REPAIR_QUOTA_BY_TASK 控制（默认 true）：
+    #   true  = 配额按「可执行任务」计，空标题走规则兜底并入本轮
+    #   false = 回退历史口径（按告警序号截断 + 空标题静默跳过 → 永久泄漏）
+    # 开关打开时不做截断，改由 count 自然终止。
     repair_tasks: list[tuple] = []
-    for w in warnings[:max_repair]:  # 最多修复 max_repair 个，避免过多 AI 调用
+    rule_only_tasks: list[tuple] = []  # 空标题节点：直接规则兜底，不调用 AI
+    _quota = max_repair if _repair_quota_by_task() else None
+    for _i, w in enumerate(warnings):
+        if _quota is None and _i >= max_repair:
+            break
         path = w.get("path", "")
         if not path:
             continue
@@ -1016,10 +1044,31 @@ async def repair_l3_generic_titles(
             )
             continue
         l1_title = ancestors[0] if ancestors else ""
-        l3_title = node.get("title", "")
+        l3_title = str(node.get("title") or "").strip()
         if not l3_title:
-            continue
-        repair_tasks.append((path, node, l1_title, parent_title, l3_title))
+            # BUG-FIX 2026-10-15（D3 · 空标题永久泄漏）：旧实现
+            # `if not l3_title: continue` 把空标题节点静默跳过，而
+            # `validate_l3_specificity` 恰恰会检出空标题 —— 于是一个比泛化标题
+            # 更严重的缺陷（落库后用户看到空条目）永远无人修复。空标题既没有
+            # 原标题可供 AI 参考，也不需要 AI 提示词，直接走规则兜底按父级
+            # 语义生成具体标题即可。
+            if _quota is None:  # 历史口径：保持静默跳过（向后兼容）
+                continue
+            rule_only_tasks.append((path, node, l1_title, parent_title, ""))
+        else:
+            repair_tasks.append((path, node, l1_title, parent_title, l3_title))
+        if _quota is not None and (len(repair_tasks) + len(rule_only_tasks)) >= max_repair:
+            break
+    _total_planned = len(repair_tasks) + len(rule_only_tasks)
+    if _total_planned < len(warnings):
+        logger.warning(
+            "[L3修复] 单次上限 %d 条，本轮计划修复 %d 个，剩余 %d 个留待后续轮次"
+            "（OUTLINE_L3_REPAIR_MAX_ROUNDS=%d）",
+            max_repair,
+            _total_planned,
+            len(warnings) - _total_planned,
+            OUTLINE_L3_REPAIR_MAX_ROUNDS,
+        )
 
     # BUG-FIX 2026-10-12（P1）：AI 复读/返回占位时**不再原样保留脏标题**，
     # 改为回落到规则化语义标题。旧行为下「专项7」被拒绝后，节点标题仍是
@@ -1093,7 +1142,10 @@ async def repair_l3_generic_titles(
         def _fallback(reason: str) -> None:
             """AI 修复失败时的规则兜底：绝不把脏标题留给用户。"""
             _new = _rule_based_fallback(node, l1_title, l2_title, path)
-            if _new and _new != l3_title and not _is_dirty_l3_title(_new):
+            # BUG-FIX 2026-10-15（D1）：判定统一升级为深度判定，与下方 AI 结果
+            # 校验口径一致 —— 规则兜底同样可能产出「总体实施策划专项方案」这类
+            # 泛化词干×维度词组合（此前用浅判定，此类标题会被放行落库）。
+            if _new and _new != l3_title and not _is_dirty_l3_title_deep(_new):
                 node["title"] = _new
                 _global_used_titles.add(_new)
                 logger.info("[L3修复] %s → %s（规则兜底: %s）", l3_title[:30], _new[:30], reason)
@@ -1127,6 +1179,20 @@ async def repair_l3_generic_titles(
         except Exception as e:
             logger.warning("[L3修复] AI调用失败 (%s): %s", l3_title[:20], e)
             _fallback("AI 调用异常")
+
+    # 空标题节点直接规则兜底（同步执行，无 AI 调用）
+    #
+    # BUG-FIX 2026-10-15（D3 · 空标题永久泄漏）：见上方 rule_only_tasks 的注释。
+    for _path, _node, _l1, _l2, _l3 in rule_only_tasks:
+        _new = _rule_based_fallback(_node, _l1, _l2, _path)
+        if _new and _new != _l3 and not _is_dirty_l3_title_deep(_new):
+            _node["title"] = _new
+            _global_used_titles.add(_new)
+            logger.info("[L3修复] 空标题 → %s（规则兜底，父级=%s）", _new[:30], _l2[:20])
+        else:
+            logger.warning(
+                "[L3修复] 空标题节点规则兜底失败，保留空标题（path=%s）", _path,
+            )
 
     if repair_tasks:
         # 2026-10-10 加固：旧实现直接 asyncio.gather 全量并发，实际并发数等于

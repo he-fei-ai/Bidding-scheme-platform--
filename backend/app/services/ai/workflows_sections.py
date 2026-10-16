@@ -86,6 +86,17 @@ except ImportError:  # pragma: no cover - 兜底路径
     format_chapter_fields_for_prompt = None
     select_fields_for_chapter = None
 
+# BUG-FIX 2026-10-15（P1·图表围栏 mask 口径分叉）：
+# 本模块的压缩前置保护（_mask_chart_fences_for_compression）原先自带一份手写
+# 围栏正则，与 content_cleaning 的单一权威状态机分叉——只认 3 个反引号、不认
+# 波浪线、且按子串而非围栏标记行匹配。现直接复用 content_cleaning 的围栏判定
+# 口径（CHART_FENCE_OPEN_PATTERN / _classify_fence_line / _fence_line_is_new_open），
+# 避免第 4 份分叉实现。
+try:
+    from ...services import content_cleaning
+except ImportError:  # pragma: no cover - 兜底路径
+    from app.services import content_cleaning  # type: ignore  # noqa: PLC0415
+
 
 logger = logging.getLogger(__name__)
 
@@ -1785,18 +1796,44 @@ _MAX_SEAM_OVERLAP = 400
 _MAX_CONTINUE_CONTEXT_CHARS = 6000
 
 
+def _seam_overlap_min_chars() -> int:
+    """读 config.SEAM_OVERLAP_MIN_CHARS（惰性读取以支持测试打桩）。
+
+    0 表示完全回退到历史行为（k=1 起逐字探测）。
+    """
+    from app.config import SEAM_OVERLAP_MIN_CHARS  # noqa: PLC0415
+
+    return int(SEAM_OVERLAP_MIN_CHARS)
+
+
 def _strip_seam_overlap(final_content: str, extra: str) -> str:
     """剥离 extra 前缀中与 final_content 尾部重叠的重复段（接缝去重）。
 
     返回去掉重叠前缀后的 extra；无重叠则原样返回。
+
+    Risk-P2c FIX 2026-10-15：为「部分重叠」设置最小长度阈值。
+    旧实现从最长一路探测到 k=1，任何 1~2 字的巧合匹配都被当作「截断续写」剥掉，
+    例如 final="本阶段已完成采购" + extra="采购的时间节点如下：" → 剥掉「采购」
+    留下「的时间节点如下：」——主语丢失、句子语义断裂。中文 2 字词（采购/完成/
+    阶段/体系/质量/安全）在相邻段落高频同现，误剥概率很高。
+
+    现规则（探针：backend/scripts/_audit5_recheck.py）：
+      - **完全重叠**（extra 整体都在 final 尾部窗口内，k == len(extra)）：
+        无条件剥离，不受阈值影响。此时 AI 未写出任何新内容，保留只是把同一段话
+        重复一遍——历史契约见 test_content_continue_hardening_2026_10_06.py::
+        test_strip_seam_overlap_full_overlap（k=4 仍须整段剥离）。
+      - **部分重叠**：仅当 k >= SEAM_OVERLAP_MIN_CHARS（默认 6）才剥离；
+        低于阈值的短匹配视为「新句首词与上一轮截断处巧合相同」。
     """
     if not final_content or not extra:
         return extra
     tail = final_content[-_MAX_SEAM_OVERLAP:]
-    max_k = min(len(tail), len(extra))
-    # 由最长向最短探测：找到 extra 前缀 == tail 后缀 的最大重叠长度
-    for k in range(max_k, 0, -1):
-        if extra[:k] == tail[-k:]:
+    min_k = _seam_overlap_min_chars()
+    for k in range(min(len(tail), len(extra)), 0, -1):
+        if extra[:k] != tail[-k:]:
+            continue
+        # 完全重叠（剥完 extra 归零）无条件生效；部分重叠须达最小长度。
+        if k >= min_k or k >= len(extra):
             return extra[k:]
     return extra
 
@@ -1815,57 +1852,55 @@ def _strip_seam_overlap(final_content: str, extra: str) -> str:
 def _detect_unclosed_chart_fence(content: str) -> dict | None:
     """检测正文中是否存在未闭合的图表围栏。
 
+    BUG-FIX 2026-10-15（第六轮·消除第三份围栏骨架）：旧实现自带
+    ``_FENCE_OPEN_RE`` / ``_FENCE_CLOSE_RE`` 两个手写正则，与 content_cleaning 的
+    单一权威规划器 ``plan_chart_fence_lines`` 分叉，实测三类误判：
+
+      ① **假阳性（最严重）**：AI 把闭合行也写上属性串（`` ```mermaid {json} ``，
+         这是 BUG-FIX 2026-10-09 明确支持的写法），旧 ``_FENCE_CLOSE_RE`` 的
+         ``[A-Za-z0-9_\\-+.#]*`` 匹配不到 ``{json}`` → 把已闭合块判为未闭合 →
+         ``_force_close_unclosed_chart_fence`` 在**文档末尾**追加一行游离的裸围栏
+         标记 → 该行原样进入正文与 SSE 流（导出文档尾部出现孤立的 `` ``` ``）。
+      ② **假阴性**：闭合判定不看开启标记的字符与长度，``~~~mermaid`` 被
+         `` ``` `` 关闭、```` ````mermaid`` 被 `` ``` `` 关闭都判为「已闭合」。
+      ③ 无「带 info-string 的围栏行 = 新块起始」的前瞻判定，语义与
+         ``plan_chart_fence_lines``（BUG-FIX 2026-10-14）不一致。
+
+    现直接调用 ``content_cleaning.find_unclosed_chart_fence``（与解析侧共用同一份
+    规划器），解析 / 检测 / 兜底三处口径彻底同源，不可能再各自漂移。
+
     Returns:
         dict: {
             "lang": "mermaid" / "chart-json",
-            "open_line": str,        # 围栏开启行原文（含 ``` 前缀）
-            "open_line_no": int,     # 围栏开启所在行号（1-based）
+            "open_line": str,         # 围栏开启行原文（含 ``` 前缀）
+            "open_line_no": int,      # 围栏开启所在行号（1-based）
+            "open_marker": str,       # 开启标记原文（``` / ~~~ / ```` …）
+            "open_marker_len": int,   # 开启标记长度
+            "close_insert_idx": int,  # 闭合标记应插入的行号（0-based）
             "content_before_open": str,  # 围栏之前的正文
-            "content_inside": str,      # 围栏内部（截断的）内容
+            "content_inside": str,      # 围栏内部的（被截断的）载荷行
         }
         None: 无未闭合图表围栏
     """
     if not content:
         return None
-    _FENCE_OPEN_RE = re.compile(
-        r"^(`{3,}|~{3,})[ \t]*(mermaid|chart[-_]?json)",
-        re.IGNORECASE | re.MULTILINE,
-    )
-    _FENCE_CLOSE_RE = re.compile(
-        r"^(`{3,}|~{3,})[ \t]*([A-Za-z0-9_\-+.#]*)?[ \t]*$",
-        re.MULTILINE,
-    )
     lines = content.split("\n")
-    open_fence_pos = None  # (line_idx, lang)
-    for i, line in enumerate(lines):
-        m_open = _FENCE_OPEN_RE.match(line)
-        if m_open:
-            open_fence_pos = (i, m_open.group(2).lower())
-            continue
-        if open_fence_pos is not None:
-            # 只看闭合标记行（匹配 ``` 或 ~~~ 等围栏标记，允许空尾或 info-string）
-            if line.strip().startswith("```") or line.strip().startswith("~~~"):
-                m_close = _FENCE_CLOSE_RE.match(line.strip())
-                if m_close:
-                    # 找到了匹配的闭合行 → 围栏已闭合
-                    open_fence_pos = None
-    if open_fence_pos is None:
+    info = content_cleaning.find_unclosed_chart_fence(lines)
+    if info is None:
         return None
-    open_line_no, lang = open_fence_pos
-    # 找到最后一个非空行作为截断位置
-    last_nonempty_idx = open_line_no
-    for idx in range(len(lines) - 1, open_line_no - 1, -1):
-        if lines[idx].strip():
-            last_nonempty_idx = idx
-            break
+    open_idx = info["open_index"]
+    insert_at = info["close_insert_idx"]
     return {
-        "lang": lang,
-        "open_line": lines[open_line_no] if open_line_no < len(lines) else "```mermaid",
-        "open_line_no": open_line_no + 1,
-        "content_before_open": "\n".join(lines[:open_line_no]),
-        "content_inside": "\n".join(lines[open_line_no + 1:last_nonempty_idx + 1])
-        if last_nonempty_idx > open_line_no
-        else "",
+        "lang": info["lang"],
+        "open_line": lines[open_idx] if open_idx < len(lines) else "```mermaid",
+        "open_line_no": open_idx + 1,
+        "open_marker": info["marker"],
+        "open_marker_len": info["marker_len"],
+        "close_insert_idx": insert_at,
+        "content_before_open": "\n".join(lines[:open_idx]),
+        # 精确取「未闭合块的载荷行」（plan 已剥离误吞进围栏体的正文段），
+        # 旧版取到「整个文档最后一个非空行」，会把块之后的正文一并算进来。
+        "content_inside": "\n".join(lines[open_idx + 1: insert_at]),
     }
 
 
@@ -1884,20 +1919,57 @@ def _force_close_unclosed_chart_fence(content: str) -> tuple[str, bool]:
 
     Returns:
         tuple: (处理后的内容, 是否发生了闭合)
+
+    BUG-FIX 2026-10-15（第六轮·加固），两处旧行为修正：
+
+      ① 闭合标记原本硬编码为 3 个反引号，而开启标记可能是波浪线或 4+ 反引号
+         （``~~~mermaid`` / ```` ````mermaid`` 会被补成 `` ``` ``）→ 产出的围栏
+         不满足 Markdown「闭合标记同字符且长度不小于开启标记」的要求。
+         现按开启标记的**原字符与原长度**补闭合行。
+      ② 原本一律把闭合行追加到**文档末尾**。当未闭合块位于文档中部时
+         （AI 漏写闭合行后紧接写下一张同语言图），追加到末尾会
+         (a) 留下一行游离的裸围栏标记进入正文与 SSE 流；
+         (b) 被误吞进第一个围栏体的正文行仍留在围栏内。
+         现改为插到**载荷末尾**（``close_insert_idx``）——对「续写被截断在
+         文档末尾」这一原始场景，插入点恰好就是 EOF，行为与旧版完全一致。
     """
     unclosed = _detect_unclosed_chart_fence(content)
     if unclosed is None:
         return content, False
-    lang = unclosed["lang"]
+    marker = unclosed.get("open_marker") or "```"
+    insert_at = unclosed["close_insert_idx"]
+    lines = content.split("\n")
+    if insert_at >= len(lines):
+        # 未闭合块直达 EOF（续写被截断的典型场景）：保持旧版尾部形态——
+        # 整体 rstrip 后闭合标记独占一行、文档以换行结尾。
+        head = "\n".join(lines).rstrip()
+        candidate = f"{head}\n{marker}\n"
+    else:
+        # 未闭合块位于文档中部（AI 漏写闭合行后紧接写下一张图）：把闭合行插到
+        # 载荷末尾而非追加到 EOF——否则被 _split_fence_body 剥离出的正文会留在
+        # 围栏体外，且文档尾部残留一行游离的裸围栏标记。
+        lines.insert(insert_at, marker)
+        candidate = "\n".join(lines)
+    # HARDEN 2026-10-15（第六轮·幂等）：病态超长围栏的载荷行数会触及
+    # content_cleaning._HARD_CHART_FENCE_LINE_LIMIT，规划器看不到截断点之后的行，
+    # 插入闭合行对它无效。不拦截的话，重复调用会每次往同一位置再插一行标记
+    # （实测文档每次 +4 字节）。以「同一位置的同一未闭合块」为无进展判据。
+    again = _detect_unclosed_chart_fence(candidate)
+    if (again is not None
+            and again["open_line_no"] == unclosed["open_line_no"]
+            and again["close_insert_idx"] == insert_at
+            and again["content_inside"] == unclosed["content_inside"]):
+        logger.warning(
+            "[围栏兜底] 未闭合 %s 围栏（第 %d 行）载荷超出围栏行数硬上限，"
+            "程序化闭合无法生效，保持原样（该块按坏块处理）",
+            unclosed["lang"], unclosed["open_line_no"],
+        )
+        return content, False
     logger.warning(
-        "[围栏兜底] 检测到未闭合 %s 围栏（第 %d 行），程序化补 ``` 闭合",
-        lang, unclosed["open_line_no"],
+        "[围栏兜底] 已为未闭合 %s 围栏（第 %d 行，%s 标记）在第 %d 行后补 %s 闭合",
+        unclosed["lang"], unclosed["open_line_no"], marker, insert_at, marker,
     )
-    stripped = content.rstrip()
-    if not stripped.endswith("\n"):
-        stripped += "\n"
-    stripped += "```\n"
-    return stripped, True
+    return candidate, True
 
 
 # =====================================================================
@@ -1911,35 +1983,64 @@ def _force_close_unclosed_chart_fence(content: str) -> tuple[str, bool]:
 # 修复：压缩前把所有图表代码块替换为占位符 <<CHART_BLOCK_1>>，
 # 压缩后再按序还原。占位符不参与压缩计数，还原后语法 100% 与原文一致。
 # =====================================================================
+# ENHANCE 2026-10-15（第六轮·围栏骨架单一权威化）：围栏标记提取与图表围栏
+# 区间扫描的权威实现已下沉到 content_cleaning（见其「第六轮·图表围栏「行区间」
+# 单一权威化」注释块）。本模块保留同名私有别名——既有调用方与测试的 import
+# 路径完全不变，且不存在两份遍历骨架。
+#: 向后兼容别名（权威实现：content_cleaning.FENCE_HEAD_PATTERN / fence_marker）
+_FENCE_HEAD_RE = content_cleaning.FENCE_HEAD_PATTERN
+_fence_marker = content_cleaning.fence_marker
+
+
+def _scan_chart_fence_blocks(lines: list[str]) -> list[tuple[int, int]]:
+    """扫描**已闭合**的图表围栏块，返回 [(开行号, 闭行号)]（0-based，含端点）。
+
+    BUG-FIX 2026-10-15（P1·图表在压缩环节静默损坏）：
+    旧实现是 hand-rolled 正则 `r"(```...```)"`，硬编码 3 个反引号，两类问题：
+      1. 不认波浪线围栏 —— `~~~mermaid` / `~~~chart-json` 不被 mask，原始
+         围栏整块送入 AI 压缩，AI 可截断/改写 mermaid 源码与 JSON 载荷；
+      2. 按子串匹配而非按围栏标记行匹配 —— ```` ````mermaid ````（4 反引号，
+         嵌套代码块的常见写法）被从第 2 个反引号起错位匹配成 ```mermaid，
+         占位符被多余的 ` 包裹（`<<CHART_BLOCK_1>>`），AI 可能改写反引号，
+         还原后围栏语法损坏。
+
+    2026-10-15（第五轮）改为按行扫描并复用 content_cleaning 的围栏判定口径；
+    2026-10-15（第六轮）进一步下沉到 content_cleaning.scan_chart_fence_blocks——
+    本模块不再保留任何自写遍历骨架，与解析侧 plan_chart_fence_lines 彻底同源。
+    附带修正：旧实现的闭合规则比解析侧**更严**（额外要求同字符且长度 >= 开启
+    标记），导致「~~~mermaid … ```」这类跨字符围栏在解析侧被判为有效块并渲染、
+    却在保护侧不被 mask → 原始 mermaid 源码裸露送给压缩 AI。现两处口径一致，
+    受保护范围严格变宽。
+    未闭合块不返回（保持原样，交由 _force_close_unclosed_chart_fence 兜底闭合）。
+    """
+    return content_cleaning.scan_chart_fence_blocks(lines)
+
+
 def _mask_chart_fences_for_compression(content: str) -> tuple[str, list[str]]:
     """把正文中的 ```mermaid / ```chart-json 围栏代码块替换为占位符。
 
     Returns:
         tuple: (masked_content, originals)
         - masked_content: 替换后的文本（含 <<CHART_BLOCK_1>> 等占位符）
-        - originals: 被替换掉的原始围栏代码块列表（完整 ```...``` 内容）
+        - originals: 被替换掉的原始围栏代码块列表（完整围栏原文，含标记行）
+
+    BUG-FIX 2026-10-15（P1）：改为「行区间扫描 + 行区间替换」，围栏口径与
+    content_cleaning 共享（见 _scan_chart_fence_blocks）。行区间替换保证块前后
+    的空行与文本逐字符不变，mask → restore 严格往返。
     """
     if not content:
         return content, []
-    _FENCE_BLOCK_RE = re.compile(
-        r"(```[ \t]*(?:mermaid|chart[-_]?json)[^\n]*\n"
-        r"[\s\S]*?"
-        r"```[ \t]*(?:mermaid|chart[-_]?json)?[ \t]*\n?)",
-        re.IGNORECASE,
-    )
-    originals: list[str] = []
-    counter = 0
-
-    def _replacer(match: re.Match) -> str:
-        nonlocal counter
-        counter += 1
-        originals.append(match.group(0))
-        # 占位符直接替换原始代码块位置，不带额外 \n
-        # （原始代码块前后的 \n 由 fence regex 本身捕获或保留）
-        return f"<<CHART_BLOCK_{counter}>>"
-
-    masked = _FENCE_BLOCK_RE.sub(_replacer, content)
-    return masked, originals
+    lines = content.split("\n")
+    blocks = _scan_chart_fence_blocks(lines)
+    if not blocks:
+        return content, []
+    originals = ["\n".join(lines[s:e + 1]) for s, e in blocks]
+    out = lines[:]
+    # 从后往前替换，避免行号失效
+    for idx in range(len(blocks) - 1, -1, -1):
+        s, e = blocks[idx]
+        out[s:e + 1] = [f"<<CHART_BLOCK_{idx + 1}>>"]
+    return "\n".join(out), originals
 
 
 def _restore_chart_fences_after_compression(masked_content: str, originals: list[str]) -> str:
@@ -2020,10 +2121,11 @@ async def _auto_continue_on_length(
                 )
                 _fence_guard = (
                     f"\n\n### 强制指令（围栏修复）\n"
-                    f"上方正文在第 {_unclosed['open_line_no']} 行开始了一个 ```{_unclosed['lang']} "
-                    f"代码块，但该代码块因输出被截断而未闭合。"
+                    f"上方正文在第 {_unclosed['open_line_no']} 行开始了一个"
+                    f" {_unclosed['open_marker']}{_unclosed['lang']} 代码块，"
+                    f"但该代码块因输出被截断而未闭合。"
                     f"请先从截断处继续补完该 {_unclosed['lang']} 代码块的剩余部分，"
-                    f"然后用 ``` 标记闭合围栏。"
+                    f"然后用同样的围栏标记（{_unclosed['open_marker']}）闭合代码块。"
                     f"**闭合围栏之后**再继续写正文剩余内容。"
                     f"严禁跳过闭合围栏直接从截断处写普通正文，"
                     f"那样会导致图表永远无法被正确解析。"

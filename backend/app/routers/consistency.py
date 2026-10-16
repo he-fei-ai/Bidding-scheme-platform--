@@ -71,6 +71,13 @@ def _evict_idle_locks_locked() -> None:
 
     跳过 `locked()` 的锁——那把可能正被持有或有等待者，删掉会让后来的请求
     拿到一把**新**锁，从而与持锁者并发进入临界区，把锁的意义直接抵消掉。
+
+    BUG-FIX 2026-10-15（P2·有界性宣称不成立）：若表里**所有**锁都处于持锁态
+    （极端场景：512 个项目同时在跑一致性写操作），本函数一轮跑完一条都淘汰不掉，
+    调用方 `_consistency_op_lock` 仍会照常插入新锁 —— 表就会长期超出上限。
+    这不是竞态（新锁与既有锁语义互斥，不会产生两把同项目的锁），但「超过上限后
+    按 LRU 淘汰最旧的」这句注释在极端情况下并不成立。现把这个退化情形显式打
+    debug 日志，使「锁表实际大小」在线上可观测，而不是靠注释宣称。
     """
     for pid in list(_CONSISTENCY_OP_LOCKS_ORDER):
         if len(_CONSISTENCY_OP_LOCKS) < _CONSISTENCY_OP_LOCKS_MAX:
@@ -80,6 +87,11 @@ def _evict_idle_locks_locked() -> None:
             continue
         _CONSISTENCY_OP_LOCKS.pop(pid, None)
         _CONSISTENCY_OP_LOCKS_ORDER.remove(pid)
+    if len(_CONSISTENCY_OP_LOCKS) >= _CONSISTENCY_OP_LOCKS_MAX:
+        logger.debug(
+            '一致性操作锁表已达上限 %d 且全部处于持锁态，本轮未淘汰任何锁',
+            _CONSISTENCY_OP_LOCKS_MAX,
+        )
 
 
 class _LockManager:
@@ -87,13 +99,23 @@ class _LockManager:
 
     def __init__(self, project_id: int):
         self._lock = _consistency_op_lock(project_id)
+        # BUG-FIX 2026-10-15（P2·可能 release 未持有的锁）：`asyncio.Lock.release()`
+        # 在未持有时抛 `RuntimeError: not locked`。虽然 `acquire()` 被取消时不会
+        # 留下持锁状态、`__aexit__` 也不会被调用，但 `_LockManager` 是**每个写
+        # 入口**都会实例化的横切设施，一旦未来有人在这里加了「等待失败即抛出」的
+        # 逻辑（例如超时抢锁），`__aexit__` 就会去释放一把从未拿到的锁、把整条
+        # 写路径炸成 500。用一个标记位把「是否真拿到了」钉死，成本近乎为零。
+        self._acquired = False
 
     async def __aenter__(self):
         await self._lock.acquire()
+        self._acquired = True
         return self
 
     async def __aexit__(self, exc_type, exc, tb):
-        self._lock.release()
+        if self._acquired:
+            self._lock.release()
+            self._acquired = False
         return False
 
 
@@ -290,6 +312,17 @@ async def get_conflicts(
                 conflict['state'] = rules.conflict_state(conflict.get('resolved'))
                 conflict['resolved'] = int(conflict.pop('resolved') or 0)
                 conflict['severity'] = rules.normalize_severity(conflict.get('severity'))
+                # BUG-FIX 2026-10-15（P1·两条审计链路混排不可区分）：
+                # `consistency_conflicts` 同时承载确定性规则冲突与 AI 语义审计发现
+                # （后者 `conflict_id` 以 `AI-` 开头、`values_json` 恒为 `'[]'`），
+                # 但此前对外接口不暴露这个区分。前端因此：
+                #   ① 把 AI 发现的 `fact_name`（最长 100 字的自由文本 issue）当
+                #      「事实项」加粗渲染，用户以为是事实名；
+                #   ② 「自动修复」按钮对 AI 发现仍可点，而 `apply_autofix` 因
+                #      `values=[]` 必然回 `no_change`，用户反复点、反复看到失败。
+                # 现随每条冲突下发 `source_kind`（`rule` / `ai`），纯新增字段，
+                # 既有字段名与取值语义一律不动。
+                conflict['source_kind'] = rules.conflict_source_kind(conflict.get('conflict_id'))
                 conflicts.append(conflict)
         return conflicts
 
@@ -541,10 +574,39 @@ async def facts_backflow_accept(
     proposals = body.get('proposals') if isinstance(body, dict) else None
     if not isinstance(proposals, list):
         raise HTTPException(status_code=400, detail='body.proposals 必须是列表')
+    # BUG-FIX 2026-10-15（P1·跨模块数据完整性 / 事实基准在生成中被改）：
+    # 本端点通过 `accept_fact_proposals` 直接写 `analysis.global_facts_json`，
+    # 与 `routers/facts.py` 的 POST /facts（手工保存）是同一条写口径 —— 但
+    # 本端点此前**完全没有任何生成中防护**，而 facts.py 早就为此加过
+    # `_ensure_no_ai_task_running`（见其 docstring 的 BUG-FIX 2026-09-29）：
+    #   「正文生成进行中时保存事实，生成循环已把旧事实读进内存并逐章注入
+    #    prompt，新事实只在后半部分章节生效 → 同一篇标书前半用旧工期、后半
+    #    用新工期，一致性审计反而报矛盾」。
+    # 注意这里必须用 content-generation 锁，而不是本文件其它写端点用的
+    # `task_guard.reject_if_generation_running` —— 后者只查 `outline-generation`
+    # （见 task_guard.live_group_lock），对正文生成完全不设防，用它等于没加。
+    # 直接复用 facts 路由的守卫函数，保持两条写口径的判定完全同源。
+    from .facts import _ensure_no_ai_task_running
+    await _ensure_no_ai_task_running(project_id)
     from ..services.consistency_backflow import accept_fact_proposals
 
     async with _LockManager(project_id):
-        result = await asyncio.to_thread(accept_fact_proposals, project_id, proposals)
+        # BUG-FIX 2026-10-15（P2·可观测性不一致）：本文件其余端点都有
+        # `try/except + logger.error(..., exc_info=True) + 本地化 detail`，
+        # 唯独本端点把异常抛成裸 500。服务层 `accept_fact_proposals` 已
+        # logger.error 后重新抛出（语义正确：不能吞掉合并失败、不产生「显示
+        # 成功但没合并」的假象），路由层再补一层以保留 HTTP 侧上下文并统一 detail。
+        try:
+            result = await asyncio.to_thread(accept_fact_proposals, project_id, proposals)
+        except HTTPException:
+            # 属权/守卫类 4xx 原样上抛，不裹一层 500
+            raise
+        except Exception as e:
+            logger.error('事实回流合并失败: %s', e, exc_info=True)
+            raise HTTPException(
+                status_code=500,
+                detail=f'事实回流合并失败: {str(e)[:120]}',
+            ) from e
     return {'status': 'ok', **result}
 
 
@@ -583,9 +645,13 @@ async def get_audit_summary(project_id: int, user=Depends(get_current_user)):
     def _read_summary():
         # PERF（2026-10-05）：纯读改 readonly + to_thread，不在 loop 内抢写锁
         with get_db(readonly=True) as conn:
+            # BUG-FIX 2026-10-09：sqlite3.Row 是惰性解引用，跨语句持有会串列，
+            # 故此处所有 Row 都在语句后立即物化为普通值。
             latest = conn.execute('SELECT * FROM consistency_audit_log \
               WHERE project_id = ?\
               ORDER BY audit_time DESC LIMIT 1', (project_id,)).fetchone()
+            latest = dict(latest) if latest is not None else None
+
             unresolved = conn.execute('SELECT COUNT(*) as cnt FROM consistency_conflicts \
                WHERE project_id = ? AND COALESCE(resolved, 0) = 0', (project_id,)).fetchone()['cnt']
             resolved = conn.execute('SELECT COUNT(*) as cnt FROM consistency_conflicts \
@@ -601,11 +667,90 @@ async def get_audit_summary(project_id: int, user=Depends(get_current_user)):
             severity_counts = {}
             for row in by_severity:
                 severity_counts[rules.normalize_severity(row['severity'])] = row['cnt']
+
+            # BUG-FIX 2026-10-15（P1·两条审计链路混统计，卡片数字被虚高）：
+            # `consistency_conflicts` 同时承载确定性规则冲突与 AI 语义审计发现。
+            # AI 发现**恒为** `SEVERITY_DEFAULT`（medium）—— 见
+            # `ai/workflows_expand._persist_ai_audit_findings`，因此「中等冲突」卡片
+            # 会被 AI 发现一并顶高，用户据此评估风险等级被误导；而「未解决冲突」
+            # 卡片与三张分级卡片之和也会永远对不上（`medium` 里混着两类东西）。
+            # 现补充按来源拆分的计数（**纯新增字段**，既有字段口径不动，
+            # 老调用方无需改动）：
+            #   - `conflicts_by_severity_rule`：只算规则冲突（前端分级卡片优先用它）
+            #   - `unresolved_rule_conflicts` / `unresolved_ai_findings`
+            #   - `resolved_ai_findings`
+            # 恒等式：unresolved_rule_conflicts + unresolved_ai_findings
+            #         == unresolved_conflicts。
+            ai_prefix = rules.AI_CONFLICT_ID_PREFIX + "%"
+            _base_open = (
+                'SELECT {sel} FROM consistency_conflicts '
+                'WHERE project_id = ? AND COALESCE(resolved, 0) = 0'
+            )
+            _base_resolved = (
+                'SELECT {sel} FROM consistency_conflicts '
+                'WHERE project_id = ? AND COALESCE(resolved, 0) = 1'
+            )
+            unresolved_rule = conn.execute(
+                _base_open.format(sel='COUNT(*) as cnt')
+                + ' AND conflict_id NOT LIKE ?',
+                (project_id, ai_prefix),
+            ).fetchone()['cnt']
+            unresolved_ai = conn.execute(
+                _base_open.format(sel='COUNT(*) as cnt')
+                + ' AND conflict_id LIKE ?',
+                (project_id, ai_prefix),
+            ).fetchone()['cnt']
+            resolved_ai = conn.execute(
+                _base_resolved.format(sel='COUNT(*) as cnt')
+                + ' AND conflict_id LIKE ?',
+                (project_id, ai_prefix),
+            ).fetchone()['cnt']
+            by_severity_rule = conn.execute(
+                _base_open.format(
+                    sel='severity, COUNT(*) as cnt'
+                )
+                + ' AND conflict_id NOT LIKE ? GROUP BY severity',
+                (project_id, ai_prefix),
+            ).fetchall()
+            severity_counts_rule = {}
+            for row in by_severity_rule:
+                severity_counts_rule[rules.normalize_severity(row['severity'])] = row['cnt']
+
+            # 最近一次审计的来源。`consistency_audit_log` 无来源列，但判定是
+            # 确定性的：AI 路径写入的日志行 `conflicts_json` 只含 `AI-` 前缀 ID，
+            # 确定性路径只含 `conflict_` 前缀 ID —— 两侧永不交叉。
+            # 用户据此能区分「最近审计时间」来自「开始审计」按钮还是正文生成
+            # 收尾的 AI 审计（两者结论性质完全不同）。
+            audit_source = rules.CONFLICT_SOURCE_RULE
+            if latest:
+                raw = latest.get('conflicts_json') or ''
+                try:
+                    entries = json.loads(raw) if raw.strip() else []
+                except (json.JSONDecodeError, TypeError):
+                    entries = []
+                if isinstance(entries, list) and entries:
+                    if any(
+                        isinstance(e, dict) and rules.is_ai_conflict_id(e.get('conflict_id'))
+                        for e in entries
+                    ):
+                        audit_source = rules.CONFLICT_SOURCE_AI
+                    elif rules.AUDIT_STATUS_NO_CONFLICTS == str(latest.get('status')) \
+                            and int(latest.get('facts_extracted') or 0) == 0:
+                        # 无冲突时 JSON 为空数组，退回「事实抽取数」这一侧信道：
+                        # AI 路径恒记 0，确定性路径按真实抽取数记录。仅作为
+                        # 提示，不改写任何既有字段。
+                        audit_source = rules.CONFLICT_SOURCE_AI
+
         return {
-            'latest_audit': dict(latest) if latest else None,
+            'latest_audit': latest,
+            'audit_source': audit_source,
             'unresolved_conflicts': unresolved,
             'resolved_conflicts': resolved,
             'conflicts_by_severity': severity_counts,
+            'conflicts_by_severity_rule': severity_counts_rule,
+            'unresolved_rule_conflicts': unresolved_rule,
+            'unresolved_ai_findings': unresolved_ai,
+            'resolved_ai_findings': resolved_ai,
         }
 
     summary = await asyncio.to_thread(_read_summary)

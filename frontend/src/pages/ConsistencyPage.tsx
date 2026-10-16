@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import { Alert, Button, Space, Tabs, Typography } from "antd";
 import { ArrowLeftOutlined, AuditOutlined } from "@ant-design/icons";
+import ErrorBoundary from "../components/ErrorBoundary";
 import { getConsistencyRules } from "../api";
 import type { ConsistencyRules } from "../api";
 import {
@@ -89,37 +90,46 @@ export default function ConsistencyPage() {
         description="两种修复方式：表格里的「自动修复」把冲突取值统一成同一个值（适合「30 天 / 45 天」这类）；「AI 补丁修复」由 AI 读懂语义后产出局部替换补丁（适合「2026 年 5 月竣工」vs「工期 90 天」这类不同措辞的冲突）。补丁只替换 AI 逐字引用的原文片段，定位不到或有多处命中都会被拒绝，不会误改正文。"
       />
 
-      <Tabs
-        activeKey={activeTab}
-        onChange={setActiveTab}
-        items={[
-          {
-            key: "conflicts",
-            label: "一致性冲突",
-            children: <ConflictListTab projectId={projectId} />,
-          },
-          {
-            key: "scoring",
-            label: "评分标准达标",
-            children: <ScoringComplianceTab projectId={projectId} rules={rules} />,
-          },
-          {
-            key: "agent",
-            label: "Agent 多轮修复",
-            children: <AgentRepairTab projectId={projectId} />,
-          },
-          {
-            key: "facts",
-            label: "事实回流",
-            children: <FactBackflowTab projectId={projectId} />,
-          },
-          {
-            key: "coverage",
-            label: "废标覆盖率",
-            children: <RejectionCoverageTab projectId={projectId} rules={rules} />,
-          },
-        ]}
-      />
+      {/*
+        BUG-FIX 2026-10-15（P0·单 Tab 崩溃白屏整站）：App.tsx 只在**路由根层**挂了
+        一个 ErrorBoundary —— 一致性页任何 Tab 抛错都会把整棵 React 树（含登录壳、
+        侧栏）卸载，用户只能强刷整站（见 2026-10-13 D1：Agent 修复拿到一份含真实
+        后端响应形态的数据，整页白屏、Tab 全切不动）。此处加**页面级**兜底：
+        错误只会接管本页内容块，「重试」就地复位、不丢路由与全局状态。
+      */}
+      <ErrorBoundary label="一致性校核页">
+        <Tabs
+          activeKey={activeTab}
+          onChange={setActiveTab}
+          items={[
+            {
+              key: "conflicts",
+              label: "一致性冲突",
+              children: <ConflictListTab projectId={projectId} rules={rules} />,
+            },
+            {
+              key: "scoring",
+              label: "评分标准达标",
+              children: <ScoringComplianceTab projectId={projectId} rules={rules} />,
+            },
+            {
+              key: "agent",
+              label: "Agent 多轮修复",
+              children: <AgentRepairTab projectId={projectId} />,
+            },
+            {
+              key: "facts",
+              label: "事实回流",
+              children: <FactBackflowTab projectId={projectId} />,
+            },
+            {
+              key: "coverage",
+              label: "废标覆盖率",
+              children: <RejectionCoverageTab projectId={projectId} rules={rules} />,
+            },
+          ]}
+        />
+      </ErrorBoundary>
 
       <Text type="secondary" style={{ fontSize: 12 }}>
         提示：点击冲突的「涉及章节」标签可直接跳转到对应章节定位问题。

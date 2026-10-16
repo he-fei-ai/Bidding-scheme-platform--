@@ -96,15 +96,17 @@ class TestAuditGroupSplitting:
             total += len(group)
         assert total == len(sections)
 
-    def test_oversize_section_packed_by_truncated_size(self):
-        # 分组按「实际送审的字符数」（截断后）装箱：超长节按单节上限计数，
-        # 因此它可以和小节同组；整组预算依然不被突破
+    def test_oversize_section_packed_by_full_render_size(self):
+        # BUG-FIX 2026-10-15：本用例原断言基于旧「截断计数」口径（超长节只按
+        # 单节上限计重、可与小节同组）。ENHANCE 2026-10-15（分块全量送审）后，
+        # 超长节按真实渲染字符数计重并自动独立成组，消除尾部审计盲区；
+        # 与 test_enhancement_2026_09_15_facts_audit_patch.py 的新口径同步。
         big = self._section(AUDIT_GROUP_CHAR_LIMIT + 5000, 0)
         small = self._section(100, 1)
         groups = _split_audit_groups([big, small])
-        assert len(groups) == 1
-        packed = sum(min(len(s["content"]), AUDIT_SECTION_CHAR_LIMIT) for s in groups[0])
-        assert packed <= AUDIT_GROUP_CHAR_LIMIT
+        assert len(groups) == 2, "超长节必须按全量送审载荷独立成组"
+        assert [s["id"] for s in groups[0]] == ["s0"]
+        assert [s["id"] for s in groups[1]] == ["s1"]
 
     def test_small_sections_pack_into_one_group(self):
         sections = [self._section(100, i) for i in range(5)]

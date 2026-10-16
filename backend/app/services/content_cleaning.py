@@ -1,3 +1,4 @@
+from collections.abc import Sequence
 from dataclasses import dataclass
 import html
 import json
@@ -165,6 +166,9 @@ CHART_MARKER_OPEN_PATTERN = re.compile(
 # 现统一按 `(?:`{3,}|~{3,})` + `chart[-_]?json` 收敛，并保留可选属性串。
 _FENCE_MARK = r"(?:`{3,}|~{3,})"
 _FENCE_ATTR = r"(?:\{[^}]*\})?"
+# 围栏行的行首形态：>=3 个反引号或波浪线，允许最多 3 个前导空格（Markdown 规范）。
+# 公开常量：供本模块与上层工作流共用，杜绝各处各写一份 `(`{3,}|~{3,})` 字面量。
+FENCE_HEAD_PATTERN = re.compile(rf"^[ \t]{{0,3}}({_FENCE_MARK})")
 CHART_FENCE_OPEN_PATTERN = re.compile(
     r"^" + _FENCE_MARK + r"[ \t]*(mermaid|chart[-_]?json)[ \t]*" + _FENCE_ATTR + r"[ \t]*$",
     re.IGNORECASE,
@@ -386,7 +390,13 @@ def plan_chart_fence_lines(lines: list[str]) -> list[tuple[str, str, list[str], 
                 break  # 异语言围栏行 → 当前块未闭合
             body.append(lines[j])
             j += 1
-            if j - i > _HARD_CHART_FENCE_LINE_LIMIT:
+            # BUG-FIX 2026-10-15（第六轮·off-by-one）：旧判据 `j - i > LIMIT` 在
+            # 追加 + 步进之后才求值，此刻 j - i == 1 + len(body)，等价于
+            # `len(body) >= LIMIT` 就中止——载荷恰好 5000 行的**合法闭合**围栏
+            # 会被早停一步、看不到紧随其后的闭合标记，整块被误判为 bad 丢弃。
+            # 现按常量注释的字面语义判定「载荷行数」，允许满 LIMIT 行后
+            # 继续再看一眼闭合标记。
+            if len(body) > _HARD_CHART_FENCE_LINE_LIMIT:
                 break  # 病态超长围栏：按坏块删除（区域有界）
         payload, prose = _split_fence_body(body)
         action = "block" if closed else "bad"
@@ -427,6 +437,21 @@ def fence_info_string(line: str) -> str | None:
     token = (m.group(1) or "").strip()
     # 只取首 token：「json {id: x}」或「python 代码」这类写法统一按语言标记处理
     return token.split()[0] if token else ""
+
+
+def fence_marker(line: str) -> tuple[str, int]:
+    """取围栏行首的 ``(标记字符, 标记长度)``；非围栏行返回 ``("", 0)``。
+
+    公开工具函数（ENHANCE 2026-10-15）：原先只存在于
+    ``workflows_sections._fence_marker``，围栏标记的提取口径因此散落在两个模块。
+    下沉到本模块后，「开启/闭合围栏标记是否同字符、长度是否达标」这一类判断
+    有了唯一入口（见 ``is_fence_close_line`` / ``_scan`` 系列）。
+
+    与 ``fence_info_string`` 的区别：本函数**不关心** info-string，只负责把
+    行首的 `` ``` `` / ``~~~`` 标记本身量出来，两者组合即可完整描述一行围栏。
+    """
+    m = FENCE_HEAD_PATTERN.match(str(line or ""))
+    return (m.group(1)[0], len(m.group(1))) if m else ("", 0)
 
 
 def is_fence_close_line(line: str, open_info: str | None = None) -> bool:
@@ -477,6 +502,145 @@ def is_fence_close_line(line: str, open_info: str | None = None) -> bool:
         return a_chart and b_chart and _normalize_fence_lang(a) == _normalize_fence_lang(b)
     # 普通代码围栏：保持历史宽松口径（见 docstring）
     return True
+
+
+# =====================================================================
+# ENHANCE 2026-10-15（第六轮·图表围栏「行区间」单一权威化）
+# ---------------------------------------------------------------------
+# 背景：此前「找出正文里图表围栏块在源行列表上的区间」存在**两份独立遍历骨架**：
+#   ① plan_chart_fence_lines —— 解析（parse_content / _protect_chart_fences）
+#      与检测（iter_chart_fences）共用的权威规划器；
+#   ② workflows_sections._scan_chart_fence_blocks —— 压缩前置 mask 专用，
+#      自己写了一份 while 循环。
+# ② 虽已复用 ① 的判定函数（_classify_fence_line / _fence_line_is_new_open），
+# 但闭合规则写得**比 ① 更严**（额外要求「同字符且长度 >= 开启标记」）。
+# 口径分叉的直接后果（实测取证）：
+#
+#     ~~~mermaid        ← ① 判定为合法开启行
+#     graph TD
+#         A --> B
+#     ```               ← ① 判为闭合（宽松：纯围栏标记恒可闭合）
+#                          ② 判为不闭合（跨字符）→ 整块**不被 mask**
+#
+#   即解析侧会保留并渲染这张图，但压缩前置保护侧漏掉了它 → 原始 mermaid
+#   源码裸露送给压缩 AI → 可能被截断/改写 → 图表渲染失败（这正是 mask
+#   机制当初要消除的事故类型，却因两份骨架而残存）。
+#
+# 修复：scan_chart_fence_blocks 不再自写遍历，而是**直接由
+# plan_chart_fence_lines 的条目还原源行区间**（取 action == "block"）。
+# 两个口径从此同源，且受保护范围严格变宽（跨字符 / 短闭合标记的图表块
+# 现在也会被 mask 保护）。
+#
+# 未闭合块（action == "bad"）仍不返回：其区间可能连带「被误吞进围栏体的
+# 正文段」，整段替换成占位符会丢失正文；这类块交由上层
+# _force_close_unclosed_chart_fence 就地补闭合行处理。
+# =====================================================================
+def _iter_plan_regions(lines: Sequence[str]):
+    """把 ``plan_chart_fence_lines`` 的条目还原成源行区间，逐个产出
+    ``(start, action, lang, payload_lines, consumed)``。
+
+    ``plan_chart_fence_lines`` 的条目**连续且无重叠**（每轮外层 `i = j`，
+    `consumed` 恰为该条目消耗的源行数，`sum(consumed) == len(lines)`），
+    故按 `consumed` 累加即可还原每个条目的区间起点。
+
+    本函数是 scan_chart_fence_blocks / find_unclosed_chart_fence 的**唯一**
+    遍历骨架——两个公开函数共享同一次规划结果，不可能再各自漂移。
+    """
+    start = 0
+    for action, lang, payload, consumed in plan_chart_fence_lines(_as_lines(lines)):
+        yield start, action, lang, payload, consumed
+        start += consumed
+
+
+def _as_lines(lines: Sequence[str] | None) -> list[str]:
+    """把行序列规范化为 list[str]（容忍 None 输入与 None 元素）。"""
+    if not lines:
+        return []
+    return ["" if ln is None else str(ln) for ln in lines]
+
+
+def scan_chart_fence_blocks(lines: Sequence[str] | None) -> list[tuple[int, int]]:
+    """扫描**已闭合**的图表围栏块，返回 ``[(开行号, 闭行号)]``（0-based，含端点）。
+
+    公开工具函数（ENHANCE 2026-10-15）：由 ``plan_chart_fence_lines`` 中
+    ``action == "block"`` 的条目还原区间，是本模块内**唯一**的图表围栏
+    区间扫描器，供压缩前置 mask（workflows_sections）、字数调整 mask
+    （workflows_word_adjust）等消费方共用。
+
+    BUG-FIX 2026-10-15（此前为本模块外 hand-rolled 的自写遍历）：
+      1. 旧实现用 `r"(```...```) "` 硬编码 3 个反引号 → 不认波浪线围栏
+         （``~~~mermaid``）且把 ```` ````mermaid ````（4 反引号）错位匹配成
+         ```mermaid，占位符被多余的 ` 包裹，AI 改写反引号后围栏损坏；
+      2. 旧实现按 CommonMark 严格判定闭合（同字符、长度 >= 开启标记），
+         而解析侧 plan_chart_fence_lines 对纯围栏标记行宽松判闭合 →
+         「解析侧保留并渲染、保护侧却不 mask」的分叉（见上方模块注释）。
+
+    Args:
+        lines: 已按 ``"\\n"`` 切分的行列表（元素为 None 时按空串处理）。
+
+    Returns:
+        已闭合图表围栏块的行区间；未闭合块（action == "bad"）**不返回**，
+        交由上层 ``_force_close_unclosed_chart_fence`` 兜底补闭合行。
+    """
+    return [
+        (start, start + consumed - 1)
+        for start, action, _lang, _payload, consumed in _iter_plan_regions(lines)
+        if action == "block"
+    ]
+
+
+def find_unclosed_chart_fence(lines: Sequence[str] | None) -> dict | None:
+    """定位**首个未闭合**的图表围栏块；无则返回 ``None``。
+
+    公开工具函数（ENHANCE 2026-10-15）：与 scan_chart_fence_blocks 共享
+    同一次规划，保证「哪里的围栏算未闭合」这一口径在解析侧与兜底闭合侧
+    永远一致——这正是 workflows_sections._detect_unclosed_chart_fence 旧版
+    自写第三份正则骨架时发生过的漂移（见下方 BUG-FIX 说明）。
+
+    Args:
+        lines: 已按 ``"\\n"`` 切分的行列表。
+
+    Returns:
+        dict 或 None。字段：
+          ``open_index``    围栏开启行号（0-based）
+          ``lang``          图表语言（已归一：``"mermaid"`` / ``"chart-json"``）
+          ``marker``        开启标记原文（如 ``"```"`` / ``"~~~"`` / ``"````"``）
+          ``marker_len``    开启标记长度
+          ``payload_len``   载荷行数（经 _split_fence_body 剥离误吞正文后）
+          ``consumed``      整个未闭合区域消耗的源行数
+          ``close_insert_idx``  闭合标记应插入的行号（= open_index + 1 + payload_len）
+
+        ``close_insert_idx`` 是关键：闭合行必须插在**载荷末尾**而不是文档末尾，
+        否则当未闭合块位于文档中部时（AI 漏写闭合行后紧接写下一张图），
+        追加到 EOF 会留下一行游离的裸围栏标记，且原属正文的行仍留在围栏体内。
+    """
+    lines_all = _as_lines(lines)
+    for start, action, lang, payload, consumed in _iter_plan_regions(lines_all):
+        if action != "bad" or not lang:
+            continue
+        # plan_chart_fence_lines 把「空载荷」无论是否闭合都归为 bad（便于整块
+        # 删除，见其 else 分支）。这里必须区分两种 bad：
+        #   - 载荷为空且块未延伸到 EOF → 这是**已闭合的空图表围栏**
+        #     （如 `` ```mermaid\n``` ``）。它不需要兜底闭合——插入闭合行只会
+        #     留下一行游离的裸围栏标记。
+        #   - 块延伸到 EOF → 真·未闭合（续写截断），必须闭合。
+        # 注：载荷触及 _HARD_CHART_FENCE_LINE_LIMIT 而被截断的病态块**不在此列**
+        # （其载荷非空），仍按未闭合返回——由 _force_close_unclosed_chart_fence
+        # 的幂等守卫识别「闭合无进展」后原样返回，两条防御各司其职。
+        if not payload and start + consumed < len(lines_all):
+            continue
+        ch, ln = fence_marker(lines_all[start]) if start < len(lines_all) else ("", 0)
+        marker = ch * ln if ch else "```"
+        return {
+            "open_index": start,
+            "lang": lang,
+            "marker": marker,
+            "marker_len": ln or 3,
+            "payload_len": len(payload),
+            "consumed": consumed,
+            "close_insert_idx": start + 1 + len(payload),
+        }
+    return None
 
 
 # Mermaid 内部 title 行（图题提取优先级第二级：载荷 title > Mermaid title > 引导语 > 类型通用名）
@@ -1205,6 +1369,34 @@ def _strip_unclosed_plain_fences(text: str) -> str:
     return "\n".join(out)
 
 
+#: 零宽字符（Risk-P2d FIX 2026-10-15）。
+#:
+#: 背景：Python re 的 \s **不匹配** U+200B（Unicode 类别 Cf，非空白字符）。
+#: 零宽字符夹在标题/列表编号里时，所有 `^(\d{1,4})\s*...` 锚点正则全部失配，
+#: 各种编号形态一律被降级成普通段落（导出文档丢标题样式与编号）：
+#:   「1​、施工部署」  应为 heading3       → 实际 paragraph
+#:   「1​）施工准备」  应为 heading6       → 实际 paragraph
+#:   「（1​）安全交底」应为 list_ordered   → 实际 paragraph
+#: （注：「1.施工准备」在本模块本就定义为 heading3，与零宽字符无关。）
+#: 这类字符常见于复制粘贴与富文本编辑器。
+#:
+#: 有意**不清理**：U+FE0E/U+FE0F（变体选择符，影响 emoji 文本/图形呈现）、
+#: U+2062~U+2064（数学不可见操作符/分隔符，影响公式语义）、
+#: U+202A~U+202E（双向控制符，删除会改变阿拉伯/希伯来文阅读方向）。
+_ZERO_WIDTH_RE = re.compile(r"[\u200b\u200c\u200d\u2060\u180e\ufeff]")
+
+
+def _strip_zero_width_chars(text: str) -> str:
+    """全局剔除零宽字符。STRIP_ZERO_WIDTH_CHARS=false 时原样返回。"""
+    if not text:
+        return text
+    from app.config import STRIP_ZERO_WIDTH_CHARS  # noqa: PLC0415
+
+    if not STRIP_ZERO_WIDTH_CHARS:
+        return text
+    return _ZERO_WIDTH_RE.sub("", text)
+
+
 def clean_generated_content(raw: str) -> str:
     if not raw:
         return ""
@@ -1213,6 +1405,12 @@ def clean_generated_content(raw: str) -> str:
     # HEADING_PATTERNS 的 ^(\d{1,4}) 锚点，首标题被降级为普通段落，
     # 导出文档首个标题丢失编号样式。
     raw = raw.lstrip("\ufeff")
+
+    # Risk-P2d FIX 2026-10-15（P2 编码 / 标题降级 / 列表拍平）：全局清理零宽字符。
+    # 必须在所有标题/列表正则之前 —— 零宽字符让 \s 失配，标题被降级成段落、
+    # 列表被升格成标题。放在 BOM 剥离之后、CRLF 归一之前，后续所有
+    # split/正则都在无零宽字符的文本上工作。
+    raw = _strip_zero_width_chars(raw)
 
     # BUG-FIX 2026-10-12（P1 编码 / 图表丢失）：CRLF / CR 归一为 LF。
     # Windows 环境下 AI 网关、数据库读回的旧正文、上传的 .md 均可能带 \r\n。

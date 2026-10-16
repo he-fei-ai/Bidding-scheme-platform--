@@ -1,4 +1,4 @@
-import { Card, Col, Row, Statistic, Typography } from "antd";
+import { Card, Col, Row, Statistic, Tag, Typography } from "antd";
 import type { AuditSummary } from "../../api";
 
 const { Text } = Typography;
@@ -10,23 +10,25 @@ export interface AuditSummaryCardsProps {
 /**
  * 一致性校核的统计卡片。
  *
- * BUG-FIX 2026-10-08（统计口径统一）：后端此前 `conflicts_by_severity` 未过滤
- * `resolved`，把**已解决**的历史冲突也计入「严重/中等冲突」卡片，而同一屏的
- * 「未解决冲突」只算未解决的 —— 用户看到「未解决 2 / 严重 1 / 中等 1」，点进
- * 表格却发现那条中等早已修好。现在后端两个数字同口径（都只算未解决），本组件
- * 的卡片与之严格对应，并在标题上标注「未解决」，消除歧义。
- *
- * 「已解决」作为**历史**单独展示，不参与严重度分级。
- *
- * ENHANCE 2026-10-09：补「轻微冲突」卡片 —— 该档此前在后端永不产出，判定标准
- * 收敛后可达（见 `consistency_rules.assess_severity`）。
+ * BUG-FIX 2026-10-15（P1·AI 发现被混进分级卡片，数字被虚高）：
+ * `consistency_conflicts` 同时承载确定性规则冲突与 AI 语义审计发现，而 AI 发现
+ * 恒为 medium 严重度（详见 `Conflict.source_kind` 的说明）。此前后端把两类混在
+ * `conflicts_by_severity` 里下发，「中等冲突」卡片被 AI 发现一并顶高。
+ * 现在：
+ *   - 分级卡片**优先**用 `conflicts_by_severity_rule`（只算规则冲突）；
+ *     老后端不返回该字段时回退 `conflicts_by_severity`，行为与改造前一致；
+ *   - 「未解决冲突」卡片单独标出其中 AI 发现的条数，用户能看出「有多少需要
+ *     人工核对、有多少可自动修复」；
+ *   - 「最近审计时间」附来源标签（rule=开始审计 / ai=正文生成收尾审计）。
  */
 export default function AuditSummaryCards({ summary }: AuditSummaryCardsProps) {
   if (!summary) return null;
 
   const unresolved = summary.unresolved_conflicts || 0;
-  // 仅统计未解决冲突（后端已按 open 口径返回）
-  const bySeverity = summary.conflicts_by_severity || {};
+  const aiFindings = summary.unresolved_ai_findings ?? 0;
+  // 老后端无按来源拆分的字段时，回退老口径（混排）以保持行为不变
+  const bySeverity = summary.conflicts_by_severity_rule
+    ?? summary.conflicts_by_severity ?? {};
   const high = bySeverity.high || 0;
   const medium = bySeverity.medium || 0;
   // ENHANCE 2026-10-09：`low`（轻微）此前在后端判定里是**永不产出的死档**
@@ -35,6 +37,14 @@ export default function AuditSummaryCards({ summary }: AuditSummaryCardsProps) {
   // 否则「未解决冲突 N」与三张分级卡片之和会对不上。
   const low = bySeverity.low || 0;
   const resolved = summary.resolved_conflicts || 0;
+
+  const auditSource = summary.audit_source;
+  const auditSourceLabel =
+    auditSource === "ai"
+      ? { text: "AI 审计", color: "purple" }
+      : auditSource === "rule"
+        ? { text: "规则审计", color: "blue" }
+        : null;
 
   return (
     <Row gutter={16} style={{ marginBottom: 16 }}>
@@ -45,6 +55,11 @@ export default function AuditSummaryCards({ summary }: AuditSummaryCardsProps) {
             value={(summary.latest_audit?.audit_time as string) || "—"}
             valueStyle={{ fontSize: 18 }}
           />
+          {auditSourceLabel && (
+            <Tag color={auditSourceLabel.color} style={{ marginTop: 4 }}>
+              {auditSourceLabel.text}
+            </Tag>
+          )}
         </Card>
       </Col>
       <Col xs={12} md={6}>
@@ -54,6 +69,11 @@ export default function AuditSummaryCards({ summary }: AuditSummaryCardsProps) {
             value={unresolved}
             valueStyle={{ color: unresolved > 0 ? "#ff4d4f" : "#52c41a" }}
           />
+          {aiFindings > 0 && (
+            <Text type="secondary" style={{ fontSize: 12 }}>
+              其中 {aiFindings} 条为 AI 语义发现（需人工核对）
+            </Text>
+          )}
         </Card>
       </Col>
       <Col xs={8} md={8}>

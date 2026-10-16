@@ -21,6 +21,8 @@ from ..security.auth import get_current_user
 from ..services.facts_service import (
     DEFAULT_FACTS_POLICY,
     FACT_CATEGORIES,
+    chapter_scope_enabled,
+    chapter_subject_scope_block,
     coerce_audit_list,
     count_placeholders,
     dedup_key,
@@ -30,11 +32,14 @@ from ..services.facts_service import (
     facts_segment_token_cap,
     group_fact_conflicts,
     is_placeholder_value,
+    kb_patch_enabled,
     mark_placeholders,
+    merge_kb_patch_items,
     normalize_fact_items,
     normalize_facts_policy,
     outline_input_enabled,
     parse_stored_items,
+    PLACEHOLDER_VALUE_PREFIX,
     policy_rule_text,
     resolve_category,
     schedule_fallback_value,
@@ -61,20 +66,46 @@ logger = logging.getLogger(__name__)
 # 的副本已经漂移（分类口径不一致 / 占位符泄漏 / 策略只认 fabricate）。
 # 现在正本收敛到 `services/facts_service.py`，本文件只做 thin re-export，
 # 既有 `from app.routers.facts import _normalize_facts` 等 import 路径全部保持可用。
+#
+# BUG-FIX 2026-10-15（TD-D 死 alias）：本块曾含 `_normalize_facts =
+# normalize_fact_items`，但它被下方同名 `def _normalize_facts` 遮蔽成**永不可达
+# 的死代码** —— 所有调用方实际都解析到 def，那一行只是误导读者的假 re-export。
+# 删除后语义完全不变（模块级名字解析到 def），静态守卫测试
+# tests/test_import_module_hardening_2026_10_15c.py::TestStaticGuards 钉住
+# 「alias 不得被同名 def 遮蔽」这条约定，防同类死代码再次引入。
 # ============================================================
 _DEFAULT_FACTS_POLICY = DEFAULT_FACTS_POLICY
 _DEFAULT_FACT_CATEGORIES = FACT_CATEGORIES
 _policy_rule_text = policy_rule_text
 _schedule_fallback_value = schedule_fallback_value
-_normalize_facts = normalize_fact_items
 _coerce_fact_audit_list = coerce_audit_list
 _dict_to_fact_items = dict_to_fact_items
 
 
-def _generate_default_facts(summary: str, scoring_points: str) -> list:
+def _generate_default_facts(
+    summary: str,
+    scoring_points: str,
+    policy: str = _DEFAULT_FACTS_POLICY,
+) -> list:
     """当 AI 提取失败时,使用启发式规则从摘要和评分点生成默认事实变量
 
     通过正则表达式匹配常见模式来提取关键信息
+
+    BUG-FIX 2026-10-15（F-5 兜底绕过缺失值策略）：旧实现无任何事实时硬编码
+    两条 ``source="default"`` 的兜底项 —— ``projectName="待确认"`` 与
+    ``projectType="建筑工程"``，两者都绕过本模块的三档策略契约：
+
+      1. ``is_placeholder_value`` 只认 ``PLACEHOLDER_VALUE_PREFIX``（【待填写）
+         前缀，所以 ``待确认`` **不被识别为占位**：不计入 ``placeholder_count``、
+         不打 ``needs_manual_input``、更不被正文生成的占位过滤剔除 —— 它会被当成
+         真实项目名原样注入全篇提示词，成为一处稳定的虚构来源；
+      2. ``projectType="建筑工程"`` 是**未经资料佐证的断言**，用户选 ``omit``
+         （不编造）/``placeholder``（留占位）时仍会拿到，等于策略选择形同虚设。
+
+    现按策略产出：projectName 在**所有**策略下都是占位（项目名无从得知，
+    写成占位会被下游过滤掉，比注入一个假名字安全）；projectType 在 ``omit``
+    下不产出、``placeholder`` 下写成占位、``fabricate`` 下保持历史默认值
+    （向后兼容，历史部署不改变行为）。
     """
     facts = []
     text = summary + " " + scoring_points
@@ -192,24 +223,34 @@ def _generate_default_facts(summary: str, scoring_points: str) -> list:
 
     # 6. 添加通用基础事实(如果都没有提取到)
     if not facts:
+        # BUG-FIX 2026-10-15（F-5）：兜底值必须落在本模块的占位契约内（见函数
+        # docstring）。projectName 一律写成可被 is_placeholder_value 识别的占位串，
+        # 使其被计入 placeholder_count、并在正文生成的占位过滤中被剔除；
+        # projectType 按策略决定「不产出 / 占位 / 历史默认值」。
         facts.append(
             {
                 "key": "projectName",
                 "label": "项目名称",
-                "value": "待确认",
+                "value": f"{PLACEHOLDER_VALUE_PREFIX}：项目名称】",
                 "category": "basic",
                 "source": "default",
             }
         )
-        facts.append(
-            {
-                "key": "projectType",
-                "label": "工程类型",
-                "value": "建筑工程",
-                "category": "basic",
-                "source": "default",
-            }
-        )
+        if policy != "omit":
+            # omit = 不编造：不产出未经资料佐证的工程类型断言。
+            facts.append(
+                {
+                    "key": "projectType",
+                    "label": "工程类型",
+                    "value": (
+                        f"{PLACEHOLDER_VALUE_PREFIX}：工程类型】"
+                        if policy == "placeholder"
+                        else "建筑工程"
+                    ),
+                    "category": "basic",
+                    "source": "default",
+                }
+            )
 
     return facts
 
@@ -650,10 +691,17 @@ async def generate_facts(project_id: int, body: FactsGenerateRequest | None = No
         except Exception as _ol_e:
             logger.warning("[AI事实] 目录输入加载失败（跳过，不影响提取）: %s", _ol_e)
 
+    # P2-1（facts-ns 2026-10-15）：九大章节选题标准随「目录输入」开关一同启用，
+    # 也可用 FACTS_CHAPTER_SCOPE_ENABLED 单独开启。目录用于确定大项覆盖范围，
+    # 该块再按九大章节给出「每章必备事实类别」的选题提示（只决定选哪些项，
+    # 不决定值）。开关默认关=不追加，提示词与历史逐字一致。
+    chapter_scope_block = chapter_subject_scope_block() if chapter_scope_enabled() else ""
+
     extract_user = f"""请从以下项目文档中提取全局事实变量：
 
 {source_text}
 {outline_block}
+{chapter_scope_block}
 """
     if step02_parts:
         extract_user += (
@@ -702,7 +750,7 @@ async def generate_facts(project_id: int, body: FactsGenerateRequest | None = No
                 _seg_user = (
                     f"请从以下项目文档中提取全局事实变量（这是第 {_idx}/{len(segments)} 个分段，"
                     "只提取本分段有明确依据的事实；本分段没有提及不代表整份文档没有提及，"
-                    f"不要因某项信息未在本段出现而放弃提取）：\n\n{_seg}\n{outline_block}\n{extract_tail}"
+                    f"不要因某项信息未在本段出现而放弃提取）：\n\n{_seg}\n{outline_block}\n{chapter_scope_block}{extract_tail}"
                 )
                 try:
                     _seg_result, _ = await run_json_extraction(
@@ -748,7 +796,7 @@ async def generate_facts(project_id: int, body: FactsGenerateRequest | None = No
                 )
             if not items:
                 logger.info("[AI事实] 分段提取归并后为空，使用启发式规则兜底")
-                items = _generate_default_facts(summary, scoring_points)
+                items = _generate_default_facts(summary, scoring_points, policy)
                 extraction_mode = "heuristic"
                 extraction_note = "AI 未提取到事实，以下为规则启发式结果，请逐条人工确认后再使用。"
         else:
@@ -769,20 +817,103 @@ async def generate_facts(project_id: int, body: FactsGenerateRequest | None = No
 
             if not items:
                 logger.info("[AI事实] AI 提取返回空结果，使用启发式规则兜底")
-                items = _generate_default_facts(summary, scoring_points)
+                items = _generate_default_facts(summary, scoring_points, policy)
                 extraction_mode = "heuristic"
                 extraction_note = "AI 未提取到事实，以下为规则启发式结果，请逐条人工确认后再使用。"
 
     except Exception as e:
         logger.warning("[AI事实] 提取异常，使用启发式规则兜底: %s", e)
-        items = _generate_default_facts(summary, scoring_points)
+        items = _generate_default_facts(summary, scoring_points, policy)
         extraction_mode = "heuristic"
         extraction_note = f"AI 提取失败（{str(e)[:80]}），以下为规则启发式结果，请逐条人工确认后再使用。"
+
+    # P2-2（facts-ns 2026-10-15，对齐易标 runKnowledgeGlobalFactPatches）：基线提取
+    # 完成后从参考知识库做一次「只补不增」的补充提取。开关 FACTS_KNOWLEDGE_PATCH_ENABLED
+    # 默认关 = 不读知识库，行为与历史一致；开启且基线 items 非空时：读知识库轻量条目 →
+    # 二次提取 → merge_kb_patch_items 拼到基线之后 → 由下方 _normalize_facts 统一去重
+    # （基线优先、基线占位/空值让位知识库实值）。任何异常都降级跳过，不阻断基线提取。
+    kb_patch_tried = False
+    if kb_patch_enabled() and items:
+        try:
+            from ..services import knowledge as _kb_svc
+
+            _kb_items = _kb_svc.get_relevant_items(limit=30) or []
+
+            def _render_kb_material(rows):
+                _lines: list[str] = []
+                _budget = 6000
+                for _i, _it in enumerate(rows or [], 1):
+                    _title = str(_it.get("title") or f"知识条目{_i}").strip()
+                    _summary = str(_it.get("summary") or "").strip()
+                    _content = str(_it.get("content") or "").strip()[:600]
+                    _block = f"[条目{_i}] 标题：{_title}"
+                    if _summary:
+                        _block += f"\n摘要：{_summary[:200]}"
+                    if _content:
+                        _block += f"\n正文：{_content}"
+                    if len(_block) > _budget:
+                        break
+                    _budget -= len(_block)
+                    _lines.append(_block)
+                return "\n\n".join(_lines)
+
+            _kb_material = _render_kb_material(_kb_items)
+            if _kb_material:
+                _kb_sys = (
+                    "你是招投标方案全局事实变量补充助手。请从参考知识库素材中提取"
+                    "『技术方案正文需要统一采用』的确定性事实（人员、工期、设备型号、"
+                    "质保期、响应时间、服务承诺、技术参数等）。"
+                    "只提取素材中有明确依据的事实；素材未提到的严禁编造；"
+                    "只返回 JSON 对象（dict），key 用英文驼峰，value 为字符串。"
+                )
+                _kb_user = f"""以下是参考知识库素材（历史项目文档/企业级规范，仅作事实补源）：
+
+{_kb_material}
+
+请从上述知识库素材中补充提取全局事实变量：
+1. 只提取素材中有明确依据的确定性事实；
+2. 与招标文件/Step02 解析结果冲突时，不要覆盖已确认的值（基线以招标为准）；
+3. 素材没有明确值时严禁编造；没有可补充内容时返回空 JSON 对象 {{}}；
+4. 输出 JSON 对象（dict），严禁附加解释。"""
+                _kb_result, _ = await run_json_extraction(
+                    [
+                        AIMessage(role="system", content=_kb_sys),
+                        AIMessage(role="user", content=_kb_user),
+                    ],
+                    provider=provider,
+                    temperature=0.3,
+                    max_retries=2,
+                )
+                if isinstance(_kb_result, dict):
+                    _kb_patch = _dict_to_fact_items(_kb_result)
+                elif isinstance(_kb_result, list):
+                    _kb_patch = _kb_result
+                else:
+                    _kb_patch = []
+                if _kb_patch:
+                    items = merge_kb_patch_items(items, _kb_patch)
+                    logger.info(
+                        "[AI事实] 知识库补充候选 %d 条已并入基线（去重后以最终清单为准）",
+                        len(_kb_patch),
+                    )
+                kb_patch_tried = True
+        except Exception as _kb_e:
+            logger.warning("[AI事实] 知识库补充失败（跳过，不影响基线提取）: %s", _kb_e)
 
     # 值规范化后处理：去重 + 必须有工期规则（缺值兜底文案按策略生成）
     items = _normalize_facts(
         items, fallback_text=(summary or "") + (scoring_points or ""), policy=policy
     )
+
+    # P2-2：知识库补充实际生效条数（规范化去重后 source=knowledge 的条目数）
+    knowledge_patches_applied = 0
+    if kb_patch_tried:
+        knowledge_patches_applied = sum(
+            1
+            for _it in items
+            if isinstance(_it, dict)
+            and str(_it.get("source") or "").strip() == "knowledge"
+        )
 
     # placeholder 策略下逐条打标，前端可高亮「这条还等着人工填」。
     # omit 策略不逐条打标 —— 它的产物是完整的笼统承诺，不需要逐条补填。
@@ -840,6 +971,8 @@ async def generate_facts(project_id: int, body: FactsGenerateRequest | None = No
         # BUG-FIX 2026-09-14：前端据此区分"AI 精准提取"与"规则启发式兜底"
         "extraction_mode": extraction_mode,
         "warning": extraction_note,
+        # ENHANCE 2026-10-15（P2-2）：知识库补充实际生效条数（0=未启用或未补充）
+        "knowledge_patches_applied": knowledge_patches_applied,
         # ENHANCE 2026-09-15：回传本次采用的缺失值策略
         "missing_value_policy": policy,
         "placeholder_count": count_placeholders(items),

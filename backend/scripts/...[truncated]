@@ -1,0 +1,134 @@
+# -*- coding: utf-8 -*-
+"""审计第五轮验证探针（章节编写模块）。
+
+独立复核「清洗 / 图表围栏 / 接缝去重 / 编码」链路 5 项疑似缺陷。
+
+用法（backend 目录下）：
+    $env:PYTHONDONTWRITEBYTECODE='1'
+    .\\.venv\\Scripts\\python.exe scripts\\_audit5_verify.py
+"""
+from __future__ import annotations
+
+import os
+import re
+import sys
+
+BACKEND = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if BACKEND not in sys.path:
+    sys.path.insert(0, BACKEND)
+os.chdir(BACKEND)
+
+sys.dont_write_bytecode = True
+
+from app.services.ai.workflows_sections import (  # noqa: E402
+    _MAX_SEAM_OVERLAP,
+    _mask_chart_fences_for_compression,
+    _restore_chart_fences_after_compression,
+    _strip_seam_overlap,
+)
+from app.services.content_cleaning import parse_content  # noqa: E402
+
+NL = "\n"
+BT = "`"                      # 反引号
+TILDE = "~"
+ZW = "\u200b"                # ZERO WIDTH SPACE
+BACKSLASH_S = chr(92) + "s"  # 正则 \s
+
+results: list[tuple[str, bool, str]] = []
+
+
+def rec(name: str, is_bug: bool, detail: str) -> None:
+    results.append((name, is_bug, detail))
+    print(("[缺陷确认] " if is_bug else "[未复现]   ") + name)
+    print("            " + detail)
+
+
+def block_types(text: str) -> list[str]:
+    return [str(b.get("type")) for b in parse_content(text)]
+
+
+# ---------- P1-1: ~~~ 波浪线图表围栏未被 mask 保护 ----------
+tilde_case = NL.join([
+    "前言段落", "", TILDE * 3 + "mermaid", "graph TD", "  A-->B",
+    TILDE * 3, "", "后记段落",
+])
+masked_t, orig_t = _mask_chart_fences_for_compression(tilde_case)
+rec(
+    "P1-1 ~~~mermaid 围栏未被 mask（压缩时暴露给 AI）",
+    len(orig_t) == 0 and (TILDE * 3 + "mermaid") in masked_t,
+    "originals=%d（期望0=漏保护），波浪线围栏仍裸露在压缩文本中=%s，"
+    "masked片段=%r" % (len(orig_t), (TILDE * 3 + "mermaid") in masked_t, masked_t[:30]),
+)
+
+# ---------- P1-2: 4 反引号围栏被错位匹配，占位符被反引号包裹 ----------
+quad_case = NL.join([
+    "前言", "", BT * 4 + "mermaid", "graph TD", "A-->B", BT * 4, "", "后记",
+])
+masked_q, orig_q = _mask_chart_fences_for_compression(quad_case)
+wrapped = masked_q.count(BT + "<<CHART_BLOCK_1>>" + BT)
+rec(
+    "P1-2 四反引号围栏错位匹配，占位符被反引号包裹",
+    bool(orig_q) and orig_q[0].startswith(BT * 3 + "mermaid") and wrapped == 1,
+    "originals[0]前12字=%r，被反引号包裹的占位符数量=%d"
+    % (orig_q[0][:12] if orig_q else None, wrapped),
+)
+
+# ---------- P1-3: 相邻两张同语言图，第二张丢失保护 ----------
+twin_case = NL.join([
+    "前言", "", BT * 3 + "mermaid", "graph TD", "  A-->B", BT * 3, "",
+    BT * 3 + "mermaid", "graph LR", "  X-->Y", BT * 3, "", "后记",
+])
+masked_w, orig_w = _mask_chart_fences_for_compression(twin_case)
+rec(
+    "P1-3 相邻两张 mermaid 图，第二张未被保护",
+    len(orig_w) != 2,
+    "originals=%d（期望2），第二张图源码裸露=%s，"
+    "originals[0]=%r" % (len(orig_w), "graph LR" in masked_w, orig_w[0] if orig_w else None),
+)
+
+# ---------- P2-1: 接缝去重对短词巧合误剥离 ----------
+seam_cases = [
+    ("本阶段已完成采购", "采购的时间节点如下："),
+    ("总体质量目标为", "质量目标为可量化指标"),
+    ("资源配置与", "与业主单位协商后落实"),
+]
+short_strip = 0
+parts = []
+for final_c, extra_c in seam_cases:
+    got = _strip_seam_overlap(final_c, extra_c)
+    k = len(extra_c) - len(got)
+    parts.append("k=%d: %r -> %r" % (k, extra_c[:10], got[:10]))
+    if 0 < k < 8:
+        short_strip += 1
+rec(
+    "P2-1 接缝去重对 2~4 字巧合误剥离（主语丢失）",
+    short_strip >= 2,
+    "_MAX_SEAM_OVERLAP=%d，短词误剥 %d/%d | %s"
+    % (_MAX_SEAM_OVERLAP, short_strip, len(seam_cases), " ; ".join(parts)),
+)
+
+# ---------- P2-2: 零宽字符导致标题/列表降级为段落 ----------
+zw_head = "1" + ZW + "、施工部署" + NL + "正文内容第一段。" + NL
+zw_list = "1." + ZW + "施工准备" + NL + "内容。" + NL
+clean_head = "1、施工部署" + NL + "正文内容第一段。" + NL
+rec(
+    "P2-2 零宽字符 U+200B 使标题/列表降级为段落",
+    block_types(zw_head)[0] != "heading3",
+    "Python re \\\\s 是否匹配 U+200B: %s | 含ZW '1+ZW+、施工部署' -> %r | "
+    "纯净对照组 -> %r | 含ZW列表 -> %r"
+    % (bool(re.match(BACKSLASH_S, ZW)), block_types(zw_head),
+       block_types(clean_head), block_types(zw_list)),
+)
+
+# ---------- 附：restore 往返正确性（对照组，确认非缺陷） ----------
+roundtrip_ok = _restore_chart_fences_after_compression(
+    "压缩后的文本 " + "<<CHART_BLOCK_1>>" + " 结尾", ["A"]
+) == "压缩后的文本 A 结尾"
+print("[对照]   restore 往返正确性: %s" % roundtrip_ok)
+
+print("\n" + "=" * 78)
+bugs = [r for r in results if r[1]]
+print("结论：%d 项复核，缺陷确认 %d 项" % (len(results), len(bugs)))
+for n, _f, _d in bugs:
+    print("  * " + n)
+print("=" * 78)

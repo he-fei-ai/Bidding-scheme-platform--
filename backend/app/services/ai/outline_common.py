@@ -985,23 +985,63 @@ _QI_ORDINAL_SUFFIX_RE = re.compile(r"[（(]\s*其\s*[0-9一二三四五六七八
 _CN_DIGITS = ("零", "一", "二", "三", "四", "五", "六", "七", "八", "九")
 
 
+def _cn_two_digits(n: int) -> str:
+    """10~99 → 中文十位段（供百/千位组合复用，形如「一十」「二十三」「五十」）。
+
+    百/千位组合里保留「一十」而非「十」：「一百一十」读起来明确，且与个位
+    「十一」的省略写法不冲突（后者由 `_cn_ordinal` 的独立分支处理）。
+    """
+    tens, ones = divmod(n, 10)
+    return _CN_DIGITS[tens] + "十" + (_CN_DIGITS[ones] if ones else "")
+
+
 def _cn_ordinal(n: int) -> str:
-    """阿拉伯序数 → 中文序数（覆盖 1~99，超出范围原样返回阿拉伯数字）。"""
+    """阿拉伯序数 → 中文序数（覆盖 1~9999，全区间输出纯中文）。
+
+    加固 2026-10-15（D6 · 阿拉伯数字泄漏）：旧实现 `n >= 100` 直接
+    `return str(n)`，而三处消歧兜底的起点恰好都落在 100 以上 ——
+    `_disambiguate_title` 的有界扫描收口于 `之{_cn_ordinal(101)}`，
+    `_uniquify_outline_titles` 的防御式循环从 `_n = 101` 起步，
+    `build_chapter7_framework` 的兜底从 `_guard = 101` 起步。于是同级重名
+    条目较多时会产出「总体实施策划之101」这类**阿拉伯数字混入中文标题**的
+    形态：既不可读，也让「之N」的脏判定豁免名存实亡（形态与「（2）」裸编号
+    同类，等于兜底函数产出了自家定义的脏格式）。现补齐十/百/千位与「零」
+    衔接规则（GB/T 15835 形式：101→一百零一、1010→一千零一十、2005→两千零五），
+    全区间不再返回阿拉伯数字。> 9999 仍回落 `str(n)`：同一父级下不可能有
+    如此多兄弟节点，仅作最后防线保留可见性。
+    """
     try:
         n = int(n)
     except (TypeError, ValueError):
         return "一"
     if n < 1:
         n = 1
+    if n > 9999:
+        return str(n)
     if n <= 10:
         # n=10 需特判：_CN_DIGITS 只有下标 0~9
         return "十" if n == 10 else _CN_DIGITS[n]
     if n < 20:
         return "十" + _CN_DIGITS[n % 10]
     if n < 100:
-        tens, ones = divmod(n, 10)
-        return _CN_DIGITS[tens] + "十" + (_CN_DIGITS[ones] if ones else "")
-    return str(n)
+        return _cn_two_digits(n)
+    out = ""
+    if n >= 1000:
+        out = _CN_DIGITS[n // 1000] + "千"
+    rest = n % 1000
+    r2 = rest % 100
+    if 0 < rest < 100:  # 千位后直接是个位/十位 → 需「零」衔接
+        out += "零"
+    hundreds = rest // 100
+    if hundreds:
+        out += _CN_DIGITS[hundreds] + "百"
+        if 0 < r2 < 10:  # 百位后直接是个位 → 需「零」衔接
+            out += "零"
+    if r2 >= 10:
+        out += _cn_two_digits(r2)
+    elif r2:
+        out += _CN_DIGITS[r2]
+    return out
 
 
 def _strip_legacy_redundant_suffix(title: str) -> str:
@@ -1084,6 +1124,11 @@ def _is_dirty_l3_title(title: str) -> bool:
          —— 只判定不剥离；且必须收窄，见下方说明
       6. 标题恰好等于纯泛化词（「总体实施策划」）
       7. 纯序号占位（「内容3」「子章节2」「章节1」）
+      8. 「泛化词干 + 泛化维度词」组合（「总体实施策划专项方案」
+         「总体实施策划补充措施」「总体方案施工工艺」「实施策划质量控制」）
+         —— 消歧分支与本章实体抽取的共同产物，语义含量为零；
+            由 `_is_generic_stem_only_title` 判定，
+            config.OUTLINE_L3_GENERIC_STEM_GUARD_ENABLED=false 时关闭。
     """
     t = (title or "").strip()
     if not t:
@@ -1108,6 +1153,14 @@ def _is_dirty_l3_title(title: str) -> bool:
     if t in _GENERIC_ONLY_TITLES:
         return True
     if t in _L3_L2LIKE_TITLES:
+        return True
+    # 8. 「泛化词干 + 泛化维度词」组合（2026-10-15 第五轮）：
+    #    「总体实施策划专项方案」「总体方案施工工艺」「实施策划质量控制」。
+    #    这类标题是消歧分支（`_disambiguate_title` 优先级 1）与本章实体抽取
+    #    （`_title_entity_fragments` 未过滤泛化段）共同产出的第三副占位面孔，
+    #    语义含量为零，且**不含任何项目实体**。规则 6/7 的「恰好等于」口径放行
+    #    它们，导致清洗链与消歧产物脏复检双双失效（见 config.py 同名开关注释）。
+    if _is_generic_stem_only_title(t):
         return True
     return False
 
@@ -1239,6 +1292,101 @@ _L3_PROCEDURE_DIMS: tuple[str, ...] = (
     "要求", "要点", "流程", "标准", "措施", "细则", "方案", "实施",
     "检查", "记录", "控制", "交底", "验收", "培训", "部署",
 )
+# ========== 泛化词干 × 维度词组合识别（2026-10-15 第五轮） ==========
+# 「总体实施策划专项方案」「总体方案施工工艺」「实施策划质量控制」这类标题由两部分
+# 构成：泛化词干（本身即章名级泛化短语，不携带工程实体）+ 泛化维度词（消歧/兜底
+# 维度池里的通用执行维度）。两者相加语义含量为零，与「专项6」「总体实施策划（2）」
+# 同属占位式泛化名称，但既有判定的「恰好等于泛化词」口径完全放行它们 —— 于是
+# 2026-10-15 的「消歧产物脏复检」和清洗链都形同虚设（详见 config.py 同名开关注释
+# 与 backend/scripts/diag_l3_leaks.py 的 D1/D2）。
+_GENERIC_STEM_WORDS: frozenset[str] = frozenset(
+    _GENERIC_ONLY_TITLES | _L3_L2LIKE_TITLES | {
+        # 泛化父级指代词中未出现在上面两个集合里的条目（≥3 字，
+        # 「总体」「方案」「措施」这类 ≤2 字短词刻意不纳入：
+        # 会把「总体技术路线」误判为泛化词干 + 泛化维度词）。
+        "管理措施", "总体施工部署", "施工部署", "总体策划", "工程实施",
+        "项目管理", "施工组织", "分阶段推进", "推进计划", "阶段推进",
+        "实施策划", "工程质量保证",
+    }
+)
+
+_GENERIC_STEM_DIMENSIONS: frozenset[str] = frozenset(
+    tuple(_DISAMBIG_DIMENSIONS)
+    + tuple(_L3_FALLBACK_DIMENSIONS)
+    + tuple(_L3_PROCEDURE_DIMS)
+    + tuple(_L3_SUFFIX_POOL["generic"])
+    + tuple(_L3_SHORT_ACTIONS["generic"])
+    + tuple(_L3_SHORT_ACTIONS["work"])
+    + tuple(_L3_SHORT_ACTIONS["quality"])
+    + tuple(_L3_SHORT_ACTIONS["safety"])
+    + tuple(_L3_SHORT_ACTIONS["schedule"])
+    + tuple(_L3_SHORT_ACTIONS["cost"])
+    + tuple(_L3_SHORT_ACTIONS["org"])
+    + tuple(_L3_SHORT_ACTIONS["tech"])
+)
+
+
+def _generic_stem_guard_enabled() -> bool:
+    """读 config.OUTLINE_L3_GENERIC_STEM_GUARD_ENABLED（惰性读取以支持测试打桩）。"""
+    from app.config import OUTLINE_L3_GENERIC_STEM_GUARD_ENABLED  # noqa: PLC0415
+
+    return OUTLINE_L3_GENERIC_STEM_GUARD_ENABLED
+
+
+def _is_generic_stem_only_title(title: str) -> bool:
+    """判定标题是否为「泛化词干 × 泛化维度词」组合（不含任何项目实体）。
+
+    命中样例（形态 A · 词干 + 单个维度词）：
+        「总体实施策划专项方案」「总体方案施工工艺」「实施策划质量控制」
+        「总体方案检测试验」「实施策划记录归档」「工程质量保证检测试验」
+    命中样例（形态 B · 连续堆叠多个泛化词干）：
+        「总体方案总体实施策划专项方案」「总体方案与实施策划质量控制」
+
+    不命中样例：「混凝土施工工艺」「样板区质量控制」「见证取样要点」
+              「专项方案编制与评审」「施工工艺流程与要点」
+              「总体实施策划之一」（中文序数消歧产物，刻意豁免：
+              `_uniquify_outline_titles` 的消歧兜底分支必然产出「X之N」，
+              若判脏会与其构成互斥循环）。
+
+    形态 B 的判定口径刻意收敛为「**连续**泛化词干」，不使用维度词参与堆叠：
+    否则「见证取样要点」（维度 + 维度，语义完整的制度类标题）会被误判。
+
+    由 config.OUTLINE_L3_GENERIC_STEM_GUARD_ENABLED 控制，设为 false 时恒为 False。
+    """
+    if not _generic_stem_guard_enabled():
+        return False
+    t = (title or "").strip()
+    if not t:
+        return False
+    if "之" in t:  # 中文序数消歧产物豁免（见 docstring）
+        return False
+
+    stems_desc = sorted(_GENERIC_STEM_WORDS, key=len, reverse=True)
+
+    # 形态 B：连续剥除泛化词干，堆叠 ≥2 个即判脏
+    rest = t
+    n_stems = 0
+    while True:
+        for stem in stems_desc:
+            if rest.startswith(stem):
+                rest = rest[len(stem):].strip()
+                n_stems += 1
+                break
+        else:
+            break
+    if n_stems >= 2:
+        return True
+
+    # 形态 A：泛化词干 + 恰好一个泛化维度词（整段被完全分解）
+    for stem in stems_desc:
+        if not t.startswith(stem):
+            continue
+        tail = t[len(stem):].strip()
+        if tail and tail in _GENERIC_STEM_DIMENSIONS:
+            return True
+    return False
+
+
 
 
 def _l3_dims_for(entity: str, dimensions: tuple[str, ...]) -> tuple[str, ...]:
@@ -1267,6 +1415,54 @@ _TITLE_ENTITY_NOISE_SUFFIXES = tuple(
         reverse=True,
     )
 )
+
+
+# 章节片段判为「泛化词干（非工程实体）」的**宽口径**词表 —— 仅供
+# `_title_entity_fragments` 过滤使用，不参与脏标题判定（后者必须严格收窄以避免
+# 误伤「混凝土施工工艺」这类合法标题）。
+#
+# 这里刻意比 `_GENERIC_STEM_WORDS` 更宽：把 L2 维度名（资源配置/协调保障/
+# 过程控制/考核评价…）与章名级组织词（项目管理/施工组织/管理体系…）都算进去。
+# 过滤掉的后果只是回落到语义域词池（`_L3_ENTITY_WORDS`，产出「样板区质量控制」
+# 这类具体实体标题），不会产生任何标题质量问题；而不过滤则会把
+# 「总体方案」「实施策划」这类泛化片段当成实体拼出「总体方案施工工艺」。
+_GENERIC_FRAGMENT_WORDS: frozenset[str] = frozenset(
+    _GENERIC_STEM_WORDS
+    | {
+        "资源配置", "协调保障", "过程控制", "考核评价", "总结改进",
+        "阶段目标", "资源投入", "协调接口", "任务分解", "责任落实",
+        "计划编制", "动态跟踪", "风险清单", "验收交付", "制度落实",
+        "管理体系", "组织架构", "岗位职责", "例会制度", "绩效考核",
+        "人员培训", "教育培训", "危险源辨识", "项目管理机构",
+        "总体技术", "工程概况", "工程特点", "施工部署", "总体安排",
+        "工程质量保证", "工程质量", "工程总平面", "工程总控",
+    }
+)
+
+
+def _is_generic_entity_fragment(seg: str) -> bool:
+    """判定章名片段是否为泛化词干（非工程实体，不得参与三级标题拼接）。
+
+    例：「总体方案」「实施策划」「资源配置」「协调保障」「工程质量保证」→ True；
+        「悬挑花篮架」「盘扣支撑体系」「试验检验」「计量管理」→ False。
+
+    判断口径：片段本身是泛化词干，或剥掉**一层**章名级虚词后是泛化词干
+    （「工程质量保证」剥「保证」得「工程质量」——两者都登记为泛化词干）。
+    只剥一层与 `_title_entity_fragments` 的剥离口径保持一致。
+    """
+    if not _generic_stem_guard_enabled():
+        return False
+    s = (seg or "").strip()
+    if not s or not re.search(r"[一-鿿]", s):
+        return False
+    if s in _GENERIC_FRAGMENT_WORDS:
+        return True
+    for suf in _TITLE_ENTITY_NOISE_SUFFIXES:
+        if s.endswith(suf) and len(s) - len(suf) >= 3:
+            if s[: -len(suf)] in _GENERIC_FRAGMENT_WORDS:
+                return True
+            break
+    return False
 
 
 def _title_entity_fragments(*titles: str) -> tuple[str, ...]:
@@ -1301,6 +1497,16 @@ def _title_entity_fragments(*titles: str) -> tuple[str, ...]:
                     break
             seg = seg.strip()
             if len(seg) >= 3 and re.search(r"[一-鿿]", seg) and seg not in frags:
+                # 2026-10-15 第五轮（D1 核心根因）：章名本身是泛化短语时
+                # （「总体方案与实施策划」「资源配置与协调保障」「工程质量保证
+                # 措施」），切出的「总体方案」「实施策划」「资源配置」「协调保障」
+                # 「工程质量保证」会被当成"本章专属实体"，与维度词拼出
+                # 「总体方案施工工艺」「实施策划质量控制」这类语义含量为零的
+                # 占位式泛化标题 —— 实测在生产形态的 6 章 × 5 节点骨架上，
+                # L3 全部是这种形态（backend/scripts/diag_l3_leaks.py 的 D4/D5）。
+                # 过滤后回落语义域词池，产出「样板区质量控制」这类具体标题。
+                if _is_generic_entity_fragment(seg):
+                    continue
                 frags.append(seg)
     return tuple(frags[:4])
 
@@ -1577,6 +1783,13 @@ def _disambiguate_title(
          `_BARE_NUM_TAIL_RE` 都不会识别它，故每个序数的 core 都不同，
          必然收敛，不会重演归一化剥离导致的死循环。
     注意：本函数不负责把结果登记进 used，由调用方登记。
+
+    2026-10-15 第五轮（D2）：分支 1/2 的候选必须过一道脏判定（`_ok`），
+    否则泛化主体「总体实施策划」会拿到「总体实施策划专项方案/补充措施/实施
+    方案/保障措施」—— 语义含量为零，且此前逃过 `_is_dirty_l3_title`（规则
+    6/7 只按"恰好等于"比对），导致 `_uniquify_outline_titles` 的消歧产物脏
+    复检形同虚设。分支 3 的「X之N」不查脏判定：`_is_generic_stem_only_title`
+    对含「之」的标题刻意豁免，查了也不影响收敛性。
     """
     if used is None:
         used = set()
@@ -1595,31 +1808,82 @@ def _disambiguate_title(
     def _free(cand: str) -> bool:
         return _title_core(cand) not in used
 
-    # 1) 专业执行维度词
-    for _d in _DISAMBIG_DIMENSIONS:
-        if title.endswith(_d):
-            continue
-        _cand = f"{title}{_d}"
-        if _free(_cand):
+    def _ok(cand: str) -> bool:
+        """候选可用：不重名 **且不是** 泛化词干+泛化维度词的空壳标题。"""
+        return _free(cand) and not _is_dirty_l3_title_deep(cand)
+
+    # 1) 专业执行维度词（泛化主体跳过：追加维度词只会得到另一副空壳面孔）
+    #    「总体实施策划」→ 若直接追加维度词会得到「总体实施策划专项方案」，
+    #    语义含量为零；改用中文序数兜底，再由 `_uniquify_outline_titles` 的
+    #    消歧产物脏复检改写成语义化标题。
+    _generic_base = title in (_GENERIC_STEM_WORDS | _GENERIC_ONLY_TITLES | _L3_L2LIKE_TITLES)
+    # BUG-FIX 2026-10-15（D1）：旧的「恰好等于」口径漏掉了『泛化词干+泛化维度词』
+    # 拼接出来的泛化标题，因此追加维度词会产出「总体实施策划专项方案」这类
+    # 两头都泛化的新脏标题。此处改用 `_is_generic_stem_only_title` 的深判定。
+    if (
+        not _generic_base
+        and _generic_stem_guard_enabled()
+        and _is_generic_stem_only_title(title)
+    ):
+        _generic_base = True
+
+    if not _generic_base:
+        for _d in _DISAMBIG_DIMENSIONS:
+            if title.endswith(_d):
+                continue
+            _cand = f"{title}{_d}"
+            if _ok(_cand):
+                return _cand
+
+        # 2) 父级差异词前缀（组合空间 = 父级词 × 维度词）
+        for _tok in _parent_tokens(parent_title, title):
+            # 2026-10-15 第五轮（D2）：`_parent_tokens` 的「剩余语义片段」分支
+            # 会把「总体方案与实施策划」裁成「方案与实」这类无意义 2 字碎片，
+            # 拼出「方案与实总体实施策划专项方案」。要求前缀是 ≥3 字的完整词，
+            # 且不含连接虚字；碎片前缀直接跳过。
+            _tk_core = re.sub(r"[与和及、,，的\s　]+", "", _tok)
+            if len(_tk_core) < 3 or re.search(r"[与和及、,，的\s　]", _tok):
+                continue
+            for _d in _DISAMBIG_DIMENSIONS:
+                if _d in title:
+                    continue
+                _cand = f"{_tok}{title}{_d}"
+                if _ok(_cand):
+                    return _cand
+            if _ok(f"{_tok}{title}"):
+                return f"{_tok}{title}"
+
+    # BUG-FIX 2026-10-15（D1）：泛化主体跳过维度词与父级碎片，改走主体专属
+    # 语义池。旧实现两条退路都会产出空壳标题：
+    #   - 「总体实施策划」+ 维度词  →「总体实施策划专项方案」（两头都泛化）
+    #   - 「总体实施策划」+ 中文序数 →「总体实施策划之四」（只有序数无语义）
+    # 语义池产出「总体施工技术交底 / 总体施工样板引路」这类真正可读的标题，
+    # 组合空间（30 实体 × 14 维度）远大于单章节点数，不会退化。
+    if _generic_base:
+        # 注意两点：
+        #  1) 必须传 `used` 的**副本** —— `_semantic_fallback_title` 会把选中的
+        #     标题写回其入参集合，而本函数的 `_free()` 以 `used` 判重，直传会
+        #     让候选被自己刚写入的条目判为重名，静默退回到纯序数兜底；
+        #  2) 选中后**不要**把 core 写回 `used` —— 调用方
+        #     （`_uniquify_outline_titles`）自己负责登记，这里抢先登记会被
+        #     其防御式去重循环误判为撞名，反而退回「X之101」。
+        _cand = _semantic_fallback_title(
+            parent_title or "", len(used), set(used), context_title=title
+        )
+        if _ok(_cand):
             return _cand
 
-    # 2) 父级差异词前缀（组合空间 = 父级词 × 维度词）
-    for _tok in _parent_tokens(parent_title, title):
-        for _d in _DISAMBIG_DIMENSIONS:
-            if _d in title:
-                continue
-            _cand = f"{_tok}{title}{_d}"
-            if _free(_cand):
-                return _cand
-        if _free(f"{_tok}{title}"):
-            return f"{_tok}{title}"
-
     # 3) 中文序数兜底（有界扫描，永不产出「（其N）」）
-    for _n in range(2, 101):
+    #    2026-10-15 加固：旧实现扫描 2..100、收口写死 `_cn_ordinal(101)`，而旧
+    #    `_cn_ordinal` 在 n≥100 直接 `return str(n)` —— 于是「扫描用尽」这个正常
+    #    可达的分支会产出「X之101」，这是该无义形态的唯一上游（同级重名条目
+    #    超过 100 即必然触发，与 `_DISAMBIG_DIMENSIONS` 组合空间无关）。
+    #    现扫描与收口统一区间，且 `_cn_ordinal` 已补齐百/千位输出纯中文。
+    for _n in range(2, 1000):
         _cand = f"{title}之{_cn_ordinal(_n)}"
         if _free(_cand):
             return _cand
-    return f"{title}之{_cn_ordinal(101)}"
+    return f"{title}之{_cn_ordinal(1000)}"
 
 
 def _cleanup_placeholder_titles(
@@ -1824,6 +2088,11 @@ def _generate_fallback_l3_for_ensure(l2_title: str, idx: int, l2_index: int = 0)
 
 # ========== 全局标题去重 ==========
 
+# `_uniquify_outline_titles` 语义化重命名的有界重试次数。
+# 步长 7 与 `_l3_entity_candidates` 内部「实体步进 idx*5」互质，使相邻重试落在
+# 不同实体×维度组合上，而不是在同一个候选上反复空转。
+_DEDUPE_SEED_TRIES = 12
+
 
 def _uniquify_outline_titles(level1: list[dict]) -> list[dict]:
     """同级标题去重安全网（V5.1 共用）。
@@ -1847,6 +2116,11 @@ def _uniquify_outline_titles(level1: list[dict]) -> list[dict]:
     注：2026-09-04 用户定制规则 3（L3-L5 不得继承父级词汇）仍由
     `_derive_child_title` 在**生成**阶段执行；本函数只在**兜底消歧**时才
     使用父级差异词前缀，且已先尝试专业维度词。
+
+    2026-10-15 加固（D6）追加一条不变式：**被改名的产物既非泛化脏标题、
+    也不含阿拉伯数字序数**。旧实现在语义池耗尽时产出「总体实施策划之101」
+    （见 `_dedupe_siblings` 内的加固注释），该形态既无信息量又逃过了脏判定
+    豁免规则。现由 `_cn_ordinal` 全区间纯中文 + 有界 seed 重试共同保证。
     """
     _clean_legacy_suffix_tree(level1)
 
@@ -1866,32 +2140,62 @@ def _uniquify_outline_titles(level1: list[dict]) -> list[dict]:
                 if core in seen:
                     new_title = _disambiguate_title(title, seen, parent_title=parent_title)
                     new_core = _title_core(new_title)
-                    # 防御式兜底（理论上不可达：_disambiguate_title 的中文序数分支
-                    # 必然收敛）。绝不回退到「（其N）」式冗余后缀。
-                    _n = 101
-                    while new_core and new_core in seen and _n < 200:
-                        new_title = f"{title}之{_cn_ordinal(_n)}"
-                        new_core = _title_core(new_title)
-                        _n += 1
-                    # 2026-10-15 修复（B4 · 消歧产物无脏复检）：
-                    # `_disambiguate_title` 的维度词分支会给泛化主体补维度词
-                    # （实测产出「总体实施策划专项方案」），而消歧发生在
-                    # `_cleanup_placeholder_titles` **之后**，脏产物因此直接落库。
-                    # 现补一道统一脏判定：仍脏则改用章内语义化兜底重生成。
-                    if _is_dirty_l3_title_deep(new_title):
+                    # 2026-10-15 加固（D6 · 消歧产物无脏复检 + 重名 fallthrough）：
+                    # 旧实现两处兜底各自只走一步，留下两条「X之101」式无义形态的
+                    # 产出路径：
+                    #   ① 防御式循环从 `_n = 101` 起步直接拼「X之N」—— 跳过了
+                    #      本可用的语义化候选，且旧 `_cn_ordinal` 在 n≥100 返回
+                    #      阿拉伯数字，实测产出「总体实施策划之101」；
+                    #   ② B4 脏复检只试**一次**语义化兜底且用固定 `idx=len(seen)`，
+                    #      一旦该候选恰好与兄弟撞名（`_rebuilt_core in seen`）条件
+                    #      就不满足，脏标题被原样保留落库。
+                    # 现合并为一个有界重试：每次换 seed（步长 7）重跑语义化兜底，
+                    # 同时要求「未与兄弟撞名 且 非泛化脏标题」两条件都满足才采纳；
+                    # 语义池也耗尽时才退回中文序数收口。
+                    _guard = 0
+                    while (
+                        new_core in seen or _is_dirty_l3_title_deep(new_title)
+                    ) and _guard < _DEDUPE_SEED_TRIES:
+                        _rb_used = set(sibling_raw) | set(seen)
                         _rebuilt = _semantic_fallback_title(
-                            parent_title, len(seen), set(sibling_raw), context_title=""
+                            parent_title,
+                            len(seen) + _guard * 7,
+                            _rb_used,
+                            context_title="",
                         )
                         _rebuilt_core = _title_core(_rebuilt)
-                        if _rebuilt_core and _rebuilt_core not in seen:
+                        if (
+                            _rebuilt_core
+                            and _rebuilt_core not in seen
+                            and not _is_dirty_l3_title_deep(_rebuilt)
+                        ):
                             logger.info(
-                                "同级去重: 消歧产物「%s」仍为泛化标题，改用语义化兜底「%s」（父级=%s）",
+                                "同级去重: 消歧产物「%s」仍为泛化/重名标题，改用语义化兜底「%s」（父级=%s）",
                                 new_title,
                                 _rebuilt,
                                 parent_title or "(根)",
                             )
                             new_title = _rebuilt
                             new_core = _rebuilt_core
+                            break
+                        _guard += 1
+                    if new_core in seen or _is_dirty_l3_title_deep(new_title):
+                        # 语义化兜底也耗尽：退回中文序数收口。「之N」刻意豁免脏
+                        # 判定（见 `_is_generic_stem_only_title` docstring），故每个
+                        # 序数的 core 都不同、必然收敛；`_cn_ordinal` 已补齐百/千位
+                        # 输出纯中文，不再产出「X之101」，也不回退到「（其N）」式
+                        # 冗余后缀（那会被 `_clean_legacy_suffix_tree` 剥掉造成抖动）。
+                        _n = 2
+                        while _n < 10000 and _title_core(f"{title}之{_cn_ordinal(_n)}") in seen:
+                            _n += 1
+                        new_title = f"{title}之{_cn_ordinal(_n)}"
+                        new_core = _title_core(new_title)
+                        logger.warning(
+                            "同级去重: 「%s」语义化兜底耗尽，退回中文序数「%s」（父级=%s）",
+                            title,
+                            new_title,
+                            parent_title or "(根)",
+                        )
                     logger.info(
                         "同级去重: 「%s」->「%s」（父级=%s）",
                         title,
@@ -3294,11 +3598,17 @@ def sanitize_framework_titles(
                         {_title_core(_t) for _t in pool},
                         parent_title=l2_title,
                     )
-                    # 理论上 `_disambiguate_title` 必然返回未占用的候选；
-                    # 极端情况下若仍冲突（理论上不可达），用无括号序数兜底，
-                    # 绝不回退到「（N）」。
-                    _guard = 101
-                    while _title_core(new_title) in {_title_core(_t) for _t in pool} and _guard < 200:
+                    # 理论上 `_disambiguate_title` 必然返回未占用的候选（其内部
+                    # 「之N」分支已扫描 2..999）；极端情况下若仍冲突，继续向上
+                    # 探。2026-10-15 加固：旧实现 `_guard = 101` 起步、`< 200` 收口，
+                    # 跳过了 2..100 整段可用区间，且旧 `_cn_ordinal` 在 n≥100 返回
+                    # 阿拉伯数字 —— 一旦触发必然产出「X之101」。现从 2 起步。
+                    _pool_core = {_title_core(_t) for _t in pool}
+                    _guard = 2
+                    while (
+                        _title_core(new_title) in _pool_core
+                        and _guard < 10000
+                    ):
                         new_title = f"{_strip_ordinal_suffix(new_title)}之{_cn_ordinal(_guard)}"
                         _guard += 1
 

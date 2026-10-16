@@ -422,7 +422,12 @@ def test_consistency_audit_skips_when_cancelled(monkeypatch):
 
 
 def test_consistency_audit_logs_oversized_section_truncation(monkeypatch, caplog):
-    """单节超长是"抽样送审"，必须留下可见日志，不能静默降级。"""
+    """超长节不再抽样截断：拆块全量送审并留下可见日志（修复覆盖盲区）。
+
+    ENHANCE 2026-10-15：旧实现只送审前 `AUDIT_SECTION_CHAR_LIMIT` 字符，
+    正文尾部永远不被审计。现在分块续送，全部块都进审计 prompt，
+    同时保留「超出单节送审上限」痕迹供排障。
+    """
     from app.services.ai import workflows_expand as wf
 
     monkeypatch.setattr(wf, "AUDIT_GROUP_CHAR_LIMIT", 60)
@@ -438,7 +443,12 @@ def test_consistency_audit_logs_oversized_section_truncation(monkeypatch, caplog
         )
 
     assert any("超出单节送审上限" in record.message for record in caplog.records)
-    assert len(provider.audit_prompts[0]) < 500
+    assert provider.audit_prompts
+    prompt = provider.audit_prompts[0]
+    # 500 字符 / 每块 50 = 10 块：最后一块的定位标记出现 = 全量送审
+    assert "第 10/10 块" in prompt
+    # 500 个“甲”全部送审（旧实现仅 50 个）
+    assert prompt.count("甲") == 500
 
 
 # ==================== C. 补丁区间占比保护 ====================

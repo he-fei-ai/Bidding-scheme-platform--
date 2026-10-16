@@ -67,6 +67,7 @@ from .outline_common import (
     _cn_ordinal,
     _disambiguate_title,
     _ensure_min_children,
+    _is_dirty_l3_title_deep,
     _parse_scope_items,
     _title_core,
     _uniquify_outline_titles,
@@ -3183,11 +3184,19 @@ def _quick_local_check(level1: list[dict]) -> list[str]:
     # 条目判为「重复标题」，随后 `_auto_fix_issues` 给它追加「（其N）」式后缀 ——
     # 这正是目录里出现「砌体成品保护（其2）」「机电管线材料管理实施细则（其2）」
     # 的来源。标书目录中同名条目分属不同章节是正常形态，只应报告**同级**重名。
-    def _report(group: dict[str, str], title: str, path: str) -> None:
+    def _report(
+        group: dict[str, str], title: str, path: str, level: int = 1
+    ) -> None:
         t = title.strip()
         if not t:
             issues.append(f"空标题: {path}")
             return
+        # BUG-FIX 2026-10-15（D8 · 脏标题漏检）：旧实现只查空标题与同级重名。
+        # 「总体实施策划（2）」这类占位/泛化 L3 标题既非空、又常为同级唯一，
+        # 于是 `_auto_fix_issues` 永远收不到它的修复指令，脏标题原样落库。
+        # 现对三级及以下用 `_is_dirty_l3_title_deep` 复检，单独报「占位标题」。
+        if level >= 3 and _is_dirty_l3_title_deep(t):
+            issues.append(f"占位标题: {path}")
         if t in group:
             issues.append(f"重复标题 '{t}': {group[t]} 和 {path}")
         group[t] = path
@@ -3214,7 +3223,12 @@ def _quick_local_check(level1: list[dict]) -> list[str]:
             for l3 in l2_children:
                 if not isinstance(l3, dict):
                     continue
-                _report(l3_seen, l3.get("title", ""), f"{l1_id}/{l2_id}/{l3.get('id', '')}")
+                _report(
+                    l3_seen,
+                    l3.get("title", ""),
+                    f"{l1_id}/{l2_id}/{l3.get('id', '')}",
+                    level=3,
+                )
 
     # 检查层级结构
     for l1 in level1:
@@ -3352,10 +3366,11 @@ def _auto_fix_issues(level1: list[dict], issues: list[str]) -> list[dict]:
                 except (ValueError, IndexError):
                     pass
 
-        # 修复空标题 (格式: "空标题: 1/2/3")
-        if "空标题" in issue:
+        # 修复空标题 / 占位泛化标题
+        # (格式: "空标题: 1/2/3" 或 "占位标题: 1/2/3" —— 后者由 2026-10-15 D8 新增)
+        if "空标题" in issue or "占位标题" in issue:
             # BUG 修复: 正确匹配 "空标题: <path>" 格式
-            path_match = re.search(r"空标题:\s*(.+)", issue)
+            path_match = re.search(r"(?:空标题|占位标题):\s*(.+)", issue)
             if path_match:
                 path = path_match.group(1).strip()
                 parts = path.split("/")

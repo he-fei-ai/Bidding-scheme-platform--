@@ -38,19 +38,36 @@ def split_into_chunks(
     chunk_size: int = CHUNK_SIZE,
     overlap: int = CHUNK_OVERLAP,
 ) -> list[str]:
-    """将文本按固定大小切分，相邻片段重叠"""
-    if not text or len(text) <= chunk_size:
-        return [text] if text else []
+    """将文本按固定大小切分，相邻片段重叠。
 
-    chunks = []
+    HARDEN 2026-10-15（P1 · 死循环防护）：
+      当 ``overlap >= chunk_size`` 时，步进 ``step = chunk_size - overlap``
+      会 ≤ 0，导致 ``start`` 不前进甚至倒退 → **无限循环**。此前仅有
+      `test_overlap_larger_than_chunk_size_edge` 暴露了分块数量爆炸
+      (<100)，但极端参数（overlap=chunk_size）仍会真正挂死。
+      现将 overlap 钳制到 ``[0, chunk_size // 2]`` 安全区间：
+        - overlap < 0 → 视为 0（无重叠，纯顺序切分）
+        - overlap >= chunk_size → 降至 chunk_size // 2（保留合理重叠，
+          既不丢内容也不死循环）
+    """
+    if not text:
+        return []
+    # 钳制 overlap 到安全区间
+    if overlap < 0:
+        overlap = 0
+    elif overlap >= chunk_size:
+        overlap = chunk_size // 2
+    if len(text) <= chunk_size:
+        return [text]
+    chunks: list[str] = []
     start = 0
+    step = chunk_size - overlap  # 保证 step > 0
     while start < len(text):
         end = start + chunk_size
-        chunk = text[start:end]
-        chunks.append(chunk)
+        chunks.append(text[start:end])
         if end >= len(text):
             break
-        start = end - overlap  # 重叠
+        start += step  # 重叠
     return chunks
 
 
@@ -145,7 +162,15 @@ def list_tasks(project_id: int | None = None, limit: int = 20) -> list[dict]:
 
 
 def delete_tasks(task_ids: list[int]) -> dict:
-    """批量删除任务（软删除，标记为deleted）"""
+    """批量删除任务（硬删除 — DELETE FROM）。
+
+    BUG-FIX 2026-10-15（D1）：docstring 此前写「软删除，标记为deleted」，
+    但实现是 ``DELETE FROM rejection_checks``（硬删除），且表中无 ``deleted``
+    状态列。修正 docstring 以匹配真实行为。
+
+    设计约束：只允许删除未完成的任务（pending / running），已完成的检查
+    结果不可删（防止误删审计结论）。批量中若混有已完成任务则整批拒绝。
+    """
     with get_db() as conn:
         if not task_ids:
             return {"success": 0, "failed": 0, "message": "没有指定任务"}
@@ -176,22 +201,29 @@ def delete_tasks(task_ids: list[int]) -> dict:
 
 def mark_all_false_positive(task_id: int, item_ids: list[str]) -> list[str]:
     """将指定任务中的所有项目标记为误报（一次性标记）"""
-    task = get_task(task_id)
-    if not task:
-        raise ValueError("任务不存在")
-
-    fps = set(task.get("false_positives", []))
-    for item_id in item_ids:
-        if item_id not in fps:
-            fps.add(item_id)
-
+    # BUG-FIX 2026-10-15（D6 · P1 TOCTOU 竞态）：原实现先 get_task()（开独立连接读
+    # false_positives），再在另一连接里 UPDATE。两个连接之间若有并发
+    # mark_false_positive 调用，后者的修改会被前者基于旧值的覆盖抹掉。
+    # 现将读-改-写收进同一事务：在 UPDATE 的同一连接内先 SELECT 当前值。
     with get_db() as conn:
+        row = conn.execute(
+            "SELECT false_positives FROM rejection_checks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if not row:
+            raise ValueError("任务不存在")
+
+        fps = json.loads(row["false_positives"] or "[]")
+        fps_set = set(fps)
+        for item_id in item_ids:
+            fps_set.add(item_id)
+
         conn.execute(
             "UPDATE rejection_checks SET false_positives = ?, updated_at = datetime('now', 'localtime') WHERE id = ?",
-            (json.dumps(list(fps), ensure_ascii=False), task_id),
+            (json.dumps(list(fps_set), ensure_ascii=False), task_id),
         )
 
-    return list(fps)
+    return list(fps_set)
 
 
 def get_tasks_by_project(project_id: int, limit: int = 100) -> list[dict]:
@@ -1426,33 +1458,41 @@ async def check_logic_dimension(
 {json.dumps([p.get("description", "") for p in false_positive_patterns[:5]], ensure_ascii=False)}
 """
 
-    # 长文本截断（避免超出上下文）
-    if len(text) > 30000:
-        logger.warning("[废标检查] 逻辑检查文本过长(%d字符)，截断至30000字符", len(text))
-        text = text[:30000] + "\n...(后续内容省略)"
-
-    # SECURITY-FIX 2026-10-06：text 为投标文件原文，做元标记中和。
-    safe_text = sanitize_prompt_value(text)
-    user_prompt = f"{fp_instruction}文档名：{bid_doc.get('name', '')}\n\n请检查以下投标文件的逻辑谬误：\n\n{safe_text}"
-    messages = [
-        AIMessage(role="system", content=sys_prompt),
-        AIMessage(role="user", content=user_prompt),
-    ]
-    try:
-        # BUG-FIX 2026-09-18（高）：同错别字维度，原实现只接受裸 list。
-        # 模型返回 {"findings": [...]} 等包装时整批丢弃 → 逻辑一致性维度静默 0 条。
-        result = _coerce_issue_list(
-            await collect_json_response(provider, messages, max_retries=2)
+    # BUG-FIX 2026-10-15（D3）：原实现把全文截断到 30000 字，超长投标
+    # 文件的尾部逻辑矛盾完全漏检。现按与废标维度同口径的滚动分段策略
+    # 逐段检查，合并所有发现。
+    chunks = split_into_chunks(text, chunk_size=30000, overlap=2000)
+    all_logic_issues: list[dict] = []
+    total_chunks = len(chunks)
+    for idx, chunk in enumerate(chunks):
+        # SECURITY-FIX 2026-10-06：chunk 为投标文件原文，做元标记中和。
+        safe_chunk = sanitize_prompt_value(chunk)
+        user_prompt = (
+            f"{fp_instruction}文档名：{bid_doc.get('name', '')}\n\n"
+            f"投标文件（第 {idx + 1}/{total_chunks} 段）：\n{safe_chunk}\n\n"
+            f"请检查本段内容中的逻辑谬误。"
         )
-        if isinstance(result, list):
-            for issue in result:
-                issue.setdefault("bid_doc_id", bid_doc.get("id"))
-                issue.setdefault("bid_doc_name", bid_doc.get("name", ""))
-                issue.setdefault("category", "逻辑")
-            return result
-    except Exception:
-        logger.warning("逻辑谬误AI检查失败", exc_info=True)
-    return []
+        messages = [
+            AIMessage(role="system", content=sys_prompt),
+            AIMessage(role="user", content=user_prompt),
+        ]
+        try:
+            # BUG-FIX 2026-09-18（高）：同错别字维度，原实现只接受裸 list。
+            # 模型返回 {"findings": [...]} 等包装时整批丢弃 → 逻辑一致性维度静默 0 条。
+            result = _coerce_issue_list(
+                await collect_json_response(provider, messages, max_retries=2)
+            )
+            if isinstance(result, list):
+                all_logic_issues.extend(result)
+        except Exception:
+            logger.warning("逻辑谬误AI检查失败 (段 %d/%d)", idx + 1, total_chunks, exc_info=True)
+            continue
+
+    for issue in all_logic_issues:
+        issue.setdefault("bid_doc_id", bid_doc.get("id"))
+        issue.setdefault("bid_doc_name", bid_doc.get("name", ""))
+        issue.setdefault("category", "逻辑")
+    return all_logic_issues
 
 
 # ========== 主检查流程 ==========
@@ -1726,15 +1766,24 @@ def export_report(task_id: int) -> str:
     # 概要
     doc.add_heading("检查概要", level=1)
     results = task.get("results", {})
-    summary_data = [
-        ("废标项问题", len(results.get("rejection", []))),
-        ("错别字问题", len(results.get("spelling", []))),
-        ("逻辑谬误", len(results.get("logic", []))),
-    ]
-    for name, count in summary_data:
+    # BUG-FIX 2026-10-15（D2）：概要计数此前含误报条目，但下方详情区
+    # 按 false_positives 过滤后只展示非误报项 → 概要说「5 项」、详情只列
+    # 3 项，用户困惑。现按过滤后口径计数，并在有误报时追加一行说明。
+    fps = set(task.get("false_positives", []))
+    dimension_titles = {
+        "rejection": "废标项问题",
+        "spelling": "错别字问题",
+        "logic": "逻辑谬误",
+    }
+    for dim, name in dimension_titles.items():
+        issues = results.get(dim, [])
+        visible = [i for i in issues if i.get("id") not in fps]
         p = doc.add_paragraph()
         p.add_run(f"{name}：").bold = True
-        p.add_run(f"{count} 项")
+        p.add_run(f"{len(visible)} 项")
+        hidden = len(issues) - len(visible)
+        if hidden:
+            p.add_run(f"（另有 {hidden} 项已标记为误报，不在下方展示）")
 
     # ENHANCE 2026-09-14：废标项证据核验概览（区分"已定位"与"待人工核验"）
     rejection_items = results.get("rejection", [])
@@ -1768,15 +1817,7 @@ def export_report(task_id: int) -> str:
             f"确认缺失 {_missing_confirmed} 项，待人工确认 {_missing_pending} 项"
         )
 
-    # 误报过滤
-    fps = set(task.get("false_positives", []))
-
-    # 各类问题详情
-    dimension_titles = {
-        "rejection": "废标项问题",
-        "spelling": "错别字问题",
-        "logic": "逻辑谬误",
-    }
+    # 各类问题详情（fps / dimension_titles 已在概要区定义，此处直接复用）
     for dim, title_text in dimension_titles.items():
         issues = results.get(dim, [])
         visible_issues = [i for i in issues if i.get("id") not in fps]

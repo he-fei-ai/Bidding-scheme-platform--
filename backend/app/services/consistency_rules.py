@@ -584,6 +584,67 @@ def conflict_state(resolved: Any) -> str:
 
 
 # ============================================================================
+# 冲突来源（conflict_source）—— 同一张表里的两条审计链路
+# ============================================================================
+#
+# `consistency_conflicts` 表被两条**语义完全不同**的链路共用：
+#
+# | 来源 | 写入方 | conflict_id 形态 | values_json | 可机器自动修复? |
+# |---|---|---|---|---|
+# | `rule`（确定性规则审计） | `consistency_auditor._save_conflicts` | `conflict_<fact>_<ts>` | 结构化取值 | 是（autofix 按取值替换） |
+# | `ai`（AI 语义审计） | `ai/workflows_expand._persist_ai_audit_findings` | `AI-{project}-{hex}` | 恒为 `'[]'` | 否（无取值可替换） |
+#
+# 在 2026-10-13 之前，这个区分**只存在于 ID 前缀这一个隐式约定里**，没有任何
+# 函数把它抽出来——于是三处 SQL 各自硬编码 `conflict_id LIKE 'AI-%'`（审计器的
+# 清理/折叠/复用三处 + 收敛判据一处），而**对外接口一个都没暴露**。后果是：
+#
+# 1. `GET /consistency/conflicts` 把 AI 发现与规则冲突混排返回，且 AI 发现的
+#    `fact_name` 是自由文本 issue（最长 100 字），前端「事实项」列把它当成事实名
+#    渲染成 `<Text strong>...</Text>`，用户看到一长段句子以为是"事实项"；
+# 2. `GET /consistency/summary` 的 `conflicts_by_severity` 把 AI 发现一并计入
+#    「中等冲突」卡片（AI 发现恒为 `SEVERITY_DEFAULT`）——「中等 3」里可能有 2 条
+#    根本不是规则冲突，用户据此评估风险等级会被误导；
+# 3. 前端「自动修复」按钮对 AI 发现仍可点：`apply_autofix` 因 `values=[]` 必然
+#    回 `no_change`（「该冲突没有需要替换的旧值」），用户反复点、反复看到失败。
+#
+# 现把该口径收敛成本命名空间的单一事实来源，并随 `GET /consistency/rules` 下发，
+# 前端据此区分展示与禁用相应操作。**对外只增字段、不改任何既有字段名与取值语义**
+# （`conflict_id` 前缀约定不动，历史数据无需迁移）。
+CONFLICT_SOURCE_RULE = "rule"
+CONFLICT_SOURCE_AI = "ai"
+
+#: AI 语义审计写入的 `conflict_id` 前缀（与
+#: `ai/workflows_expand._persist_ai_audit_findings` 的生成规则保持严格一致）。
+AI_CONFLICT_ID_PREFIX = "AI-"
+
+#: 冲突来源 → 展示文案/配色（随规则快照下发，前端「AI 发现」标签用）。
+CONFLICT_SOURCE_META: dict[str, dict[str, str]] = {
+    CONFLICT_SOURCE_RULE: {"label": "规则冲突", "color": "red"},
+    CONFLICT_SOURCE_AI: {"label": "AI 发现", "color": "purple"},
+}
+
+
+def is_ai_conflict_id(conflict_id: Any) -> bool:
+    """该冲突 ID 是否属于 AI 语义审计链路。
+
+    防御式判断：`None` / 非字符串一律按规则冲突处理（宁可漏标也不误把规则
+    冲突当成 AI 发现——后者会导致 autofix 被禁用）。
+    """
+    return str(conflict_id or "").startswith(AI_CONFLICT_ID_PREFIX)
+
+
+def conflict_source_kind(conflict_id: Any) -> str:
+    """`conflict_id` → 冲突来源名（`rule` / `ai`）。"""
+    return CONFLICT_SOURCE_AI if is_ai_conflict_id(conflict_id) else CONFLICT_SOURCE_RULE
+
+
+def conflict_source_meta(source_kind: Any) -> dict[str, str]:
+    """冲突来源的文案/配色；未知值安全降级为规则冲突（不冒充 AI 发现）。"""
+    text = str(source_kind or "").strip().lower()
+    return CONFLICT_SOURCE_META.get(text, dict(CONFLICT_SOURCE_META[CONFLICT_SOURCE_RULE]))
+
+
+# ============================================================================
 # 评分标准达标状态（scoring_compliance.ScoringGap.status）
 # ============================================================================
 
@@ -736,6 +797,15 @@ def rules_payload() -> dict[str, Any]:
         "conflict_state": {
             "open": CONFLICT_STATE_OPEN,
             "resolved": CONFLICT_STATE_RESOLVED,
+        },
+        # 冲突来源命名空间：`consistency_conflicts` 表同时承载「规则冲突」与
+        # 「AI 语义发现」两条链路（ID 前缀约定），前端据此区分展示与禁用操作。
+        # 新增顶层键（test_rules_payload_shape 已放宽为「必备键 ⊆ 顶层键」）。
+        "conflict_source": {
+            "rule": CONFLICT_SOURCE_RULE,
+            "ai": CONFLICT_SOURCE_AI,
+            "ai_id_prefix": AI_CONFLICT_ID_PREFIX,
+            "meta": CONFLICT_SOURCE_META,
         },
         "scoring_status": {
             "meta": SCORING_STATUS_META,

@@ -377,6 +377,37 @@ def dedup_facts(items: list) -> list:
     return dedup
 
 
+def merge_kb_patch_items(base_items: list, patch_items: list) -> list:
+    """知识库补充事实并入基线事实（P2-2，facts-ns 2026-10-15）。
+
+    对齐易标 `runKnowledgeGlobalFactPatches` 的「只补不增 + 基线优先」思路：
+    把知识库补充提取的结果拼接到**基线之后**，再交给 `normalize_fact_items`
+    统一去重——
+
+    * 同 key/label 的冲突条目：`dedup_facts` 保留首个（基线 = 招标/Step02 优先），
+      仅当基线是空值/占位符而知识库给出实值时用实值替换（保留基线 key/label 命名）；
+    * 基线缺失的新 key/label：追加（补齐基线漏项，如知识库沉淀的型号/参数/承诺）；
+    * 每条知识库来源条目标记 ``source="knowledge"``、去掉 ``verified``，
+      前端可按来源区分「文件实值 / AI 编造 / 知识库参考」。
+
+    本函数只做拼接与来源标记，不产生 AI 调用、不做规范化
+    （规范化与去重由调用方统一走 `normalize_fact_items`）。
+    """
+    out: list = []
+    for item in base_items or []:
+        if isinstance(item, dict):
+            out.append(item)
+    for item in patch_items or []:
+        if not isinstance(item, dict):
+            continue
+        p = dict(item)
+        p["source"] = "knowledge"
+        p.pop("verified", None)
+        p.pop("needs_manual_input", None)
+        out.append(p)
+    return out
+
+
 # ============================================================
 # 七、AI dict → 事实条目（分类推断 + 中文标签）
 # ============================================================
@@ -763,6 +794,40 @@ def fact_extract_system_prompt(policy: str = DEFAULT_FACTS_POLICY) -> str:
 
 
 # ============================================================
+# 一〇、建筑工程专项施工方案九大章节选题标准（P2-1，facts-ns 2026-10-15）
+# ============================================================
+#
+# 对齐 `content_field_contract.NINE_CHAPTERS` 的九大章节顺序，把「正文各章会反复
+# 用到且必须前后一致」的短小事实按章节落到选题范围里。只作提取选题提示，不是取值来源。
+# 定位：建筑工程专项施工方案编写（参照九大章节编制标准、六大类危大工程）。
+_CHAPTER_SUBJECT_SCOPE = (
+    "\n\n### 选题范围参考（按建筑工程专项施工方案九大章节归类，仅决定「选哪些项」，不决定「值」）\n"
+    "以下每章列出正文会反复使用、且各小节必须统一口径的事实类别，凡项目资料中能找到明确值的都应建项：\n"
+    "1. 工程概况与编制依据：项目名称、建设地点、建设规模、工程结构形式、总工期、质量标准、安全目标、编制依据的规范标准名称；\n"
+    "2. 施工组织部署与机构：项目经理、技术负责人、安全负责人等岗位与职责（含姓名）、项目经理部组织架构、施工区段划分；\n"
+    "3. 主要分部分项工程施工方案：主要施工方法、关键工艺、技术参数、工序验收标准；\n"
+    "4. 专项施工方案（危大工程）：高支模、深基坑、脚手架、起重吊装、临时用电等专项参数与安全措施；\n"
+    "5. 施工进度计划及保证措施：总工期天数、开竣工日期、关键里程碑、进度保障措施；\n"
+    "6. 资源配置计划：劳动力人数、主要机械设备型号与数量、关键材料品牌型号；\n"
+    "7. 质量管理体系与措施：质量目标、验收标准、创优目标；\n"
+    "8. 安全管理与文明施工：安全目标、职业健康与环保指标、文明施工措施；\n"
+    "9. 应急预案与风险控制：应急组织机构、应急响应时间、主要风险清单与控制措施。\n"
+    "事实格式要求：每条 content 必须短小、明确、可直接引用，写成「关于XX问题统一采用XX方案/为XX」的口径；"
+    "只提取正文会反复用到的小变量，不提取长篇摘要或招标要求原文。"
+)
+
+
+def chapter_subject_scope_block() -> str:
+    """返回九大章节选题标准块（P2-1）。
+
+    供 `/facts/generate` 等提取链路在「目录输入」开启时（`FACTS_OUTLINE_INPUT_ENABLED`）
+    追加到用户提示词：明确按九大章节列出的正文必备事实类别，提高提取内容项与正文
+    章节的对应度。默认关=不追加该块，提示词与历史逐字一致。
+    """
+    return _CHAPTER_SUBJECT_SCOPE
+
+
+# ============================================================
 # 九、按章节筛选事实（ENHANCE 2026-10-05 / P-5）
 # ============================================================
 
@@ -953,6 +1018,51 @@ def content_repair_max_attempts() -> int:
     except (TypeError, ValueError):
         n = 1
     return max(1, min(n, 5))
+
+
+def content_facts_gate_enabled() -> bool:
+    """P-3（facts-ns 2026-10-15）：正文生成事实门槛开关
+    （FACTS_CONTENT_GATE_ENABLED，默认关）。
+
+    对齐易标「请先完成全局事实设定，再生成正文」：开启后没有任何全局事实时
+    拒绝进入正文生成，保证全文有统一口径基准；默认关 = 保持现有行为
+    （无事实也可生成，正文生成自行降级）。
+    """
+    return _env_flag("FACTS_CONTENT_GATE_ENABLED")
+
+
+def consistency_patch_repair_enabled() -> bool:
+    """引入项 B（2026-10-15，对齐易标）：生成收尾 AI 审计修复精确补丁模式开关
+    （CONSISTENCY_PATCH_REPAIR_ENABLED，默认关）。
+
+    开启后 `workflows_expand._audit_one_group` 的冲突修复从「整节重写+80%长度
+    保护」切换为易标同款：old_text/new_text 精确补丁 + 唯一命中才替换 +
+    失败原因回喂重试（复用 `consistency_repair.generate_patches` 与
+    `text_patch.apply_patches`，重试轮数用 `content_repair_max_attempts()`）。
+    默认关 = 保持整节重写路径，提示词与行为逐字不变。
+    """
+    return _env_flag("CONSISTENCY_PATCH_REPAIR_ENABLED")
+
+
+def kb_patch_enabled() -> bool:
+    """P2-2（facts-ns 2026-10-15）：知识库补充事实开关
+    （FACTS_KNOWLEDGE_PATCH_ENABLED，默认关）。
+
+    对齐易标 `runKnowledgeGlobalFactPatches`：基线提取后从参考知识库条目再做一次
+    补充提取，只补基线漏项、同源冲突以基线（招标/Step02）优先。默认关 = 不读知识库，
+    提取提示词与行为历史一致。
+    """
+    return _env_flag("FACTS_KNOWLEDGE_PATCH_ENABLED")
+
+
+def chapter_scope_enabled() -> bool:
+    """九大章节选题标准块开关（facts-ns 2026-10-15）。
+
+    目录输入开启（`FACTS_OUTLINE_INPUT_ENABLED=1`）时自动启用（「先目录后事实」
+    语义下按章选主题项）；也可用 `FACTS_CHAPTER_SCOPE_ENABLED=1` 单独开启。
+    默认关 = 提取提示词不含选题块，与历史逐字一致。
+    """
+    return outline_input_enabled() or _env_flag("FACTS_CHAPTER_SCOPE_ENABLED")
 
 
 #: 编排标题清单的条数上限（易标：编排只看标题，token 成本≈事实全文 1/10）

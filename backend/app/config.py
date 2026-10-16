@@ -286,6 +286,34 @@ OUTLINE_L3_REPAIR_MAX_ROUNDS = max(
 OUTLINE_L3_MAX_PARENT_REUSE = max(
     0, int(os.environ.get("OUTLINE_L3_MAX_PARENT_REUSE", "3"))
 )
+# 三级标题「泛化词干 × 维度词」组合识别开关（2026-10-15 第五轮新增）。
+# 背景：前四轮治理已拦住「专项6」「总体实施策划（2）」两个原始家族，但同一
+# 症状换了三副新面孔（复现见 backend/scripts/diag_l3_leaks.py 的 D1/D2/D3，
+# 回归见 backend/tests/test_l3_generic_stem_guard_2026_10_15.py）：
+#   1) `_title_entity_fragments` 从章名切出的「本章专属实体」未过滤泛化词段，
+#      章名本身泛化（「总体方案与实施策划」「资源配置与协调保障」）时，
+#      「总体方案」「实施策划」「资源配置」「协调保障」被当成实体与维度词拼接，
+#      产出「总体方案施工工艺」「实施策划质量控制」——语义含量为零；
+#   2) `_disambiguate_title` 的优先级 1 给泛化主体追加维度词，产出
+#      「总体实施策划专项方案/补充措施/实施方案/保障措施」；
+#   3) 以上两类标题都逃过既有脏判定（`_GENERIC_ONLY_TITLES` 按"恰好等于"比对），
+#      导致 2026-10-15 的「消歧产物脏复检」形同虚设，全部绿灯放行到落库。
+# 判据：标题恰好 = 泛化词干 + 泛化维度词，且不含任何项目实体。
+# 设为 false 完全回退到历史行为（向后兼容，供 A/B 对比或定位问题时使用）。
+OUTLINE_L3_GENERIC_STEM_GUARD_ENABLED = (
+    os.environ.get("OUTLINE_L3_GENERIC_STEM_GUARD_ENABLED", "true").lower() == "true"
+)
+# 三级标题 AI 修复的「有效修复配额」上限（2026-10-15 第五轮新增）。
+# 背景：`repair_l3_generic_titles` 旧实现先 `warnings[:max_repair]` 切片、
+# 再在循环里 `continue` 跳过空标题节点 —— 被跳过的条目仍消耗配额，
+# 实际修复数显著小于 max_repair，靠后位置的脏标题永远进不了任务队列。
+# 现改为「凑满 max_repair 个可修复任务为止」，配额按可执行任务计。
+# 本配置项仅作为该口径的显式开关（true=新口径，false=历史截断口径），
+# 同时仍受 OUTLINE_L3_REPAIR_MAX 约束。
+OUTLINE_L3_REPAIR_QUOTA_BY_TASK = (
+    os.environ.get("OUTLINE_L3_REPAIR_QUOTA_BY_TASK", "true").lower() == "true"
+)
+
 
 
 # ========== 增强 2.1: RAG 向量检索配置 ==========
@@ -385,6 +413,41 @@ CHART_FAIL_PLACEHOLDER = os.environ.get("CHART_FAIL_PLACEHOLDER", "false").lower
 # 向后兼容：默认 false，不改变任何既有输出；需剥离时设置环境变量
 # STRIP_PLAIN_CODE_BLOCKS=true（运行时读取，改动后重启生效）。
 STRIP_PLAIN_CODE_BLOCKS = os.environ.get("STRIP_PLAIN_CODE_BLOCKS", "false").lower() == "true"
+
+
+# ========== 遗留项 2026-10-15（第五轮）: 续写接缝去重的最小重叠长度 ==========
+# 控制正文续写（_auto_continue_on_length）在拼接两轮输出时对「接缝重复」的剥离口径：
+#   - 完全重叠（extra 整体都落在上一轮正文尾部窗口内）：**无条件剥离**，不受本
+#     阈值影响——此时 AI 没有写出任何新内容，保留只是把同一段话重复一遍。
+#   - 部分重叠：仅当重叠长度 >= 本值时才剥离。
+# 背景（Risk-P2c 2026-10-15）：旧实现从最长一路探测到 k=1，任何 1~2 字的巧合
+# 都被当作「截断续写」剥掉，例如
+#     final="本阶段已完成采购" + extra="采购的时间节点如下："  →  剥掉「采购」
+# 留下「的时间节点如下：」，主语丢失、句子语义断裂；中文 2 字词（采购/完成/阶段/
+# 体系/质量/安全）在相邻段落高频同现，误剥概率很高。
+# 权衡：阈值过高会漏掉真实重叠（多出一小段重复文字，属可接受的表观瑕疵）；
+# 阈值过低会砍掉句子主语（文本损坏）。故取 6 作为默认下限。
+# 向后兼容：设为 0 完全回退到历史行为（k=1 起逐字探测）。
+SEAM_OVERLAP_MIN_CHARS = max(0, int(os.environ.get("SEAM_OVERLAP_MIN_CHARS", "6")))
+
+
+# ========== 遗留项 2026-10-15（第五轮）: 零宽字符清理开关 ==========
+# 控制正文清洗（clean_generated_content）是否全局剔除零宽字符：
+#   U+200B ZERO WIDTH SPACE / U+200C NON-JOINER / U+200D JOINER /
+#   U+2060 WORD JOINER / U+180E MONGOLIAN VOWEL SEPARATOR / U+FEFF BOM·ZWNBSP。
+# 背景（Risk-P2d 2026-10-15）：Python re 的 \s 不匹配 U+200B（Unicode 类别 Cf，
+# 非空白），零宽字符夹在标题/列表编号里时会让所有 ^(\d{1,4})\s*... 锚点正则
+# 失配，各种编号形态一律被降级成普通段落（导出丢标题样式与编号）：
+#   「1\u200b、施工部署」  应为 heading3      → 实际 paragraph
+#   「1\u200b）施工准备」  应为 heading6      → 实际 paragraph
+#   「（1\u200b）安全交底」应为 list_ordered  → 实际 paragraph
+# （注：「1.施工准备」在本模块本就定义为 heading3，与零宽字符无关。）
+# 这类字符常见于复制粘贴与富文本编辑器。
+# 向后兼容：默认 true（修复行为）；设 STRIP_ZERO_WIDTH_CHARS=false 可完全回退
+# 到历史行为。不清理变体选择符 U+FE0E/U+FE0F（影响 emoji 呈现）与数学不可见符
+# U+2062~U+2064（影响公式语义）。
+STRIP_ZERO_WIDTH_CHARS = os.environ.get("STRIP_ZERO_WIDTH_CHARS", "true").lower() == "true"
+
 
 
 # ========== 增强: 一致性自动修复（autofix）防护口径 ==========

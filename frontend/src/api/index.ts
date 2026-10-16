@@ -784,13 +784,65 @@ export async function getFacts(projectId: number): Promise<{
   return res.data;
 }
 
+/**
+ * ENHANCE 2026-10-07 后端已下发的「字段级定向重生成」载荷。
+ *
+ * BUG-FIX 2026-10-15（G5 前后端字段契约漂移）：此前本文件的 saveFacts 只声明
+ * `{ ok, fact_conflicts }`，而后端 `POST /facts` 实际回传 6 个字段 ——
+ * `field_changes` / `affected_sections` / `extraction_fields` /
+ * `extraction_fields_provenance` 前端连类型都没有声明，更谈不上消费。
+ * 后果：后端 2026-10-07 投入的一整条「关键字段变更 → 圈定受影响章节」链路
+ * 在前端是**已投入但未交付**的死字段，且 tsc 无法感知这类漂移（未声明的
+ * 字段被 JSON 反序列化静默忽略）。现在把契约显式声明，字段漂移由 tsc 拦截。
+ */
+/** 单个关键字段的变更明细 */
+export interface FactFieldChange {
+  old_value?: string | null;
+  new_value?: string | null;
+  [k: string]: unknown;
+}
+
+/** 引用了被变更字段的章节集合（定向重生成的精确范围） */
+export interface AffectedSections {
+  section_ids?: number[];
+  chapters?: string[];
+  global_change?: boolean;
+  [k: string]: unknown;
+}
+
+/** 结构化项目字段表的单行（ENHANCE 2026-10-07） */
+export interface ExtractionFieldRow {
+  key?: string;
+  label?: string;
+  value?: string;
+  source?: string;
+  [k: string]: unknown;
+}
+
+/** POST /facts 的完整响应契约（与后端 routers/facts.py 的 save_facts 对齐） */
+export interface SaveFactsResult {
+  ok: boolean;
+  /** BUG-FIX 2026-10-06：事实集内部互斥取值分组 */
+  fact_conflicts?: FactConflict[];
+  /** ENHANCE 2026-10-07：关键字段变更明细（key → 变更） */
+  field_changes?: Record<string, FactFieldChange>;
+  /** ENHANCE 2026-10-07：受变更影响的章节集合 */
+  affected_sections?: AffectedSections;
+  /** ENHANCE 2026-10-07：结构化字段表（随保存回显） */
+  extraction_fields?: ExtractionFieldRow[];
+  /** ENHANCE 2026-10-07：字段溯源 */
+  extraction_fields_provenance?: Record<string, unknown>;
+}
+
 export async function saveFacts(
   projectId: number,
   items: GlobalFactItem[],
-): Promise<{ ok: boolean; fact_conflicts?: FactConflict[] }> {
+): Promise<SaveFactsResult> {
   // ENHANCE 2026-10-06：后端保存响应即时回传事实集内部互斥分组
   // （同 label 不同 key/值），前端不必等下次 GET 才发现矛盾。
-  const res = await http.post<{ ok: boolean; fact_conflicts?: FactConflict[] }>(
+  // BUG-FIX 2026-10-15（G5）：返回类型由 `{ok, fact_conflicts}` 扩展为
+  // SaveFactsResult，覆盖后端实际回传的全部 6 个字段。
+  const res = await http.post<SaveFactsResult>(
     `/projects/${projectId}/facts`,
     { items },
   );
@@ -3170,6 +3222,18 @@ export interface Conflict {
   resolved?: number;
   /** 规范化状态名：open | resolved */
   state?: string;
+  /**
+   * BUG-FIX 2026-10-15（P1·两条审计链路混排不可区分）：`consistency_conflicts`
+   * 同时承载确定性规则冲突与 AI 语义审计发现（后者 `conflict_id` 以 `AI-` 开头、
+   * `values_json` 恒为 `'[]'`）。此前后端不暴露这个区分，前端因此：
+   *   ① 把 AI 发现的 `fact_name`（最长 100 字的自由文本 issue）当「事实项」加粗
+   *      渲染，用户以为是事实名；
+   *   ② 「自动修复」按钮对 AI 发现仍可点，而 `apply_autofix` 因 `values=[]` 必然
+   *      回 `no_change`，用户反复点、反复看到「没有需要替换的旧值」。
+   * 现由后端 `GET /consistency/conflicts` 逐条下发。可选（老后端无此字段，
+   * 消费方须回退为 "rule"）。
+   */
+  source_kind?: "rule" | "ai";
   created_at?: string;
   resolved_value?: string | null;
   resolved_at?: string | null;
@@ -3271,6 +3335,17 @@ export interface ConsistencyRules {
     no_conflicts: string;
   };
   conflict_state: { open: string; resolved: string };
+  /**
+   * 冲突来源命名空间（2026-10-15 新增，可选 —— 老后端不下发）。
+   * `consistency_conflicts` 同时承载两条审计链路的产物，此前这个区分只藏在
+   * `conflict_id` 前缀这一个隐式约定里、对外接口一个都没暴露。见 `Conflict.source_kind`。
+   */
+  conflict_source?: {
+    rule: string;
+    ai: string;
+    ai_id_prefix: string;
+    meta: Record<string, { label: string; color: string }>;
+  };
   scoring_status: {
     meta: Record<string, { label: string; color: string }>;
     coverage_weak: number;
@@ -3465,8 +3540,34 @@ export interface AuditSummary {
   unresolved_conflicts: number;
   /** 已解决（历史）冲突数，2026-10-08 新增 */
   resolved_conflicts?: number;
-  /** 仅统计**未解决**冲突的严重度分布 */
+  /** 仅统计**未解决**冲突的严重度分布（含 AI 发现 —— 老口径，保留兼容） */
   conflicts_by_severity: Record<string, number>;
+
+  /**
+   * BUG-FIX 2026-10-15（P1·AI 发现被混进分级卡片，数字被虚高）：
+   * AI 语义发现**恒为** `SEVERITY_DEFAULT`（medium）—— 后端
+   * `ai/workflows_expand._persist_ai_audit_findings` 无结构化取值可判级。
+   * 于是「中等冲突」卡片会把规则冲突与 AI 发现一并顶高，用户据此评估风险等级
+   * 被误导，且三张分级卡片之和永远与「未解决冲突」对不上。
+   *
+   * 以下四个字段为纯增量（老后端不返回时为 undefined，消费方须回退到上面的
+   * `conflicts_by_severity`）：
+   *   - `conflicts_by_severity_rule`：只算规则冲突的分级分布（分级卡片优先用）
+   *   - `unresolved_rule_conflicts` / `unresolved_ai_findings`
+   *   - `resolved_ai_findings`
+   * 恒等式：unresolved_rule_conflicts + unresolved_ai_findings == unresolved_conflicts
+   */
+  conflicts_by_severity_rule?: Record<string, number>;
+  unresolved_rule_conflicts?: number;
+  unresolved_ai_findings?: number;
+  resolved_ai_findings?: number;
+  /**
+   * 最近一次审计的来源（`rule` / `ai`）。`consistency_audit_log` 无来源列，
+   * 后端按 `conflicts_json` 里的 `conflict_id` 前缀确定性推断（两侧永不交叉）。
+   * 用户据此能区分「最近审计时间」来自「开始审计」按钮，还是正文生成收尾的
+   * AI 审计 —— 两者结论性质完全不同（前者可自动修复，后者需人工核对）。
+   */
+  audit_source?: "rule" | "ai";
 }
 
 export async function getAuditSummary(projectId: number): Promise<{

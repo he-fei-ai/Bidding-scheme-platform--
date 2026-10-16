@@ -7,7 +7,7 @@ import {
 const { Text } = Typography;
 import { ClearOutlined, ArrowLeftOutlined, CheckCircleOutlined, ThunderboltOutlined, EditOutlined, CodeOutlined, DatabaseOutlined, TeamOutlined, ToolOutlined, FileTextOutlined, LoadingOutlined, DeleteOutlined, PlusOutlined, SaveOutlined } from "@ant-design/icons";
 import { getProject, getAnalysis, generateSummary, generateScoring, confirmSummary, confirmScoring, clearAnalysis, analyzeBoq, confirmBoq, analyzeWorkInterface, confirmWorkInterface, analyzeConstructionMethod, confirmConstructionMethod, getFacts, saveFacts, generateFacts, confirmFacts, auditFactsConsistency } from "../api";
-import { extractApiError, isValidSummary, parseScoringPoints, parseArrayData } from "../utils";
+import { extractApiError, isValidSummary, parseScoringPoints, parseArrayData, classifyAuditOutcome } from "../utils";
 import type { ScoringPoint } from "../utils";
 import type { FactsMissingValuePolicy, FactConflict } from "../api";
 import type { AnalysisResult } from "../types";
@@ -770,24 +770,12 @@ export default function SummaryReviewPage() {
                     failed_groups: r.failed_groups,
                     skipped_placeholder: r.skipped_placeholder,
                   });
-                  const inconsistent = items.filter((i: any) => i.status === "inconsistent").length;
-                  const missing = items.filter((i: any) => i.status === "missing").length;
-                  // ENHANCE 2026-09-29：先区分「审计没跑起来」与「真的一致」，
-                  // 再才谈通过/不通过；旧实现把两者混为一谈。
-                  if (r.audit_status === "failed") {
-                    message.error("一致性审计未能执行（AI 调用全部失败），本次结果不代表正文无矛盾", 8);
-                  } else if (inconsistent > 0) {
-                    message.warning(`发现 ${inconsistent} 处事实不一致`, 6);
-                  } else if (r.audit_status === "partial") {
-                    message.warning(
-                      `审计未覆盖全部正文（${r.audited_sections}/${r.total_sections} 章），未发现不一致不等于全部一致`,
-                      8,
-                    );
-                  } else if (missing > 0) {
-                    message.warning(`正文未发现矛盾，但有 ${missing} 项事实在正文中没有对应表述`, 6);
-                  } else {
-                    message.success("一致性检查通过");
-                  }
+                  // 判定逻辑已抽到 utils.classifyAuditOutcome（纯函数，可脱离 DOM 单测）。
+                  // 旧实现内联在本 onClick 里，其 else 分支把「不是 failed 也不是 partial」
+                  // 全部当成通过 —— 后端一旦漏回 audit_status 就会谎报「检查通过」，
+                  // 而实际上审计可能根本没跑（BUG-FIX 2026-10-15 P-4 静默通过）。
+                  const verdict = classifyAuditOutcome(r);
+                  message[verdict.type](verdict.text, verdict.duration);
                 } catch (e: any) {
                   message.error(e.response?.data?.detail || "审计失败");
                 } finally {
@@ -1083,6 +1071,25 @@ export default function SummaryReviewPage() {
                   setFactsConfirmed(fSaved.confirmed ?? false);
                   // 保存响应即时回传的冲突分组优先于回读值（同一口径）
                   setFactConflicts(saved?.fact_conflicts ?? fSaved.fact_conflicts ?? []);
+                  // BUG-FIX 2026-10-15（G5 字段链路未交付）：后端 2026-10-07 已实现
+                  // 「关键字段变更 → 圈定受影响章节」，但前端此前从未读取这两个字段
+                  // （api/index.ts 连类型都没声明）。用户改工期/项目名后只能整册重跑，
+                  // 后端投入的定向重生成能力是死字段。现在至少把影响面如实告诉用户。
+                  const changedKeys = Object.keys(saved?.field_changes ?? {});
+                  const affectedIds = saved?.affected_sections?.section_ids ?? [];
+                  const affectedTitles = saved?.affected_sections?.chapters ?? [];
+                  if (changedKeys.length > 0 && affectedIds.length > 0) {
+                    const hint =
+                      affectedTitles.length > 0
+                        ? affectedTitles.slice(0, 3).join("、")
+                        : `${affectedIds.length} 个章节`;
+                    message.warning(
+                      `已保存；${changedKeys.length} 个关键字段变更将影响 ${hint}，建议在「章节编写」中定向重新生成`,
+                      10,
+                    );
+                  } else if (changedKeys.length > 0) {
+                    message.warning(`已保存；检测到 ${changedKeys.length} 个关键字段变更，相关章节可能需要重新生成`, 8);
+                  }
                   if ((saved?.fact_conflicts?.length ?? 0) > 0) {
                     message.warning(`已保存，但检测到 ${saved!.fact_conflicts!.length} 组事实内部矛盾，请合并后再确认`);
                   } else {

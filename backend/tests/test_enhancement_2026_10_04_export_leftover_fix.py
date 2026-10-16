@@ -387,10 +387,15 @@ class TestSseDisconnectResume:
         # drain 接管线程要做真实 DOCX 构建，CPU 被其余 4000+ 测试争抢时
         # 构建耗时显著拉长。放宽至 240s 并降低自旋频率（0.05→0.1s），
         # 给负载高峰留足余量；终态到达后循环立即退出，不影响快速路径。
-        deadline = time.time() + 240
+        _t0 = time.time()
+        deadline = _t0 + 420
         while not journal.terminal and time.time() < deadline:
-            time.sleep(0.1)
-        assert journal.terminal, "断线后 journal 应在 drain 接管下于构建结束时封存"
+            time.sleep(0.2)
+        assert journal.terminal, (
+            "断线后 journal 应在 drain 接管下于构建结束时封存；"
+            f"已等待 {time.time() - _t0:.1f}s 仍非终态"
+            f"（journal.events={[(s, e.get('event')) for s, e in journal.events]}）"
+        )
         events = [item for _, item in journal.events]
         terminal_events = [e for e in events if e.get("event") in ("completed", "error")]
         assert terminal_events, f"journal 缺少终态事件: {[e.get('event') for e in events]}"

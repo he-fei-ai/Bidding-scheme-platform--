@@ -24,6 +24,7 @@ if str(BACKEND_DIR) not in sys.path:
 from app.services.ai.outline_common import (
     _cleanup_placeholder_titles,
     _disambiguate_title,
+    _is_dirty_l3_title_deep,
     _semantic_fallback_title,
     _short_parent_token,
     _uniquify_outline_titles,
@@ -166,10 +167,17 @@ class TestUniquifyAndDisambiguate:
         _uniquify_outline_titles(out)
         titles = [o["title"] for o in out]
         assert titles[0] == "总体实施策划"
-        # 后续重名应被改写为语义维度词，而非「（2）/（二）」
+        # 后续重名应被改写为语义化标题，而非「（2）/（二）」裸编号
         for t in titles[1:]:
             assert not re.search(r"（\d+）$", t), f"出现裸编号: {t}"
-            assert any(d in t for d in ("专项方案", "补充措施", "实施方案", "保障措施"))
+            # 2026-10-15 增强：改写结果必须是「非空壳」的语义标题。
+            # 旧实现退化为「总体实施策划专项方案」（泛化词干+泛化维度词）或
+            # 「总体实施策划之四」（纯序数），两头都判不了脏；现改走主体专属
+            # 语义池，用 `_is_dirty_l3_title_deep` 复检。
+            assert not _is_dirty_l3_title_deep(t), f"改写结果仍是空壳标题: {t}"
+            assert t.startswith("总体实施策划之") is False, (
+                f"退化为纯序数后缀: {t}"
+            )
 
     def test_disambiguate_distinct_and_no_bare_number(self):
         seen = set()

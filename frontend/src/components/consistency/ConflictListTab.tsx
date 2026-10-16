@@ -13,6 +13,7 @@ import {
 } from "../../api";
 import type {
   AiRepairReport, AuditResult, AuditSummary, AutoFixReport, Conflict, ConflictFilter,
+  ConsistencyRules,
 } from "../../api";
 import { extractApiError, mapConsistencySeverity, parseConflictSources } from "../../utils";
 import AuditSummaryCards from "./AuditSummaryCards";
@@ -31,6 +32,13 @@ const FILTER_OPTIONS: { label: string; value: ConflictFilter }[] = [
 
 export interface ConflictListTabProps {
   projectId: number;
+  /**
+   * 审核规则快照（页面壳已拉取 `GET /consistency/rules`）。冲突 Tab 用它取
+   * `autofix_value_max_chars` 给「统一后的数值」输入框设上限提示 —— 后端在
+   * `apply_autofix` 对超长 `new_value` 回 400，与其让用户提交了才知道，不如
+   * 输入阶段就拦。老调用方不传时按 undefined 兜底（不设 maxLength，行为不变）。
+   */
+  rules?: ConsistencyRules | null;
 }
 
 /**
@@ -49,7 +57,7 @@ export interface ConflictListTabProps {
  *    过滤下非空 —— 此时后端只会回「没有未解决的一致性冲突」。现按未解决数判定。
  * 5. **断链**：「涉及章节」的 `section_<id>` 来源改为可点击深链到章节编辑器。
  */
-export default function ConflictListTab({ projectId }: ConflictListTabProps) {
+export default function ConflictListTab({ projectId, rules }: ConflictListTabProps) {
   const navigate = useNavigate();
 
   const [audit, setAudit] = useState<AuditResult | null>(null);
@@ -83,6 +91,11 @@ export default function ConflictListTab({ projectId }: ConflictListTabProps) {
   const loadSeqRef = useRef(0);
 
   const isValidProject = Number.isFinite(projectId) && projectId > 0;
+
+  // autofix 的 new_value 长度上限（后端 `apply_autofix` 对超长值回 400）。
+  // 页面壳已把规则快照下发下来，这里给输入框设 maxLength 前置拦截；
+  // 老后端/不传 rules 时 undefined，等同不限长（行为不变）。
+  const autofixValueMaxChars = rules?.facts?.autofix_value_max_chars;
 
   // BUG-FIX 2026-10-13：autofix 报告里的 `filtered` / `scoped_section_ids` /
   // `scope_fallback_reason` 是后端**一直在返回、类型里刚补上**的可选字段。
@@ -230,8 +243,24 @@ setAudit(result);
       title: "事实项",
       dataIndex: "fact_name",
       key: "fact_name",
-      width: 180,
-      render: (v: string) => <Text strong>{v}</Text>,
+      width: 200,
+      render: (v: string, record: Conflict) => {
+        // BUG-FIX 2026-10-15（P1·AI 发现被当成「事实项」渲染）：
+        // `source_kind === 'ai'` 的冲突是正文生成收尾时 AI 审计的自由文本发现，
+        // `fact_name` 是后端截短的 issue 原文（最长 100 字），不是事实名 ——
+        // 此前当「事实项」加粗渲染，一长句话杵在表格里，用户以为是系统把这段
+        // 话当成了事实项。现区分展示：AI 发现挂紫色标签 + 截断文本（悬浮看全文），
+        // 规则冲突保持原样。
+        const isAi = record.source_kind === "ai";
+        if (!isAi) return <Text strong>{v}</Text>;
+        const shown = v.length > 24 ? `${v.slice(0, 24)}…` : v;
+        return (
+          <Space size={4} wrap>
+            <Tag color="purple" style={{ marginInlineEnd: 0 }}>AI 发现</Tag>
+            <Text type="secondary" style={{ fontSize: 12 }} title={v}>{shown}</Text>
+          </Space>
+        );
+      },
     },
     {
       title: "严重程度",
@@ -259,14 +288,21 @@ setAudit(result);
       title: "冲突数值",
       dataIndex: "values",
       key: "values",
-      width: 180,
-      render: (values: string[]) => (
-        <Space size={[4, 4]} wrap>
-          {(values || []).map((v, i) => (
-            <Tag key={i} color="red">{v}</Tag>
-          ))}
-        </Space>
-      ),
+      width: 160,
+      render: (values: string[], record: Conflict) => {
+        // BUG-FIX 2026-10-15：AI 语义发现没有结构化取值（后端恒写 `[]`），
+        // 此前渲染成一个空单元格，用户不知道为什么这一行的「冲突数值」是空的。
+        if (record.source_kind === "ai") {
+          return <Text type="secondary" style={{ fontSize: 12 }}>—（AI 语义发现，无结构化取值）</Text>;
+        }
+        return (
+          <Space size={[4, 4]} wrap>
+            {(values || []).map((v, i) => (
+              <Tag key={i} color="red">{v}</Tag>
+            ))}
+          </Space>
+        );
+      },
     },
     {
       title: "冲突说明",
@@ -329,6 +365,12 @@ setAudit(result);
               type="primary"
               icon={<CheckOutlined />}
               onClick={() => setFixModal({ conflict: record, newValue: "", loading: false })}
+              disabled={record.source_kind === "ai"}
+              title={
+                record.source_kind === "ai"
+                  ? "AI 语义发现没有结构化取值（统一不了具体数值），请查看修复建议后人工处理"
+                  : undefined
+              }
             >
               自动修复
             </Button>
@@ -640,9 +682,13 @@ setAudit(result);
               value={fixModal.newValue}
               onChange={(e) => setFixModal((s) => ({ ...s, newValue: e.target.value }))}
               placeholder="请输入统一后的数值，将应用到所有涉及章节"
+              maxLength={autofixValueMaxChars}
             />
             <Text type="secondary" style={{ fontSize: 12 }}>
               <CloseCircleOutlined /> 注意：修复操作将覆盖所有涉及章节中的该事实表述。
+              {typeof autofixValueMaxChars === "number" && (
+                <> 统一值最长 {autofixValueMaxChars} 字（与后端 `apply_autofix` 的上限对齐）。</>
+              )}
             </Text>
           </Space>
         )}

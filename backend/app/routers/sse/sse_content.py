@@ -462,6 +462,23 @@ async def generate_content_impl(
             # 旧 Redis 缓存无此键时按 fabricate 处理，行为不变）。
             facts_policy: str = project_data.get("facts_policy") or "fabricate"
 
+            # ENHANCE 2026-10-15（对齐易标「请先完成全局事实设定，再生成正文」）：
+            # 可选事实门槛。开关 FACTS_CONTENT_GATE_ENABLED 默认关=保持现有行为；
+            # 开启后没有任何全局事实时拒绝进入正文生成，强制用户先完成事实设定，
+            # 避免正文在没有统一口径基准的情况下各章节自由发挥。
+            try:
+                from ...services.facts_service import content_facts_gate_enabled as _facts_gate
+
+                if _facts_gate() and not global_facts:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="已开启全局事实门槛：请先完成全局事实设定（提取并确认事实变量）后再生成正文。",
+                    )
+            except HTTPException:
+                raise
+            except Exception as _gate_e:  # pragma: no cover - 防御性
+                logger.warning("[正文生成] 事实门槛开关读取失败，视为未开启: %s", _gate_e)
+
             # ENHANCE 2026-10-07：构建字段契约（提取项目字段 + 全局数据字典）。
             # 全局数据字典把项目名称/编号/业主/工期/人员数量/设备型号/质保期等
             # 关键一致性字段收敛为唯一权威值，随稳定上下文注入每一章，
@@ -2352,20 +2369,21 @@ async def generate_content_impl(
 
 
 
-                    # 重新统计配图结果（通过日志 + queue 剩余推导）
+                    # 重新统计配图结果。
+                    # BUG-FIX 2026-10-15（P3 日志口径错位）：原实现用 saved_count
+                    # （所有落库成功章节数）充当「总入队」，并由此推导 worker 处理数。
+                    # 这与本模块为 BUG-P3-A 引入的 chart_enqueued_count 口径分叉：
+                    # 失败/取消章节根本不入队、chart_queue 满载被丢弃的章节也不入队，
+                    # 于是「总入队」与「已处理」双双被高估，排错日志误导。
 
-                    total_completed = saved_count
-
+                    _chart_enqueued = chart_enqueued_count
                     remaining = chart_queue.qsize()
-
-                    chart_processed = total_completed - remaining
+                    chart_processed = max(_chart_enqueued - remaining, 0)
 
                     logger.info(
-
-                        "自动配图流水线完成: 总入队=%d, worker已处理≈%d, 队列剩余=%d",
-
-                        total_completed, chart_processed, remaining,
-
+                        "自动配图流水线完成: 总入队=%d, 已取走(含处理中)≈%d, "
+                        "队列剩余=%d, 落库成功章节=%d",
+                        _chart_enqueued, chart_processed, remaining, saved_count,
                     )
 
 
@@ -2403,6 +2421,14 @@ async def generate_content_impl(
                             tender_context,
 
                             cancel_event=cancel_event,
+
+                            # ENHANCE 2026-10-15（对齐易标 buildConsistencyAuditMessages）：
+
+                            # 审计显式注入结构化全局事实 + 缺失值策略口径，作为一致性裁决基准。
+
+                            global_facts=global_facts,
+
+                            facts_policy=facts_policy,
 
                         )
 

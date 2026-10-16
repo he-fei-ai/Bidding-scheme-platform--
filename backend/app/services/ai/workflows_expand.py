@@ -450,18 +450,102 @@ async def expand_content_fallback(
     return results
 
 
+def _format_global_facts_for_audit(global_facts: Any) -> str:
+    """把扁平全局事实列表格式化为审计提示词块。
+
+    ENHANCE 2026-10-15（对齐参考软件 `buildConsistencyAuditMessages` 的
+    「Step04 全局事实变量」）：审计输入必须显式携带**结构化全局事实**，
+    而不是只依赖摘要里的叙事文本。事实项扁平结构为 {key,label,value,category}，
+    这里按 key/label/value 渲染（与 `workflows_sections._format_facts_list`
+    同一取值口径）。
+
+    Args:
+        global_facts: 全局事实列表（list[dict]）或已格式化文本（str）。
+    Returns:
+        markdown 文本；空输入返回空串（审计退化为原历史行为）。
+    """
+    if not global_facts:
+        return ""
+    if isinstance(global_facts, str):
+        return global_facts.strip()
+    lines: list[str] = []
+    items = global_facts if isinstance(global_facts, list) else [global_facts]
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        label = str(item.get("label") or item.get("key") or item.get("title") or "").strip()
+        value = str(item.get("value") or item.get("content") or "").strip()
+        if not label or not value:
+            continue
+        lines.append(f"- **{label}**：{value}")
+    return "\n".join(lines)
+
+
+def _split_section_into_chunks(content: str, limit: int) -> list[str]:
+    """把超长正文按段落切成多块（每块不超 ``limit``；单段超限按字符硬切）。
+
+    ENHANCE 2026-10-15：AI 审计不再对超长节「截断送审」，改为**分块全量送审**，
+    消除正文尾部永远不被审计的覆盖盲区。切分尽量在换行处断开（保留语义边界），
+    无法断开的连续长行按字符硬切。块之间用 ``\\n\\n`` 分隔。
+    """
+    content = str(content or "")
+    if not content:
+        return []
+    if limit <= 0 or len(content) <= limit:
+        return [content]
+    paragraphs = content.split("\n")
+    chunks: list[str] = []
+    current: list[str] = []
+    current_len = 0
+    for para in paragraphs:
+        # 单段超过一块上限：先把当前块落盘，再对该段字符硬切，保证每块 <= limit
+        while len(para) > limit:
+            if current:
+                chunks.append("\n".join(current))
+                current, current_len = [], 0
+            chunks.append(para[:limit])
+            para = para[limit:]
+        mark_len = len(para) + (1 if current else 0)
+        if current and current_len + mark_len > limit:
+            chunks.append("\n".join(current))
+            current, current_len = [], 0
+        current.append(para)
+        current_len += len(para) + (1 if len(current) > 1 else 0)
+    if current:
+        chunks.append("\n".join(current))
+    return chunks
+
+
+def _audit_section_render_chars(content: str, limit: int) -> int:
+    """该节实际会送审的渲染字符数（供分组按真实载荷装箱）。
+
+    超长节 = 全部正文长度 + 每块续送前的「( 标题 第 i/n 块 )」提示词与分隔开销
+    （按 16 字符常数预算），保证普通节行为不变。
+    """
+    if len(content) <= limit:
+        return len(content)
+    chunks = _split_section_into_chunks(content, limit)
+    if len(chunks) <= 1:
+        return len(content)
+    return len(content) + (len(chunks) - 1) * 16
+
+
 def _split_audit_groups(completed_sections: list[dict]) -> list[list[dict]]:
     """把待审计小节按 `AUDIT_GROUP_CHAR_LIMIT` 顺序装箱成组（字符口径）。
 
     装箱用的是「本节实际会送审的字符数」（即截断后的长度），因此
     **不会出现"分组预算很大、实际送审被截掉大半"的口径错位**。
+
+    ENHANCE 2026-10-15：超长节不再按 `AUDIT_SECTION_CHAR_LIMIT` 截断计重，
+    而是按「分块全量送审后的渲染字符数」计重（`_audit_section_render_chars`），
+    超长节因其真实载荷自动独立成组，普通节行为不变。
     """
     groups: list[list[dict]] = []
     current: list[dict] = []
     current_chars = 0
     for section in completed_sections:
         content = section.get("content") or ""
-        chars = min(len(content), AUDIT_SECTION_CHAR_LIMIT)
+        chars = _audit_section_render_chars(content, AUDIT_SECTION_CHAR_LIMIT)
         if current and current_chars + chars > AUDIT_GROUP_CHAR_LIMIT:
             groups.append(current)
             current = []
@@ -473,6 +557,131 @@ def _split_audit_groups(completed_sections: list[dict]) -> list[list[dict]]:
     return groups
 
 
+async def _repair_conflicts_with_patches(
+    provider: Any,
+    repairable: list[tuple[dict, dict, dict]],
+    sections_by_id: dict,
+    facts_text: str,
+    cancel_event: asyncio.Event | None,
+) -> int:
+    """引入项 B（2026-10-15，对齐易标 `applyExactConsistencyPatch`）：
+    用 old_text/new_text 精确补丁修复审计冲突，替代整节重写。
+
+    复用两个既有正本，不新设补丁引擎：
+    - `consistency_repair.generate_patches`：带行号正文提示词、补丁别名归一、
+      section_id 越界白名单过滤、failure_note 失败回喂；
+    - `text_patch.apply_patches`：行区间优先、全文唯一精确匹配、
+      0/多命中拒绝、逐条错误隔离、失衡比例保护。
+
+    重试语义（与易标 CONSISTENCY_REPAIR_MAX_ATTEMPTS 一致）：本轮全部补丁
+    被拒的小节，把失败原因回喂重新生成补丁，至多 `content_repair_max_attempts()`
+    轮（默认 1 = 不重试）。只有命中才改字，绝不重写整节；失败保持原正文
+    （finding.repaired=False 落库供用户跟进）。
+
+    Args:
+        repairable: `(finding, conflict, target)` 三元组列表（已由调用方确认
+            有建议、有目标小节且有正文）。
+        sections_by_id: {id: section_dict}，取章节标题供提示词展示。
+        facts_text: 一致性基准文本（结构化全局事实优先，退化为项目摘要）。
+    Returns:
+        成功修复（至少一条补丁落文）的小节数。
+    """
+    from .. import text_patch
+    from ..consistency_repair import generate_patches
+    from ..facts_service import content_repair_max_attempts
+
+    if not repairable:
+        return 0
+
+    # 按小节归并冲突（易标同为按章修复：一次请求携带该章全文与全部冲突）
+    by_sid: dict[str, dict] = {}
+    for finding, conflict, target in repairable:
+        sid = str(conflict.get("section_id"))
+        entry = by_sid.setdefault(
+            sid,
+            {
+                "target": target,
+                "title": (sections_by_id.get(target.get("id")) or {}).get("title", ""),
+                "issues": [],
+                "findings": [],
+            },
+        )
+        entry["issues"].append(
+            f"- {conflict.get('issue', '')}（修复建议：{conflict.get('suggestion', '')}）"
+        )
+        entry["findings"].append(finding)
+
+    conflicts_text = "\n".join(
+        f"【小节 {sid}】\n" + "\n".join(e["issues"]) for sid, e in by_sid.items()
+    )
+
+    repaired_count = 0
+    pending = dict(by_sid)
+    failure_note = ""
+    max_attempts = max(1, content_repair_max_attempts())
+    for _attempt in range(max_attempts):
+        if not pending or (cancel_event and cancel_event.is_set()):
+            break
+        sections_payload = [
+            {
+                "node_id": sid,
+                "title": e["title"],
+                "content": e["target"].get("content", "") or "",
+            }
+            for sid, e in pending.items()
+        ]
+        patches, _unresolved, error = await with_timeout(
+            generate_patches(
+                provider,
+                sections=sections_payload,
+                conflicts_text=conflicts_text,
+                facts_text=facts_text,
+                failure_note=failure_note,
+            ),
+            timeout=120,
+        )
+        patches_by_sid: dict[str, list[dict]] = {}
+        for patch in patches:
+            patches_by_sid.setdefault(str(patch.get("section_id")), []).append(patch)
+
+        reject_notes: list[str] = []
+        if error:
+            reject_notes.append(f"- [整体] {error}")
+        for sid, entry in list(pending.items()):
+            sec_patches = patches_by_sid.get(sid)
+            if sec_patches is None:
+                # AI 本轮未对该小节给出补丁（可能判为无需修/放进 unresolved）：
+                # 不再重试该节，保持原正文。
+                if not error:
+                    pending.pop(sid, None)
+                continue
+            apply_result = text_patch.apply_patches(
+                entry["target"].get("content", ""), sec_patches
+            )
+            if apply_result.get("changed"):
+                entry["target"]["content"] = apply_result["content"]
+                for finding in entry["findings"]:
+                    finding["repaired"] = True
+                repaired_count += 1
+                pending.pop(sid, None)
+            else:
+                # 全部补丁被拒（未命中/不唯一/失衡）：该节正文未被改动。
+                for err_msg in apply_result.get("errors") or ["补丁均未应用"]:
+                    reject_notes.append(f"- [小节 {sid}] {err_msg}")
+
+        if not pending or not reject_notes or _attempt + 1 >= max_attempts:
+            break
+        # 失败回喂：只重试全军覆没的小节，正文快照取当前最新值
+        failure_note = "\n".join(reject_notes[-20:])
+        logger.info(
+            "一致性补丁修复重试（第 %d 轮）：%d 个小节待重做，失败原因已回喂",
+            _attempt + 2,
+            len(pending),
+        )
+
+    return repaired_count
+
+
 async def _audit_one_group(
     provider: Any,
     group: list[dict],
@@ -482,6 +691,9 @@ async def _audit_one_group(
     results: list[dict],
     summary: str,
     cancel_event: asyncio.Event | None,
+    *,
+    global_facts_text: str = "",
+    completeness_text: str = "",
 ) -> tuple[int, list[dict]]:
     """审计并修复一组正文，返回 (成功修复的小节数, 本组审计发现列表)。
 
@@ -503,22 +715,51 @@ async def _audit_one_group(
         title = section.get("title", "")
         content = r.get("content", "") or ""
         if len(content) > AUDIT_SECTION_CHAR_LIMIT:
-            # 单节超长只能抽样送审 —— 但必须留下可见的痕迹，
-            # 否则"审计覆盖率不足"会变成无从察觉的静默降级。
-            logger.warning(
-                "一致性审计：章节 %s（%s）正文 %d 字符超出单节送审上限 %d，本次只审计前 %d 字符",
-                r.get("id"),
-                title or "-",
-                len(content),
-                AUDIT_SECTION_CHAR_LIMIT,
-                AUDIT_SECTION_CHAR_LIMIT,
-            )
-            content = content[:AUDIT_SECTION_CHAR_LIMIT]
-        parts.append(f"=== {title} ===\n{content}")
+            chunks = _split_section_into_chunks(content, AUDIT_SECTION_CHAR_LIMIT)
+            if len(chunks) > 1:
+                # ENHANCE 2026-10-15：超长节不再截断抽样，改为分块全量送审，
+                # 各块带「( 标题 第 i/n 块 )」定位标记；审计返回的 conflicts 仍
+                # 以原 section_id 关联，修复时用整节完整正文。
+                blocks = [
+                    f"（{title or '章节'} 第 {idx + 1}/{len(chunks)} 块）\n{chunk}"
+                    for idx, chunk in enumerate(chunks)
+                ]
+                parts.append(f"=== {title} ===\n" + "\n\n".join(blocks))
+                logger.warning(
+                    "一致性审计：章节 %s（%s）正文 %d 字符超出单节送审上限 %d，"
+                    "已拆 %d 块全量送审",
+                    r.get("id"),
+                    title or "-",
+                    len(content),
+                    AUDIT_SECTION_CHAR_LIMIT,
+                    len(chunks),
+                )
+            else:
+                parts.append(f"=== {title} ===\n{content}")
+        else:
+            parts.append(f"=== {title} ===\n{content}")
     group_content = "\n\n".join(parts)
+
+    # ENHANCE 2026-10-15（对齐易标 buildConsistencyAuditMessages）：审计必须
+    # 显式携带结构化全局事实作为一致性基准。正文中「已经明写且与之相背」才报
+    # 冲突；不报缺失、不评文风、不建议整章重写。
+    facts_block = ""
+    if global_facts_text:
+        facts_block = (
+            "【全局事实变量（本项目的统一口径，正文中已明确写出且与其相背的内容才算冲突）】\n"
+            f"{global_facts_text[:4000]}\n\n"
+            "审计要求：\n"
+            "1. 只找正文中已经明确写出、且与全局事实相违背的内容；正文没有涉及某条事实时，不要报告缺失，不要要求补充。\n"
+            "2. 不要报告文风、质量、重复、篇幅、表达优化等问题；不要建议重写整章，只指出冲突位置与原因。\n"
+            "3. 全文中同一事项出现不同值时，以全局事实变量里的值为准。\n\n"
+        )
+    completeness_block = ""
+    if completeness_text:
+        completeness_block = f"【缺值口径】\n{completeness_text}\n\n"
 
     audit_prompt = (
         f"你是一个标书一致性审计专家。请检查以下正文内容是否与项目事实变量存在冲突或不一致。\n\n"
+        f"{facts_block}{completeness_block}"
         f"【项目事实】\n{summary[:5000]}\n\n"
         f"【正文内容（第 {group_idx + 1}/{total_groups} 组）】\n{group_content}\n\n"
         f"【一致性检查清单】\n"
@@ -563,6 +804,48 @@ async def _audit_one_group(
 
     repaired_count = 0
     findings: list[dict] = []
+
+    # 引入项 B（2026-10-15，对齐易标 buildConsistencyRepairMessages）：
+    # CONSISTENCY_PATCH_REPAIR_ENABLED 开启时走 old_text/new_text 精确补丁
+    # （唯一命中才替换、失败原因回喂重试、绝不重写整节）；默认关 = 保持
+    # 下方整节重写路径，提示词与行为逐字不变。
+    from ..facts_service import consistency_patch_repair_enabled
+
+    if consistency_patch_repair_enabled():
+        repairable: list[tuple[dict, dict, dict]] = []
+        for conflict in conflicts:
+            if not isinstance(conflict, dict):
+                continue
+            section_id = conflict.get("section_id")
+            issue = conflict.get("issue", "")
+            suggestion = conflict.get("suggestion", "")
+            if not section_id:
+                continue
+            finding = {
+                "section_id": section_id,
+                "issue": issue,
+                "suggestion": suggestion,
+                "repaired": False,
+            }
+            findings.append(finding)
+            if not suggestion:
+                continue
+            target = next(
+                (r for r in results if str(r.get("id")) == str(section_id)),
+                None,
+            )
+            if target is None or not target.get("content"):
+                continue
+            repairable.append((finding, conflict, target))
+        repaired_count = await _repair_conflicts_with_patches(
+            provider,
+            repairable,
+            sections_by_id,
+            global_facts_text or summary[:5000],
+            cancel_event,
+        )
+        return repaired_count, findings
+
     for conflict in conflicts:
         if not isinstance(conflict, dict):
             continue
@@ -728,8 +1011,9 @@ def _persist_ai_audit_findings(
         conn.execute(
             """INSERT INTO consistency_audit_log
                (project_id, total_sections, facts_extracted,
-                conflicts_found, conflicts_json, audit_time, status)
-               VALUES (?, ?, 0, ?, ?, ?, ?)""",
+                conflicts_found, conflicts_json, audit_time, status,
+                source_kind)
+               VALUES (?, ?, 0, ?, ?, ?, ?, ?)""",
             (
                 project_id,
                 total_sections,
@@ -739,8 +1023,23 @@ def _persist_ai_audit_findings(
                 rules.AUDIT_STATUS_COMPLETED
                 if findings
                 else rules.AUDIT_STATUS_NO_CONFLICTS,
+                # T2 根治（2026-10-16）：AI 语义审计路径，来源恒为 'ai'。
+                rules.CONFLICT_SOURCE_AI,
             ),
         )
+
+    # T5 指标埋点（2026-10-16）：AI 审计落库次数 / 累计发现数 / 已就地修复数。
+    # 纯内存计数，重启归零，供 GET /consistency/metrics 实时观测。
+    try:
+        from ..consistency_metrics import consistency_metrics
+        consistency_metrics.inc("ai_audit_runs")
+        consistency_metrics.inc("ai_findings", len(findings))
+        consistency_metrics.inc(
+            "ai_findings_repaired",
+            sum(1 for f in findings if f.get("repaired")),
+        )
+    except Exception:  # noqa: BLE001  指标埋点不得影响业务写入
+        logger.debug("一致性模块指标埋点失败（AI 审计），已忽略", exc_info=True)
 
 
 async def consistency_audit_content(
@@ -751,6 +1050,9 @@ async def consistency_audit_content(
     summary: str,
     tender_context: str,
     cancel_event: asyncio.Event | None = None,
+    *,
+    global_facts: Any = None,
+    facts_policy: str = "",
 ) -> list[dict]:
     """全文一致性审计：检查正文与项目事实变量的冲突。
 
@@ -784,6 +1086,12 @@ async def consistency_audit_content(
         summary: 项目摘要（含项目事实）
         tender_context: 招标文件全文
         cancel_event: 取消事件
+        global_facts: 结构化全局事实列表（ENHANCE 2026-10-15，对齐易标
+            Step04 全局事实变量审计输入）；None/空时审计退化为只依赖摘要，
+            行为与历史一致。
+        facts_policy: 缺失值策略（fabricate / omit / placeholder），非空时
+            追加「缺值口径」约束，omit/placeholder 下不得把笼统承诺/【待填写】
+            误判为冲突。
     Returns:
         list[dict]: 修复后的结果列表
     """
@@ -808,6 +1116,19 @@ async def consistency_audit_content(
     if not completed_sections:
         return results
 
+    # ENHANCE 2026-10-15（对齐易标 buildConsistencyAuditMessages）：审计输入
+    # 显式携带结构化全局事实，作为「同一事项以谁为准」的唯一裁决基准。
+    global_facts_text = _format_global_facts_for_audit(global_facts)
+    completeness_text = ""
+    if facts_policy:
+        try:
+            from ..facts_service import content_completeness_instruction
+
+            completeness_text = content_completeness_instruction(facts_policy)
+        except Exception as _coord_e:  # pragma: no cover - 防御性
+            logger.debug("缺值口径指令读取失败，审计不附加该块: %s", _coord_e)
+            completeness_text = ""
+
     audit_groups = _split_audit_groups(completed_sections)
     logger.info(
         "一致性审计：%d 个小节 → %d 组（单组上限 %d 字符，单节上限 %d 字符）",
@@ -829,6 +1150,8 @@ async def consistency_audit_content(
                 results,
                 summary,
                 cancel_event,
+                global_facts_text=global_facts_text,
+                completeness_text=completeness_text,
             )
         except Exception as e:
             logger.warning("一致性审计第 %d 组失败: %s", index + 1, e)

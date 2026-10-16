@@ -1102,6 +1102,79 @@ export function upsertSectionProgressItem<T extends { section_id: number; progre
 }
 
 // ============================================================
+// 全局事实一致性审计 —— 结果判定纯函数（组件级可测化 2026-10-15）
+// ============================================================
+
+/** POST /facts/audit 的判定相关字段（仅取判定所需的子集） */
+export interface AuditOutcomeInput {
+  items?: Array<{ status?: string }>;
+  audit_status?: "ok" | "partial" | "failed" | (string & {});
+  audited_sections?: number;
+  total_sections?: number;
+}
+
+/** 判定结果：type 对应 antd message 的方法名，duration 单位为秒 */
+export interface AuditVerdict {
+  type: "success" | "warning" | "error";
+  text: string;
+  duration: number;
+}
+
+/**
+ * 依据审计响应判定用户可见的结论。
+ *
+ * BUG-FIX 2026-10-15（P-4 静默通过）：判定逻辑原内联在 SummaryReviewPage 的
+ * 按钮 onClick 里，其 `else` 分支把「不是 failed 也不是 partial」全部当成通过。
+ * 一旦后端漏回 audit_status（契约漂移）或将来新增取值，界面就会**谎报**
+ * 「一致性检查通过」—— 最危险的失败形态：用户以为已核验，实际审计可能
+ * 根本没跑。现在抽成纯函数：① 可脱离 DOM 单测；② 只有显式 'ok' 才播报通过。
+ */
+export function classifyAuditOutcome(r: AuditOutcomeInput): AuditVerdict {
+  const items = r.items ?? [];
+  const inconsistent = items.filter((i) => i?.status === "inconsistent").length;
+  const missing = items.filter((i) => i?.status === "missing").length;
+  const status = r.audit_status;
+
+  if (status === "failed") {
+    return {
+      type: "error",
+      text: "一致性审计未能执行（AI 调用全部失败），本次结果不代表正文无矛盾",
+      duration: 8,
+    };
+  }
+  if (inconsistent > 0) {
+    return {
+      type: "warning",
+      text: `发现 ${inconsistent} 处事实不一致`,
+      duration: 6,
+    };
+  }
+  if (status === "partial") {
+    return {
+      type: "warning",
+      text: `审计未覆盖全部正文（${r.audited_sections}/${r.total_sections} 章），未发现不一致不等于全部一致`,
+      duration: 8,
+    };
+  }
+  if (missing > 0) {
+    return {
+      type: "warning",
+      text: `正文未发现矛盾，但有 ${missing} 项事实在正文中没有对应表述`,
+      duration: 6,
+    };
+  }
+  if (status === "ok") {
+    return { type: "success", text: "一致性检查通过", duration: 3 };
+  }
+  // 未知或缺失：不得谎报通过
+  return {
+    type: "warning",
+    text: `一致性审计状态未知（${status ?? "字段缺失"}），本次结果不代表正文无矛盾`,
+    duration: 8,
+  };
+}
+
+// ============================================================
 // 上传解析模块 —— 前端交互纯函数（组件级可测化 2026-10-05）
 // 从 FileUploadPage.tsx 抽取，钉住前后端解析状态契约。
 // ============================================================
@@ -1112,20 +1185,40 @@ export interface FileStatusTag {
 }
 
 /**
- * BUG-FIX 2026-09-18（P1）：前后端状态契约对齐——后端写入的是
- * success / failed（Celery 链路另有 processing），此前的
- * uploaded/extracting/extracted 集合后端从不产生，导致解析成功
- * 显示灰色原始值、提取计数永远为 0。保留旧 key 兼容历史数据。
+ * 文件解析状态的**前端唯一口径**。
+ *
+ * BUG-FIX 2026-10-15（TD-A/TD-B/P-5 状态口径漂移）：
+ *
+ * - 后端 `uploaded_files.status` 实际写入 4 个值：`processing` / `success` /
+ *   `failed` / `pending`；`file_parse_tasks.status` 写入 3 个值：`processing` /
+ *   `completed` / `failed`，但其 **DDL 默认值是 `'queued'`**（db_migrations.py），
+ *   即任何绕过 `_create_parse_task` 直接 INSERT 的路径（历史脏数据、外部脚本、
+ *   迁移回填）都可能留下一行 `queued`。此前本表**没有 queued 键**，
+ *   `mapFileStatusTag('queued')` 会落到 `|| { color:"default", text: status }`
+ *   兜底 —— 界面上直接显示英文原始值，用户看不出这是什么状态。
+ * - `uploaded` / `extracting` / `extracted` 三个键后端**从不产生**（2026-09-18
+ *   就修过一次），保留是为兼容历史数据；现加注释标注其来源，避免下一个人
+ *   以为是现役状态而照抄。
+ *
+ * 新增状态时必须同时更新这里与 `FILE_STATUSES`（后者是断言集合，被单测锁定）。
  */
 const FILE_STATUS_TAG_MAP: Record<string, FileStatusTag> = {
   success: { color: "success", text: "已提取" },
   processing: { color: "processing", text: "提取中" },
   pending: { color: "default", text: "待提取" },
+  /** DDL 默认值，见上文说明 */
+  queued: { color: "default", text: "排队中" },
+  /** ↓↓↓ 以下 3 项后端已不产生，仅兼容历史数据（BUG-FIX 2026-09-18 P1）↓↓↓ */
   uploaded: { color: "default", text: "已上传" },
   extracting: { color: "processing", text: "提取中" },
   extracted: { color: "success", text: "已提取" },
   failed: { color: "error", text: "提取失败" },
 };
+
+/** 前端已收录的全部状态键（供静态一致性测试锁定，防止再次漏登记）。 */
+export const FILE_STATUSES: readonly string[] = Object.freeze(
+  Object.keys(FILE_STATUS_TAG_MAP),
+);
 
 export function mapFileStatusTag(status: string): FileStatusTag {
   return FILE_STATUS_TAG_MAP[status] || { color: "default", text: status };

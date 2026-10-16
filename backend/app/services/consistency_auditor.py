@@ -1134,8 +1134,9 @@ class ConsistencyAuditor:
             conn.execute(
                 """INSERT INTO consistency_audit_log
                    (project_id, total_sections, facts_extracted,
-                    conflicts_found, conflicts_json, audit_time, status)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    conflicts_found, conflicts_json, audit_time, status,
+                    source_kind)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     project_id,
                     result.total_sections,
@@ -1144,6 +1145,8 @@ class ConsistencyAuditor:
                     conflicts_json,
                     result.audit_time,
                     result.status,
+                    # T2 根治（2026-10-16）：确定性规则审计路径，来源恒为 'rule'。
+                    rules.CONFLICT_SOURCE_RULE,
                 ),
             )
 

@@ -382,6 +382,40 @@ def _update_parse_task(
         logger.warning("更新文件解析任务失败: %s", e)
 
 
+def _force_parse_task_failed(project_id: int, filename: str, error_message: str) -> None:
+    """把指定文件最近的解析任务行**强制**改写为 failed（可覆盖已写终态的行）。
+
+    BUG-FIX 2026-10-15（F-1/F-2 解析失败静默成功）：`_update_parse_task` 的
+    WHERE 恒带 `status = 'processing'`，只能覆盖**在途**行。但
+    「写提取文本失败」这条链路里，任务行往往在写盘**之前**就已经被写成
+    `completed`（save_upload 在 extract 成功分支先写 completed，随后才落 .txt），
+    此时再用 `_update_parse_task("failed")` 更新会 **UPDATE 0 行**，终态悄悄丢失，
+    状态端点与前端进度条因此仍显示「已成功」。
+
+    本函数不带 `status = 'processing'` 过滤，专供「先前误判成功、事后发现失败」
+    这类需要覆盖终态的场景。仍按 `filename` 精确过滤（与 2026-09-18 修的并发
+    串写同一不变式），只碰本次上传/提取对应的那一行，避免误伤同项目其它文件的
+    历史任务行。异常只告警：任务行是本表的「可观测性通道」，写不进去不该让
+    上传主流程本身失败。
+    """
+    try:
+        from ..db import get_db
+
+        with get_db() as conn:
+            conn.execute(
+                """UPDATE file_parse_tasks
+                   SET status = 'failed', progress = 50, error_message = ?,
+                       completed_at = datetime('now', 'localtime'),
+                       updated_at = datetime('now', 'localtime')
+                   WHERE project_id = ? AND filename = ?""",
+                (error_message[:500], project_id, filename),
+            )
+    except Exception as e:
+        logger.warning(
+            "强制更新解析任务终态失败 project=%d file=%s: %s", project_id, filename, e
+        )
+
+
 # ============================================================================
 # 异步文件 I/O 包装器（消除事件循环阻塞）
 # ============================================================================
@@ -571,7 +605,18 @@ def save_upload(project_id: int, filename: str, content: bytes, file_role: str =
             text_path.write_text(extracted_text, encoding="utf-8")
             text_written = True
         except Exception as e:
+            # BUG-FIX 2026-10-15（F-1 假 success）：文本已提取成功但 .txt 落盘失败
+            # （磁盘满 / 权限拒绝 / 目录被外部进程占住）。旧实现只 logger.error，
+            # 而 status/message 早在 extract 分支被置为 'success'/''，随后 INSERT
+            # 会把「status='success' + extracted_text_path='' + message=''」一起入库，
+            # 任务行也已被写成 completed —— 用户看到「解析成功」却没有任何正文，
+            # 下游 AI 拿到空文本且无从排查。re_extract_text(:1953) 早已对同一失败
+            # 如实返回 failed，这里是同一缺陷在 save_upload 入口的漏网之鱼。
+            # 现如实降级为 failed，并把任务行从 completed 覆盖回 failed。
             logger.error("保存提取文本失败: %s", e)
+            status = "failed"
+            message = f"写入提取文本失败: {e}"
+            _force_parse_task_failed(project_id, filename, message)
     else:
         logger.info("跳过空文本文件写入: %s (status=%s)", filename, status)
 
@@ -717,20 +762,36 @@ def _persist_file_extraction(
 
     # 与 save_upload 同口径：只有真实非空文本才写 .txt；只有落盘成功才记录路径。
     text_written = False
+    _write_error: str | None = None
     if extracted_text.strip():
         try:
             text_path.write_text(extracted_text, encoding="utf-8")
             text_written = True
         except Exception as _wt_e:
-            logger.warning("保存提取文本失败: %s (file=%s)", _wt_e, file_path)
+            # BUG-FIX 2026-10-15（F-2 假 success · Celery 主链路）：提取成功但 .txt
+            # 落盘失败时，旧实现只 logger.warning，随后 _status 恒为 'success'、
+            # _msg 恒为 ''，DB 行 / Celery 返回值 / 任务行三方全部报成功，
+            # 而 extracted_text_path 已是空串 —— 用户点「重新提取」或直接看到
+            # 「解析成功」，磁盘上却没有那份正文。这是**异步解析主链路**，
+            # 影响面大于 save_upload 的同步路径。现如实判 failed。
+            logger.error(
+                "保存提取文本失败（Celery 解析链路）file=%s: %s", file_path, _wt_e
+            )
+            _write_error = f"写入提取文本失败: {_wt_e}"
     else:
         logger.info("跳过空文本文件写入: %s", filename)
 
     # 与 save_upload 同口径：老格式降级提示串判 failed；空文本 success + 空提示。
-    if is_extraction_notice(extracted_text):
+    if _write_error is not None:
+        _status, _msg = "failed", _write_error
+    elif is_extraction_notice(extracted_text):
         _status, _msg = "failed", extracted_text.strip()
     else:
         _status, _msg = "success", ("" if extracted_text.strip() else EMPTY_TEXT_MESSAGE)
+    if _write_error is not None:
+        # 任务行可能已被写为 completed（create_task_row=False 的派发路径），
+        # 必须强制覆盖，否则会 UPDATE 0 行、状态端点继续谎报成功。
+        _force_parse_task_failed(project_id, filename, _write_error)
 
     stored_text_path = str(text_path) if text_written else ""
     with get_db() as conn:
@@ -1302,10 +1363,28 @@ def _pick_main_file(files: list[dict]) -> dict | None:
     主招标文件解析失败（status='failed'，提取文本为空）时仍会被选为「主文件」，
     导致下游摘要 / 评分点识别 / 目录生成全部基于空文本运行，且无任何告警。
     现在优先选「已成功解析的主文件」，仅在没有成功项时才回退到未成功的主文件。
+
+    BUG-FIX 2026-10-15（F-3 主文件文本缺失被降级为摘要）：`_truncate_supporting_file`
+    会校验 `extracted_text_path` 非空且文件存在（:1352-1354），但本函数只按 status
+    选文件。一旦主文件行是 `status='success'` 而 .txt 缺失（历史脏行 / 磁盘被外部
+    清理 / clear 与解析竞态），它仍会被选中，于是**真正的招标正文**被推到 supporting
+    通道、被截断成 200 行「摘要」喂给 AI —— 全文分析质量静默劣化且无任何告警。
+    现在在「已成功的主文件」内部再优先取「有可用提取文本」的那一个；没有任何
+    主文件带有效文本时保持原有回退语义（既有测试锁定的回退行为不变）。
     """
     main_files = [f for f in files if f.get("file_role") == "main"]
     ok_main = [f for f in main_files if f.get("status") == "success"]
     if ok_main:
+        # 优先「status=success 且提取文本确实可读」的主文件；判定口径与
+        # _truncate_supporting_file 完全一致（非空路径 + exists），不重复造轮子。
+        with_text = [
+            f
+            for f in ok_main
+            if f.get("extracted_text_path")
+            and Path(f["extracted_text_path"]).exists()
+        ]
+        if with_text:
+            return with_text[0]
         return ok_main[0]
     if main_files:
         return main_files[0]
@@ -1745,6 +1824,18 @@ def delete_file(project_id: int, file_id: int) -> dict:
 
     # 项目文本已变化，使合并文本缓存失效
     _text_cache_clear(project_id)
+
+    # BUG-FIX 2026-10-15（F-4 缓存未失效）：删除路径此前只清「合并文本缓存」，
+    # 却不清「单文件解析结果缓存」。_clear_parse_cache 在另三条写入路径
+    # （re_extract_text / _persist_file_extraction / clear_project_texts）都已调用，
+    # 删除是漏网之鱼。后果：删除后**重新上传同名文件**时，若新文件的
+    # (size, mtime) 哈希恰与旧文件相同（覆盖式导出、模板复用、mtime 精度粒度内
+    # 重传都很常见），extract_text_from_path 会直接命中旧缓存、把**已删除文件**的
+    # 正文当成新文件正文写回 —— 解析结果错配且无任何告警。
+    try:
+        _clear_parse_cache(str(file_path))
+    except Exception as _dc_e:  # pragma: no cover - 缓存清理失败不影响删除主流程
+        logger.debug("删除文件后清理解析缓存失败（忽略）file=%s: %s", file_path, _dc_e)
 
     return {
         "status": "deleted",

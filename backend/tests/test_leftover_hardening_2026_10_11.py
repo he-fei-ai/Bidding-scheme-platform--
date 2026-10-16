@@ -16,13 +16,19 @@ from app.services.content_cleaning import _fence_payload_to_marker_text
 
 
 class TestEstimateTokensTiktoken:
-    """遗留项3：tiktoken 精确计数集成。"""
+    """遗留项3：tiktoken 精确计数集成。
 
+    tiktoken 是可选依赖（缺失时 `estimate_tokens` 设回退启发式，设计即允许）：
+    未安装环境下精确值断言不适用，按 skip 处理而非假红
+    （BUG-FIX 2026-10-15：本仓库 .venv 未装 tiktoken，全量回归长期携带 2 项环境性失败）。
+    """
+
+    @pytest.mark.skipif(_TIKTOKEN_ENCODER is None, reason="可选依赖 tiktoken 未安装，回退启发式计数")
     def test_tiktoken_available(self):
         """tiktoken 已安装时编码器可用。"""
-        # 本环境已安装 tiktoken
         assert _TIKTOKEN_ENCODER is not None
 
+    @pytest.mark.skipif(_TIKTOKEN_ENCODER is None, reason="可选依赖 tiktoken 未安装，回退启发式计数")
     def test_ascii_accuracy(self):
         """ASCII 文本：tiktoken 计数比启发式更准确。"""
         text = "hello world"  # tiktoken: 2 tokens; 启发式: (11+3)//4 = 3
