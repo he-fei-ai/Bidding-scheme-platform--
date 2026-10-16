@@ -66,3 +66,12 @@ frontend/vite.*.config.ts
 backend/tests/.tmp_*/
 
 /_*.txt
+
+# 测试/诊断运行产物（勿提交）
+backend/import_out.txt
+backend/pytest_final*.txt
+backend/temp_*.txt
+backend/temp_test_*.py
+frontend/vitest_out.txt
+frontend/vitest_err.txt
+frontend/run_tests.ps1
