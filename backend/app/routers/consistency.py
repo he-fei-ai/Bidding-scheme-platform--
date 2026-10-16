@@ -195,6 +195,11 @@ async def run_audit(project_id: int, user=Depends(get_current_user)):
         # ENHANCE 2026-10-09：与 autofix / AI 修复串行（见模块头并发说明）。
         async with _LockManager(project_id):
             result = await asyncio.to_thread(consistency_auditor.run_full_audit, project_id)
+        # T5 指标埋点（2026-10-16）：审计成功/失败计数。
+        from ..services.consistency_metrics import consistency_metrics
+        consistency_metrics.inc(
+            'audit_runs' if rules.is_audit_success(result.status) else 'audit_failed'
+        )
         # BUG-FIX 2026-10-08（P1·谎报成功）：`run_full_audit` 内部把异常吞掉并
         # 降级返回 `status='failed'` + 全 0，而本行此前**无条件**回 `status='ok'`。
         # 前端收到后弹「审计完成，发现 0 处冲突」——实际审计在第一步就崩了，
@@ -491,6 +496,9 @@ async def repair_with_ai(
         # 串行，避免与并发审计的 DELETE 交错导致冲突状态被误判。
         async with _LockManager(project_id):
             report = await _repair(project_id, dry_run=dry_run, section_ids=parsed_ids)
+        # T5 指标埋点（2026-10-16）：AI 补丁被唯一性校验拒绝的累计条数。
+        from ..services.consistency_metrics import consistency_metrics
+        consistency_metrics.inc('ai_patch_rejected', len(report.get('rejected') or []))
     except Exception as e:
         logger.error('AI 一致性修复失败: %s', e, exc_info=True)
         raise HTTPException(status_code=500, detail=f'修复失败: {e!s}') from e
@@ -534,6 +542,9 @@ async def agent_mode_repair(
             report = await run_agent_repair(
                 project_id, dry_run=dry_run, max_turns=max_turns
             )
+        # T5 指标埋点（2026-10-16）：Agent 修复同样统计补丁拒绝数。
+        from ..services.consistency_metrics import consistency_metrics
+        consistency_metrics.inc('ai_patch_rejected', len(report.get('rejected') or []))
     except Exception as e:
         logger.error('Agent 一致性修复失败 project=%s: %s', project_id, e, exc_info=True)
         raise HTTPException(status_code=500, detail=f'Agent 修复失败: {e!s}') from e
@@ -587,7 +598,13 @@ async def facts_backflow_accept(
     # （见 task_guard.live_group_lock），对正文生成完全不设防，用它等于没加。
     # 直接复用 facts 路由的守卫函数，保持两条写口径的判定完全同源。
     from .facts import _ensure_no_ai_task_running
-    await _ensure_no_ai_task_running(project_id)
+    from ..services.consistency_metrics import consistency_metrics
+    try:
+        await _ensure_no_ai_task_running(project_id)
+    except HTTPException:
+        # T5 指标埋点（2026-10-16）：生成中守卫拦截（409）计数。
+        consistency_metrics.inc('guard_interceptions')
+        raise
     from ..services.consistency_backflow import accept_fact_proposals
 
     async with _LockManager(project_id):
@@ -716,30 +733,15 @@ async def get_audit_summary(project_id: int, user=Depends(get_current_user)):
             for row in by_severity_rule:
                 severity_counts_rule[rules.normalize_severity(row['severity'])] = row['cnt']
 
-            # 最近一次审计的来源。`consistency_audit_log` 无来源列，但判定是
-            # 确定性的：AI 路径写入的日志行 `conflicts_json` 只含 `AI-` 前缀 ID，
-            # 确定性路径只含 `conflict_` 前缀 ID —— 两侧永不交叉。
-            # 用户据此能区分「最近审计时间」来自「开始审计」按钮还是正文生成
-            # 收尾的 AI 审计（两者结论性质完全不同）。
-            audit_source = rules.CONFLICT_SOURCE_RULE
-            if latest:
-                raw = latest.get('conflicts_json') or ''
-                try:
-                    entries = json.loads(raw) if raw.strip() else []
-                except (json.JSONDecodeError, TypeError):
-                    entries = []
-                if isinstance(entries, list) and entries:
-                    if any(
-                        isinstance(e, dict) and rules.is_ai_conflict_id(e.get('conflict_id'))
-                        for e in entries
-                    ):
-                        audit_source = rules.CONFLICT_SOURCE_AI
-                    elif rules.AUDIT_STATUS_NO_CONFLICTS == str(latest.get('status')) \
-                            and int(latest.get('facts_extracted') or 0) == 0:
-                        # 无冲突时 JSON 为空数组，退回「事实抽取数」这一侧信道：
-                        # AI 路径恒记 0，确定性路径按真实抽取数记录。仅作为
-                        # 提示，不改写任何既有字段。
-                        audit_source = rules.CONFLICT_SOURCE_AI
+            # T2 根治（2026-10-16）：审计来源直接读 `source_kind` 列（两条写入
+            # 路径已写入），剔除此前靠 `conflicts_json` 侧信道（conflict_id
+            # 前缀）推断的分支。列恒存在（init_db 迁移补列），latest 为 None
+            # （无任何审计记录）时回退默认 'rule'。
+            audit_source = (
+                (latest.get('source_kind') or rules.CONFLICT_SOURCE_RULE)
+                if latest
+                else rules.CONFLICT_SOURCE_RULE
+            )
 
         return {
             'latest_audit': latest,
@@ -755,6 +757,19 @@ async def get_audit_summary(project_id: int, user=Depends(get_current_user)):
 
     summary = await asyncio.to_thread(_read_summary)
     return {'status': 'ok', 'summary': summary}
+
+
+@router.get('/metrics')
+async def get_consistency_metrics(user=Depends(get_current_user)):
+    """一致性校核模块运行时指标快照（ENHANCE 2026-10-16 / T5）。
+
+    返回进程内累计计数器：审计次数/失败数、AI 审计/发现/修复数、补丁拒绝数、
+    生成守卫拦截数。纯内存、重启归零，用于实时观测，不作为审计结论来源
+    （结论一律看 `consistency_audit_log`）。纯读、无副作用、不触碰项目数据，
+    故不做 `enforce_project_access`。
+    """
+    from ..services.consistency_metrics import consistency_metrics
+    return {'status': 'ok', 'metrics': consistency_metrics.snapshot_with_defaults()}
 
 
 @router.get('/scoring-compliance/{project_id}')
