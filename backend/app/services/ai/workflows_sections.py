@@ -926,6 +926,13 @@ def build_chapter_content_messages(chapter_info: dict, facts: Any = None,
                 _sel_titles = ((chapter_info.get("plan") or {}).get("facts") or {}).get("titles") or []
                 if _sel_titles:
                     _chapter_facts = resolve_facts_by_titles(_sel_titles, facts) or None
+                    # PERF 2026-10-17: 标题解析命中/未命中指标
+                    from ..facts_metrics import inc as _inc_metrics
+                    _inc_metrics("fact_resolve_runs")
+                    if _chapter_facts:
+                        _inc_metrics("fact_resolve_hits", len(_chapter_facts))
+                    else:
+                        _inc_metrics("fact_resolve_misses", len(_sel_titles))
         except Exception as e:  # pragma: no cover - 防御性
             logger.debug("编排选事实通道不可用，回退打分筛选: %s", e)
         if not _chapter_facts:

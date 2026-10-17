@@ -13,6 +13,7 @@ import {
   DeleteOutlined, PauseCircleOutlined, PlayCircleOutlined,
   HistoryOutlined, RightOutlined, DownOutlined, UpOutlined, ArrowUpOutlined, ArrowDownOutlined,
   SlidersOutlined, QuestionCircleOutlined,
+  BarChartOutlined, CommentOutlined,
 } from "@ant-design/icons";
 import {
   getProject, fetchSections, updateSection as updateSectionApi,
@@ -27,6 +28,8 @@ import ContentPreview from "../components/ContentPreview";
 import RichTextEditor from "../components/RichTextEditor";
 import RecoveryBanner from "../components/RecoveryBanner";
 import VersionHistory from "../components/VersionHistory";
+import ChartGenerationTab from "../components/ChartGenerationTab";
+import CommentsTab from "../components/CommentsTab";
 import { taskStore } from "../services/taskStore";
 import { extractApiError, annotateOutlineWithNumbers, getLevelColor, getLevelLabel, findNodeInTree, updateNodeInTree, collectLeafIds, countSubtreeLeaves, getLeafCount, getPendingFailedLeafCount, getWordDeficientStats, upsertSectionProgressItem, resolveTargetForNode, resolveToleranceForNode, getWordCountRange, WORD_COUNT_TIERS } from "../utils";
 const { Text } = Typography;
@@ -1851,6 +1854,34 @@ globalCompletedReceivedRef.current = true;
           onSaveVersion={async (sid, content, label) => {
             await saveContentVersion(projectId, sid, content, label);
           }}
+        />
+      ),
+    },
+    {
+      key: "charts",
+      label: <span><BarChartOutlined /> 图表生成</span>,
+      children: (
+        <ChartGenerationTab
+          projectId={projectId}
+          sectionId={selectedSection!.id}
+          sectionTitle={selectedSection?.title || ""}
+          writingLength={writingLength}
+          onGenerated={() => {
+            // 生成完成后刷新章节详情（后端已将图表数据落库）
+            if (selectedSection) {
+              loadSectionDetail(selectedSection.id);
+            }
+          }}
+        />
+      ),
+    },
+    {
+      key: "comments",
+      label: <span><CommentOutlined /> 评论</span>,
+      children: (
+        <CommentsTab
+          projectId={projectId}
+          sectionId={selectedSection!.id}
         />
       ),
     },

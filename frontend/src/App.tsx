@@ -28,6 +28,7 @@ const QAPage = lazy(() => import("./pages/QAPage"));
 const WordCountPage = lazy(() => import("./pages/WordCountPage"));
 const ConsistencyPage = lazy(() => import("./pages/ConsistencyPage"));
 const WordControlHelpPage = lazy(() => import("./pages/WordControlHelpPage"));
+const I18nSettingsPage = lazy(() => import("./pages/I18nSettingsPage"));
 
 // 加载状态组件
 function LoadingFallback() {
@@ -70,6 +71,7 @@ function App() {
             <Route path="/projects/:id/word-count" element={<WordCountPage />} />
             <Route path="/projects/:id/consistency" element={<ConsistencyPage />} />
             <Route path="/word-control-standard" element={<WordControlHelpPage />} />
+            <Route path="/i18n-settings" element={<I18nSettingsPage />} />
             <Route path="*" element={<Navigate to="/" replace />} />
             </Route>
           </Route>

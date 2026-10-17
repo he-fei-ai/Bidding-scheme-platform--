@@ -406,6 +406,13 @@ async def export_html(project_id: int, config: ExportConfig=Body(default_factory
         _p = Path(path)
         if not _p.exists():
             raise HTTPException(status_code=500, detail="HTML 导出产物落盘失败")
+        # BUG-FIX 2026-10-16（P3·空壳 HTML）：写盘后如果产物为 0 字节，说明
+        # 内容组装/渲染链在中途产出了空文件；这里直接判定为失败并删除产物，
+        # 避免把空壳 HTML 写成 completed 记录，同时阻止前端下载到不可用文件。
+        if _p.stat().st_size == 0:
+            _p.unlink(missing_ok=True)
+            _record_export_failure(project_id, config, "HTML 导出产物大小为 0 字节")
+            raise HTTPException(status_code=500, detail="HTML 导出产物为空，请重试")
         # O-4（2026-10-16）：HTML 导出产物落库，写入 exports 历史表。
         # 前端导出历史页即可看到 HTML 记录，配合 download_export 白名单扩展
         # 支持从历史页直接重新下载 HTML 产物。落库失败仅告警，不影响本次下载。

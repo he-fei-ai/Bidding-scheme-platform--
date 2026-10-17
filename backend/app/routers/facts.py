@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import re
+import time
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -55,6 +56,7 @@ from ..services.content_field_contract import (
 from ..services.files import get_facts_file_text, latest_extracted_text
 from ..services.sections import invalidate_content_caches
 from ..services.task_lock import get_active_lock, is_lock_live
+from ..services.facts_metrics import inc, set_value
 
 
 logger = logging.getLogger(__name__)
@@ -580,6 +582,7 @@ async def generate_facts(project_id: int, body: FactsGenerateRequest | None = No
     `runOriginalPlanGlobalFactPatches`），结果计入 `template_patches_applied`。
     """
     policy = normalize_facts_policy(body.missing_value_policy if body else None)
+    _t0 = time.monotonic()  # PERF 2026-10-17: 提取耗时指标
     await _ensure_project_access(project_id, current_user)
     # BUG-FIX 2026-09-29（并发竞态）：提取会全量覆写 global_facts_json 并把
     # confirmed_facts 打回 0，生成进行中执行它等于中途换掉正文的事实基准。
@@ -829,6 +832,7 @@ async def generate_facts(project_id: int, body: FactsGenerateRequest | None = No
 
     except Exception as e:
         logger.warning("[AI事实] 提取异常，使用启发式规则兜底: %s", e)
+        inc("fact_extract_failed")
         items = _generate_default_facts(summary, scoring_points, policy)
         extraction_mode = "heuristic"
         extraction_note = f"AI 提取失败（{str(e)[:80]}），以下为规则启发式结果，请逐条人工确认后再使用。"
@@ -1071,6 +1075,16 @@ async def generate_facts(project_id: int, body: FactsGenerateRequest | None = No
             invalidate_content_caches(project_id)
 
     await asyncio.to_thread(_persist)
+
+    # PERF 2026-10-17: 记录提取耗时与条目数指标
+    _elapsed_ms = int((time.monotonic() - _t0) * 1000)
+    inc("fact_extract_runs")
+    set_value("fact_extract_elapsed_ms", _elapsed_ms)
+    inc("fact_extract_items_total", len(items))
+    if knowledge_patches_applied:
+        inc("fact_knowledge_patch_hits", knowledge_patches_applied)
+    if template_patches_applied:
+        inc("fact_template_patch_hits", template_patches_applied)
 
     return {
         "items": items,
@@ -1335,3 +1349,15 @@ async def audit_facts_consistency(project_id: int, current_user: Annotated[Any, 
         "failed_groups": failed_groups,
         "skipped_placeholder": skipped_placeholder,
     }
+
+
+@router.get("/metrics")
+async def facts_metrics_endpoint():
+    """全局事实模块运行时指标快照（ENHANCE 2026-10-17 / 加固）。
+
+    与 ``GET /consistency/metrics`` 同构：纯内存计数器，进程重启归零，
+    仅用于实时观测事实提取/编排选择/标题解析的耗时与命中情况。
+    """
+    from ..services.facts_metrics import snapshot_with_defaults
+
+    return snapshot_with_defaults()

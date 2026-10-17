@@ -2059,6 +2059,16 @@ export async function generateComparison(projectId: number, sectionId: number): 
   return res.data;
 }
 
+export async function generateFlowchart(projectId: number, sectionId: number): Promise<{ mermaid_code: string; valid: boolean }> {
+  const res = await http.post(`/projects/${projectId}/sections/${sectionId}/generate-flowchart`);
+  return res.data;
+}
+
+export async function generateGantt(projectId: number, sectionId: number): Promise<{ mermaid_code: string; valid: boolean }> {
+  const res = await http.post(`/projects/${projectId}/sections/${sectionId}/generate-gantt`);
+  return res.data;
+}
+
 // 图表全部自动生成（正文内联围栏代码块），已移除人工配图 generate-illustration 前端 API。
 
 // Export
@@ -2673,8 +2683,10 @@ export function resolveImageTaskSrc(task: ImageGenTask): string {
   return "";
 }
 
-export async function fetchModels(apiKey: string, baseUrl: string): Promise<{ models: string[]; suggest_alternatives?: Array<{ name: string; base_url: string; description: string }> }> {
-  const res = await http.post<{ models: string[]; suggest_alternatives?: Array<{ name: string; base_url: string; description: string }> }>("/ai/models", { api_key: apiKey, base_url: baseUrl });
+export async function fetchModels(apiKey: string, baseUrl: string, provider: string = ""): Promise<{ models: string[]; suggest_alternatives?: Array<{ name: string; base_url: string; description: string }> }> {
+  // BUG-FIX 2026-10-16：透传 provider，后端对「已配置厂商的脱敏占位符密钥」
+  // 按厂商隔离解析（此前 /ai/models 只能回落到主配置密钥）。第三参可选，旧调用点不受影响。
+  const res = await http.post<{ models: string[]; suggest_alternatives?: Array<{ name: string; base_url: string; description: string }> }>("/ai/models", { api_key: apiKey, base_url: baseUrl, provider });
   return res.data;
 }
 
@@ -3029,6 +3041,62 @@ export interface CategoryStatsResponse {
 /** 按分类统计提示词调用量 */
 export async function fetchMetricsByCategory(): Promise<CategoryStatsResponse> {
   const res = await http.get<CategoryStatsResponse>("/prompts/metrics/by-category");
+  return res.data;
+}
+
+// ========== 预算与成本管理（ENHANCE 2026-10-23：前后端对齐补全） ==========
+
+export interface PromptBudget {
+  monthly_limit: number;
+  current_month_usage: number;
+  usage_ratio: number;
+  daily_limit: number;
+  current_day_usage: number;
+  daily_ratio: number;
+}
+
+export async function getPromptBudget(): Promise<PromptBudget> {
+  const res = await http.get<PromptBudget>("/prompts/budget");
+  return res.data;
+}
+
+export async function updatePromptBudget(budget: Partial<PromptBudget>): Promise<{ status: string; message: string }> {
+  const res = await http.put<{ status: string; message: string }>("/prompts/budget", budget);
+  return res.data;
+}
+
+export async function getBudgetPrediction(): Promise<any> {
+  const res = await http.get("/prompts/budget/predict");
+  return res.data;
+}
+
+export async function getBudgetSuggestions(): Promise<any[]> {
+  const res = await http.get("/prompts/budget/suggest");
+  return res.data;
+}
+
+export async function getCostSuggestions(): Promise<any[]> {
+  const res = await http.get("/prompts/cost/suggestions");
+  return res.data;
+}
+
+export async function compareModelCosts(): Promise<any[]> {
+  const res = await http.get("/prompts/cost/compare-models");
+  return res.data;
+}
+
+export async function getCostOptimizationSummary(): Promise<any> {
+  const res = await http.get("/prompts/cost/optimization-summary");
+  return res.data;
+}
+
+export async function getAlertThresholds(): Promise<any> {
+  const res = await http.get("/prompts/alerts/thresholds");
+  return res.data;
+}
+
+export async function updateAlertThresholds(thresholds: Record<string, unknown>): Promise<{ status: string; message: string }> {
+  const res = await http.put<{ status: string; message: string }>("/prompts/alerts/thresholds", thresholds);
   return res.data;
 }
 
@@ -3920,51 +3988,6 @@ export interface WSStats {
   };
 }
 
-export async function getWSStats(): Promise<WSStats> {
-  const res = await http.get<WSStats>("/ws/stats");
-  return res.data;
-}
-
-// ========== 批量操作 ==========
-
-export async function getStatistics(): Promise<{
-  status: string; statistics: Record<string, any>;
-}> {
-  const res = await http.get<{ status: string; statistics: Record<string, any> }>("/batch/statistics");
-  return res.data;
-}
-
-export async function batchUpsertProjects(projects: Array<{
-  id?: number; name: string; description?: string; status?: string;
-}>): Promise<{ status: string; message: string; project_ids: number[] }> {
-  const res = await http.post<{ status: string; message: string; project_ids: number[] }>(
-    "/batch/projects",
-    projects,
-  );
-  return res.data;
-}
-
-export async function batchUpdateSectionStatus(
-  projectId: number,
-  sectionUpdates: [number, string][],
-): Promise<{ status: string; message: string; updated_count: number }> {
-  const res = await http.post<{ status: string; message: string; updated_count: number }>(
-    `/batch/sections/status?project_id=${projectId}`,
-    sectionUpdates,
-  );
-  return res.data;
-}
-
-export async function batchGetFiles(projectIds: string): Promise<{
-  status: string; files: Record<number, FileInfo[]>;
-}> {
-  const res = await http.get<{ status: string; files: Record<number, FileInfo[]> }>(
-    "/batch/files",
-    { params: { project_ids: projectIds } },
-  );
-  return res.data;
-}
-
 // ========== 缓存管理 ==========
 
 export async function getCacheStats(): Promise<{
@@ -4019,22 +4042,60 @@ export async function getCacheInfo(): Promise<{
   return res.data;
 }
 
-// ========== API 文档 ==========
+// ========== 系统监控中心 API（ENHANCE 2026-10-23：前后端对齐补全） ==========
 
-export async function exportAPIDocument(format: string = "markdown"): Promise<{
-  status: string; content: string; content_type: string; generated_at: string;
-}> {
-  const res = await http.get<{ status: string; content: string; content_type: string; generated_at: string }>(
-    "/docs",
-    { params: { format } },
-  );
+export async function getMonitorAiStats(): Promise<any> {
+  const res = await http.get("/monitor/ai-stats");
   return res.data;
 }
 
-export async function getAPISummary(): Promise<{
-  status: string; summary: { total_endpoints: number; groups: any[] };
-}> {
-  const res = await http.get<{ status: string; summary: { total_endpoints: number; groups: any[] } }>("/docs/summary");
+export async function getMonitorAiStatsByProvider(provider: string): Promise<any> {
+  const res = await http.get(`/monitor/ai-stats/${encodeURIComponent(provider)}`);
+  return res.data;
+}
+
+export async function clearMonitorAlerts(): Promise<{ status: string; message: string }> {
+  const res = await http.post<{ status: string; message: string }>("/monitor/clear-alerts");
+  return res.data;
+}
+
+export async function configureMonitor(config: Record<string, unknown>): Promise<{ status: string; message: string }> {
+  const res = await http.put<{ status: string; message: string }>("/monitor/configure", config);
+  return res.data;
+}
+
+export async function getMonitorHealth(): Promise<any> {
+  const res = await http.get("/monitor/health");
+  return res.data;
+}
+
+export async function getMonitorCacheStats(): Promise<any> {
+  const res = await http.get("/monitor/cache-stats");
+  return res.data;
+}
+
+export async function getMonitorConcurrencyStats(): Promise<any> {
+  const res = await http.get("/monitor/concurrency-stats");
+  return res.data;
+}
+
+export async function getRepairStats(): Promise<any> {
+  const res = await http.get("/monitor/repair-stats");
+  return res.data;
+}
+
+export async function flushRepairStats(): Promise<{ status: string; message: string }> {
+  const res = await http.post<{ status: string; message: string }>("/monitor/repair-stats/flush");
+  return res.data;
+}
+
+export async function getRepairStatsHistory(): Promise<any> {
+  const res = await http.get("/monitor/repair-stats/history");
+  return res.data;
+}
+
+export async function cleanupRepairStats(): Promise<{ status: string; message: string }> {
+  const res = await http.post<{ status: string; message: string }>("/monitor/repair-stats/cleanup");
   return res.data;
 }
 
@@ -4544,47 +4605,8 @@ export interface TaskRecoveryStatus {
   }>;
 }
 
-export interface V51RecoveryInfo {
-  recoverable: boolean;
-  phase: string;
-  cancelled: boolean;
-  has_edited_outline: boolean;
-  level1_count: number;
-  summary: string;
-  message: string;
-}
-
-export interface ContentRecoveryInfo {
-  recoverable: boolean;
-  total_sections: number;
-  completed_count: number;
-  pending_count: number;
-  pending_sections: Array<{ id: number; title: string; content?: string }>;
-  message: string;
-}
-
 export async function fetchTaskRecoveryStatus(projectId: number): Promise<TaskRecoveryStatus> {
   const res = await http.get<TaskRecoveryStatus>(`/projects/${projectId}/tasks/status`);
-  return res.data;
-}
-
-export async function fetchV51RecoveryInfo(projectId: number): Promise<V51RecoveryInfo> {
-  const res = await http.get<V51RecoveryInfo>(`/projects/${projectId}/tasks/v51/recovery`);
-  return res.data;
-}
-
-export async function fetchContentRecoveryInfo(projectId: number): Promise<ContentRecoveryInfo> {
-  const res = await http.get<ContentRecoveryInfo>(`/projects/${projectId}/tasks/content/recovery`);
-  return res.data;
-}
-
-export async function fetchContentPendingSections(projectId: number, offset = 0, limit = 50): Promise<{
-  total: number; offset: number; limit: number; items: any[];
-}> {
-  const res = await http.get<{ total: number; offset: number; limit: number; items: any[] }>(
-    `/projects/${projectId}/tasks/content/pending-sections`,
-    { params: { offset, limit } },
-  );
   return res.data;
 }
 
@@ -4874,5 +4896,75 @@ export async function saveFeasibilityChapter(
   content: string,
 ): Promise<FeasibilityReportState> {
   const res = await http.put(`/feasibility/chapters/${encodeURIComponent(nodeId)}`, { content });
+  return res.data;
+}
+
+// ============================================================
+// P2 图表智能编排 API（2026-10-17）
+// ============================================================
+
+export interface ChartOrchestrationRequest {
+  sections: Array<{ id: string; title: string; content: string }>;
+  project_summary?: string;
+  use_ai?: boolean;
+}
+
+export interface ChartOrchestrationResponse {
+  results: Array<{
+    section_id: string;
+    needed: boolean;
+    chart_type: string;
+    confidence: number;
+    reason: string;
+    title_hint: string;
+    insert_after: string;
+    source: string;
+  }>;
+  needed_count: number;
+  total_count: number;
+}
+
+export async function orchestrateCharts(
+  request: ChartOrchestrationRequest,
+): Promise<ChartOrchestrationResponse> {
+  const res = await http.post("/charts/orchestrate", request);
+  return res.data;
+}
+
+export interface ChartPayloadRequest {
+  sections: Array<Record<string, unknown>>;
+  use_ai?: boolean;
+}
+
+export interface ChartPayloadResponse {
+  payloads: Array<{
+    section_id: string;
+    chart_type: string;
+    payload: Record<string, unknown>;
+  }>;
+  generated_count: number;
+}
+
+export async function generateChartPayloads(
+  request: ChartPayloadRequest,
+): Promise<ChartPayloadResponse> {
+  const res = await http.post("/charts/generate-payloads", request);
+  return res.data;
+}
+
+export async function generateSingleChartPayload(
+  section_title: string,
+  content: string,
+  chart_type: string,
+  title_hint?: string,
+  use_ai?: boolean,
+): Promise<{ payload: Record<string, unknown> }> {
+  const res = await http.post("/charts/generate-payload", {
+    section_title,
+    content,
+    chart_type,
+    title_hint: title_hint || "",
+    use_ai: use_ai || false,
+  });
   return res.data;
 }

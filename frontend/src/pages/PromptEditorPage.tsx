@@ -4,6 +4,7 @@ import {
 } from "antd";
 import {
   EditOutlined, RollbackOutlined, SaveOutlined, CodeOutlined, HistoryOutlined,
+  DollarCircleOutlined,
 } from "@ant-design/icons";
 import {
   fetchPrompts, updatePrompt, resetPrompt,
@@ -11,6 +12,7 @@ import {
 } from "../api";
 import type { PromptTemplate, PromptVersionMeta } from "../types";
 import type { AxiosError } from "axios";
+import BudgetCostTab from "../components/BudgetCostTab";
 
 /** 从后端错误响应提取 detail 文本（变量校验/SSRF 等 400） */
 function errDetail(e: unknown): string {
@@ -198,62 +200,74 @@ export default function PromptEditorPage() {
   const categoryPrompts = (cat: string) =>
     prompts.filter((p) => p.category === cat);
 
-  const tabItems = categories.map((cat) => ({
-    key: cat.key,
-    label: (
-      <span>
-        <Tag color={cat.color} style={{ marginRight: 4 }}>{cat.label}</Tag>
-        ({categoryPrompts(cat.key).length})
-      </span>
-    ),
-    children: (
-      <List
-        dataSource={categoryPrompts(cat.key)}
-        renderItem={(item) => (
-          <List.Item
-            actions={[
-              <Tooltip title="编辑" key="edit">
-                <Button
-                  type="link"
-                  icon={<EditOutlined />}
-                  onClick={() => openEditor(item)}
-                />
-              </Tooltip>,
-              <Tooltip title="重置为默认值" key="reset">
-                <Button
-                  type="link"
-                  danger
-                  icon={<RollbackOutlined />}
-                  onClick={() => handleReset(item.key)}
-                />
-              </Tooltip>,
-            ]}
-          >
-            <List.Item.Meta
-              title={
-                <Space>
-                  <CodeOutlined />
-                  <Typography.Text code style={{ fontSize: 12 }}>{item.key}</Typography.Text>
-                  <Typography.Text strong>{item.label}</Typography.Text>
-                  {item.content !== item.default_content && (
-                    <Tag color="orange" style={{ fontSize: 11 }}>已修改</Tag>
-                  )}
-                </Space>
-              }
-              description={
-                <Typography.Paragraph
-                  ellipsis={{ rows: 2 }}
-                  style={{ margin: 0, fontSize: 12, color: "#888" }}
-                >
-                  {item.content.slice(0, 200)}
-                </Typography.Paragraph>
-              }
-            />
-          </List.Item>
-        )}
-      />
-    ),
-  }));
+  const tabItems = [
+    ...categories.map((cat) => ({
+      key: cat.key,
+      label: (
+        <span>
+          <Tag color={cat.color} style={{ marginRight: 4 }}>{cat.label}</Tag>
+          ({categoryPrompts(cat.key).length})
+        </span>
+      ),
+      children: (
+        <List
+          dataSource={categoryPrompts(cat.key)}
+          renderItem={(item) => (
+            <List.Item
+              actions={[
+                <Tooltip title="编辑" key="edit">
+                  <Button
+                    type="link"
+                    icon={<EditOutlined />}
+                    onClick={() => openEditor(item)}
+                  />
+                </Tooltip>,
+                <Tooltip title="重置为默认值" key="reset">
+                  <Button
+                    type="link"
+                    danger
+                    icon={<RollbackOutlined />}
+                    onClick={() => handleReset(item.key)}
+                  />
+                </Tooltip>,
+              ]}
+            >
+              <List.Item.Meta
+                title={
+                  <Space>
+                    <CodeOutlined />
+                    <Typography.Text code style={{ fontSize: 12 }}>{item.key}</Typography.Text>
+                    <Typography.Text strong>{item.label}</Typography.Text>
+                    {item.content !== item.default_content && (
+                      <Tag color="orange" style={{ fontSize: 11 }}>已修改</Tag>
+                    )}
+                  </Space>
+                }
+                description={
+                  <Typography.Paragraph
+                    ellipsis={{ rows: 2 }}
+                    style={{ margin: 0, fontSize: 12, color: "#888" }}
+                  >
+                    {item.content.slice(0, 200)}
+                  </Typography.Paragraph>
+                }
+              />
+            </List.Item>
+          )}
+        />
+      ),
+    })),
+    {
+      key: "budget-cost",
+      label: (
+        <span>
+          <DollarCircleOutlined style={{ marginRight: 4 }} />
+          <Tag color="gold">预算与成本</Tag>
+        </span>
+      ),
+      children: <BudgetCostTab />,
+    },
+  ];
 
   const currentPrompt = prompts.find((p) => p.key === editingKey);
 

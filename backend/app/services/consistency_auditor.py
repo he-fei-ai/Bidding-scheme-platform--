@@ -576,6 +576,13 @@ class ConsistencyAuditor:
                     f"AND conflict_id NOT IN ({placeholders})",
                     (project_id, *keep_ids),
                 )
+            else:
+                conn.execute(
+                    "DELETE FROM consistency_conflicts "
+                    "WHERE project_id = ? AND COALESCE(resolved, 0) = 1 "
+                    "AND conflict_id NOT LIKE 'AI-%'",
+                    (project_id,),
+                )
             # {fact_name: 实际落库的 conflict_id} —— 复用行时与生成 ID 不同，
             # 由调用方回写进 Conflict 对象（见 `detect_conflicts` 的说明）。
             id_map: dict[str, str] = {}

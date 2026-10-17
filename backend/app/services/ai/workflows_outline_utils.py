@@ -934,6 +934,42 @@ def _locate_by_path(tree: list, path: str, ancestors: list | None = None):
     )
 
 
+def _repair_title_conflicts(tree: list, path: str, node: dict, candidate: str) -> bool:
+    """AI 修复结果是否与「当前同级兄弟」或「祖先链」标题归一化后撞名。
+
+    2026-10-16 加固（修复结果双重撞名防线）：
+      - 同级撞名：接收后虽有 `_uniquify_outline_titles` 兜底，但消歧改名落在
+        「重复项」上 —— 可能把既有合法标题改坏，且消歧产物（追加维度词 /
+        中文序数）质量劣于规则语义化兜底。此处按**写入时点**实时定位父节点
+        判定（AI 修复并发执行，任务构建期缓存的兄弟快照会过期）；
+      - 祖先撞名（L3 复述 L2/L1）：`_ensure_l2_l3_differentiation` 跑在修复
+        之前，拦不住修复阶段新产生的复述；同级去重只处理兄弟节点，父子重名
+        没有任何防线，会原样流入终态。
+
+    归一化口径与 `_uniquify_outline_titles` 一致（`_title_core`）。
+    对规则兜底（`_rule_based_fallback`）无需重复检查：其 used 为全树标题
+    集合，天然覆盖同级与祖先。
+    """
+    if not isinstance(tree, list):
+        return False
+    parts = [p for p in str(path or "").split(".") if p]
+    if len(parts) < 2:
+        return False
+    cand_core = _title_core(candidate)
+    if not cand_core:
+        return False
+    parent, _, ancestors = _locate_by_path(tree, ".".join(parts[:-1]))
+    if isinstance(parent, dict):
+        if _title_core(str(parent.get("title") or "")) == cand_core:
+            return True
+        for sib in parent.get("children") or []:
+            if not isinstance(sib, dict) or sib is node:
+                continue
+            if _title_core(str(sib.get("title") or "")) == cand_core:
+                return True
+    return any(_title_core(str(anc or "")) == cand_core for anc in ancestors)
+
+
 def _repair_quota_by_task() -> bool:
     """惰性读取 config.OUTLINE_L3_REPAIR_QUOTA_BY_TASK（支持测试打桩/热更新）。
 
@@ -1167,9 +1203,20 @@ async def repair_l3_generic_titles(
             # BUG-FIX 2026-10-13（G1/G2）：判定升级为深度判定，中文数字占位
             # 与「（其N）+泛化词干」残渣同样拒绝接收。
             if new_title and len(new_title) >= 5 and new_title != l3_title and not _is_dirty_l3_title_deep(new_title):
-                node["title"] = new_title
-                _global_used_titles.add(new_title)
-                logger.info("[L3修复] %s → %s", l3_title[:30], new_title[:30])
+                # 2026-10-16 加固（修复结果撞名拒绝）：AI 结果非脏但仍可能与
+                # 同级兄弟或祖先（L2/L1）撞名 —— 接收后前者靠同级去重改名会
+                # 波及既有合法标题，后者（复述二级）没有任何去重防线。拒绝后
+                # 走规则兜底（全树 used，必然唯一非脏），与规则兜底口径对齐。
+                if _repair_title_conflicts(repaired, path, node, new_title):
+                    logger.info(
+                        "[L3修复] 拒绝 AI 返回的重名标题（与同级/祖先撞名），改用规则兜底: %s",
+                        new_title[:30],
+                    )
+                    _fallback(f"AI 返回与同级/祖先重名「{new_title[:20]}」")
+                else:
+                    node["title"] = new_title
+                    _global_used_titles.add(new_title)
+                    logger.info("[L3修复] %s → %s", l3_title[:30], new_title[:30])
             elif new_title:
                 logger.info(
                     "[L3修复] 拒绝 AI 返回的占位/重复标题，改用规则兜底: %s",

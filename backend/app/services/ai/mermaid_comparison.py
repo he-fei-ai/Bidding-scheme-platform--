@@ -140,6 +140,22 @@ def _render_comparison_image_v2(data: dict) -> BytesIO | None:
             ]
             headers = ["对比项", "数值"]
 
+    # ENHANCE 2026-10-17（跨层契约统一·E2E 发现）：前端预览（DiagramPreview.tsx）
+    # 把 {"chart":"pie","data":[{"label","value"}]} 视为饼图契约并客户端转 Mermaid pie，
+    # 但导出端渲染器只认 rows/items → 同一载荷「预览正常、导出静默丢图」。
+    # 现把 data 列表按 items 同语义映射（本渲染器本就是左饼右柱，天然适配）。
+    if not rows_data and isinstance(data.get("data"), list):
+        _items = [
+            it
+            for it in data.get("data", [])
+            if isinstance(it, dict) and ("label" in it or "value" in it)
+        ]
+        if _items:
+            rows_data = [
+                {"label": it.get("label", ""), "value": it.get("value", 0)} for it in _items
+            ]
+            headers = ["对比项", "数值"]
+
     if not rows_data:
         return None
 

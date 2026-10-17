@@ -1282,6 +1282,46 @@ def ensure_enhancement_tables():
             ("word_count_deviation", "INTEGER NOT NULL DEFAULT 0"),
         ]:
             _add_column_if_not_exists("sections", _wc_col, _wc_def)
+
+        # 38. 文本模型配置模块深审闭环（2026-10-16）
+        #
+        # image_provider_configs 缺「至多一个激活」约束。文本侧已有
+        # idx_tpc_unique_active（部分唯一索引，迁移 #33），图像侧没有 ——
+        # 跨进程并发激活两个图像厂商时可能双双 is_active = 1，而「激活」会
+        # 同步写 model_configs 主表，最终生效配置取决于谁最后 commit，
+        # 前端同时显示两个「当前使用」，生成时却只走其一。
+        # 先按 updated_at 收敛存量重复行，再加同款部分索引（幂等）。
+        #
+        # 注：厂商级 rate_limit_per_min 不在此补列。ai_profiles 已有该列、
+        # _make_provider 也消费它，文本主配置无对应列也无对应 UI 输入项；
+        # 「应用 Profile 后限速不生效」的真实根因是 _load_active_profile_limits
+        # 只按 ai_profiles.is_active 查、忽略 ai_config.current_profile_name，
+        # 已在 provider_factory._load_active_profile_limits 内修复，无需新增列。
+        try:
+            _img_dup = conn.execute(
+                "SELECT provider_name FROM image_provider_configs"
+                " WHERE is_active = 1 AND rowid NOT IN ("
+                "   SELECT rowid FROM image_provider_configs"
+                "   WHERE is_active = 1 ORDER BY updated_at DESC LIMIT 1)"
+            ).fetchall()
+            for _row in _img_dup:
+                conn.execute(
+                    "UPDATE image_provider_configs SET is_active = 0"
+                    " WHERE provider_name = ?",
+                    (_row["provider_name"],),
+                )
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_imgpc_unique_active"
+                " ON image_provider_configs(is_active) WHERE is_active = 1"
+            )
+            if _img_dup:
+                logger.info(
+                    "[OK] 修复 image_provider_configs 多激活: %s",
+                    [r["provider_name"] for r in _img_dup],
+                )
+        except Exception as e:
+            logger.warning("image_provider_configs 唯一激活索引跳过: %s", e)
+
         conn.commit()
 
 

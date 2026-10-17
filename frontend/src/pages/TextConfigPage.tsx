@@ -148,7 +148,7 @@ function ProviderCard({
     if (!apiKey || !baseUrl) { message.warning("请先填写 API Key 和 Base URL"); return; }
     setFetchingModels(true);
     try {
-      const result = await fetchModels(apiKey, baseUrl);
+      const result = await fetchModels(apiKey, baseUrl, config.provider_name);
       const modelList: string[] = Array.isArray(result) ? result : (result.models || []);
       if (modelList.length > 0) {
         const options: DefaultOptionType[] = modelList.map((m) => ({ label: m, value: m }));

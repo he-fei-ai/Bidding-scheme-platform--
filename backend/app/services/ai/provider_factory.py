@@ -645,6 +645,17 @@ def get_provider_priority_order() -> list[dict]:
                     "base_url": profile.get("base_url", ""),
                     "api_key": profile.get("api_key", ""),
                     "model": profile.get("model") or "gpt-4o",
+                    # BUG-FIX（2026-10-16）：此前 Profile 层条目只有身份字段，
+                    # 丢失 max_tokens / temperature / concurrency / timeout /
+                    # rate_limit_per_min —— 降级到 Profile 后 Provider 构造器全部
+                    # 回落到内置默认（4096 / 0.7 / 4 / 120 / 0），与「Profile 正是
+                    # 为按任务调参而存在」的语义直接冲突（用户设的 outline 8192/
+                    # 0.3 在降级后不生效）。与上两层（主配置 / 厂商配置）字段口径对齐。
+                    "max_tokens": profile.get("max_tokens") or 0,
+                    "temperature": profile.get("temperature", 0.7),
+                    "concurrency": profile.get("concurrency") or 0,
+                    "timeout": profile.get("timeout") or 0,
+                    "rate_limit_per_min": profile.get("rate_limit_per_min") or 0,
                     "success_rate": 1.0,
                     "is_builtin_default": False,
                     "is_primary": False,
@@ -730,10 +741,34 @@ def _load_active_profile_limits() -> dict:
     """
     try:
         with get_db_with_retry() as conn:
-            row = conn.execute(
-                "SELECT rate_limit_per_min, concurrency FROM ai_profiles "
-                "WHERE is_active = 1 ORDER BY id LIMIT 1"
+            row = None
+            # BUG-FIX（2026-10-16）：「应用 Profile」只写 ai_config.current_profile_name，
+            # 并不会改 ai_profiles.is_active。旧实现固定按 is_active=1 取限流，于是应用
+            # 了一个非默认 Profile 后，它自己的 rate_limit_per_min / concurrency 完全不
+            # 生效（生成链仍按默认 Profile 的配额跑），与「当前配置即该 Profile」的用户
+            # 预期相反，也与 apply_profile_to_config 同步主配置其余字段的语义不一致。
+            # 现优先解析已应用的 Profile，未应用时回落到默认 Profile（即原行为）。
+            _applied = conn.execute(
+                "SELECT current_profile_name FROM ai_config WHERE id = 1"
             ).fetchone()
+            _applied_name = ""
+            if _applied is not None:
+                _applied_name = (
+                    _applied["current_profile_name"]
+                    if hasattr(_applied, "keys")
+                    else _applied[0]
+                ) or ""
+            if _applied_name:
+                row = conn.execute(
+                    "SELECT rate_limit_per_min, concurrency FROM ai_profiles "
+                    "WHERE name = ? ORDER BY id LIMIT 1",
+                    (_applied_name,),
+                ).fetchone()
+            if not row:
+                row = conn.execute(
+                    "SELECT rate_limit_per_min, concurrency FROM ai_profiles "
+                    "WHERE is_active = 1 ORDER BY id LIMIT 1"
+                ).fetchone()
         if not row:
             return {}
         return {
@@ -849,6 +884,14 @@ def get_ai_config() -> dict:
                                     "concurrency",
                                     "max_tokens",
                                     "document_profile",
+                                    # BUG-FIX（2026-10-16）：此前回落只同步 7 个字段，
+                                    # 漏了 timeout / temperature —— 主配置 api_key 为空
+                                    # 而激活厂商单独调了超时/温度时，AI 调用仍用主配置
+                                    # 默认值（120s / 0.7），「厂商级参数」在回落路径上
+                                    # 完全失效。与 activate_text_provider_config 的同步
+                                    # 口径对齐（该端点已把 timeout 写进主表）。
+                                    "timeout",
+                                    "temperature",
                                 )
                                 if k in tpc_dict and tpc_dict[k] is not None
                             }
@@ -1054,6 +1097,13 @@ def _quick_health_check(base_url: str, api_key: str, model: str, timeout: int) -
     if not model:
         model = _AI_CONFIG_DEFAULTS.get("model", "gpt-4o")
 
+    # BUG-FIX（2026-10-16）：`timeout` 参数此前被完全忽略，客户端硬编码 5s。
+    # 两个后果：(1) 把 timeout 调小（例如 2s）想快速失败的厂商，探活仍白等 5s，
+    # 降级链最坏 N×5s 逐条串行；(2) 参数形同虚设，读代码者会误以为已生效。
+    # 现让配置值**只允许缩短**探活（下限 1s），并硬性封顶 5s —— 配置里填个 600s
+    # 不会把整条降级链拖成十分钟。异步链的 wait_for 外层超时不受影响。
+    _probe_timeout = min(max(int(timeout or 5), 1), 5)
+    _probe_connect = min(3, _probe_timeout)
     try:
         # F-NEW-1（2026-10-06）：此前同步探活直接构造 httpx.Client 未走
         # build_httpx_proxy_settings，而异步版 get_working_provider/quick-setup
@@ -1061,7 +1111,7 @@ def _quick_health_check(base_url: str, api_key: str, model: str, timeout: int) -
         # asyncio.to_thread 调用）的降级链探活会全部连不通，与异步链行为
         # 漂移。这里对齐：无代理配置时返回 {}，**展开为空，行为不变。
         with httpx.Client(
-            timeout=httpx.Timeout(5, connect=3, read=5),
+            timeout=httpx.Timeout(_probe_timeout, connect=_probe_connect),
             **build_httpx_proxy_settings(),
         ) as client:
             resp = client.post(
@@ -1073,10 +1123,10 @@ def _quick_health_check(base_url: str, api_key: str, model: str, timeout: int) -
                     "max_tokens": 4,
                 },
             )
-            return resp.status_code == 200
             # TD-3（2026-10-06）：429（限流）此前被视为健康，会选中该厂商后在真正
             # 调用时被拒；与异步 get_working_provider 的 429=跳过 语义对齐。
             # 失败结论走 _health_cache 15s 短 TTL，厂商恢复后能尽快重选。
+            return resp.status_code == 200
     except Exception:
         return False
 

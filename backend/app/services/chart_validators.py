@@ -414,6 +414,26 @@ def validate_timeline_data(data: Any) -> tuple[bool, list[str]]:
                     f"timeline.milestones[{i}] status 应为 completed/in_progress/pending，实际: {status}"
                 )
 
+        # ENHANCE 2026-10-17（v3.1 规范补齐·日期逆序）：旧实现只查格式不查顺序，
+        # 「竣工早于开工」这类致命逻辑错误静默通过 → 渲染出时间倒挂的里程碑图，
+        # 且 CHART_DATA_FIX 提示词承诺检测「时间线日期逆序」却从未触发 AI 修复。
+        # YYYY-MM-DD 定长格式可直接按字符串字典序比较。
+        _valid_dates = [
+            str(m.get("date", ""))
+            for m in milestones
+            if isinstance(m, dict)
+            and len(str(m.get("date", ""))) == 10
+            and str(m.get("date", ""))[4:5] == "-"
+            and str(m.get("date", ""))[7:8] == "-"
+        ]
+        for _di in range(1, len(_valid_dates)):
+            if _valid_dates[_di] < _valid_dates[_di - 1]:
+                errors.append(
+                    f"timeline.milestones 日期逆序（{_valid_dates[_di - 1]} → "
+                    f"{_valid_dates[_di]}），里程碑应按时间升序排列"
+                )
+                break
+
     except (json.JSONDecodeError, TypeError) as e:
         errors.append(f"数据解析失败: {e!s}")
 
@@ -462,15 +482,36 @@ def validate_labor_data(data: Any) -> tuple[bool, list[str]]:
             return False, errors
 
         n_cats = len(categories)
+        # ENHANCE 2026-10-17（v3.1 规范补齐·维度一致性）：旧实现对短行**静默补 0**
+        # （人数被少报）、对长行静默截断（数据被丢弃），图表照渲但数字与工种对不上，
+        # 且 CHART_DATA_FIX 提示词承诺检测「劳动力图维度不一致」却从未触发 AI 修复。
+        # 现双向显式报错（补 0 逻辑保留以护渲染器不崩——围栏路径校验失败仅诊断，
+        # SSE 管线路径则据此触发 AI 修复）。
+        for _ri, row in enumerate(matrix):
+            if len(row) > n_cats:
+                errors.append(
+                    f"维度不一致：第{_ri + 1}个阶段数据有 {len(row)} 个值但仅有 {n_cats} 个工种"
+                )
+            elif len(row) < n_cats:
+                errors.append(
+                    f"维度不一致：第{_ri + 1}个阶段数据仅有 {len(row)} 个值但有 {n_cats} 个工种，"
+                    f"缺失部分将按 0 处理（数据可能不完整）"
+                )
         for row in matrix:
             if len(row) < n_cats:
                 row.extend([0.0] * (n_cats - len(row)))
+
+        # ENHANCE 2026-10-17：矩阵行数应与阶段数一致（行↔阶段、列↔工种口径）
+        if len(matrix) != len(phases):
+            errors.append(f"数据矩阵有 {len(matrix)} 行但阶段有 {len(phases)} 个，维度不一致")
 
         # 检查每个阶段至少有一个工种数值 > 0
         for i, row in enumerate(matrix):
             has_positive = any(v > 0 for v in row)
             if not has_positive:
-                errors.append(f"第{i+1}个阶段('{phases[i]}')所有工种数值为0，无效数据")
+                # 防护：矩阵行多于阶段数时 phases[i] 越界（BUG 修复 2026-10-17）
+                _phase_name = phases[i] if i < len(phases) else f"第{i + 1}行"
+                errors.append(f"第{i+1}个阶段('{_phase_name}')所有工种数值为0，无效数据")
 
         # 检查总人数非负（隐含，因为都是非负值，但显式检查更清晰）
         total = sum(sum(row) for row in matrix)
@@ -576,6 +617,43 @@ def validate_layout_data(data: Any) -> tuple[bool, list[str]]:
                         pass  # 合法，稍后检查是否在范围内
                     else:
                         errors.append("连接项 from/to 必须是整数或字符串索引")
+
+        # ENHANCE 2026-10-17（v3.1 规范补齐·几何检查）：旧实现 docstring 明确
+        # 「不检查几何重叠」，导致 CHART_DATA_FIX 提示词承诺的「布局图区域重叠 /
+        # 坐标越界」检测从未生效——重叠/越界的总平面布置图会被原样渲染进投标
+        # 文件，且 AI 修复路径无错误上下文可介入。现对带 x/y/w/h 数字坐标的
+        # 区域做 100×100 画布越界 + 两两相交检测（仅 1 条错误防日志洪水）。
+        _rects = []
+        for _zi, zone in enumerate(zones):
+            if not isinstance(zone, dict):
+                continue
+            try:
+                _zx = float(zone.get("x"))
+                _zy = float(zone.get("y"))
+                _zw = float(zone.get("w"))
+                _zh = float(zone.get("h"))
+            except (TypeError, ValueError):
+                continue  # 无数字坐标（如纯描述型区域）→ 不参与几何检查
+            _zn = str(zone.get("name") or zone.get("label") or f"区域{_zi + 1}")
+            if _zx < 0 or _zy < 0 or _zx + _zw > 100.001 or _zy + _zh > 100.001:
+                errors.append(
+                    f"布局图区域 '{_zn}' 坐标越界（x={_zx}, y={_zy}, w={_zw}, "
+                    f"h={_zh}，画布为 100x100）"
+                )
+            _rects.append((_zn, _zx, _zy, _zw, _zh))
+        _overlap_reported = False
+        for _pi in range(len(_rects)):
+            if _overlap_reported:
+                break
+            _n1, _x1, _y1, _w1, _h1 = _rects[_pi]
+            for _qj in range(_pi + 1, len(_rects)):
+                _n2, _x2, _y2, _w2, _h2 = _rects[_qj]
+                _ox = min(_x1 + _w1, _x2 + _w2) - max(_x1, _x2)
+                _oy = min(_y1 + _h1, _y2 + _h2) - max(_y1, _y2)
+                if _ox > 1e-6 and _oy > 1e-6:
+                    errors.append(f"布局图区域 '{_n1}' 与 '{_n2}' 重叠，区域不得交叉")
+                    _overlap_reported = True
+                    break
 
     except (json.JSONDecodeError, TypeError) as e:
         errors.append(f"数据解析失败: {e!s}")

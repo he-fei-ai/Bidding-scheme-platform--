@@ -1366,6 +1366,8 @@ def _add_parsed_content(
                 _has_chart_marker = True
                 chart_type = marker.get("chart_type", "")
                 chart_desc = marker.get("description", "")
+                # ENHANCE 2026-10-17：透传围栏路径捕获的引导语（图题第三优先级）
+                _caption_hint = marker.get("caption_hint", "") or ""
                 if section_detail:
                     _add_inline_chart(
                         doc,
@@ -1376,6 +1378,7 @@ def _add_parsed_content(
                         _http_service_available=_http_service_available,
                         parent_section_number=parent_section_number,
                         chapter_number=chapter_number,
+                        caption_hint=_caption_hint,
                     )
             except Exception as e:
                 logger.warning("解析图表标记失败: %s", e)
@@ -1750,6 +1753,7 @@ def _add_inline_chart(
     _http_service_available: bool | None = None,
     parent_section_number: str = "",
     chapter_number: str = "",
+    caption_hint: str = "",
 ):
     """根据图表类型和章节数据，在当前位置内联渲染图表（商业级 v2 渲染器）
 
@@ -1833,30 +1837,32 @@ def _add_inline_chart(
                     source_obj = source
 
             # 提取标题（ENHANCE 2026-10-04 四级优先级，需求 8）：
-            #   载荷 title/caption > Mermaid 代码内 title 行 > 引导语 chart_desc > 类型通用名
+            #   载荷 title/caption > Mermaid 代码内 title 行 > 引导语（围栏路径
+            #   caption_hint / <<CHART>> 路径的非 JSON chart_desc）> 类型通用名
+            # ENHANCE 2026-10-17：围栏路径的 chart_desc 是 JSON，旧实现中「引导语」
+            # 一级在此路径永远取不到值（直接落到 default_title）。现由 parse_content
+            # 捕获围栏紧邻前的正文引语经 caption_hint 透传，补齐该优先级。
             _mermaid_title = ""
             if isinstance(source_obj, dict):
                 _code_field = source_obj.get("code")
                 if isinstance(_code_field, str) and _code_field.strip() and not _code_field.lstrip().startswith("{"):
                     # 仅纯 Mermaid 语法载荷提 title；JSON 内嵌 code 不交叉提取
                     _mermaid_title = extract_mermaid_title(_code_field)
+            _lead_in = (
+                chart_desc
+                if isinstance(chart_desc, str) and not chart_desc.startswith("{")
+                else caption_hint
+            )
             if source_obj and isinstance(source_obj, dict):
                 title_text = (
                     source_obj.get("title")
                     or source_obj.get("caption")
                     or _mermaid_title
-                    or (
-                        chart_desc
-                        if isinstance(chart_desc, str) and not chart_desc.startswith("{")
-                        else default_title
-                    )
+                    or _lead_in
+                    or default_title
                 )
             else:
-                title_text = (
-                    chart_desc
-                    if isinstance(chart_desc, str) and not chart_desc.startswith("{")
-                    else default_title
-                )
+                title_text = _lead_in or default_title
             # 标题清理：去除 AI 可能残留的 emoji/Markdown，限制长度
             if title_text:
                 title_text = str(title_text).strip()[:24]
@@ -1949,6 +1955,7 @@ def _add_inline_chart(
                 _http_service_available=_http_service_available,
                 parent_section_number=parent_section_number,
                 chapter_number=chapter_number,
+                caption_hint=caption_hint,
             )
 
     if inline_data:
@@ -1974,6 +1981,7 @@ def _add_inline_chart(
                 _http_service_available=_http_service_available,
                 parent_section_number=parent_section_number,
                 chapter_number=chapter_number,
+                caption_hint=caption_hint,
             )
         # FIX 2026-10-11（E-8·P1·兜底分支传无效类型）：旧实现在 inner_type 为空时
         # 以 `inner_type or "chart"` 调用 _render_commercial，"chart" 不是合法 mermaid

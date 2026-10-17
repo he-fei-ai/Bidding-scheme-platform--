@@ -22,6 +22,7 @@
 from __future__ import annotations
 
 import contextvars  # HARDENING 2026-10-11（遗留·图号计数器会话化）
+import hashlib  # P3-1 同代码 hash 去重（2026-10-17）
 import json
 import logging
 import os
@@ -76,6 +77,165 @@ _CHART_FALLBACK_KEYWORDS = {
 # D5 加固开关（2026-10-07）：章节无图表数据/无图表标记时，按标题本地模板兜底补图。
 # 默认关闭（"0"）以保留现有行为；设为 "1" 开启。
 AUTO_FALLBACK_CHARTS = os.getenv("AUTO_FALLBACK_CHARTS", "0") == "1"
+
+
+# ============================================================
+# P3 性能调优（2026-10-17）
+# ============================================================
+
+# P3-1: 同代码 hash 去重缓存
+# 相同 Mermaid 代码只渲染一次，后续复用缓存结果。
+# 缓存键: hash(mermaid_code) -> (timestamp, rendered_bytes)
+_CHART_HASH_CACHE: dict[str, tuple[float, bytes]] = {}
+_CHART_HASH_CACHE_LOCK = threading.Lock()
+_CHART_HASH_CACHE_MAX_SIZE = 1000  # 最大缓存条目数
+_chart_hash_cache_stats = {"hits": 0, "misses": 0, "evictions": 0}
+
+
+def _get_chart_hash(mermaid_code: str) -> str:
+    """计算 Mermaid 代码的 hash（P3-1 同代码去重）
+
+    用于识别相同图表代码，避免重复渲染。
+    使用 SHA1 而非 MD5 以获得更好的碰撞抗性。
+    """
+    return hashlib.sha1(mermaid_code.encode("utf-8")).hexdigest()
+
+
+def _get_cached_chart_render(mermaid_code: str) -> bytes | None:
+    """获取缓存的图表渲染结果（P3-1 同代码去重）
+
+    Args:
+        mermaid_code: Mermaid 图表代码
+
+    Returns:
+        bytes: 缓存的渲染结果，未命中返回 None
+    """
+    chart_hash = _get_chart_hash(mermaid_code)
+    with _CHART_HASH_CACHE_LOCK:
+        entry = _CHART_HASH_CACHE.get(chart_hash)
+        if entry:
+            _chart_hash_cache_stats["hits"] += 1
+            return entry[1]  # 返回缓存的渲染数据
+        _chart_hash_cache_stats["misses"] += 1
+        return None
+
+
+def _cache_chart_render(mermaid_code: str, rendered_bytes: bytes) -> None:
+    """缓存图表渲染结果（P3-1 同代码去重）
+
+    Args:
+        mermaid_code: Mermaid 图表代码
+        rendered_bytes: 渲染结果字节数据
+    """
+    chart_hash = _get_chart_hash(mermaid_code)
+    with _CHART_HASH_CACHE_LOCK:
+        # LRU 淘汰：超过最大缓存条数时移除最旧的
+        if len(_CHART_HASH_CACHE) >= _CHART_HASH_CACHE_MAX_SIZE:
+            # 简单策略：移除第一个插入的条目
+            oldest_key = next(iter(_CHART_HASH_CACHE))
+            del _CHART_HASH_CACHE[oldest_key]
+            _chart_hash_cache_stats["evictions"] += 1
+        _CHART_HASH_CACHE[chart_hash] = (time.time(), rendered_bytes)
+
+
+def get_chart_hash_cache_stats() -> dict[str, int]:
+    """获取 hash 缓存统计信息（P3-3 性能监控）"""
+    with _CHART_HASH_CACHE_LOCK:
+        return {
+            "cache_size": len(_CHART_HASH_CACHE),
+            **_chart_hash_cache_stats,
+        }
+
+
+def clear_chart_hash_cache() -> None:
+    """清空图表 hash 缓存（测试用）"""
+    with _CHART_HASH_CACHE_LOCK:
+        _CHART_HASH_CACHE.clear()
+        _chart_hash_cache_stats.update({"hits": 0, "misses": 0, "evictions": 0})
+
+
+# P3-2: 动态批量大小优化
+# 根据图表数量和系统资源动态调整线程池大小
+def _adaptive_batch_size(num_charts: int, cpu_count: int | None = None) -> int:
+    """根据图表数量动态计算最优批量大小（P3-2 小并发批量优化）
+
+    策略：
+    - 小批量（<=10）：使用全部可用 CPU 核心
+    - 中批量（11-50）：使用 CPU 核心数的 50%
+    - 大批量（>50）：使用 CPU 核心数的 25%（避免过度并发导致 CPU 争抢）
+
+    Args:
+        num_charts: 图表总数
+        cpu_count: CPU 核心数（None 则自动检测）
+
+    Returns:
+        int: 建议的线程池大小
+    """
+    if cpu_count is None:
+        cpu_count = os.cpu_count() or 4
+
+    if num_charts <= 10:
+        # 小批量：全速并行
+        return min(cpu_count * 2, 16)
+    elif num_charts <= 50:
+        # 中批量：适度并行
+        return max(2, cpu_count)
+    else:
+        # 大批量：保守并行，避免 CPU 争抢
+        return max(2, cpu_count // 2)
+
+
+# P3-3: 渲染耗时 profiling
+# 记录每个图表的渲染耗时，用于性能分析和优化
+_chart_render_profile: list[dict] = []
+_chart_render_profile_lock = threading.Lock()
+
+
+def _record_render_time(chart_id: str, duration_ms: float, cached: bool = False) -> None:
+    """记录图表渲染耗时（P3-3 性能监控）
+
+    Args:
+        chart_id: 图表标识（章节ID:类型）
+        duration_ms: 渲染耗时（毫秒）
+        cached: 是否命中缓存
+    """
+    with _chart_render_profile_lock:
+        _chart_render_profile.append({
+            "chart_id": chart_id,
+            "duration_ms": round(duration_ms, 2),
+            "cached": cached,
+            "timestamp": time.time(),
+        })
+        # 限制最多记录 1000 条
+        if len(_chart_render_profile) > 1000:
+            _chart_render_profile.pop(0)
+
+
+def get_render_profile() -> list[dict]:
+    """获取渲染耗时统计（P3-3 性能监控）"""
+    with _chart_render_profile_lock:
+        return list(_chart_render_profile)
+
+
+def get_render_profile_summary() -> dict:
+    """获取渲染耗时摘要统计（P3-3 性能监控）"""
+    with _chart_render_profile_lock:
+        if not _chart_render_profile:
+            return {"count": 0, "avg_ms": 0, "max_ms": 0, "min_ms": 0}
+        durations = [r["duration_ms"] for r in _chart_render_profile]
+        return {
+            "count": len(durations),
+            "avg_ms": round(sum(durations) / len(durations), 2),
+            "max_ms": round(max(durations), 2),
+            "min_ms": round(min(durations), 2),
+            "cached_count": sum(1 for r in _chart_render_profile if r["cached"]),
+        }
+
+
+def clear_render_profile() -> None:
+    """清空渲染耗时记录（测试用）"""
+    with _chart_render_profile_lock:
+        _chart_render_profile.clear()
 
 
 def _afc_enabled(config) -> bool:

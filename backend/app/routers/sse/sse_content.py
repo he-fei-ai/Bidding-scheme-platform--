@@ -1263,8 +1263,12 @@ async def generate_content_impl(
                             fact_titles_for_orchestration,
                             orchestrated_select_enabled,
                         )
+                        from ...services.facts_metrics import inc as _inc_metrics
                         if orchestrated_select_enabled() and global_facts:
                             _fact_titles_for_orch = fact_titles_for_orchestration(global_facts)
+                            _inc_metrics("orchestration_titles_offered", len(_fact_titles_for_orch))
+                        elif global_facts:
+                            _inc_metrics("orchestration_titles_skipped")
                     except Exception as _ft_e:
                         logger.warning("事实标题清单装配失败（跳过 facts 编排）: %s", _ft_e)
 
@@ -1339,6 +1343,35 @@ async def generate_content_impl(
                     # 同时写入 plan(table/mermaid/image 决策) + illustration_type + section_type
                     if isinstance(orchestration_result, list):
                         apply_orchestration_to_leaves(leaf_dicts, orchestration_result)
+
+                        # ENHANCE 2026-10-17（加固）：编排后验证 facts.titles 完整性
+                        # 对齐参考软件 validateContentPlan —— 编排开关开启但全部空时告警
+                        if _fact_titles_for_orch:
+                            _total_selected = 0
+                            _sections_with_facts = 0
+                            _all_empty = True
+                            for _leaf in leaf_dicts:
+                                _plan = _leaf.get("plan") or {}
+                                _ft = _plan.get("facts", {}).get("titles", [])
+                                if _ft:
+                                    _sections_with_facts += 1
+                                    _total_selected += len(_ft)
+                                    _all_empty = False
+                            from ...services.facts_metrics import inc as _inc_metrics
+                            _inc_metrics("orchestration_titles_selected", _total_selected)
+                            if _all_empty:
+                                _inc_metrics("orchestration_titles_empty")
+                                logger.warning(
+                                    "[正文生成] 编排 facts 通道开启但全部 %d 节事实标题为空"
+                                    "（%d 条可用标题未选中），回退到生成阶段确定性打分",
+                                    len(leaf_dicts), len(_fact_titles_for_orch),
+                                )
+                            else:
+                                logger.info(
+                                    "[正文生成] 编排 facts 通道：%d 节选中事实标题，"
+                                    "共 %d 条（可用 %d 条）",
+                                    _sections_with_facts, _total_selected, len(_fact_titles_for_orch),
+                                )
 
                         # E-2：按编排选定的 knowledge.item_ids 解析素材正文写回叶子，
                         # 供正文生成注入（build_chapter_content_messages 读 chapter_info）。
@@ -2105,6 +2138,9 @@ async def generate_content_impl(
                             ),
                             cancel_event=cancel_event,
                             on_summary=_on_adjust_summary,
+                            # ENHANCE 2026-10-17（对齐易标字数调整注入全局事实）
+                            global_facts=global_facts,
+                            facts_policy=facts_policy,
                         )
                         # 落库：与 condense / 兜底扩写同构（批量 UPDATE + 三层失效）。
                         # BUG-FIX 2026-10-12 同源教训：调整只改内存 results 而不落库 /

@@ -156,6 +156,13 @@ def validate_mermaid(code: str) -> tuple[bool, str]:
             code,
         ):
             return False, "流程图菱形节点中文标签含特殊字符但缺少双引号"
+        # BUG-FIX 2026-10-17（P1·菱形括号不配对漏检）：AI 截断常产出 B{判断 这类
+        # 未闭合菱形节点。旧实现只数节点数不查括号配对 → 校验通过 → 渲染层拿到
+        # 非法 Mermaid 报错 → 整图静默丢失。此处剔除双引号字符串后比对计数，
+        # 避免误伤 A["{x"}] 这类标签内合法花括号。
+        _no_quoted = re.sub(r'"[^"\n]*"', "", code)
+        if _no_quoted.count("{") != _no_quoted.count("}"):
+            return False, "流程图菱形节点花括号不配对（如 B{判断 缺少右括号）"
         if has_semicolon:
             return False, "流程图代码包含行末分号"
         return True, "ok"
@@ -206,6 +213,41 @@ def validate_mermaid(code: str) -> tuple[bool, str]:
         return True, "ok"
 
     if code.startswith("erDiagram"):
+        return True, "ok"
+
+    # BUG-FIX 2026-10-17（P1·xychart/journey 被误杀）：xychart/xychart-beta（柱状/
+    # 折线对比图）与 journey（用户旅程图）是 Mermaid 合法类型，且
+    # _fence_payload_to_marker_text 已把 xychart 归入 comparison 通道、journey 归入
+    # flowchart 通道，validate_output_format（BUG-FIX-PROMPT-O4）也把二者列为合法。
+    # 但本函数不支持 → 围栏路径 repair 无法修复 → 整块被判「坏块」**静默删除**，
+    # AI 辛苦生成的对比图/旅程图从成品文档中消失。补齐轻量结构校验。
+    if code.startswith("xychart"):
+        # xychart-beta 合法形式：x [类目] / y 轴声明 / bar|line|histogram 数据系列
+        _xy_lines = code.split("\n")
+        _has_x_axis = any(
+            re.match(r"^\s*x\s+\[", l) or re.match(r"^\s*x\s", l) for l in _xy_lines
+        )
+        _has_series = any(
+            re.match(r"^\s*(bar|line|histogram)\s*\[", l) for l in _xy_lines
+        )
+        if not (_has_x_axis and _has_series):
+            return False, "xychart 缺少 x 轴类目或 bar/line 数据系列声明"
+        return True, "ok"
+
+    if code.startswith("journey"):
+        # journey 合法形式：title / section / 「事件: 分数: 描述」
+        _has_event = False
+        for line in code.split("\n")[1:]:
+            stripped = line.strip()
+            if (
+                stripped
+                and not stripped.startswith(("%", "//", "title", "section"))
+                and ":" in stripped
+            ):
+                _has_event = True
+                break
+        if not _has_event:
+            return False, "journey 缺少事件定义"
         return True, "ok"
 
     # BUG-FIX-29 修复：原 validate_mermaid 不支持 timeline 类型，
@@ -376,6 +418,22 @@ def repair_mermaid(code: str, return_diff: bool = False) -> str | tuple[str, dic
             _sq_fixed.append(_s)
         code = "\n".join(_sq_fixed)
     code = _track("fix_unmatched_brackets", _before, code)
+
+    # BUG-FIX 2026-10-17（P1·菱形节点括号不配对）：上方只补齐方括号 [ ]，
+    # 菱形节点 { } 无配对修复——AI 截断产出 `A[开始] --> B{判断`（少 } ）时，
+    # 修复与校验双双放行，渲染层才炸，整图静默丢失。与方括号同策略逐行补齐：
+    # 仅当某行 { 多于 } 时在行尾补 }（跳过注释行），全局 { 少于 } 不动
+    # （多余右括号是另一种畸形，交给 validate 拦截 + AI 修复，机械删除风险更高）。
+    _before = code
+    if code.count("{") > code.count("}"):
+        _cu_lines = []
+        for _ln in code.split("\n"):
+            _s = _ln.rstrip()
+            if _s.count("{") > _s.count("}") and not _s.strip().startswith("%%"):
+                _s += "}" * (_s.count("{") - _s.count("}"))
+            _cu_lines.append(_s)
+        code = "\n".join(_cu_lines)
+    code = _track("fix_unmatched_curly_braces", _before, code)
 
     # 缺图类型头：含箭头但首行非类型关键字 → 补 graph TD
     _first = code.split("\n", 1)[0].strip().lower()

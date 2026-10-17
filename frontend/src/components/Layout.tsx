@@ -21,6 +21,7 @@ import {
   CloudUploadOutlined,
   EditOutlined,
   ExportOutlined,
+  GlobalOutlined,
 } from "@ant-design/icons";
 import { Outlet, useNavigate, useParams, useLocation } from "react-router-dom";
 import HealthStatusIndicator from "./HealthStatusIndicator";
@@ -126,6 +127,7 @@ export default function AppLayout() {
     },
     { key: "/api-keys", icon: <ApiOutlined />, label: "API Key 管理" },
     { key: "/cache-monitor", icon: <BarChartOutlined />, label: "缓存监控" },
+    { key: "/i18n-settings", icon: <GlobalOutlined />, label: "国际化设置" },
   ];
 
   const allMenuItems = [...projectMenuItems, ...globalMenuItems];

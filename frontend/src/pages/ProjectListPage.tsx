@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from "react";
-import { Table, Button, Space, message, Popconfirm, Typography, Tag, Card, Empty, Input } from "antd";
+import { Table, Button, Space, message, Popconfirm, Typography, Tag, Card, Empty, Input, Modal, Tooltip } from "antd";
 import {
   PlusOutlined,
   UploadOutlined,
@@ -9,6 +9,8 @@ import {
   FolderOutlined,
   ProjectOutlined,
   FileDoneOutlined,
+  EditOutlined,
+  CheckSquareOutlined,
 } from "@ant-design/icons";
 import { useNavigate } from "react-router-dom";
 import type { Project } from "../types";
@@ -43,6 +45,10 @@ export default function ProjectListPage() {
   const [loading, setLoading] = useState(false);
   const [searchTerm, setSearchTerm] = useState("");
   const [projectStats, setProjectStats] = useState<Record<number, number>>({});
+  const [selectedRowKeys, setSelectedRowKeys] = useState<React.Key[]>([]);
+  const [batchDeleting, setBatchDeleting] = useState(false);
+  const [renaming, setRenaming] = useState<{ project: Project; name: string } | null>(null);
+  const [renamingLoading, setRenamingLoading] = useState(false);
 
   const loadProjects = async () => {
     setLoading(true);
@@ -96,6 +102,41 @@ export default function ProjectListPage() {
     }
   };
 
+  const handleBatchDelete = async () => {
+    if (selectedRowKeys.length === 0) return;
+    setBatchDeleting(true);
+    try {
+      const ids = selectedRowKeys as number[];
+      await Promise.all(ids.map((id) => deleteProject(id)));
+      message.success(`已删除 ${ids.length} 个项目`);
+      setSelectedRowKeys([]);
+      loadProjects();
+    } catch (e: any) {
+      message.error(e.message || "批量删除失败");
+    } finally {
+      setBatchDeleting(false);
+    }
+  };
+
+  const handleRenameConfirm = async () => {
+    if (!renaming || !renaming.name.trim()) {
+      message.warning("请输入项目名称");
+      return;
+    }
+    setRenamingLoading(true);
+    try {
+      const { updateProject } = await import("../api");
+      await updateProject(renaming.project.id, { name: renaming.name.trim() });
+      message.success("项目名称已更新");
+      setRenaming(null);
+      loadProjects();
+    } catch (e: any) {
+      message.error(e.message || "重命名失败");
+    } finally {
+      setRenamingLoading(false);
+    }
+  };
+
   const filteredProjects = projects.filter((p) =>
     p.name.toLowerCase().includes(searchTerm.toLowerCase()),
   );
@@ -108,6 +149,20 @@ export default function ProjectListPage() {
         description="管理招投标项目：新建项目后上传招标文件，系统将自动提取要点并生成方案大纲。"
         extra={
           <>
+            {selectedRowKeys.length > 0 && (
+              <Popconfirm
+                title={`确定删除选中的 ${selectedRowKeys.length} 个项目？`}
+                description="将同时删除项目下全部文件与数据，操作不可恢复。"
+                onConfirm={handleBatchDelete}
+                okText="批量删除"
+                okButtonProps={{ danger: true }}
+                cancelText="取消"
+              >
+                <Button danger icon={<CheckSquareOutlined />} loading={batchDeleting}>
+                  批量删除 ({selectedRowKeys.length})
+                </Button>
+              </Popconfirm>
+            )}
             <Input
               placeholder="搜索项目名称"
               prefix={<SearchOutlined style={{ color: "#b4bccb" }} />}
@@ -176,6 +231,10 @@ export default function ProjectListPage() {
           onClick: () => navigate(`/projects/${record.id}/files`),
           style: { cursor: "pointer" },
         })}
+        rowSelection={{
+          selectedRowKeys,
+          onChange: (keys) => setSelectedRowKeys(keys),
+        }}
         showHeader={filteredProjects.length > 0}
         locale={{
           emptyText: (
@@ -253,10 +312,18 @@ export default function ProjectListPage() {
           },
           {
             title: "操作",
-            width: 200,
+            width: 260,
             align: "right",
             render: (_: unknown, record: Project) => (
               <Space size={4} onClick={(e) => e.stopPropagation()}>
+                <Tooltip title="重命名">
+                  <Button
+                    type="link"
+                    size="small"
+                    icon={<EditOutlined />}
+                    onClick={() => setRenaming({ project: record, name: record.name })}
+                  />
+                </Tooltip>
                 <Button
                   type="link"
                   size="small"
@@ -290,6 +357,24 @@ export default function ProjectListPage() {
           },
         ]}
       />
+
+      <Modal
+        title="重命名项目"
+        open={!!renaming}
+        onOk={handleRenameConfirm}
+        onCancel={() => setRenaming(null)}
+        okText="保存"
+        cancelText="取消"
+        confirmLoading={renamingLoading}
+      >
+        <Input
+          value={renaming?.name}
+          onChange={(e) => setRenaming(r => r ? { ...r, name: e.target.value } : null)}
+          onPressEnter={handleRenameConfirm}
+          placeholder="输入项目名称"
+          maxLength={200}
+        />
+      </Modal>
     </div>
   );
 }

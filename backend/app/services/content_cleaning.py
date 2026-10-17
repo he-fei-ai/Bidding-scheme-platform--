@@ -655,6 +655,44 @@ def extract_mermaid_title(code: str) -> str:
     return m.group(1).strip() if m else ""
 
 
+# 引导语候选行的句尾标点（含中文/英文）。引导语惯例以句号/冒号收束，
+# 无标点裸行大概率是普通段落而非「如下图所示」式引语，不予采信。
+_CAPTION_HINT_TAIL_PUNCT = "。！？!?：:…"
+
+
+def _extract_fence_caption_hint(lines: Sequence[str], fence_open_idx: int) -> str:
+    """提取围栏图表紧邻前一行作为图题「引导语」（需求 8 第三优先级）。
+
+    背景：围栏路径（```mermaid / ```chart-json）的载荷是 JSON，`chart_desc`
+    无法携带自由文本，旧实现导致图题优先级链中的「引导语」一级在围栏路径
+    **永远不可达**——载荷无 title 且 Mermaid 无 title 行时，图题退化为类型
+    通用名（如「施工流程图」），丢失 AI 在正文中写好的具体引语。
+
+    采信条件（全部满足才返回，否则空串）：
+      1. 围栏开行前**紧邻**的非空行（不跨越空行，避免抓到无关段落）；
+      2. 非标题 / 围栏 / 表格行 / 列表项 / 图表标记等结构化行；
+      3. 以句尾标点（。！？!?:：…）收束，长度 ≤ 50 字符；
+      4. 截断到 30 字符作图题（图题宜短）。
+    """
+    if fence_open_idx <= 0 or fence_open_idx >= len(lines):
+        return ""
+    raw = (lines[fence_open_idx - 1] or "").strip()
+    if not raw:
+        return ""
+    # 结构化行/其它围栏/代码行不作引导语
+    if raw.startswith(("#", "```", "~~~", "|", "[[", "<<", ">", "<")):
+        return ""
+    if re.match(r"^[-*+]\s", raw) or re.match(r"^\d+[\.、)]\s", raw):
+        return ""
+    if "```" in raw or "~~~" in raw or "<<" in raw or "[[" in raw:
+        return ""
+    if len(raw) > 50:
+        return ""
+    if raw[-1] not in _CAPTION_HINT_TAIL_PUNCT:
+        return ""
+    return raw[:30].strip()
+
+
 def iter_chart_fences(content: str):
     """遍历内容中的图表围栏代码块，产出 (lang, body, marker_text)。
 
@@ -709,7 +747,17 @@ def _validate_chart_json_structure(chart_type: str, data: dict) -> None:
     if _fn is None:
         return
     try:
-        _ok, _errors = _fn(data)
+        # BUG-FIX 2026-10-17（P2·诊断误报）：旧实现直接调裸校验器，架构图的
+        # chart-json 包装载荷 {"type","tree":{...}} 未先解包 tree → 有效载荷每次
+        # 被误报「缺少根节点标签」，诊断日志长期狼来了失去信号价值。
+        # 现统一走 image_engine.validate_chart_payload 统一闸门（内含 tree 解包等
+        # 字段适配），与 SSE 管线同口径；本函数保留其「仅日志不删块」语义。
+        try:
+            from .ai.image_engine import validate_chart_payload as _vcp
+
+            _ok, _errors = _vcp(chart_type, data)
+        except Exception:
+            _ok, _errors = _fn(data)  # 统一闸门不可用 → 回退裸校验器（兼容）
     except Exception:
         return  # 校验异常 → 静默跳过
     if isinstance(_ok, bool) and not _ok:
@@ -1924,6 +1972,20 @@ def parse_content(raw: str, base_level: int = 0) -> list[DocumentBlock]:
             if _payload_text:
                 _marker_text = _fence_payload_to_marker_text(_lang, _payload_text)
                 if _marker_text is not None:
+                    # ENHANCE 2026-10-17（需求 8·引导语第三优先级）：围栏路径的载荷
+                    # 是 JSON，旧实现图题优先级链中「引导语」一级永远不可达。现把
+                    # 围栏紧邻前的正文引语作为 caption_hint 随标记块透传给导出端
+                    # （图题优先级：载荷 title > Mermaid title > 引导语 > 类型通用名）。
+                    # caption_hint 放在标记块顶层（不进 description），不污染渲染
+                    # 载荷与缓存键；提取失败仅放弃该级，不影响主链路。
+                    try:
+                        _hint = _extract_fence_caption_hint(lines, i)
+                        if _hint:
+                            _m = json.loads(_marker_text)
+                            _m["caption_hint"] = _hint
+                            _marker_text = json.dumps(_m, ensure_ascii=False)
+                    except Exception:
+                        pass
                     blocks.append(DocumentBlock(type="chart_marker", text=_marker_text))
                 else:
                     logger.info(

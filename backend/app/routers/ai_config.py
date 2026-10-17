@@ -134,11 +134,23 @@ def _encrypt_fresh_key(key: str) -> str:
 
 
 def _actor_of(request) -> str:
-    """L-5 审计主体提取：优先 JWT 解析后的 request.state.user；
-    测试/内部调用直接传函数参数时 request=None，退化为 'unknown'。"""
+    """L-5 审计主体提取：优先 JWT 解析后的 request.state.current_user（main.py
+    JwtAuthMiddleware 注入的是 dict {'id','username','role'}）；兼容旧形态
+    request.state.user（User 对象）。测试/内部调用直接传函数参数时
+    request=None，退化为 'unknown'。
+
+    BUG-FIX（2026-10-16）：此前只读 request.state.user —— 中间件从未设置该属性
+    （设的是 current_user），导致审计日志 actor 恒为 'unknown'，无法追溯操作者。
+    """
     if request is None:
         return 'unknown'
-    return getattr(getattr(request.state, 'user', None), 'username', None) or 'unknown'
+    cu = getattr(request.state, 'current_user', None)
+    if isinstance(cu, dict):
+        return cu.get('username') or 'unknown'
+    u = getattr(request.state, 'user', None)
+    if u is not None:
+        return getattr(u, 'username', None) or 'unknown'
+    return 'unknown'
 
 
 def _audit(action: str, target: str, detail: str = '', request=None) -> None:
@@ -175,6 +187,45 @@ def _resolve_api_key(api_key: str) -> str:
     except Exception as _e:
         logger.debug('解析占位符密钥失败: %s', _e)
     return ''
+
+
+def _resolve_provider_api_key(provider_name: str, api_key: str) -> str:
+    """按厂商解析密钥：传入脱敏占位符时，先从该厂商的 text_provider_configs
+    取真实密钥（厂商隔离语义），厂商未单独配置时才回退主配置 ai_config。
+
+    BUG-FIX（2026-10-16）：此前 /ai/test、/ai/models、/ai/model-info 一律用
+    _resolve_api_key（只读 ai_config 主表）—— 前端对「已配置但非主用」的厂商
+    点「测试连接/获取模型列表」时，占位符被解析成主配置密钥（或空串），导致
+    测试用了错误密钥或恒 401。与 _resolve_image_api_key 的厂商隔离口径对齐。
+
+    BUG-FIX（2026-10-16，跨模块复用）：模型列表接口 /ai/models 由图像配置页复用
+    （前端 fetchModels），传入的是**图像厂商名**，其密钥只存在 image_provider_configs。
+    此前查 text_provider_configs 必然落空 → 回落到主配置密钥，而图像厂商密钥与
+    主配置不同本是常态（两表从不共享），于是「已配置好的图像厂商点获取模型列表」
+    恒 401。注意方向：以「文本表查不到该厂商」为信号再查图像表，而不是把图像厂商名
+    当成文本厂商去猜；两表都查不到才回落主配置，行为与修复前一致。
+    """
+    if not _is_masked_api_key(api_key):
+        return _plain_api_key(api_key)
+    try:
+        with get_db_with_retry() as conn:
+            row = conn.execute(
+                'SELECT api_key FROM text_provider_configs WHERE provider_name = ?',
+                [provider_name],
+            ).fetchone()
+            if row and row['api_key']:
+                return _plain_api_key(row['api_key'])
+            # 文本表无该厂商配置 → 兜底查图像厂商表（/ai/models 被图像页复用）
+            row = conn.execute(
+                'SELECT api_key FROM image_provider_configs WHERE provider_name = ?',
+                [provider_name],
+            ).fetchone()
+            if row and row['api_key']:
+                return _plain_api_key(row['api_key'])
+    except Exception as _e:
+        logger.debug('解析厂商密钥失败 provider=%s: %s', provider_name, _e)
+    # 两表均未配置 → 回退主配置（兼容「只配置了主 AI」的旧路径）
+    return _resolve_api_key(api_key)
 
 
 def _resolve_image_api_key(provider_name: str, api_key: str) -> str:
@@ -412,7 +463,15 @@ async def save_ai_config(data: AIConfigData, request: Request = None):
     await asyncio.to_thread(_post_save_bookkeeping)
     return JSONResponse(
         content={'status': 'ok', 'version': new_version},
-        headers={'ETag': str(new_version), 'Version': str(new_version)},
+        headers={
+            'ETag': str(new_version),
+            'Version': str(new_version),
+            # G-8（2026-10-16）：配置刚变更，中间层/浏览器若按 Cache-Control 启发式
+            # 缓存了**旧配置**响应，下一次 GET /ai/config 会拿到过期内容 —— 页面显示
+            # 的「当前配置」与实际生成所用配置不一致。写入响应显式 no-cache 声明
+            # 「本次返回不可作为缓存依据」，与只读接口的启发式缓存互不冲突。
+            'Cache-Control': 'no-cache',
+        },
     )
 
 
@@ -526,6 +585,9 @@ async def clear_ai_config_api_key(request: Request = None):
 class ModelFetchRequest(BaseModel):
     api_key: str
     base_url: str
+    # BUG-FIX（2026-10-16）：可选厂商名，用于占位符密钥按厂商解析（厂商隔离），
+    # 否则已配置厂商的模型列表请求会误用主配置密钥。
+    provider: str = ''
 
 @router.post('/models')
 async def fetch_available_models(data: ModelFetchRequest):
@@ -539,7 +601,7 @@ async def fetch_available_models(data: ModelFetchRequest):
     if _matched_ver and _matched_ver.group(1) in ('v1', 'v2', 'v3'):
         base = base[:_matched_ver.start()].rstrip('/')
     _stored_ver = _matched_ver.group(1) if _matched_ver else None
-    api_key = _resolve_api_key(data.api_key)
+    api_key = _resolve_provider_api_key(data.provider, data.api_key)
     headers = {'User-Agent': 'BidAssistant/1.0 (AI Config Service; +https://github.com/bid-assistant)'}
     if api_key:
         headers['Authorization'] = f'Bearer {api_key}'
@@ -769,7 +831,7 @@ async def test_ai_connection(data: AIConfigTest):
                 if not default_base:
                     raise HTTPException(status_code=400, detail='base_url 不能为空')
                 data.base_url = default_base
-            config = {'provider': data.provider, 'api_key': _resolve_api_key(data.api_key), 'model': data.model, 'base_url': data.base_url, 'max_tokens': data.max_tokens, 'temperature': data.temperature}
+            config = {'provider': data.provider, 'api_key': _resolve_provider_api_key(data.provider, data.api_key), 'model': data.model, 'base_url': data.base_url, 'max_tokens': data.max_tokens, 'temperature': data.temperature}
             provider = _create_shared_provider(config)
             result = await provider.chat(messages=[AIMessage(role='user', content='回复OK即可')], max_tokens=256, temperature=0.1)
             record_provider_usage(data.provider, data.provider, data.base_url, success=True)
@@ -968,15 +1030,21 @@ async def get_cache_metrics():
 async def get_image_model_config(user_id: int=Depends(lambda: 1)):
     """获取用户的图像模型配置"""
     try:
-        with get_db_with_retry(readonly=True) as conn:
-            row = conn.execute('\n                SELECT image_provider, image_model, image_base_url, image_api_key_enc,\n                       image_max_concurrency, image_max_per_project, image_quality,\n                       image_style_injection, image_enabled, image_default_size, image_default_ratio, image_price_per_image\n                FROM model_configs WHERE user_id = ?\n            ', [user_id]).fetchone()
-            if row:
+        # PERF（2026-10-16）：同步 SQLite 读移出事件循环（与 save_image_model_config /
+        # list_image_provider_configs 已修口径一致）—— 全局写锁在 worker 线程阻塞，
+        # 避免每次拉取图像配置都卡住事件循环上的并发请求。
+        def _read_image_model_row():
+            with get_db_with_retry(readonly=True) as conn:
+                return conn.execute('\n                SELECT image_provider, image_model, image_base_url, image_api_key_enc,\n                       image_max_concurrency, image_max_per_project, image_quality,\n                       image_style_injection, image_enabled, image_default_size, image_default_ratio, image_price_per_image\n                FROM model_configs WHERE user_id = ?\n            ', [user_id]).fetchone()
+
+        row = await asyncio.to_thread(_read_image_model_row)
+        if row:
                 # BUG-FIX（安全 P0）：图像模型密钥同样只回传脱敏占位符；
                 # `PUT /ai/image-model` 已支持 API_KEY_MASK 回填原值。
                 display_key = _display_api_key(row[3] or '')
                 return ImageModelConfigResponse(provider=row[0] or 'agnes', model=row[1] or 'agnes-image-2.1-flash', base_url=_normalize_image_base_url(row[2] or 'https://api.agnes-ai.cn/v1'), api_key=display_key, max_concurrency=row[4] or 2, max_per_project=row[5] or 10, quality=row[6] or 'standard', style_injection=row[7] or '', enabled=bool(row[8]) if row[8] is not None else True, default_size=row[9] or '1024x1024', default_ratio=row[10] or '1:1', price_per_image=row[11] or 0.0, is_default=False)
-            else:
-                return ImageModelConfigResponse(provider='agnes', model='agnes-image-2.1-flash', base_url='https://api.agnes-ai.cn/v1', api_key='', max_concurrency=2, max_per_project=10, quality='standard', style_injection='', enabled=True, default_size='1024x1024', default_ratio='1:1', price_per_image=0.0, is_default=True)
+        else:
+            return ImageModelConfigResponse(provider='agnes', model='agnes-image-2.1-flash', base_url='https://api.agnes-ai.cn/v1', api_key='', max_concurrency=2, max_per_project=10, quality='standard', style_injection='', enabled=True, default_size='1024x1024', default_ratio='1:1', price_per_image=0.0, is_default=True)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f'获取配置失败: {e!s}') from e
 
@@ -1744,13 +1812,21 @@ class ImageProviderConfigData(BaseModel):
 @router.get('/image-provider-configs')
 async def list_image_provider_configs():
     """获取所有厂商的图像模型配置（每个厂商独立保存，互不共享）"""
+    # PERF（2026-10-16）：同步 SQLite 读移出事件循环（与 /ai/provider-configs
+    # 文本厂商列表 2026-10-14 已修口径统一）—— 全局写锁在 worker 线程阻塞，
+    # loop 不受影响。此前列表接口在事件循环内抢全局写锁，页面打开时会短暂卡住
+    # 所有并发请求。
+    _col_names = ['provider_name', 'api_key', 'base_url', 'model', 'max_concurrency', 'max_per_project', 'quality', 'style_injection', 'enabled', 'default_size', 'default_ratio', 'price_per_image', 'is_active', 'updated_at']
+
+    def _read_image_provider_rows():
+        with get_db_with_retry(readonly=True) as conn:
+            return conn.execute('\n            SELECT provider_name, api_key, base_url, model, max_concurrency,\n                   max_per_project, quality, style_injection, enabled,\n                   default_size, default_ratio, price_per_image, is_active, updated_at\n            FROM image_provider_configs\n            ORDER BY is_active DESC, provider_name\n        ').fetchall()
+
+    rows = await asyncio.to_thread(_read_image_provider_rows)
     configs = []
-    with get_db_with_retry(readonly=True) as conn:
-        rows = conn.execute('\n            SELECT provider_name, api_key, base_url, model, max_concurrency,\n                   max_per_project, quality, style_injection, enabled,\n                   default_size, default_ratio, price_per_image, is_active, updated_at\n            FROM image_provider_configs\n            ORDER BY is_active DESC, provider_name\n        ').fetchall()
-        col_names = ['provider_name', 'api_key', 'base_url', 'model', 'max_concurrency', 'max_per_project', 'quality', 'style_injection', 'enabled', 'default_size', 'default_ratio', 'price_per_image', 'is_active', 'updated_at']
-        for row in rows:
-            d = dict(row) if hasattr(row, 'keys') else dict(zip(col_names, row, strict=False))
-            configs.append({'provider_name': d.get('provider_name', ''), 'api_key': _display_api_key(d.get('api_key') or ''), 'base_url': d.get('base_url') or '', 'model': d.get('model') or '', 'max_concurrency': d.get('max_concurrency') or 2, 'max_per_project': d.get('max_per_project') or 10, 'quality': d.get('quality') or 'standard', 'style_injection': d.get('style_injection') or '', 'enabled': bool(d.get('enabled', 1)), 'default_size': d.get('default_size') or '1024x1024', 'default_ratio': d.get('default_ratio') or '1:1', 'price_per_image': d.get('price_per_image') or 0.0, 'is_active': bool(d.get('is_active', 0)), 'updated_at': d.get('updated_at', '')})
+    for row in rows:
+        d = dict(row) if hasattr(row, 'keys') else dict(zip(_col_names, row, strict=False))
+        configs.append({'provider_name': d.get('provider_name', ''), 'api_key': _display_api_key(d.get('api_key') or ''), 'base_url': d.get('base_url') or '', 'model': d.get('model') or '', 'max_concurrency': d.get('max_concurrency') or 2, 'max_per_project': d.get('max_per_project') or 10, 'quality': d.get('quality') or 'standard', 'style_injection': d.get('style_injection') or '', 'enabled': bool(d.get('enabled', 1)), 'default_size': d.get('default_size') or '1024x1024', 'default_ratio': d.get('default_ratio') or '1:1', 'price_per_image': d.get('price_per_image') or 0.0, 'is_active': bool(d.get('is_active', 0)), 'updated_at': d.get('updated_at', '')})
     configured_names = {c['provider_name'] for c in configs}
     image_providers = ['agnes', 'dashscope', 'volcengine', 'hunyuan', 'zhipu', 'stepfun', 'baidu', 'openai_compatible']
     for pid in image_providers:
@@ -1771,9 +1847,14 @@ async def save_image_provider_config(provider_name: str, data: ImageProviderConf
     # 回填的库内原值（密文/历史明文）幂等透传，不二次加密、不降级。
     data.api_key = _encrypt_fresh_key(data.api_key)
     # PERF（2026-10-05）：写入整段派发 to_thread，全局写锁在 worker 线程阻塞，loop 不受影响
+    # 2026-10-17：INSERT 显式写 is_active=0（新增行不自动激活）、UPDATE 保留原值。
+    # 此前该列走建表默认值 1 —— 新厂商一保存就成了 active，与表默认值语义耦合；
+    # 迁移 #38 给 image_provider_configs 补上「至多一行 is_active=1」的部分唯一索引后，
+    # 这种隐式激活直接撞唯一约束（第二个厂商保存即 IntegrityError → 500）。
+    # 激活语义统一交给下方的 activate_image_provider_config，与文本厂商保存路径同构。
     def _write_image_provider_config():
         with get_db_with_retry() as conn:
-            conn.execute("\n            INSERT INTO image_provider_configs\n                (provider_name, api_key, base_url, model, max_concurrency,\n                 max_per_project, quality, style_injection, enabled,\n                 default_size, default_ratio, price_per_image, updated_at)\n            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now', 'localtime'))\n            ON CONFLICT(provider_name) DO UPDATE SET\n                api_key=excluded.api_key,\n                base_url=excluded.base_url,\n                model=excluded.model,\n                max_concurrency=excluded.max_concurrency,\n                max_per_project=excluded.max_per_project,\n                quality=excluded.quality,\n                style_injection=excluded.style_injection,\n                enabled=excluded.enabled,\n                default_size=excluded.default_size,\n                default_ratio=excluded.default_ratio,\n                price_per_image=excluded.price_per_image,\n                updated_at=datetime('now', 'localtime')\n        ", (data.provider_name, data.api_key, data.base_url, data.model, data.max_concurrency, data.max_per_project, data.quality, data.style_injection, 1 if data.enabled else 0, data.default_size, data.default_ratio, data.price_per_image))
+            conn.execute("\n            INSERT INTO image_provider_configs\n                (provider_name, api_key, base_url, model, max_concurrency,\n                 max_per_project, quality, style_injection, enabled,\n                 default_size, default_ratio, price_per_image, is_active, updated_at)\n            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, datetime('now', 'localtime'))\n            ON CONFLICT(provider_name) DO UPDATE SET\n                api_key=excluded.api_key,\n                base_url=excluded.base_url,\n                model=excluded.model,\n                max_concurrency=excluded.max_concurrency,\n                max_per_project=excluded.max_per_project,\n                quality=excluded.quality,\n                style_injection=excluded.style_injection,\n                enabled=excluded.enabled,\n                default_size=excluded.default_size,\n                default_ratio=excluded.default_ratio,\n                price_per_image=excluded.price_per_image,\n                is_active=image_provider_configs.is_active,\n                updated_at=datetime('now', 'localtime')\n        ", (data.provider_name, data.api_key, data.base_url, data.model, data.max_concurrency, data.max_per_project, data.quality, data.style_injection, 1 if data.enabled else 0, data.default_size, data.default_ratio, data.price_per_image))
             conn.commit()
     await asyncio.to_thread(_write_image_provider_config)
     # A-1 审计补齐（2026-10-06）：与文本厂商保存路径同口径（密钥只记脱敏摘要）
@@ -1791,8 +1872,13 @@ async def save_image_provider_config(provider_name: str, data: ImageProviderConf
 @router.get('/image-provider-configs/{provider_name}')
 async def get_image_provider_config(provider_name: str):
     """获取单个厂商的图像模型配置"""
-    with get_db_with_retry(readonly=True) as conn:
-        row = conn.execute('\n            SELECT provider_name, api_key, base_url, model, max_concurrency,\n                   max_per_project, quality, style_injection, enabled,\n                   default_size, default_ratio, price_per_image, updated_at\n            FROM image_provider_configs WHERE provider_name = ?\n        ', [provider_name]).fetchone()
+    # PERF（2026-10-16）：同步 SQLite 读移出事件循环（与列表接口 list_image_
+    # provider_configs 同口径）—— 全局写锁在 worker 线程阻塞，loop 不受影响。
+    def _read_image_provider_row():
+        with get_db_with_retry(readonly=True) as conn:
+            return conn.execute('\n            SELECT provider_name, api_key, base_url, model, max_concurrency,\n                   max_per_project, quality, style_injection, enabled,\n                   default_size, default_ratio, price_per_image, updated_at\n            FROM image_provider_configs WHERE provider_name = ?\n        ', [provider_name]).fetchone()
+
+    row = await asyncio.to_thread(_read_image_provider_row)
     if not row:
         # G-4（2026-10-11）：补齐 updated_at（列表接口 F-13 口径同构）+ api_key_set 提示
         return {'provider_name': provider_name, 'api_key': '', 'api_key_set': False, 'base_url': '', 'model': '', 'max_concurrency': 2, 'max_per_project': 10, 'quality': 'standard', 'style_injection': '', 'enabled': False, 'default_size': '1024x1024', 'default_ratio': '1:1', 'price_per_image': 0.0, 'updated_at': ''}
@@ -1820,7 +1906,21 @@ async def activate_image_provider_config(provider_name: str, request: Request = 
             else:
                 conn.execute('\n                INSERT INTO model_configs\n                    (user_id, image_provider, image_model, image_base_url, image_api_key_enc,\n                     image_max_concurrency, image_max_per_project, image_quality,\n                     image_style_injection, image_enabled, image_default_size,\n                     image_default_ratio, image_price_per_image)\n                VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)\n            ', (d.get('provider_name'), d.get('model'), d.get('base_url'), d.get('api_key') or '', d.get('max_concurrency', 2), d.get('max_per_project', 10), d.get('quality', 'standard'), d.get('style_injection', ''), 1 if d.get('enabled', 1) else 0, d.get('default_size', '1024x1024'), d.get('default_ratio', '1:1'), d.get('price_per_image', 0.0)))
             conn.commit()
-    await asyncio.to_thread(_activate_image_write)
+    try:
+        await asyncio.to_thread(_activate_image_write)
+    except sqlite3.IntegrityError as e:
+        # 2026-10-16（迁移 #38）：image_provider_configs 新增部分唯一索引
+        # idx_imgpc_unique_active（全库至多一行 is_active=1）。文本侧
+        # activate_text_provider_config 早已按同款语义把唯一冲突翻译成 409 ——
+        # 图像侧此前完全没有该兜底，跨进程并发激活两个图像厂商时后到者撞唯一
+        # 索引会直接冒泡成 500，调用方无法区分「并发冲突」与「真故障」。
+        # 进程内并发由本端点外层 asyncio.Lock 串行化，此分支只在多实例下触发。
+        if 'unique' in str(e).lower():
+            raise HTTPException(
+                status_code=409,
+                detail='配置已被其他进程同时修改，请重试',
+            ) from e
+        raise
     # A-1 审计补齐（2026-10-06）：与文本厂商激活路径同口径
     # F-NEW-4：审计写库派发到线程
     await asyncio.to_thread(lambda: _audit('activate_image_provider_config', provider_name, request=request))
@@ -1867,7 +1967,7 @@ async def fetch_model_info(data: ModelInfoRequest):
         return result
     if data.api_key and data.base_url:
         try:
-            api_key = _resolve_api_key(data.api_key)
+            api_key = _resolve_provider_api_key(data.provider or data.provider_id, data.api_key)
             url_err = _validate_base_url(data.base_url)
             if url_err:
                 return result

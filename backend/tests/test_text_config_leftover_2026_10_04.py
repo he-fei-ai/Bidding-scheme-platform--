@@ -360,6 +360,8 @@ def test_save_config_writes_audit_with_masked_key(restore_state):
 
 def test_audit_failure_does_not_block_save(restore_state, monkeypatch):
     """L-5 容错：审计写入抛异常时配置保存主流程必须照常成功。"""
+    import json
+
     import app.routers.ai_config as m
     from app.routers.ai_config import AIConfigData
 
@@ -371,7 +373,11 @@ def test_audit_failure_does_not_block_save(restore_state, monkeypatch):
         provider_name="L5b", provider="openai_compatible", api_key="sk-l5b",
         model="m", base_url="https://l5b.example.com/v1",
     )))
-    assert res == {"status": "ok"}
+    # 契约对齐（P0-CONTRACT 2026-10-14）：save_ai_config 已改为返回 JSONResponse，
+    # 携带 etag/version 响应头与 {status, version} 响应体（供乐观锁客户端使用）。
+    # 本用例断言点仍是「审计抛错不阻断主流程」，因此解析响应体再比对 status。
+    body = json.loads(res.body.decode("utf-8"))
+    assert body["status"] == "ok"
 
 
 # ──────────────────────────────────────────────────────────────────────

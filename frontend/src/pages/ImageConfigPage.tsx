@@ -182,7 +182,10 @@ function ProviderCard({
     if (!apiKey || !baseUrl) { message.warning("请先填写 API Key 和 Base URL"); return; }
     setFetchingModels(true);
     try {
-      const result = await fetchImageModels(apiKey, baseUrl);
+      // 跨模块复用：这里走的是文本路由的 /ai/models。传入 provider 名让后端按
+      // image_provider_configs 解析本厂商自己的密钥 —— 否则占位符会回落成主配置
+      // 密钥，而图像厂商密钥与主配置不同本是常态，导致已配置厂商恒 401。
+      const result = await fetchImageModels(apiKey, baseUrl, config.provider_name);
       const modelList: string[] = Array.isArray(result) ? result : (result.models || []);
       if (modelList.length > 0) {
         const options: DefaultOptionType[] = modelList.map((m) => ({ label: m, value: m }));

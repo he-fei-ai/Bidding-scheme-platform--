@@ -1305,7 +1305,18 @@ def _post_process_title_quality(level1: list[dict]) -> tuple[list[dict], int]:
                 if not isinstance(l3_node, dict):
                     continue
                 l3_title = l3_node.get("title", "").strip()
-                if not l3_title or _is_generic_title(l3_title) or _is_banned_l3_title(l3_title):
+                # 2026-10-16 加固（早期清洗并入统一口径）：L3 判定补上
+                # `_is_dirty_l3_title_deep` —— 本模块局部的 _GENERIC_TITLE_PATTERNS
+                # 仅 8 条锚定式正则，带前缀变体（「分阶段推进专项13」）、「（其N）」
+                # 残渣、「泛化词干×维度词」组合在 L2 审核点前无人拦截，只能等
+                # 生成末尾的收口链。提前到本函数拦截，人工 L2 审核看到的就是
+                # 已净化目录；判定与收口链同源，不会引入新的误伤口径。
+                if (
+                    not l3_title
+                    or _is_dirty_l3_title_deep(l3_title)
+                    or _is_generic_title(l3_title)
+                    or _is_banned_l3_title(l3_title)
+                ):
                     new_l3 = _generate_quality_l3_title(l2_title, l1_title, l3_idx, used_l3_titles)
                     logger.info(
                         "标题质量修正: L3[%d.%d.%d] '%s' -> '%s'",
@@ -1370,12 +1381,17 @@ def _tech_enhance_titles(level1: list[dict]) -> tuple[list[dict], int]:
 
     fix_count = 0
     for l1_idx, l1_node in enumerate(level1):
+        # BUG 修复（类型检查，与 _post_process_title_quality 口径一致）
+        if not isinstance(l1_node, dict):
+            continue
         l1_title = l1_node.get("title", "")
         l2_children = l1_node.get("children", [])
         if not isinstance(l2_children, list):
             continue
 
         for l2_idx, l2_node in enumerate(l2_children):
+            if not isinstance(l2_node, dict):
+                continue
             l2_title = l2_node.get("title", "")
             l3_children = l2_node.get("children", [])
             if not isinstance(l3_children, list):
@@ -1386,6 +1402,16 @@ def _tech_enhance_titles(level1: list[dict]) -> tuple[list[dict], int]:
                     continue
                 l3_title = l3_node.get("title", "").strip()
                 if not l3_title:
+                    continue
+
+                # 2026-10-16 加固（占位标题「洗白」防线）：脏标题不做技术增强。
+                # 旧实现会对「总体实施策划」这类占位标题垫一个技术词前缀
+                # （→「智能建造总体实施策划」），增强产物恰好逃过收口链的
+                # 词面判定 —— 规则 6 需整段相等、泛化词干判定需词面起始命中，
+                # 本该被 `_cleanup_placeholder_titles` 语义化改写的占位标题
+                # 变成无法识别的泛化残留直达落库。脏标题统一交由收口链改写，
+                # 技术增强只服务于「干净但缺技术含量」的标题。
+                if _is_dirty_l3_title_deep(l3_title):
                     continue
 
                 # 检查是否已经含有技术特征
@@ -1405,18 +1431,33 @@ def _tech_enhance_titles(level1: list[dict]) -> tuple[list[dict], int]:
 
                 # 生成技术增强标题
                 new_title = _generate_tech_enhanced_title(l3_title, l2_title, tech_term)
-                if new_title and new_title != l3_title:
+                if not new_title or new_title == l3_title:
+                    continue
+                # 2026-10-16 加固：增强产物脏判定复检（G4 同口径的最后防线）。
+                # 增强是「原标题 + 技术词」的模板拼接，模板池与技术词条持续演进，
+                # 任何一侧新增词面都可能拼出占位形态；此处拒绝即保留原干净标题，
+                # 绝不把增强环节自身变成脏标题来源。
+                if _is_dirty_l3_title_deep(new_title):
                     logger.info(
-                        "技术增强: L3[%d.%d.%d] '%s' -> '%s' (技术词条: %s)",
+                        "技术增强: L3[%d.%d.%d] '%s' 增强产物「%s」命中脏判定，放弃增强保留原标题",
                         l1_idx + 1,
                         l2_idx + 1,
                         l3_idx + 1,
                         l3_title,
-                        new_title,
-                        tech_term,
+                        new_title[:30],
                     )
-                    l3_node["title"] = new_title
-                    fix_count += 1
+                    continue
+                logger.info(
+                    "技术增强: L3[%d.%d.%d] '%s' -> '%s' (技术词条: %s)",
+                    l1_idx + 1,
+                    l2_idx + 1,
+                    l3_idx + 1,
+                    l3_title,
+                    new_title,
+                    tech_term,
+                )
+                l3_node["title"] = new_title
+                fix_count += 1
 
     if fix_count > 0:
         logger.info("V5.1 技术增强: 共增强 %d 个三级标题", fix_count)
