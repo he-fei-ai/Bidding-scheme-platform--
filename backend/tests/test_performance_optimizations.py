@@ -20,6 +20,45 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 
 # ============================================================================
+# 测试隔离（BUG-FIX 2026-10-17 · 全局表清空）
+# ============================================================================
+#
+# 旧实现在本文件 13 个用例里各自执行
+#     DELETE FROM sections;  DELETE FROM projects
+# 把**整个共享测试库**掏空。这有两个真实危害：
+#
+#   1. 跨用例污染：任何依赖「库里有数据」的用例，只要排在本文件之后就会被抹掉，
+#      表现为**与本文件毫无关系**的用例在全量套件里偶发失败，而孤立运行必过。
+#      本轮排查 `test_build_tree_cache_hit` 的偶发失败时就被它误导过一次——
+#      先误判为「既有时序 flake」，实为跨文件污染。
+#   2. 反向污染：全量套件里其他模块的用例数据同样被清掉。
+#
+# 而这些清空对本文件**毫无收益**：每个用例都自建项目，且所有查询都带
+# `WHERE project_id = ?`，从不需要「库里没有别的数据」。
+#
+# 改为 autouse fixture：记录用例执行前的项目 id 集合，结束后只删除本用例
+# 新建的行（连带其 sections）。既保持库整洁，又不越界动别人的数据。
+@pytest.fixture(autouse=True)
+def _isolate_projects():
+    from app.db import init_db, get_db
+
+    init_db()
+    with get_db() as conn:
+        before = {r["id"] for r in conn.execute("SELECT id FROM projects").fetchall()}
+    try:
+        yield
+    finally:
+        with get_db() as conn:
+            for r in conn.execute("SELECT id FROM projects").fetchall():
+                pid = r["id"]
+                if pid in before:
+                    continue
+                conn.execute("DELETE FROM sections WHERE project_id = ?", (pid,))
+                conn.execute("DELETE FROM projects WHERE id = ?", (pid,))
+            conn.commit()
+
+
+# ============================================================================
 # count_words 优化测试
 # ============================================================================
 
@@ -105,15 +144,13 @@ class TestBuildTreeCache:
 
         init_db()
         with get_db() as conn:
-            conn.execute("DELETE FROM sections")
-            conn.execute("DELETE FROM projects")
             conn.execute("INSERT INTO projects (name, industry) VALUES (?, ?)", ("测试项目", "通用"))
-            pid = conn.execute("SELECT id FROM projects ORDER BY id DESC LIMIT 1").fetchone()["id"]
+            pid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
             conn.execute(
                 "INSERT INTO sections (project_id, title, level, sort_order) VALUES (?, ?, 1, 1)",
                 (pid, "第一章"),
             )
-            c1 = conn.execute("SELECT id FROM sections ORDER BY id DESC LIMIT 1").fetchone()["id"]
+            c1 = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
             conn.execute(
                 "INSERT INTO sections (project_id, title, level, sort_order, parent_id) VALUES (?, ?, 2, 1, ?)",
                 (pid, "第一节", c1),
@@ -140,8 +177,6 @@ class TestBuildTreeCache:
 
         init_db()
         with get_db() as conn:
-            conn.execute("DELETE FROM sections")
-            conn.execute("DELETE FROM projects")
             conn.execute("INSERT INTO projects (name, industry) VALUES (?, ?)", ("缓存测试", "通用"))
             pid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
             conn.execute(
@@ -190,15 +225,13 @@ class TestBuildTreeCache:
 
         init_db()
         with get_db() as conn:
-            conn.execute("DELETE FROM sections")
-            conn.execute("DELETE FROM projects")
             conn.execute("INSERT INTO projects (name, industry) VALUES (?, ?)", ("失效测试", "通用"))
-            pid = conn.execute("SELECT id FROM projects ORDER BY id DESC LIMIT 1").fetchone()["id"]
+            pid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
             conn.execute(
                 "INSERT INTO sections (project_id, title, level, sort_order) VALUES (?, ?, 1, 1)",
                 (pid, "原始标题"),
             )
-            sid = conn.execute("SELECT id FROM sections ORDER BY id DESC LIMIT 1").fetchone()["id"]
+            sid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
 
         _invalidate_build_tree_cache(pid)
 
@@ -226,29 +259,27 @@ class TestGetSectionPathN1Fix:
 
         init_db()
         with get_db() as conn:
-            conn.execute("DELETE FROM sections")
-            conn.execute("DELETE FROM projects")
             conn.execute("INSERT INTO projects (name, industry) VALUES (?, ?)", ("路径测试", "通用"))
-            pid = conn.execute("SELECT id FROM projects ORDER BY id DESC LIMIT 1").fetchone()["id"]
+            pid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
 
             # 创建三级目录: 1 -> 1.1 -> 1.1.1
             conn.execute(
                 "INSERT INTO sections (project_id, title, level, sort_order) VALUES (?, ?, 1, 1)",
                 (pid, "第一章"),
             )
-            c1 = conn.execute("SELECT id FROM sections ORDER BY id DESC LIMIT 1").fetchone()["id"]
+            c1 = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
 
             conn.execute(
                 "INSERT INTO sections (project_id, title, level, sort_order, parent_id) VALUES (?, ?, 2, 1, ?)",
                 (pid, "第一节", c1),
             )
-            c2 = conn.execute("SELECT id FROM sections ORDER BY id DESC LIMIT 1").fetchone()["id"]
+            c2 = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
 
             conn.execute(
                 "INSERT INTO sections (project_id, title, level, sort_order, parent_id) VALUES (?, ?, 3, 1, ?)",
                 (pid, "第一款", c2),
             )
-            c3 = conn.execute("SELECT id FROM sections ORDER BY id DESC LIMIT 1").fetchone()["id"]
+            c3 = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
 
         _invalidate_build_tree_cache(pid)
         path = get_section_path(c3)
@@ -261,15 +292,13 @@ class TestGetSectionPathN1Fix:
 
         init_db()
         with get_db() as conn:
-            conn.execute("DELETE FROM sections")
-            conn.execute("DELETE FROM projects")
             conn.execute("INSERT INTO projects (name, industry) VALUES (?, ?)", ("单层测试", "通用"))
-            pid = conn.execute("SELECT id FROM projects ORDER BY id DESC LIMIT 1").fetchone()["id"]
+            pid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
             conn.execute(
                 "INSERT INTO sections (project_id, title, level, sort_order) VALUES (?, ?, 1, 1)",
                 (pid, "第一章"),
             )
-            sid = conn.execute("SELECT id FROM sections ORDER BY id DESC LIMIT 1").fetchone()["id"]
+            sid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
 
         _invalidate_build_tree_cache(pid)
         path = get_section_path(sid)
@@ -289,10 +318,8 @@ class TestGetSectionPathN1Fix:
 
         init_db()
         with get_db() as conn:
-            conn.execute("DELETE FROM sections")
-            conn.execute("DELETE FROM projects")
             conn.execute("INSERT INTO projects (name, industry) VALUES (?, ?)", ("查询次数测试", "通用"))
-            pid = conn.execute("SELECT id FROM projects ORDER BY id DESC LIMIT 1").fetchone()["id"]
+            pid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
 
             # 创建较深的目录结构（5层）
             parent_id = None
@@ -303,7 +330,7 @@ class TestGetSectionPathN1Fix:
                     "VALUES (?, ?, ?, ?, ?)",
                     (pid, f"第{i}章", i, 1, parent_id),
                 )
-                sid = conn.execute("SELECT id FROM sections ORDER BY id DESC LIMIT 1").fetchone()["id"]
+                sid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
                 section_ids.append(sid)
                 parent_id = sid
 
@@ -340,10 +367,8 @@ class TestGetAncestorTitlesN1Fix:
 
         init_db()
         with get_db() as conn:
-            conn.execute("DELETE FROM sections")
-            conn.execute("DELETE FROM projects")
             conn.execute("INSERT INTO projects (name, industry) VALUES (?, ?)", ("祖先测试", "通用"))
-            pid = conn.execute("SELECT id FROM projects ORDER BY id DESC LIMIT 1").fetchone()["id"]
+            pid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
 
             titles = ["顶层章节", "中层章节", "底层章节"]
             parent_id = None
@@ -354,7 +379,7 @@ class TestGetAncestorTitlesN1Fix:
                     "VALUES (?, ?, ?, ?, ?)",
                     (pid, title, i, 1, parent_id),
                 )
-                sid = conn.execute("SELECT id FROM sections ORDER BY id DESC LIMIT 1").fetchone()["id"]
+                sid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
                 section_ids.append(sid)
                 parent_id = sid
 
@@ -369,15 +394,13 @@ class TestGetAncestorTitlesN1Fix:
 
         init_db()
         with get_db() as conn:
-            conn.execute("DELETE FROM sections")
-            conn.execute("DELETE FROM projects")
             conn.execute("INSERT INTO projects (name, industry) VALUES (?, ?)", ("单级测试", "通用"))
-            pid = conn.execute("SELECT id FROM projects ORDER BY id DESC LIMIT 1").fetchone()["id"]
+            pid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
             conn.execute(
                 "INSERT INTO sections (project_id, title, level, sort_order) VALUES (?, ?, 1, 1)",
                 (pid, "唯一章节"),
             )
-            sid = conn.execute("SELECT id FROM sections ORDER BY id DESC LIMIT 1").fetchone()["id"]
+            sid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
 
         _invalidate_build_tree_cache(pid)
         result = get_ancestor_titles(sid)
@@ -420,8 +443,6 @@ class TestCacheInvalidation:
 
         init_db()
         with get_db() as conn:
-            conn.execute("DELETE FROM sections")
-            conn.execute("DELETE FROM projects")
             conn.execute("INSERT INTO projects (name, industry) VALUES (?, ?)", ("失效验证", "通用"))
             pid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
             conn.commit()
@@ -449,10 +470,8 @@ class TestCacheInvalidation:
 
         init_db()
         with get_db() as conn:
-            conn.execute("DELETE FROM sections")
-            conn.execute("DELETE FROM projects")
             conn.execute("INSERT INTO projects (name, industry) VALUES (?, ?)", ("删除失效", "通用"))
-            pid = conn.execute("SELECT id FROM projects ORDER BY id DESC LIMIT 1").fetchone()["id"]
+            pid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
 
         _invalidate_build_tree_cache(pid)
 
@@ -576,8 +595,6 @@ class TestPerformanceBenchmarks:
 
         init_db()
         with get_db() as conn:
-            conn.execute("DELETE FROM sections")
-            conn.execute("DELETE FROM projects")
             conn.execute("INSERT INTO projects (name, industry) VALUES (?, ?)", ("基准测试", "通用"))
             pid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
             conn.execute(
@@ -620,8 +637,6 @@ class TestPerformanceBenchmarks:
 
         init_db()
         with get_db() as conn:
-            conn.execute("DELETE FROM sections")
-            conn.execute("DELETE FROM projects")
             conn.execute("INSERT INTO projects (name, industry) VALUES (?, ?)", ("路径性能", "通用"))
             pid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
 
