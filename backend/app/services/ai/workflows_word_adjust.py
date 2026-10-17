@@ -143,6 +143,8 @@ def build_word_adjust_messages(
     target_words: int,
     lo: int,
     hi: int,
+    global_facts: list | None = None,
+    facts_policy: str = "",
 ) -> list[Any]:
     """构造调整提示词（对应易标 ``buildWordAdjustmentMessages``）。
 
@@ -150,6 +152,12 @@ def build_word_adjust_messages(
     1. **方向**（expand / shrink）与**粒度**（paragraph / sentence）；
     2. **本轮额度**（``|Δ| ≤ budget``，不允许过冲——R11 第 3 道）；
     3. **目标区间**（``lo``~``hi``，越界即回退——R11 第 5 道）。
+
+    ENHANCE 2026-10-17（对齐易标 R9/R10 字数调整注入全局事实）：
+      - ``global_facts``: 扁平事实列表 [{key,label,value,...}]；非空时注入
+        「本章节需要使用的全局事实变量」块，保证扩写/缩写不引入未提供的事实。
+      - ``facts_policy``: 缺失值策略（fabricate/omit/placeholder）；非空时
+        追加「缺值口径」约束，与正文生成/一致性修复侧保持同一来源函数。
     """
     from .providers.base import AIMessage
 
@@ -170,8 +178,26 @@ def build_word_adjust_messages(
         f"【当前正文】\n{masked_content}\n\n"
         f"请输出{direction}后的完整正文。"
     )
+
+    # ENHANCE 2026-10-17：注入全局事实与缺值策略约束
+    system_parts = [_load_system_prompt()]
+    if global_facts:
+        from .workflows_sections import _format_facts_list
+        facts_text = _format_facts_list(global_facts)
+        if facts_text:
+            system_parts.append(
+                f"\n\n【本章节全局事实变量（调整时不得引入上述事实之外的具体人名/日期/品牌/型号/承诺）】\n{facts_text}"
+            )
+    if facts_policy:
+        try:
+            from ...facts_service import content_completeness_instruction
+            instr = content_completeness_instruction(facts_policy)
+            if instr:
+                system_parts.append(f"\n\n【缺值策略约束】\n{instr}")
+        except Exception:
+            pass
     return [
-        AIMessage(role="system", content=_load_system_prompt()),
+        AIMessage(role="system", content="\n".join(system_parts)),
         AIMessage(role="user", content=user_msg),
     ]
 
@@ -195,6 +221,8 @@ async def adjust_section_words(
     maximum_words: Optional[int] = None,
     minimum_words: Optional[int] = None,
     enforce_total_bounds: bool = False,
+    global_facts: list | None = None,
+    facts_policy: str = "",
 ) -> tuple[Optional[str], dict]:
     """对**单节**做一次字数调整并返回 ``(新正文 | None, meta)``。
 
@@ -255,6 +283,8 @@ async def adjust_section_words(
             target_words=int(target_words),
             lo=int(lo),
             hi=int(hi),
+            global_facts=global_facts,
+            facts_policy=facts_policy,
         )
         if provider is None or not hasattr(provider, "chat"):
             raise RuntimeError("provider 为空或无 chat 接口")
@@ -332,6 +362,8 @@ async def run_section_word_adjustments(
     max_rounds: Optional[int] = None,
     concurrency: int = 4,
     cancel_event: Any = None,
+    global_facts: list | None = None,
+    facts_policy: str = "",
 ) -> dict:
     """R9 —— 强控小节的**双向**拉回（每节 ≤ ``MAX_WORD_ADJUSTMENT_ROUNDS`` 轮）。
 
@@ -421,6 +453,8 @@ async def run_section_word_adjustments(
                     lo=lo,
                     hi=hi,
                     cancel_event=cancel_event,
+                    global_facts=global_facts,
+                    facts_policy=facts_policy,
                     # R11 第 5 道（强控边界）**不在单轮强制**：一轮额度未必能把
                     # 500 字直接压进 [240,360]，若强制入区间则合法的部分进展
                     # （500→380）会被整轮丢弃，模型反复重写同一篇、白烧轮次。
@@ -449,9 +483,23 @@ async def run_section_word_adjustments(
             if not (lo <= _count_words(r.get("content")) <= hi):
                 unresolved.append(sid)
 
-    await asyncio.gather(
+    _gather_results = await asyncio.gather(
         *(_adjust_one(r, ov) for r, ov in candidates), return_exceptions=True
     )
+    # BUG-FIX 2026-10-17（gather 吞异常防护）：return_exceptions=True 会把协程内
+    # 的异常作为返回值吞掉（之前的 TypeError: adjust_section_words() got an
+    # unexpected keyword argument 'global_facts' 就是被这里静默吞掉的，导致用户
+    # 看到「调整 0 节、失败 0」的假成功）。现在显式检查异常实例并记日志，使
+    # 生产排障能从日志中发现被吞的异常。
+    for _i, _res in enumerate(_gather_results):
+        if isinstance(_res, Exception):
+            _cand = candidates[_i] if _i < len(candidates) else None
+            _sid = _cand[0].get("id") if _cand else "?"
+            logger.error(
+                "[字数调整-R9] 小节 %s 协程异常（被 gather 吞掉，现已显式记录）: %s",
+                _sid, _res, exc_info=_res,
+            )
+            summary["fail_count"] += 1
     # adjusted_ids 去重（同一节多轮命中只记一次）
     seen: set = set()
     deduped = []
@@ -479,6 +527,8 @@ async def run_total_word_adjustments(
     max_rounds: Optional[int] = None,
     concurrency: int = 4,
     cancel_event: Any = None,
+    global_facts: list | None = None,
+    facts_policy: str = "",
 ) -> dict:
     """R10 —— **全文**扩写 / 缩写（额度按比例分配，六道校验逐节把关）。
 
@@ -602,6 +652,8 @@ async def run_total_word_adjustments(
                     lo=lo,
                     hi=hi,
                     cancel_event=cancel_event,
+                    global_facts=global_facts,
+                    facts_policy=facts_policy,
                     # R11 第 6 道：全文边界（扩写不超上限 / 缩写不低于下限）。
                     total_words=total,
                     maximum_words=maximum_words,
@@ -621,9 +673,18 @@ async def run_total_word_adjustments(
                         item.get("title") or sid, meta.get("reason", ""),
                     )
 
-        await asyncio.gather(
+        _batch_results = await asyncio.gather(
             *(_adjust_batch_item(item) for item in batch), return_exceptions=True
         )
+        # BUG-FIX 2026-10-17（gather 吞异常防护）：同 R9，显式检查异常实例并记日志。
+        for _i, _res in enumerate(_batch_results):
+            if isinstance(_res, Exception):
+                _bid = batch[_i].get("id") if _i < len(batch) else "?"
+                logger.error(
+                    "[字数调整-R10] 小节 %s 协程异常（被 gather 吞掉，现已显式记录）: %s",
+                    _bid, _res, exc_info=_res,
+                )
+                summary["fail_count"] += 1
 
         total = sum(_count_words(r.get("content")) for r in completed)
         if mode == wc.MODE_EXPAND:
@@ -660,6 +721,8 @@ async def run_word_adjustment_pipeline(
     cancel_event: Any = None,
     enable_total: bool = True,
     on_summary: Any = None,
+    global_facts: list | None = None,
+    facts_policy: str = "",
 ) -> dict:
     """编排：**R9 小节强控拉回 → R10 全文扩/缩写**。
 
@@ -686,6 +749,8 @@ async def run_word_adjustment_pipeline(
         max_rounds=max_rounds,
         concurrency=concurrency,
         cancel_event=cancel_event,
+        global_facts=global_facts,
+        facts_policy=facts_policy,
     )
     out["section"] = section_summary
     if on_summary:
@@ -707,6 +772,8 @@ async def run_word_adjustment_pipeline(
             max_rounds=max_rounds,
             concurrency=concurrency,
             cancel_event=cancel_event,
+            global_facts=global_facts,
+            facts_policy=facts_policy,
         )
         out["total"] = total_summary
         if on_summary:

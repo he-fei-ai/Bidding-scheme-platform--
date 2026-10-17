@@ -6,6 +6,13 @@ import atexit
 from pathlib import Path
 
 
+# BUG-FIX 2026-10-17（TD-1 根因修复）：在任何 app 模块被导入之前（包括 conftest
+# 自身的 `from app.db import init_db`），设置 PYTEST_RUNNING=1。app/main.py 检测
+# 到此标记后改用 load_dotenv(override=False)，从根源杜绝 .env 功能开关污染
+# os.environ。必须在模块级（而非 fixture）设置，确保早于任何 test 文件的
+# `from app.main import app` 触发的 load_dotenv。
+os.environ["PYTEST_RUNNING"] = "1"
+
 # 将 backend/ 目录加入 Python 路径，使 from app.xxx 导入可用
 BACKEND_DIR = Path(__file__).resolve().parent.parent
 if str(BACKEND_DIR) not in sys.path:
@@ -105,3 +112,41 @@ def _robust_getsource(obj):
 
 
 _inspect.getsource = _robust_getsource
+
+
+# =====================================================================
+# 测试隔离加固（2026-10-17）：清除 app.main 导入时 load_dotenv(override=True)
+# 污染到 os.environ 的功能开关
+# ---------------------------------------------------------------------
+# 根因：app/main.py:34 在模块导入时执行 load_dotenv(override=True)，把 .env 里的
+# CONSISTENCY_PATCH_REPAIR_ENABLED=1 / FACTS_*_ENABLED=1 等功能开关强制载入
+# os.environ。任何测试一旦 from app.main import app（e2e 测试、TestClient 等）
+# 就永久污染进程级 os.environ，使后续所有测试的 _env_flag() 从默认 False 变为 True。
+#
+# 后果：workflows_expand._audit_one_group 的冲突修复从「整节重写」切换为
+# 「JSON 精确补丁」路径，使基于文本返回的假 provider 返回非 JSON 内容 →
+# consistency_repair.generate_patches 解析失败 → 8 个测试在全量运行时失败
+# （单独运行时因未触发 app.main 导入而通过，造成"间歇性失败"假象）。
+#
+# 修复策略：在 pytest 收集完成后（所有模块级代码已执行完毕）、测试执行前，
+# 清除这些功能开关环境变量，让测试环境回归「默认关闭」的干净状态。
+# 需要这些开关为 True 的测试（如 test_global_facts_integration）应自行用
+# monkeypatch.setenv 显式设置，不依赖全局污染。
+_FUNCTIONAL_SWITCH_PREFIXES = (
+    "CONSISTENCY_PATCH_REPAIR_ENABLED",
+    "CONSISTENCY_AUDIT_EVIDENCE_ENABLED",
+    "FACTS_ORCHESTRATED_SELECT_ENABLED",
+    "FACTS_SEGMENTED_EXTRACTION_ENABLED",
+    "FACTS_OUTLINE_INPUT_ENABLED",
+    "FACTS_CHAPTER_SCOPE_ENABLED",
+    "FACTS_COMPLETENESS_INSTRUCTION_ENABLED",
+    "FACTS_CONTENT_GATE_ENABLED",
+    "FACTS_KNOWLEDGE_PATCH_ENABLED",
+    "FACTS_TEMPLATE_PATCH_ENABLED",
+)
+
+
+def pytest_collection_modifyitems(session, config, items):
+    """收集完成后、测试执行前：清除功能开关环境变量污染。"""
+    for _key in _FUNCTIONAL_SWITCH_PREFIXES:
+        os.environ.pop(_key, None)

@@ -29,11 +29,19 @@ from starlette.middleware.cors import CORSMiddleware
 
 
 # 加载 .env 文件（支持 backend/.env 和项目根目录 .env），必须在 config 导入前执行
+# BUG-FIX 2026-10-17（TD-1 根因修复）：此前无条件 override=True，把 .env 里的
+# 功能开关（CONSISTENCY_PATCH_REPAIR_ENABLED=1 等）强制载入 os.environ。任何测试
+# 一旦 from app.main import app 就永久污染进程级 os.environ，使后续所有测试的
+# _env_flag() 从默认 False 变为 True → 8 个测试全量间歇性失败。
+# 现在测试模式（conftest.py 在模块级设置 PYTEST_RUNNING=1，早于任何 app import）
+# 跳过 override=True，改用 override=False（只填空、不覆盖已有环境变量），从根源
+# 消除污染。生产环境行为不变（override=True 仍让 .env 优先于 shell）。
 env_path = Path(__file__).resolve().parent.parent / ".env"
+_is_pytest = os.environ.get("PYTEST_RUNNING") == "1"
 if env_path.exists():
-    load_dotenv(dotenv_path=env_path, override=True)
+    load_dotenv(dotenv_path=env_path, override=not _is_pytest)
 else:
-    load_dotenv()
+    load_dotenv(override=not _is_pytest)
 
 from .config import AUTH_ENABLED, HOST, PORT
 from .db import init_db
@@ -51,6 +59,7 @@ from .routers import (
     batch,
     cache,
     charts,
+    charts_orchestration,  # P2 前端智能编排（2026-10-17）
     consistency,
     content_version,
     duplicate,
@@ -534,6 +543,7 @@ v1_router.include_router(images.router, prefix="", tags=["images"])
 v1_router.include_router(content_version.router, prefix="", tags=["content_version"])
 v1_router.include_router(tasks.router, prefix="", tags=["tasks"])
 v1_router.include_router(charts.router, prefix="", tags=["charts"])
+v1_router.include_router(charts_orchestration.router, prefix="", tags=["charts_orchestration"])  # P2 前端智能编排（2026-10-17）
 v1_router.include_router(auth.router, prefix="/auth", tags=["auth"])
 
 # 调试接口：发射一条带 request_id/project/section/task 的示例日志（F-P0-1 验证用）

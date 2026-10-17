@@ -46,13 +46,18 @@ export default defineConfig({
     // 打满 —— 实测全量跑有 4 个用例因 waitFor 超时假失败（WordCountPage 161s、
     // SummaryReviewPage.facts 138s 逼近 timeout；单独重跑 6/6 全过，确认与代码
     // 无关）。限制到 4 worker（物理核数）从根因降低争抢。
+    // BUG-FIX 2026-10-17（消除 OutlineEditorPage 全量假失败）：此前 maxThreads=4
+    // 时，antd+jsdom 的 9 个 DOM 测试文件同时渲染仍把 CPU/内存打满 ——
+    // OutlineEditorPage.dom.test.tsx 在全量并发时需 191s（单跑 74s），其 setup
+    // 阶段被并行争抢拖到超时，导致 8 tests 全部 skip + 文件级 ❯ 标记失败。
+    // 单独运行 8/8 通过，确认非代码缺陷。现在降到 2 worker（物理核数/2）从根因
+    // 消除争抢；retry 升到 2 给偶发一次额外重试。纯函数用例不受影响（毫秒级）。
     poolOptions: {
       threads: {
-        maxThreads: 4,
+        maxThreads: 2,
       },
     },
-    // 双保险：对环境性偶发失败自动重试一次。确定性回归重试后仍失败、照常红灯，
-    // 不会被掩盖；仅过滤「本机当时就是慢了一下」类噪音。
-    retry: 1,
+    // 三保险：retry=2（最多重试 2 次），确定性回归重试后仍失败、照常红灯。
+    retry: 2,
   },
 });
