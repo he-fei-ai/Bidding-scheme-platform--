@@ -162,7 +162,7 @@ export default function I18nSettingsPage() {
                   >
                     翻译
                   </Button>
-                </Space>
+                </Space.Compact>
               </div>
               {translateResult && (
                 <Alert

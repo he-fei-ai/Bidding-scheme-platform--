@@ -195,7 +195,7 @@ function CacheMonitorTab() {
           {lastUpdated && ` · 最后更新：${lastUpdated}`}
         </Text>
         <Space>
-          <Switch checked={autoRefresh} onChange={setAutoRefresh} size="small" checkedChildren="自动" uncheckedChildren="关闭" />
+          <Switch checked={autoRefresh} onChange={setAutoRefresh} size="small" checkedChildren="自动" unCheckedChildren="关闭" />
           <Button icon={<ReloadOutlined />} onClick={fetchData} loading={loading}>刷新</Button>
         </Space>
       </div>
@@ -224,7 +224,7 @@ function CacheMonitorTab() {
           </Row>
           {redisServer.memory_used_bytes !== undefined && redisServer.memory_used_bytes > 0 && (
             <div style={{ marginTop: 16 }}>
-              <div style={{ display: "flex", justificationContent: "space-between", marginBottom: 4 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
                 <Text type="secondary" style={{ fontSize: 12 }}>内存占用</Text>
                 <Text style={{ fontSize: 12 }}>{redisServer.memory_used_bytes} bytes</Text>
               </div>
@@ -485,7 +485,7 @@ function ConcurrencyTab() {
 
   if (!data) return <Card loading={loading}>加载中...</Card>;
 
-  const limits = data.limits || {};
+  const limits = (data.limits || {}) as Record<string, number>;
   const current = data.current || {};
   const history = data.history || [];
 
@@ -494,7 +494,7 @@ function ConcurrencyTab() {
       <Button icon={<ReloadOutlined />} onClick={fetchData} loading={loading} style={{ marginBottom: 16 }}>刷新</Button>
 
       <Row gutter={[16, 16]} style={{ marginBottom: 16 }}>
-        {Object.entries(limits).map(([key, val]: [string, number]) => {
+        {Object.entries(limits).map(([key, val]) => {
           const cur = current[key];
           const ratio = cur !== undefined ? Math.round((cur / val) * 100) : 0;
           return (
@@ -641,7 +641,7 @@ export default function CacheMonitorPage() {
   return (
     <div style={{ maxWidth: 1200, margin: "0 auto" }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
-        <Title level="3" style={{ margin: 0 }}>
+        <Title level={3} style={{ margin: 0 }}>
           <CloudServerOutlined /> 系统监控中心
         </Title>
       </div>

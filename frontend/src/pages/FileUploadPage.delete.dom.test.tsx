@@ -64,7 +64,7 @@ const BOQ_PROMOTED = mkFile({ id: 2, filename: "工程量清单.txt", file_role:
 const API_MOCKS = {
   uploadFile: vi.fn(),
   fetchFiles: vi.fn(async () => [MAIN_DOC, BOQ_TXT] as MockFile[]),
-  deleteFile: vi.fn(async () => ({ status: "deleted", file_id: 1 })),
+  deleteFile: vi.fn(async (): Promise<{ status: string; file_id: number; promoted_file_id?: number | null }> => ({ status: "deleted", file_id: 1 })),
   reExtractFileText: vi.fn(async () => ({ status: "success", text_length: 10, message: "" })),
   updateFileRole: vi.fn(async () => ({ status: "success", demoted_file_ids: [], needs_reanalysis: false })),
   fetchFileParsingStatus: vi.fn(async () => ({

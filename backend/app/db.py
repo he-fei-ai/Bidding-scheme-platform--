@@ -925,6 +925,7 @@ def _migrate(conn: sqlite3.Connection):
             illustration_data TEXT DEFAULT NULL,
             content TEXT NOT NULL DEFAULT '',
             target_words INTEGER DEFAULT NULL,
+            word_count INTEGER NOT NULL DEFAULT 0,
             status TEXT NOT NULL DEFAULT 'pending',
             graph_suitable INTEGER NOT NULL DEFAULT 0,
             suggested_chart TEXT NOT NULL DEFAULT '',
@@ -949,6 +950,12 @@ def _migrate(conn: sqlite3.Connection):
             "illustration_data": "TEXT DEFAULT NULL",
             "content": "TEXT NOT NULL DEFAULT ''",
             "target_words": "INTEGER DEFAULT NULL",
+            # BUG-FIX 2026-10-12（DDL 双写漂移守卫）：本列此前**只**在
+            # db_migrations 里 ALTER 出来，init_db 的建表与兼容列清单都没有它
+            # —— 一旦出现「只跑 init_db 不跑迁移」的路径（单测夹具 / 精简部署），
+            # 整条正文链（读 sections.word_count）会抛 no such column。
+            # init_db 末尾虽会调用 ensure_enhancement_tables()，但双写应各自完整。
+            "word_count": "INTEGER NOT NULL DEFAULT 0",
             "status": "TEXT NOT NULL DEFAULT 'pending'",
             "graph_suitable": "INTEGER NOT NULL DEFAULT 0",
             "suggested_chart": "TEXT NOT NULL DEFAULT ''",

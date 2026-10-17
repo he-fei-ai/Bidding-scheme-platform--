@@ -12,8 +12,8 @@ import {
   arrangeArchitecture, generateArchitecture,
   arrangeLabor, generateLabor,
   arrangeComparison, generateComparison,
-} from "../../api";
-import { extractApiError } from "../../utils";
+} from "../api";
+import { extractApiError } from "../utils";
 
 const { Text, Paragraph } = Typography;
 
@@ -44,6 +44,7 @@ const CHART_TYPES = [
     arrangeApi: arrangeFlowchart,
     generateApi: generateFlowchart,
     resultKey: "mermaid_code",
+    needsWritingLength: false,
   },
   {
     key: "gantt",
@@ -53,6 +54,7 @@ const CHART_TYPES = [
     arrangeApi: null,
     generateApi: generateGantt,
     resultKey: "mermaid_code",
+    needsWritingLength: false,
   },
   {
     key: "architecture",
@@ -62,6 +64,7 @@ const CHART_TYPES = [
     arrangeApi: arrangeArchitecture,
     generateApi: generateArchitecture,
     resultKey: "mermaid",
+    needsWritingLength: false,
   },
   {
     key: "labor",
@@ -81,6 +84,7 @@ const CHART_TYPES = [
     arrangeApi: arrangeComparison,
     generateApi: generateComparison,
     resultKey: "mermaid_code",
+    needsWritingLength: false,
   },
 ] as const;
 
@@ -198,7 +202,6 @@ export default function ChartGenerationTab({
                   <Alert
                     type={state.arrangeResult.need_arrange ? "warning" : "success"}
                     showIcon
-                    style={{ marginBottom: 8 }}
                     message={state.arrangeResult.need_arrange ? "建议生成" : "无需生成"}
                     description={state.arrangeResult.reason}
                     style={{ marginBottom: 8, fontSize: 12 }}

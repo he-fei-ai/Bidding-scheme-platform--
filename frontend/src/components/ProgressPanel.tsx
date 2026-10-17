@@ -64,7 +64,17 @@ function isWordTargetOutOfRange(item: ProgressItem): boolean {
   return actual < target * 0.8 || actual > target * 1.2;
 }
 
-/** 「目标 300（240~360）· +4%」；无目标时返回空串（不渲染）。 */
+/** 目标来源短标签（便于排障：同一页可能混用强控 / 档位 / L3 自身三种口径）。 */
+const WORD_TARGET_SOURCE_LABEL: Record<string, string> = {
+  strict: "强控",
+  l3_own: "L3自身",
+  section_tier: "单节档位",
+  writing_length_tier: "全局档位",
+  default_tier: "默认档位",
+  section_target_words: "单节目标",
+};
+
+/** 「目标300字（240~360）· +4%」；无目标时返回空串（不渲染）。 */
 function describeWordTarget(item: ProgressItem): string {
   const target = item.word_count_target;
   if (!target || target <= 0) return "";
@@ -72,7 +82,11 @@ function describeWordTarget(item: ProgressItem): string {
   const hi = item.word_count_target_hi;
   const range = lo != null && hi != null && hi > 0 ? `（${lo}~${hi}）` : "";
   const dev = deviationText(item);
-  return `目标${target}字${range}${dev ? ` · ${dev}` : ""}`;
+  const src = item.word_count_target_source
+    ? WORD_TARGET_SOURCE_LABEL[item.word_count_target_source]
+    : undefined;
+  const srcTag = src ? `[${src}]` : "";
+  return `${srcTag}目标${target}字${range}${dev ? ` · ${dev}` : ""}`;
 }
 
 export default React.memo(function ProgressPanel({ items, total, success, failed, isRunning, cancelled = 0 }: ProgressPanelProps) {

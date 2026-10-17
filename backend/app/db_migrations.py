@@ -1280,6 +1280,11 @@ def ensure_enhancement_tables():
             ("readable_word_count", "INTEGER NOT NULL DEFAULT 0"),
             ("word_count_target", "INTEGER NOT NULL DEFAULT 0"),
             ("word_count_deviation", "INTEGER NOT NULL DEFAULT 0"),
+            # BUG-FIX 2026-10-12（双写漂移守卫 test_ddl_parity_* 报出）：单节
+            # 目标字数列此前**只**存在于 db.py::init_db，老库升级后没有此列 ——
+            # 而校验页 / 生成提示词 / 压缩阈值都要读 sections.target_words，
+            # 老库上会直接抛 no such column。补进迁移链，幂等零破坏。
+            ("target_words", "INTEGER DEFAULT NULL"),
         ]:
             _add_column_if_not_exists("sections", _wc_col, _wc_def)
 

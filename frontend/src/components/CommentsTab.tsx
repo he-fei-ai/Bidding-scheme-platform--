@@ -5,9 +5,9 @@ import {
 import {
   CheckCircleOutlined, DeleteOutlined, MessageOutlined, ReloadOutlined, SendOutlined, UserOutlined,
 } from "@ant-design/icons";
-import { getComments, addComment, resolveComment, getAuthToken } from "../../api";
-import type { Comment } from "../../api";
-import { extractApiError } from "../../utils";
+import { getComments, addComment, resolveComment, getAuthToken } from "../api";
+import type { Comment } from "../api";
+import { extractApiError } from "../utils";
 
 const { Text, Paragraph } = Typography;
 const { TextArea } = Input;
@@ -134,7 +134,7 @@ export default function CommentsTab({ projectId, sectionId }: CommentsTabProps) 
             <List.Item
               key={item.id}
               actions={
-                item.status === "resolved" ? [] : [
+                Number(item.resolved) === 1 ? [] : [
                   <Popconfirm
                     key="resolve"
                     title="确认标记为已解决？"
@@ -155,12 +155,12 @@ export default function CommentsTab({ projectId, sectionId }: CommentsTabProps) 
             >
               <List.Item.Meta
                 avatar={
-                  <Avatar icon={<UserOutlined />} style={{ backgroundColor: item.status === "resolved" ? "#52c41a" : "#1677ff" }} />
+                  <Avatar icon={<UserOutlined />} style={{ backgroundColor: Number(item.resolved) === 1 ? "#52c41a" : "#1677ff" }} />
                 }
                 title={
                   <Space>
                     <Text strong>{item.user_name || "anonymous"}</Text>
-                    {item.status === "resolved" && <Tag color="green">已解决</Tag>}
+                    {Number(item.resolved) === 1 && <Tag color="green">已解决</Tag>}
                     <Text type="secondary" style={{ fontSize: 12 }}>
                       {new Date(item.created_at).toLocaleString("zh-CN")}
                     </Text>
