@@ -239,7 +239,15 @@ class ContentQualityEvaluator:
         # 截取内容前5000字进行评估（避免token超限）
         content_sample = content[:5000] if len(content) > 5000 else content
 
-        prompt = f"""请评估以下标书章节的内容质量，从以下几个维度打分（0-100分）：
+        # ENHANCE 2026-10-18（审计遗留 D2 批次 2 收编）：user 侧收编为
+        # QUALITY_EVAL_USER（system 侧早已于 BUG-FIX-PROMPT-E4 收编）。
+        # 正文为 AI 生成的标书内容（下游数据，非原始外部输入），做元标记中和。
+        prompt = get_prompt(
+            "QUALITY_EVAL_USER",
+            section_title=section_title,
+            content_sample=content_sample,
+            sanitize=True,
+        ) or f"""请评估以下标书章节的内容质量，从以下几个维度打分（0-100分）：
 
 【章节标题】
 {section_title}

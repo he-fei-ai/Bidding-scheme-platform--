@@ -346,7 +346,7 @@ class TestReferenceTemplateConsistency:
 
     @staticmethod
     def _core():
-        from app.services.ai.outline_sort_optimizer import CORE_28_CHAPTERS
+        from app.services.ai.outline_gate import CORE_28_CHAPTERS
 
         return CORE_28_CHAPTERS
 
@@ -404,7 +404,7 @@ class TestReferenceTemplateConsistency:
 
     def test_zone_map_covers_every_core_title(self):
         """排序器的 zone 映射必须覆盖 CORE 全部标题，否则分区排序会静默降级。"""
-        from app.services.ai.outline_sort_optimizer import CORE_ZONE_MAP, ZONE_ORDER
+        from app.services.ai.outline_gate import CORE_ZONE_MAP, ZONE_ORDER
 
         for chapter in self._core():
             zone = CORE_ZONE_MAP.get(chapter["title"])
@@ -417,134 +417,10 @@ class TestReferenceTemplateConsistency:
         这不是要修的 bug，而是 id=23 标题分叉的既有影响 —— 固化下来，
         避免有人误以为 CORE_ZONE_MAP 能覆盖 FIXED 的全部章节。
         """
-        from app.services.ai.outline_sort_optimizer import CORE_ZONE_MAP
+        from app.services.ai.outline_gate import CORE_ZONE_MAP
 
         fixed_23 = next(c for c in self._fixed() if c["id"] == "23")
         assert fixed_23["title"] not in CORE_ZONE_MAP
-
-
-class TestSortOptimizerStableOrdering:
-    """`outline_sort_optimizer` 降级排序的稳定性。
-
-    该模块目前是孤儿（无生产调用方），但它的降级路径有个真实缺陷：补充章的
-    tie-breaker 用的是 `title`，导致同分区章节按**标题字典序**乱排。而 V5.1 的
-    L1 输出是「评分项专业化改写」标题，实测 8/8 都命中不了 `CORE_TITLE_SET`
-    （`is_core` 全为 False），于是全部落到补充章分支 —— AI 按
-    「总纲→组织→方案→管理→收尾」排好的顺序会被字典序彻底打乱。
-    若将来接线本模块，这个缺陷会直接破坏目录顺序。
-    """
-
-    # 真实 L1 输出风格的标题（评分项专业化改写，非参考模板原文）
-    L1_STYLE_TITLES = [
-        "项目总体概况与建设条件分析",
-        "施工组织部署与资源配置方案",
-        "主要分部分项工程施工技术方案",
-        "质量保证体系与过程控制措施",
-        "安全生产管理与文明施工保障",
-        "施工进度计划与工期保证措施",
-        "环境保护与绿色施工措施",
-        "售后服务与工程保修承诺",
-    ]
-
-    @staticmethod
-    def _outline(titles):
-        return [{"id": str(i + 1), "title": t} for i, t in enumerate(titles)]
-
-    def test_real_l1_titles_are_not_recognised_as_core(self):
-        """固化前提：改写标题命中不了核心章集合，所以降级路径是主路径。"""
-        from app.services.ai.outline_sort_optimizer import CORE_TITLE_SET
-
-        hits = [t for t in self.L1_STYLE_TITLES if t in CORE_TITLE_SET]
-        assert hits == [], f"用例前提失效，这些标题被当成了核心章: {hits}"
-
-    def test_v1_fallback_is_stable_for_real_l1_titles(self):
-        from app.services.ai.outline_sort_optimizer import CORE_TITLE_SET, OutlineSortOptimizer
-
-        opt = OutlineSortOptimizer(provider=None)
-        outline = self._outline(self.L1_STYLE_TITLES)
-        enriched = opt._enrich_zones(outline, CORE_TITLE_SET)
-        after = [c["title"] for c in opt._fallback_sort_by_zone(enriched, CORE_TITLE_SET)]
-        assert after == self.L1_STYLE_TITLES, f"同分区章节被乱排: {after}"
-
-    def test_v1_fallback_still_regroups_across_zones(self):
-        """稳定化不能把「跨分区归组」也一起废掉。"""
-        from app.services.ai.outline_sort_optimizer import CORE_TITLE_SET, OutlineSortOptimizer
-
-        opt = OutlineSortOptimizer(provider=None)
-        shuffled = [
-            "售后服务与工程保修承诺",
-            "项目总体概况与建设条件分析",
-            "质量保证体系与过程控制措施",
-        ]
-        enriched = opt._enrich_zones(self._outline(shuffled), CORE_TITLE_SET)
-        after = [c["title"] for c in opt._fallback_sort_by_zone(enriched, CORE_TITLE_SET)]
-        assert after[0] == "项目总体概况与建设条件分析", after
-
-    def test_v1_fallback_preserves_core_chapter_order(self):
-        from app.services.ai.outline_sort_optimizer import (
-            CORE_28_CHAPTERS,
-            CORE_TITLE_SET,
-            OutlineSortOptimizer,
-        )
-
-        opt = OutlineSortOptimizer(provider=None)
-        core = [{"id": c["id"], "title": c["title"]} for c in CORE_28_CHAPTERS]
-        enriched = opt._enrich_zones(core, CORE_TITLE_SET)
-        after = [c["title"] for c in opt._fallback_sort_by_zone(enriched, CORE_TITLE_SET)]
-        assert after == [c["title"] for c in CORE_28_CHAPTERS]
-
-    def test_v2_composite_is_stable_without_weights(self):
-        from app.services.ai.outline_sort_optimizer import (
-            CORE_TITLE_SET,
-            OutlineSortOptimizerV2,
-        )
-
-        v2 = OutlineSortOptimizerV2(provider=None)
-        enriched = v2._enrich_zones(self._outline(self.L1_STYLE_TITLES), CORE_TITLE_SET)
-        after = [c["title"] for c in v2._composite_sort(enriched, CORE_TITLE_SET, {})]
-        assert after == self.L1_STYLE_TITLES, f"V2 同分区章节被乱排: {after}"
-
-    def test_v2_score_weight_still_reorders_within_zone(self):
-        """稳定化不能把「同分区内按评分权重前移」的设计意图废掉。"""
-        from app.services.ai.outline_sort_optimizer import (
-            CORE_TITLE_SET,
-            OutlineSortOptimizerV2,
-        )
-
-        v2 = OutlineSortOptimizerV2(provider=None)
-        same_zone = [
-            "环境保护与绿色施工措施",
-            "质量保证体系与过程控制措施",
-            "安全生产管理与文明施工保障",
-        ]
-        outline = self._outline(same_zone)
-        zones = {e["zone"] for e in v2._enrich_zones(outline, CORE_TITLE_SET)}
-        assert len(zones) == 1, f"用例前提失效：三章应同分区，实为 {zones}"
-
-        weights = {"安全生产管理与文明施工保障": 30.0}
-        enriched = v2._enrich_zones(outline, CORE_TITLE_SET)
-        after = [c["title"] for c in v2._composite_sort(enriched, CORE_TITLE_SET, weights)]
-        assert after[0] == "安全生产管理与文明施工保障", after
-        assert set(after) == set(same_zone), "排序不得增删章节"
-
-    def test_v2_never_crosses_zone_boundary_by_weight_alone(self):
-        """固化既有设计意图：评分权重只在同分区内生效，不能跨越分区边界。
-
-        这不是缺陷 —— `_composite_sort` 的注释明确写「同分区内评分权重高的
-        适当前移」。用例存在的意义是：若有人调整权重公式，会立刻看到这层语义。
-        """
-        from app.services.ai.outline_sort_optimizer import (
-            CORE_TITLE_SET,
-            OutlineSortOptimizerV2,
-        )
-
-        v2 = OutlineSortOptimizerV2(provider=None)
-        outline = self._outline(self.L1_STYLE_TITLES)
-        weights = {"售后服务与工程保修承诺": 30.0}
-        enriched = v2._enrich_zones(outline, CORE_TITLE_SET)
-        after = [c["title"] for c in v2._composite_sort(enriched, CORE_TITLE_SET, weights)]
-        # 售后服务属「专项预案」区，权重不足以把它提到「管理保障」区之前
-        assert after.index("售后服务与工程保修承诺") > after.index("环境保护与绿色施工措施")
 
 
 class TestLevel2PromptDisallowedWords:
@@ -719,7 +595,7 @@ class TestZoneOrderGateDetection:
     def test_both_28_chapter_templates_are_clean(self):
         """护栏：关键词表一旦改动导致标准模板被判乱序，这里立刻失败"""
         from app.services.ai import outline_gate
-        from app.services.ai.outline_sort_optimizer import CORE_28_CHAPTERS
+        from app.services.ai.outline_gate import CORE_28_CHAPTERS
         from app.services.ai.workflows_outline_v51 import REFERENCE_TEMPLATE_V51
 
         for name, template in (("core28", CORE_28_CHAPTERS), ("v51", REFERENCE_TEMPLATE_V51)):
@@ -752,7 +628,7 @@ class TestZoneOrderGateDetection:
 
     def test_infer_chapter_zone_prefers_core_titles(self):
         from app.services.ai import outline_gate
-        from app.services.ai.outline_sort_optimizer import CORE_ZONE_MAP
+        from app.services.ai.outline_gate import CORE_ZONE_MAP
 
         title, zone = next(iter(CORE_ZONE_MAP.items()))
         assert outline_gate.infer_chapter_zone(title) == zone

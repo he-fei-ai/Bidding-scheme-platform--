@@ -222,6 +222,11 @@ class ExportConfig(BaseModel):
     # 按标题本地模板自动补图（仅命中强关键词的图表相关章节）。默认关闭以保持历史行为；
     # 亦可由环境变量 AUTO_FALLBACK_CHARTS=1 全局开启。
     auto_fallback_charts: bool = False
+    # L-6（2026-10-17）：图题编号与标题间分隔符。默认空格（历史口径
+    # 「图3-1 施工进度计划」）；招标规范要求冒号时传 "：" 得到
+    # 「图3-1：施工进度计划」。失败占位符剥离图号的前缀正则对两种分隔符均兼容。
+    # 仅接受 " " / "：" / ":" / "" 四种取值，其余回退默认空格（见 _figure_caption）。
+    figure_no_separator: str = " "
 
     # ===== ENHANCE 2026-09-14：导出格式预设体系（移植自易标 exportFormatPresets）=====
     # 版式预设 / 主题预设 id，空串表示不使用预设（保持历史行为）

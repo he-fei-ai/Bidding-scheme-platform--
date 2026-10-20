@@ -59,6 +59,16 @@ asyncio_default_fixture_loop_scope = "function"
 # backend/.pytest_cache 在中文路径下偶发 WinError 5 写入崩溃（间歇性 Killing 进程），
 # 将缓存移到 tests/ 子目录规避
 cache_dir = "tests/.pytest_cache"
+# ---------------------------------------------------------------------------
+# 运行约束（2026-10-17 · L-3）：**不要并行跑多个 pytest 进程**。
+# 本仓库测试在中文路径（J:\编程\...）下运行，`__pycache__` 的并发读写会偶发
+# WinError 5（安全软件锁文件 / 瞬时竞态），实证表现为收集期 ImportError 或
+# 个别测试批次计数漂移（如 192 → 183，缺的恰是某个文件的全部用例）。
+# conftest 已做三层隔离（sys.dont_write_bytecode + PYTHONDONTWRITEBYTECODE=1
+# 阻止本进程落 .pyc、每进程独立 mkdtemp 数据目录、getsource 元数据漂移补丁），
+# 但**读**侧竞态来自仓库内其他进程（并行的另一个 pytest / 开发中的服务进程）。
+# 官方基线数据一律单进程顺序运行取得；CI 亦应串行执行。
+# ---------------------------------------------------------------------------
 
 [tool.coverage.run]
 source = ["app"]

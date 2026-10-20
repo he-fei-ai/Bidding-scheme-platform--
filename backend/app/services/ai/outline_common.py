@@ -886,7 +886,27 @@ _PLACEHOLDER_TITLE_RE = re.compile(r"^专项\s*[0-9一二三四五六七八九�
 # 兜底都会产中文数字变体，且含实体词的「地下室专项六」连
 # `_is_l3_title_project_specific` 的实体词白名单都能穿透，直接存活到落库。
 # 现两种数字体系都纳入。
-_PLACEHOLDER_ANYWHERE_RE = re.compile(r"专项\s*[0-9一二三四五六七八九十百]+")
+#
+# BUG-FIX 2026-10-17（第六轮 · 括号式专项占位漏判）：旧正则要求数字紧邻
+# 「专项」，「专项（6）」「专项(6)」这类括号式编号完全穿透判定与清洗
+# （对抗探针实证：作为唯一兄弟时原样存活到落库）。现允许括号间隔。
+_PLACEHOLDER_ANYWHERE_RE = re.compile(r"专项\s*[（(]?\s*[0-9一二三四五六七八九十百]+")
+
+# BUG-FIX 2026-10-17（第六轮 · 倒序专项占位漏判）：「第六专项」「6专项」
+# 「第三章专项」——编号在「专项」**之前**的镜像形态，上面两个正则都只查后置。
+# 允许可选「第」前缀（「第六专项」是更常见的 AI 产出形态）。锚定标题开头
+# 收敛误判面（L3 层级的「2026专项规划」同样无语义，判脏后由清洗链改写）。
+_PLACEHOLDER_PREFIXED_RE = re.compile(r"^第?\s*[0-9一二三四五六七八九十百]+\s*专项")
+
+# BUG-FIX 2026-10-17（第六轮 · 专项+泛化词+尾编号漏判）：「专项措施6」
+# 「专项方案6」「专项施工3」——主体是泛化短语、结尾是裸编号。
+# `_BARE_NUM_TAIL_RE` 的收窄口径（去数字后须恰为泛化词表成员）放行它们，
+# 因为「专项措施」不在 `_GENERIC_ONLY_TITLES`/`_L3_L2LIKE_TITLES` 词表。
+# 泛化词显式列举（不放开到任意 CJK），避免误伤「专项施工方案2026」这类
+# 带年份的合法标题。
+_PLACEHOLDER_TAIL_NUM_RE = re.compile(
+    r"专项(?:措施|方案|施工|工程|技术|管理)?\s*[0-9一二三四五六七八九十百]+\s*$"
+)
 
 # 纯序号占位标题：「内容3」「子章节2」「章节1」「小节4」…
 #
@@ -899,9 +919,33 @@ _PLACEHOLDER_ANYWHERE_RE = re.compile(r"专项\s*[0-9一二三四五六七八九
 #
 # 正则刻意收紧为「通用结构词 + 纯数字」，避免误伤「第一内容」「内容管理」
 # 「第三章施工部署」这类合法标题。
+#
+# BUG-FIX 2026-10-17（第六轮 · 序号占位家族漏判）：
+#   1) 中文数字变体「内容三」「项目六」穿透（旧正则只认阿拉伯数字）；
+#   2) 「项目6」未纳入结构词表；
+#   3) 「第6项」「第六项」整标题即纯序号——旧 `_ORDINAL_SUFFIX_RE` 要求
+#      编号之外还有主体，这类**整体就是编号**的形态无人拦截。
 _PLACEHOLDER_ORDINAL_ONLY_RE = re.compile(
-    r"^(?:内容|子章节|章节|小节|条|项|节)\s*\d{1,3}$"
+    r"^(?:内容|项目|子章节|章节|小节|条|项|节)\s*[0-9一二三四五六七八九十百]{1,3}$"
 )
+
+# BUG-FIX 2026-10-17（第六轮）：整标题为「第N项/第N条/N项」式纯序号占位。
+# 「第6项」「第六项」「6项」——不带任何主体，语义为零。
+_ORDINAL_ITEM_ONLY_RE = re.compile(
+    r"^第?\s*[0-9一二三四五六七八九十百]+\s*[项条]$"
+)
+
+# BUG-FIX 2026-10-17（第六轮 · 清洗器碎片主体护栏）：`_cleanup_placeholder_titles`
+# 的「先剥后缀保主体」分支对 bare fragment 主体会保留出不可读标题——
+# 「专项（6）」剥后缀得「专项」、「内容（3）」剥后得「内容」、「项目（2）」
+# 剥后得「项目」。这类 1~2 字结构词不是标题，只是被剥空了壳的占位。
+# 现对过短主体（< 4 字）或碎片词表成员改走整体语义化重写，
+# 与 `_semantic_fallback_title` 的候选口径一致。
+_MIN_CLEAN_BODY_LEN = 4
+_L3_TITLE_FRAGMENTS = frozenset({
+    "专项", "内容", "项目", "章节", "小节", "子章节", "条", "项", "节",
+    "措施", "方案", "要点", "要求", "计划", "部署", "工程", "技术",
+})
 # 裸编号冲突后缀（括号式）：（2）/（3）/（第2项）/（二）/半角 (2)
 #
 # 2026-10-11 修复：旧正则只认全角括号，导致「总体实施策划(2)」这类半角括号
@@ -924,6 +968,50 @@ _PLACEHOLDER_ORDINAL_ONLY_RE = re.compile(
 _ORDINAL_SUFFIX_RE = re.compile(
     r"[（(]\s*第?\s*[0-9一二三四五六七八九十百]+\s*项?\s*[）)]\s*$"
 )
+
+# ========== 2026-10-17 第六轮：编号前缀形态（BUG-OUTLINE-2026-10-17-01） ==========
+# 用户复报症状「编号冲突后缀（2）（3）」的**镜像形态**：AI 输出与人工编辑会把
+# 编号写到标题**开头**——「（2）总体实施策划」「(3)总体实施策划」
+# 「（二）质量保证措施」「2、总体实施策划」「2. 总体实施策划」。
+# `_ORDINAL_SUFFIX_RE` 只锚定结尾（`[）)]\s*$`），`_PLACEHOLDER_TITLE_RE` 又要求
+# 整标题恰为「专项N」，于是此前缀形态完整穿过清洗链/去重/自检/安全网/落库
+# （对抗探针实证：3 处存活且 `_is_dirty_l3_title_deep` 全判非脏）。
+#
+# 口径与后缀侧严格对称：
+#   - 括号式前缀：（2）/（3）/（二）/（第2项）/半角 (2)，括号内容必须全为编号
+#     （沿用 `_ORDINAL_SUFFIX_RE` 的收紧规则，不误伤「深基坑（超5m）支护方案」）；
+#   - 列表式前缀：「2、」「二、」「2，」与「2. 」（点号要求后跟空白，
+#     避免误伤「1.5 目标」这类小数编号）；
+#   - 堆叠前缀「（2）（3）X」循环剥离。
+# 本命名空间中 DB title 不携带编号（编号按位置现算，见 `renumber_outline_ids`），
+# 故任何前导编号都是应剥离的污染：`_is_dirty_l3_title` 判脏，
+# `_cleanup_placeholder_titles` 按「先剥前缀保主体，主体仍泛化才重写」处理
+# （与后缀侧同口径，见 L1943 附近的对称实现）。
+_ORDINAL_PREFIX_BRACKET_RE = re.compile(
+    r"^[（(]\s*第?\s*[0-9一二三四五六七八九十百]+\s*项?\s*[）)]"
+)
+_ORDINAL_PREFIX_LIST_RE = re.compile(
+    r"^(?:[0-9一二三四五六七八九十百]{1,4}\s*[、．,，]|[0-9]{1,4}\.\s+)"
+)
+_ORDINAL_PREFIX_RE = re.compile(
+    r"^(?:[（(]\s*第?\s*[0-9一二三四五六七八九十百]+\s*项?\s*[）)]"
+    r"|[0-9一二三四五六七八九十百]{1,4}\s*[、．,，]"
+    r"|[0-9]{1,4}\.\s+)\s*"
+)
+
+
+def _strip_ordinal_prefix(title: str) -> str:
+    """剥离标题开头的裸编号前缀（（2）/（第2项）/2、/2. ），循环处理堆叠形态。
+
+    与 `_strip_ordinal_suffix` 对称：只剥编号、不动主体；无命中原样返回。
+    整标题即编号时返回空串（由调用方按空标题处理）。
+    """
+    t = (title or "").strip()
+    while True:
+        new = _ORDINAL_PREFIX_RE.sub("", t, count=1).strip()
+        if new == t:
+            return t
+        t = new
 
 # 裸数字结尾「总体实施策划2」/「总体实施策划20」—— 仅用于脏标题判定，不参与归一化剥离。
 # 负向断言排除：数字/字母（单位如 mm、m、C30）、百分比、以及任意 CJK 量词
@@ -1065,15 +1153,23 @@ def _strip_legacy_redundant_suffix(title: str) -> str:
 def _title_core(title: str) -> str:
     """标题归一化**唯一正本**：去重与消歧判断「两个标题是否同名」时必须共用。
 
-    步骤：剥离裸编号后缀（（2）/（第3项））→ 剥离冗余序数后缀（（其N））→
-    去空白 → 小写 → 剔除非词字符。
+    步骤：剥离编号**前缀**（（2）/2、）→ 剥离裸编号后缀（（2）/（第3项））→
+    剥离冗余序数后缀（（其N））→ 去空白 → 小写 → 剔除非词字符。
 
     ⚠️ 历史缺陷（2026-10-11 修复）：`_disambiguate_title` 曾用**原始字符串**
     去比对**归一化 core 集合**，「X（其2）」永远不等于集合里的「X其2」，
     于是它的序数计数器 `_n` 恒停在 2，上层再包一层后滚成「（其3）（其4）…」
     的递增污染。现在两侧统一走本函数，比对口径一致。
+
+    BUG-FIX 2026-10-17（L-4 · 前缀不参与归一化）：前缀剥离此前缺失，
+    「（2）X」与「X」被判为不同标题。生产链路里 `_cleanup_placeholder_titles`
+    先于去重执行、会把前缀剥掉，故此缺口只在**绕过清洗的路径**
+    （`_uniquify_outline_titles` 被单独调用、遗留数据、人工编辑回灌）
+    暴露：前缀污染标题与干净同名标题双双保留，语义重复。现与后缀侧对称
+    纳入，保证「判重口径」与「清洗口径」严格一致。
     """
-    tt = _strip_ordinal_suffix(title or "")
+    tt = _strip_ordinal_prefix(title or "")
+    tt = _strip_ordinal_suffix(tt)
     tt = _strip_legacy_redundant_suffix(tt)
     tt = tt.strip().lower()
     tt = re.sub(r"[\s\u3000]+", "", tt)
@@ -1129,7 +1225,16 @@ def _is_dirty_l3_title(title: str) -> bool:
          —— 消歧分支与本章实体抽取的共同产物，语义含量为零；
             由 `_is_generic_stem_only_title` 判定，
             config.OUTLINE_L3_GENERIC_STEM_GUARD_ENABLED=false 时关闭。
-    """
+      9. 编号前缀形态（「（2）总体实施策划」「2、总体实施策划」）
+         —— 用户复报的「编号冲突（2）（3）」的镜像形态：编号在标题**开头**。
+            本命名空间 DB title 不携带编号（编号按位置现算），任何前导编号
+            都是污染；且前缀 + 泛化主体正是零语义占位。判脏后由
+            `_cleanup_placeholder_titles` 按「先剥前缀保主体」处理。
+      10. 专项占位家族扩展（「专项（6）」「第六专项」「专项措施6」）
+         —— 括号式/倒序/泛化词+尾编号三种变体，旧正则只查「专项+紧邻数字」。
+      11. 纯序号占位家族扩展（「项目6」「第六项」「第6项」）
+         —— 中文数字、「项目」结构词、整标题即序号三种漏判形态。
+      """
     t = (title or "").strip()
     if not t:
         return True
@@ -1137,7 +1242,13 @@ def _is_dirty_l3_title(title: str) -> bool:
         return True
     if _PLACEHOLDER_ANYWHERE_RE.search(t):
         return True
+    if _PLACEHOLDER_PREFIXED_RE.search(t):
+        return True
+    if _PLACEHOLDER_TAIL_NUM_RE.search(t):
+        return True
     if _PLACEHOLDER_ORDINAL_ONLY_RE.match(t):
+        return True
+    if _ORDINAL_ITEM_ONLY_RE.match(t):
         return True
     if _ORDINAL_SUFFIX_RE.search(t):
         return True
@@ -1161,6 +1272,14 @@ def _is_dirty_l3_title(title: str) -> bool:
     #    语义含量为零，且**不含任何项目实体**。规则 6/7 的「恰好等于」口径放行
     #    它们，导致清洗链与消歧产物脏复检双双失效（见 config.py 同名开关注释）。
     if _is_generic_stem_only_title(t):
+        return True
+    # 9. 编号前缀形态（2026-10-17 第六轮 · BUG-OUTLINE-2026-10-17-01）：
+    #    「（2）总体实施策划」「2、总体实施策划」「(3)总体实施策划」。
+    #    与后缀侧（规则 4）对称：本命名空间 DB title 不携带编号，前导编号
+    #    一律是污染；且前缀 + 泛化主体正是用户复报的「编号冲突（2）（3）」
+    #    镜像症状。判脏后 `_cleanup_placeholder_titles` 先剥前缀保主体，
+    #    主体仍泛化才整体重写（与后缀侧同口径）。
+    if _strip_ordinal_prefix(t) != t:
         return True
     return False
 
@@ -1796,7 +1915,14 @@ def _disambiguate_title(
     # 加固：输入本身可能带裸编号或历史冗余后缀（「总体实施策划（2）」
     # 「砌体成品保护（其2）」）。先全部剥离再消歧，避免残留后缀被挪到标题中间
     # 而让 `_clean_legacy_suffix_tree` 的末尾匹配失效。仅剥离不登记。
-    title = _strip_ordinal_suffix(title or "")
+    #
+    # 2026-10-17 第六轮（BUG-OUTLINE-2026-10-17-01）前缀侧对称：输入还可能带
+    # **开头**编号（「（2）总体实施策划」「2、总体实施策划」）。旧实现只剥后缀，
+    # 前缀残留会参与消歧拼接，产出「（2）总体实施策划专项方案」这类把编号挪到
+    # 中间的形态——既逃过 `_clean_legacy_suffix_tree` 的末尾匹配，又让
+    # `_title_core` 判重失真。入口统一剥前缀后再消歧。
+    title = _strip_ordinal_prefix(title or "")
+    title = _strip_ordinal_suffix(title)
     title = _strip_legacy_redundant_suffix(title)
     if _BARE_NUM_TAIL_RE.search(title):
         _rest = _BARE_NUM_TAIL_RE.sub("", title).strip()
@@ -1940,10 +2066,20 @@ def _cleanup_placeholder_titles(
                 # 自己成了泛化标题的来源之一。
                 # 现按「先剥后缀保主体，主体仍泛化才重写」处理，
                 # 与 `_clean_legacy_suffix_tree` 对「（其N）」的处理口径一致。
+                #
+                # 2026-10-17 第六轮（BUG-OUTLINE-2026-10-17-01）前缀侧对称：
+                # 「（2）总体实施策划」「2、总体实施策划」的编号在**开头**，
+                # 同样先剥前缀保主体。另加碎片主体护栏：「专项（6）」剥后缀
+                # 得「专项」、「内容（3）」剥后得「内容」—— bare fragment
+                # 不是可读标题，旧实现直接保留等于把一种占位垃圾换成另一种，
+                # 现改走整体语义化重写。
                 _body = _strip_legacy_redundant_suffix(_strip_ordinal_suffix(_title)).strip()
+                _body = _strip_ordinal_prefix(_body).strip()
                 if (
                     _body
                     and _body != _title
+                    and len(_body) >= _MIN_CLEAN_BODY_LEN
+                    and _body not in _L3_TITLE_FRAGMENTS
                     and not _is_dirty_l3_title_deep(_body)
                     and _body not in _used
                 ):
@@ -2327,6 +2463,278 @@ def _cap_cross_chapter_repetition(
     if fixed:
         logger.info("跨章复用护栏: 共改写 %d 个跨章成套复用的三级标题", fixed)
     return level1, fixed
+
+
+def _cap_intra_chapter_repetition(
+    level1: list[dict], max_parents_per_chapter: int = 2
+) -> tuple[list[dict], int]:
+    """限制同一个三级标题在**同一个一级章内**不同二级父级下的复用个数。
+
+    2026-10-19 新增，修复《岳阳路园区科研南楼室内装修工程》事故中
+    「一、总体方案与实施策划（1-7）/ 二、分阶段推进计划（1-7 完全相同）/
+    三、资源配置与协调保障（前 7 个照抄）」的成套照抄形态。
+
+    与既有两道护栏的关系（互补、不重叠）：
+      - `_uniquify_outline_titles`：同一 L2 父级下的兄弟去重（同级唯一政策）；
+      - `_cap_cross_chapter_repetition`：全树按不同父级**实例**计数，上限 3；
+        「同一章内 3 个 L2 各挂同一批 L3」恰好 = 3 个父级实例，不会触发；
+      - 本函数：按「每个一级章内」计数，上限更严（默认 2）——同章内跨 L2
+        复用读者同屏对照即穿帮，是最刺眼的死循环形态。
+
+    规则（与 `_cap_cross_chapter_repetition` 同口径）：
+      - 只作用于三级及以下节点；
+      - 按 `_title_core` 归一化统计「本章内不同 L2 父级实例」个数；
+      - 保留前 `max_parents_per_chapter` 个出现（先到先得，幂等）；
+      - 超出部分用所在 L2 主题经 `_semantic_fallback_title` 重新生成，
+        永不产出「（N）」式裸编号后缀。
+
+    Args:
+        level1: 一级目录树（就地修改）
+        max_parents_per_chapter: 同一 L3 标题在单个一级章内允许出现的
+            不同 L2 父级个数上限；<=0 表示关闭护栏（向后兼容）
+
+    Returns:
+        (目录树, 被改写的节点数)
+    """
+    if not isinstance(level1, list) or max_parents_per_chapter <= 0:
+        return level1, 0
+
+    fixed_total = 0
+    for chapter in level1:
+        if not isinstance(chapter, dict):
+            continue
+        l1_title = str(chapter.get("title") or "").strip()
+        l2_children = chapter.get("children")
+        if not isinstance(l2_children, list):
+            continue
+
+        # 收集本章 L3：core -> [(node, l2_parent_key, l2_title), ...]
+        occurrences: dict[str, list[tuple[dict, int, str]]] = {}
+        _parent_seq = 0
+
+        def _walk_l3(nodes: list, parent_key: int, parent_title: str) -> None:
+            nonlocal _parent_seq
+            for node in nodes:
+                if not isinstance(node, dict):
+                    continue
+                title = str(node.get("title") or "").strip()
+                sub = node.get("children")
+                # 只统计挂在 L2 下的 L3 节点（parent_key>0 即处于某个 L2 之下）
+                if title and parent_key > 0:
+                    core = _title_core(title)
+                    if core:
+                        occurrences.setdefault(core, []).append(
+                            (node, parent_key, parent_title)
+                        )
+                if isinstance(sub, list):
+                    _parent_seq += 1
+                    _walk_l3(sub, _parent_seq, title or parent_title)
+
+        _walk_l3(l2_children, 0, l1_title)
+
+        if not occurrences:
+            continue
+
+        all_titles: set[str] = set()
+
+        def _collect_titles(nodes: list) -> None:
+            for n in nodes:
+                if isinstance(n, dict):
+                    t = str(n.get("title") or "").strip()
+                    if t:
+                        all_titles.add(t)
+                    _collect_titles(n.get("children") or [])
+
+        _collect_titles(chapter.get("children") or [])
+
+        for core, items in occurrences.items():
+            if len(items) <= max_parents_per_chapter:
+                continue
+            parent_keys = list(dict.fromkeys(k for _, k, _ in items))
+            if len(parent_keys) <= max_parents_per_chapter:
+                continue
+            kept_keys = set(parent_keys[:max_parents_per_chapter])
+            seq = 0
+            rewritten = 0
+            sample_title = str(items[0][0].get("title") or "").strip()
+            for node, parent_key, parent_title in items:
+                if parent_key in kept_keys:
+                    continue
+                old_title = str(node.get("title") or "").strip()
+                new_title = _semantic_fallback_title(
+                    parent_title, seq, all_titles, context_title=l1_title
+                )
+                if not new_title or new_title == old_title or _is_dirty_l3_title_deep(new_title):
+                    logger.warning(
+                        "同章复用护栏: 「%s」重生成失败（L2=%s，章=%s），保留原标题",
+                        old_title,
+                        parent_title or "(根)",
+                        l1_title,
+                    )
+                    continue
+                node["title"] = new_title
+                all_titles.add(new_title)
+                rewritten += 1
+                seq += 1
+            if rewritten:
+                logger.info(
+                    "同章复用护栏: 「%s」在章「%s」内出现于 %d 个不同 L2（上限 %d），改写超出的 %d 个",
+                    sample_title,
+                    l1_title,
+                    len(parent_keys),
+                    max_parents_per_chapter,
+                    rewritten,
+                )
+                fixed_total += rewritten
+
+    if fixed_total:
+        logger.info("同章复用护栏: 共改写 %d 个同章成套照抄的三级标题", fixed_total)
+    return level1, fixed_total
+
+
+# ========== 专业隔离（跨领域术语串台修复，2026-10-19） ==========
+
+#: 项目类型判定关键词（按扫描优先级排序；命中即停）
+_PROJECT_TYPE_KEYWORDS: tuple[tuple[str, str], ...] = (
+    ("装饰装修", "装饰装修"),
+    ("室内装修", "装饰装修"),
+    ("装修工程", "装饰装修"),
+    ("装饰工程", "装饰装修"),
+    ("精装", "装饰装修"),
+    ("幕墙", "装饰装修"),
+    ("改造工程", "装饰装修"),
+    ("市政", "市政"),
+    ("公路", "市政"),
+    ("道路", "市政"),
+    ("管道", "市政"),
+    ("园林", "园林景观"),
+    ("绿化", "园林景观"),
+    ("水利", "水利"),
+    ("电力", "电力"),
+    ("机电安装", "机电安装"),
+    ("建筑", "房建"),
+    ("土建", "房建"),
+)
+
+#: 各项目类型严禁出现的「域外术语 → 语义转化词」映射。
+#: 装饰装修项目出现地勘/房建结构术语即串台（生产事故：装修项目目录出现
+#: 「勘察技术路线与地质难点应对方案」）。
+_CROSS_DOMAIN_TERM_MAP: dict[str, dict[str, str]] = {
+    "装饰装修": {
+        "地质勘察": "现场调查",
+        "工程地质": "既有建筑",
+        "地质难点": "既有设施难点",
+        "地质条件": "既有建筑条件",
+        "地质": "既有建筑",
+        "深基坑": "既有地下设施",
+        "基坑支护": "既有地下设施防护",
+        "基坑": "既有地下设施",
+        "桩基": "基础加固",
+        "灌注桩": "基础加固",
+        "塔吊基础": "垂直运输设施",
+        "塔吊": "垂直运输",
+        "土方开挖": "基层处理",
+        "降水": "渗漏治理",
+    },
+}
+
+#: 提示词用的各域禁用词表（与 _CROSS_DOMAIN_TERM_MAP 键对应，取键原文）
+_PROMPT_FORBIDDEN_TERMS: dict[str, str] = {
+    "装饰装修": "地质勘察、深基坑、基坑支护、桩基、塔吊、土方开挖、降水",
+}
+
+
+def _detect_project_type(summary: str, global_facts: list | None = None) -> str:
+    """从全局事实与项目摘要中检测项目类型（专业域）。
+
+    优先级：事实变量 projectType/工程类型 > 摘要关键词扫描 > 空串。
+    返回归一化类型名（如「装饰装修」「市政」「房建」），无法判定返回 ""。
+    """
+    if isinstance(global_facts, list):
+        for item in global_facts:
+            if not isinstance(item, dict):
+                continue
+            key = str(item.get("key") or item.get("label") or "")
+            val = str(item.get("value") or "")
+            if not val:
+                continue
+            if key in ("projectType", "工程类型", "project_type"):
+                return val.strip()
+    text = summary or ""
+    for kw, ptype in _PROJECT_TYPE_KEYWORDS:
+        if kw in text:
+            return ptype
+    return ""
+
+
+def _sanitize_cross_domain_titles(level1: list[dict], project_type: str) -> tuple[list[dict], int]:
+    """将目录树中与项目类型冲突的域外术语改写为本域语义（就地修改）。
+
+    2026-10-19 新增：装修项目目录出现「勘察技术路线与地质难点应对方案」
+    这类地勘术语时，正文会被标题误导强行往地质上扯（文不对题）。
+    在目录收口阶段按 `_CROSS_DOMAIN_TERM_MAP` 做确定性术语转化，例如
+    「地质」→「既有建筑」——「勘察技术路线与地质难点应对方案」改写后
+    语义自动贴合「原建筑踏勘与既有设施保护」。
+
+    仅当项目类型命中映射表（当前支持装饰装修）时生效；无法判定类型时
+    不做任何改写（避免误伤其他行业的合法术语）。
+
+    Returns:
+        (目录树, 改写命中的节点数)
+    """
+    term_map = _CROSS_DOMAIN_TERM_MAP.get((project_type or "").strip())
+    if not term_map or not isinstance(level1, list):
+        return level1, 0
+
+    fixed = 0
+
+    def _walk(nodes: list) -> None:
+        nonlocal fixed
+        for node in nodes:
+            if not isinstance(node, dict):
+                continue
+            title = str(node.get("title") or "").strip()
+            if title:
+                new_title = title
+                for bad, good in term_map.items():
+                    if bad in new_title:
+                        new_title = new_title.replace(bad, good)
+                if new_title != title:
+                    node["title"] = new_title
+                    fixed += 1
+            sub = node.get("children")
+            if isinstance(sub, list):
+                _walk(sub)
+
+    _walk(level1)
+    if fixed:
+        logger.info(
+            "专业隔离护栏: 项目类型「%s」，共改写 %d 个含域外术语的目录标题",
+            project_type,
+            fixed,
+        )
+    return level1, fixed
+
+
+def _build_professional_isolation_block(project_type: str) -> str:
+    """构建注入生成提示词的「专业隔离约束」文本块。
+
+    对齐质量报告建议 2：正文/目录生成的 System Prompt 必须锁定项目类型并
+    严禁域外术语。project_type 未命中禁用词表时返回空串（不注入）。
+    """
+    ptype = (project_type or "").strip()
+    if not ptype:
+        return ""
+    forbidden = _PROMPT_FORBIDDEN_TERMS.get(ptype, "")
+    if not forbidden:
+        return ""
+    return (
+        f"\n【专业隔离约束】本工程为【{ptype}】项目，严禁出现「{forbidden}」"
+        f"等不属于本专业的其他领域术语。若目录标题或评分要点中出现此类词汇，"
+        f"必须按{ptype}的业务逻辑进行语义转化后再使用"
+        f"（如「勘察」→「现场调查与既有设施排查」、「地质难点」→「既有设施难点」），"
+        f"不得死板硬套其他行业的内容框架。\n"
+    )
 
 
 # ========== 最小子节点保障 ==========

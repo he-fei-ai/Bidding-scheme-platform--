@@ -32,6 +32,12 @@ def list_sections_light(project_id: int) -> list[dict]:
 
     适用场景：目录展示、路径计算、树构建等不需要正文内容的操作。
     需要正文时仍应使用 list_sections（完整查询）。
+
+    返回顺序 = 目录树深度优先前序（与落库/展示/导出/正文生成同一权威口径）。
+    历史口径 `ORDER BY sort_order, created_at` 有两个缺陷：created_at 秒级精度
+    并列时顺序不确定；且扁平跨父 `sort_order` 会把两个 L1 子树交错。
+    现改为 SQL 只保证稳定取行，最终顺序由 ordered_generation.order_tree_dfs
+    统一收敛（防御性：即便 SQL 排序被改写，返回顺序仍与权威一致）。
     """
     from ..db import get_db
 
@@ -41,10 +47,17 @@ def list_sections_light(project_id: int) -> list[dict]:
     )
     with get_db() as conn:
         rows = conn.execute(
-            f"SELECT {columns} FROM sections WHERE project_id = ? ORDER BY sort_order, created_at",
+            f"SELECT {columns} FROM sections WHERE project_id = ? ORDER BY id",
             (project_id,),
         ).fetchall()
-    return [dict(r) for r in rows]
+    result = [dict(r) for r in rows]
+
+    try:
+        from .ai.ordered_generation import order_tree_dfs
+        return order_tree_dfs(result)
+    except ImportError:  # pragma: no cover - 防御性兜底（等价旧口径）
+        result.sort(key=lambda r: (r.get("sort_order") or 0, r.get("id") or 0))
+        return result
 
 
 # ============================================================================

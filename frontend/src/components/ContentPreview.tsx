@@ -1419,8 +1419,30 @@ type PreviewBlock = { type: "table" | "chart" | "text" | "mermaid"; value: strin
 /** 图表围栏起始行：与后端 content_cleaning.CHART_FENCE_OPEN_PATTERN 同口径
  *  （支持 ``` / ~~~ 两种围栏与 chart-json / chart_json / chartjson 三种标签）。 */
 const CHART_FENCE_OPEN = /^(?:`{3,}|~{3,})[ \t]*(mermaid|chart[-_]?json)[ \t]*(?:\{[^}]*\})?[ \t]*$/i;
-const FENCE_CLOSE = /^(?:`{3,}|~{3,})[ \t]*$/;
+/** 图表围栏闭合行：与后端 content_cleaning.FENCE_CLOSE_LINE_PATTERN 同口径
+ *  （BUG-FIX 2026-10-17 前端口径对齐：允许闭合行携带 info-string / 属性串——
+ *  AI 常把闭合行也写成 ```mermaid，旧口径会误判未闭合导致预览丢图）。 */
+const FENCE_CLOSE = /^(?:`{3,}|~{3,})[ \t]*[A-Za-z0-9_\-+.#]*[ \t]*(?:\{[^}]*\})?[ \t]*$/;
 const CHART_FENCE_HARD_LINE_LIMIT = 5000;
+/** Mermaid 图表首行关键字：与后端 content_cleaning._MERMAID_DIAGRAM_KEYWORD_RE 同口径 */
+const MERMAID_KEYWORD_RE = /^(?:flowchart|graph|gantt|pie|xychart|timeline|journey|mindmap|quadrantChart|requirementDiagram|gitGraph|C4Context|C4Container|C4Component|C4Dynamic|C4Deployment|sankey-beta|block-beta|xychart-beta|kanban|packet-beta|architecture-beta|radar|treemap)\b/i;
+
+/** 与后端 content_cleaning._is_chart_payload_start 同口径 */
+function isChartPayloadStart(line: string | null): boolean {
+  const s = (line || "").trim();
+  if (!s) return false;
+  if (MERMAID_KEYWORD_RE.test(s)) return true;
+  return s.startsWith("{") || s.startsWith('"');
+}
+
+/** 其后第一个非空行：与后端 content_cleaning._fence_line_is_new_open 前瞻同口径 */
+function firstNonEmptyAfter(lines: string[], from: number): string | null {
+  for (let k = from; k < lines.length; k++) {
+    const s = lines[k].trim();
+    if (s) return s;
+  }
+  return null;
+}
 /** 标记聚合上限：与后端 CHART_MARKER 40 行 / 表格 60 行对齐 */
 const MARKER_AGGREGATE_LIMIT = 60;
 
@@ -1452,36 +1474,49 @@ function parseContent(content: string): PreviewBlock[] {
       let j = i + 1;
       let closed = false;
       while (j < lines.length) {
-        if (FENCE_CLOSE.test(lines[j].trim())) {
+        const t = lines[j].trim();
+        if (FENCE_CLOSE.test(t)) {
+          // 前瞻判定（与后端 _fence_line_is_new_open 同口径）：闭合候选行携带
+          // 图表语言 info-string、且其后第一个非空行仍是图表载荷起始 →
+          // 它是下一张图的起始行（AI 漏写了上一块的闭合行），本块按未闭合处理
+          if (CHART_FENCE_OPEN.test(t) && isChartPayloadStart(firstNonEmptyAfter(lines, j + 1))) {
+            break;
+          }
           closed = true;
           break;
         }
-        // 遇到下一个围栏起始行 → 视为本块未闭合
-        if (/^(?:`{3,}|~{3,})/.test(lines[j].trim())) break;
+        // 其他围栏标记行（非图表语言起始）→ 视为本块未闭合
+        if (/^(?:`{3,}|~{3,})/.test(t)) break;
         body.push(lines[j]);
         j += 1;
         if (j - i > CHART_FENCE_HARD_LINE_LIMIT) break;
       }
       const payload = body.join("\n").trim();
-      if (closed && payload) {
-        if (/^mermaid$/.test(lang)) {
-          blocks.push({ type: "mermaid", value: payload });
-        } else {
-          try {
-            const obj = JSON.parse(payload);
-            // 归一成后端/parseChartPayload 认识的标记形态，交给既有 ChartBlock 通道
-            blocks.push({ type: "chart", value: `<<CHART:${JSON.stringify(obj)}>>` });
-          } catch {
-            // 载荷非法：绝不把 JSON 源码当正文显示（与后端"坏块删除"口径一致）
-            i = j + 1;
-            continue;
+      if (closed) {
+        if (payload) {
+          if (/^mermaid$/.test(lang)) {
+            blocks.push({ type: "mermaid", value: payload });
+          } else {
+            try {
+              const obj = JSON.parse(payload);
+              // 归一成后端/parseChartPayload 认识的标记形态，交给既有 ChartBlock 通道
+              blocks.push({ type: "chart", value: `<<CHART:${JSON.stringify(obj)}>>` });
+            } catch {
+              // 载荷非法：绝不把 JSON 源码当正文显示（与后端"坏块删除"口径一致）
+              i = j + 1;
+              continue;
+            }
           }
         }
+        // 闭合但空载荷：丢弃围栏行与空载荷
         i = j + 1;
         continue;
       }
-      // 未闭合 / 空载荷：按后端口径删除坏块，绝不把源码写进预览
-      i = j + 1;
+      // 未闭合 / 达到硬上限：按后端口径删除坏块，绝不把源码写进预览；
+      // BUG-FIX 2026-10-17（前端口径对齐）：从终止行继续解析（i = j）——
+      // 终止行往往是下一张图的起始围栏，旧实现 i = j + 1 会把它吞掉，
+      // 其载荷落入正文显示为 mermaid 源码（源码泄漏乱码）。
+      i = j;
       continue;
     }
 

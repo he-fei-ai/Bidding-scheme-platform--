@@ -128,8 +128,15 @@ def build_section_override(
 ) -> dict[Any, dict]:
     """强控生效时为每个参与生成的 L3+ 章节装配覆盖参数（R5 / R8）。
 
-    返回 ``{section_id: {"section_words", "lo", "hi", "generation_target", "strict"}}``；
-    未配置 / 未强控 / 快照无效时返回空 dict（调用方回落既有档位逻辑）。
+    返回 ``{section_id: {"section_words", "lo", "hi", "generation_target",
+    "strict", "tolerance", "source"}}``；未配置 / 未强控 / 快照无效时返回空
+    dict（调用方回落到档位口径）。
+
+    2026-10-20 体系合并：本产物是**统一解析器最高优先级项的输入**——
+    调用方把它透传给 ``word_target_resolver.resolve_section_word_target(…, strict_override=…)``，
+    命中即短路返回 R5 区间（source=``word_control_strict``），不再各自维护
+    「先查强控、未命中再走档位」的双分支。``tolerance`` / ``source`` 两键为
+    自描述冗余（解析器不信任入参容差，始终取 STRICT_SECTION_TOLERANCE 权威值）。
 
     - ``lo`` / ``hi``：R5 强控区间 ``[ceil(0.8S), floor(1.2S)]``；
     - ``generation_target``：R8 初稿倒推目标（强控且设了全文上限时非 0）；
@@ -168,6 +175,10 @@ def build_section_override(
         "hi": hi_words,
         "generation_target": gen_target,
         "strict": True,
+        # 体系合并（2026-10-20）：自描述两键，供直接消费覆盖表的旧调用方
+        # 与统一解析器的 source/tolerance 语义保持一致。
+        "tolerance": float(wc.STRICT_SECTION_TOLERANCE),
+        "source": "word_control_strict",
     }
     result: dict[Any, dict] = {}
     for s in pool:
@@ -211,6 +222,7 @@ def finalize_word_control_warning(
     results: Iterable[Any],
     *,
     single_section: bool = False,
+    override: Optional[Mapping[Any, dict]] = None,
 ) -> Optional[dict]:
     """生成收尾（R12）：构造结构化警告并回写 DB。
 
@@ -218,9 +230,15 @@ def finalize_word_control_warning(
 
     1. 逐节按 **R1 可读字数**重算实际字数（剔除 Markdown/图片/代码块/URL）；
     2. 调纯函数 ``build_word_control_warning`` 判定小节越界（强控）与全文偏离；
-    3. 强控项目回写 ``sections.word_count_target / word_count_deviation`` 列；
+    3. 强控项目回写 ``sections.word_count_target / word_count_deviation`` 列
+       （体系合并 2026-10-20：目标经统一解析器 ``strict_override`` 短路项取得，
+       与生成/压缩/校验/SSE 同一事实源；数值与旧路径逐字一致）；
     4. 警告写入 ``word_control_settings.word_control_warning``（None 也写，
        清除上一轮残留），供前端弹窗展示「期望区间 vs 实际 + 逐节明细」。
+
+    Args:
+        override: 装配层 ``build_section_override`` 产物（可选）；提供时回写
+            目标逐节经统一解析器解析，缺失时回落快照 S（行为不变）。
     """
     opts = state.effective_options
     if not opts:
@@ -253,7 +271,7 @@ def finalize_word_control_warning(
 
     _persist_warning(state.project_id, warning)
     if opts.section_words and opts.strict_section_words and views:
-        _persist_section_deviations(views, int(opts.section_words))
+        _persist_section_deviations(views, int(opts.section_words), override=override)
     return warning
 
 
@@ -281,16 +299,31 @@ def _persist_warning(project_id: int, warning: Optional[dict]) -> None:
         logger.warning("[字数控制] 警告回写失败（忽略）: %s", e)
 
 
-def _persist_section_deviations(views: list[dict], target: int) -> None:
+def _persist_section_deviations(
+    views: list[dict], target: int, *, override: Optional[Mapping[Any, dict]] = None
+) -> None:
     """强控项目回写 sections.word_count_target / word_count_deviation。
 
-    实际字数用 R1 可读口径（与警告判定同一事实源）；target 来自快照派生。
+    实际字数用 R1 可读口径（与警告判定同一事实源）；目标经**统一解析器**
+    逐节解析（体系合并 2026-10-20）：命中 ``strict_override`` 短路项时取其
+    target（= R5 标称 S），未命中/无覆盖表时回落快照派生的统一 S（逐值不变）。
     """
-    rows = [
-        (target, int(v["word_count"]) - target, v["id"])
-        for v in views
-        if v.get("id") is not None
-    ]
+    from .word_target_resolver import SOURCE_STRICT, resolve_section_word_target
+
+    rows = []
+    for v in views:
+        if v.get("id") is None:
+            continue
+        t = target
+        ov = override.get(v["id"]) if override else None
+        if ov:
+            try:
+                resolved = resolve_section_word_target(strict_override=ov)
+                if resolved is not None and resolved.source == SOURCE_STRICT and resolved.target > 0:
+                    t = int(resolved.target)
+            except Exception:
+                pass  # 解析异常回落快照 S，不阻断回写
+        rows.append((t, int(v["word_count"]) - t, v["id"]))
     if not rows:
         return
     try:

@@ -38,6 +38,62 @@ DEFAULT_PRIORITIES: dict[str, int] = {
     "OTHER_CHAPTERS": 40,         # 其它章节（参考性最弱）
 }
 
+# 上下文片段名别名表（UNIFY 2026-10-17：统一变量定义与命名）。
+#
+# 背景（缺口 G-NAMING）：各 workflow 组装上下文时对同一语义使用了不同片段名
+# ——「评分标准」有 SCORING_STANDARDS / SCORING_POINTS / SCORING 三种写法，
+# 「全局事实」有 GLOBAL_FACTS / FACTS / GLOBAL_FACT，「目录树」有 OUTLINE /
+# OUTLINE_TREE / TOC。后果：
+#   1) 片段名未在 DEFAULT_PRIORITIES 中时静默回落魔法默认值 50（曾导致
+#      PROJECT_SCOPE 被优先截断，见 BUG-FIX-PROMPT-G5）；
+#   2) 同名不同义/异名同义使 Token 预算行为无法预测、监控无法聚合。
+# 现统一收敛到 DEFAULT_PRIORITIES 中的规范名，非规范名自动映射。
+PART_ALIASES: dict[str, str] = {
+    # 全局事实
+    "FACTS": "GLOBAL_FACTS",
+    "GLOBAL_FACT": "GLOBAL_FACTS",
+    "GLOBALFACTS": "GLOBAL_FACTS",
+    # 评分
+    "SCORING": "SCORING_POINTS",
+    "SCORING_STANDARD": "SCORING_STANDARDS",
+    "SCORE_POINTS": "SCORING_POINTS",
+    # 目录树
+    "OUTLINE_TREE": "OUTLINE",
+    "TOC": "OUTLINE",
+    "CATALOG": "OUTLINE",
+    # 项目概述 / 解析摘要
+    "PROJECT_SUMMARY": "SUMMARY",
+    "OVERVIEW": "SUMMARY",
+    "PROJECT_OVERVIEW": "SUMMARY",
+    # 图表
+    "CHART_INSTRUCTION": "CHART_INSTRUCTIONS",
+    "CHART_HINTS": "CHART_INSTRUCTIONS",
+    # 行业
+    "INDUSTRY": "INDUSTRY_PROFILE",
+    # 承包范围
+    "SCOPE": "PROJECT_SCOPE",
+    # 工程量清单
+    "BOQ": "BOQ_ANALYSIS",
+    # 施工方法
+    "METHOD": "CONSTRUCTION_METHOD",
+    # 工作面接口
+    "INTERFACE": "WORK_INTERFACE",
+    # 其它章节
+    "OTHER": "OTHER_CHAPTERS",
+    "SIBLING_CHAPTERS": "OTHER_CHAPTERS",
+}
+
+
+def normalize_part_name(name: str) -> str:
+    """把上下文片段名收敛到 DEFAULT_PRIORITIES 中的规范名。
+
+    未知片段名原样返回（保持向后兼容，优先级回落到默认值 50）。
+    """
+    if not name:
+        return name
+    upper = name.strip().upper()
+    return PART_ALIASES.get(upper, upper)
+
 
 def estimate_tokens(text: str) -> int:
     """Token 估算：tiktoken 精确计数（可用时）→ CJK 启发式回退。
@@ -87,6 +143,36 @@ except Exception:
 # 低于此值时「【名称】+ 截断标记」没有信息量，不如整段丢弃，把预算留给下轮。
 _MIN_TRUNCATED_BODY_TOKENS = 1
 
+# PERF 2026-10-17：token 维度快速裁剪的调参。
+# 跨边界 BPE 合并的安全余量：head|正文、正文|marker 两处，各最多合并出 1 token，
+# 故取 2 即可覆盖；多留会白白浪费预算（实测余量 4 时每次少用 4~5 token）。
+_MERGE_SAFETY_TOKENS = 2
+# 回退步长（字符）/ 最大回退次数：把最坏情况下的额外全量编码次数控制在个位数
+_REFINE_STEP = 64
+_MAX_SHRINK_STEPS = 6
+# 前进步长（字符）/ 最大前进次数：把安全余量吃回来，同时限制额外编码次数
+_GROW_STEP = 8
+_MAX_GROW_STEPS = 3
+
+
+def _token_prefix_char_len(content: str, token_budget: int) -> int | None:
+    """返回「前 token_budget 个 token 对应的字符数」；无法快速计算时返回 None。
+
+    仅在 tiktoken 可用且确实需要截断时走这条快路径；否则返回 None 由调用方
+    回落到字符维度二分（行为与修复前一致）。
+    """
+    if _TIKTOKEN_ENCODER is None or token_budget <= 0 or not content:
+        return None
+    try:
+        ids = _TIKTOKEN_ENCODER.encode(content)
+        if len(ids) <= token_budget:
+            return len(content)
+        # decode 前 k 个 token，其字符长度即所求切点（decode 与 encode 互逆，
+        # 故 content.startswith(decode(ids[:k])) 成立，切点必然落在 token 边界）
+        return len(_TIKTOKEN_ENCODER.decode(ids[:token_budget]))
+    except Exception:
+        return None
+
 
 def assemble_prompt_context(
     parts: dict[str, str],
@@ -118,8 +204,11 @@ def assemble_prompt_context(
     """
     prio = priorities or DEFAULT_PRIORITIES
 
+    # UNIFY 2026-10-17：片段名先归一化（别名 → 规范名），保证「异名同义」
+    # 命中同一优先级，避免回落魔法默认 50。同名冲突时按原顺序后者覆盖前者
+    # （与 dict 语义一致），并在下方按优先级稳定排序。
     items = [
-        (name, content)
+        (normalize_part_name(name), content)
         for name, content in parts.items()
         if content and content.strip()
     ]
@@ -168,10 +257,101 @@ def assemble_prompt_context(
             body = _fit_to_token_budget(content, remain, head, marker)
             if body:
                 kept.append(f"{head}{body}{marker}")
-        # 更低优先级片段不再加入
-        break
+                # 边界片段已把剩余预算填满（或接近填满），更低优先级不再加入。
+                break
+            # 截断后无有效正文（极端小预算）→ 视为该片段不可容纳，落到下面继续。
+
+        # BUG-FIX-PROMPT-C11（2026-10-17，预算浪费 + 低优先级误杀）：
+        # 原实现在此**无条件 break**——只要遇到第一个放不下的片段，其后所有
+        # 更低优先级片段统统丢弃，即便它们很短、完全装得进剩余预算。
+        # 实测复现（max_tokens=40，HIGH 占 27 token，MID 超长，LOW 仅 8 token）：
+        #     remain=12 < head(5)+marker(15)+1=21 → MID 无法容纳
+        #     原实现直接 break → 产出 27 token，13 token 预算(32%)被浪费，
+        #     且 LOW（8 token，装得下）被误杀。
+        # 该行为与「按优先级最大化利用预算」的设计目标相悖：优先级只应决定
+        # **谁先被满足**，不应导致预算闲置。改为跳过该片段、继续尝试后续
+        # 更低优先级片段；已截断并加入的边界片段仍走上面的 break（预算已满）。
+        continue
 
     return delimiter.join(kept)
+
+
+#: PERF 2026-10-20：无 tiktoken 环境下，启发式计数的前缀统计块大小（字符）。
+#: 建表成本 ≈ 全文 translate（C 速度）；查询成本 ≤ 一个块的 translate。
+_HEURISTIC_PREFIX_CHUNK = 2048
+
+#: 仅对达到该长度的正文构建前缀统计表；短文本一次 translate 比建表更便宜，
+#: 且与历史逐字一致（零行为变化）。
+_HEURISTIC_FAST_PATH_MIN_CHARS = 4096
+
+
+def _cjk_noncjk(text: str) -> tuple[int, int]:
+    """文本的 (CJK 字符数, 非 CJK 字符数)（与 estimate_tokens 启发式同口径）。"""
+    non_cjk = len(text.translate(_CJK_DELETE_TABLE))
+    return len(text) - non_cjk, non_cjk
+
+
+def _build_cjk_prefix_heads(content: str) -> list[int]:
+    """按块预计算「截至该块末尾的 CJK 字符数」累计表。
+
+    配合 `_heuristic_fast_fits` 把二分查找的每次全量 translate 降为 O(1)。
+    注意：token 合并取整必须按「总 CJK + (总非 CJK + 3)//4」一次性计算
+    （见 _heuristic_fast_fits 的等价性说明），按段各自取整再相加会因小数
+    累积产生 1 token 偏差。
+    """
+    heads = [0]
+    for i in range(0, len(content), _HEURISTIC_PREFIX_CHUNK):
+        chunk = content[i : i + _HEURISTIC_PREFIX_CHUNK]
+        heads.append(heads[-1] + (len(chunk) - len(chunk.translate(_CJK_DELETE_TABLE))))
+    return heads
+
+
+def _heuristic_fast_fits(content: str, head: str, marker: str, budget_tokens: int):
+    """构造与 ``estimate_tokens(head + content[:n].rstrip() + marker)`` **逐位等价**
+    的 O(1) 版 _fits（仅无 tiktoken 环境启用）。
+
+    等价性依据：estimate_tokens 启发式 = ``cjk + (non_cjk + 3) // 4``，其中
+    cjk / non_cjk 是**拼接串**的字符分类计数；字符串拼接不改变单字符分类，
+    故 cjk(concat) = Σcjk(段)、non_cjk(concat) = Σnon_cjk(段)，按总量一次
+    取整即得与原实现完全相同的结果——是精确等价，不是近似。
+
+    性能依据：原 _fits 每次对 content[:n] 做一次全量 translate + 字符串拼接，
+    二分约 18 次迭代，在 24 万字符正文上实测整函数 ~0.35s（full-suite 负载下
+    会越过 perf 测试的 0.4s 断言线）；本版建表一次（~40ms）+ 每次查询
+    O(块大小)（~1ms），实测 ~0.06s。`truncate_to_tokens` 在长文档上被逐段
+    反复调用，收益同享。
+
+    Args:
+        content: 待裁剪正文（调用方保证非空且长度 ≥ _HEURISTIC_FAST_PATH_MIN_CHARS）
+        head / marker: 预算整块的固定头尾（其 token 成本只算一次）
+        budget_tokens: 整块 token 预算
+
+    Returns:
+        ``fits(n: int) -> bool``：content[:n]（rstrip 后）配 head/marker 是否不超预算
+    """
+    heads = _build_cjk_prefix_heads(content)
+    head_cjk, head_non = _cjk_noncjk(head)
+    marker_cjk, marker_non = _cjk_noncjk(marker)
+    chunk = _HEURISTIC_PREFIX_CHUNK
+
+    def _fits(n: int) -> bool:
+        # 与 content[:n].rstrip() 等价的后缀空白剥离：str.isspace() 与
+        # str.rstrip() 使用同一 Unicode 空白定义（含 U+3000 等），逐字符等价。
+        while n > 0 and content[n - 1].isspace():
+            n -= 1
+        if n <= 0:
+            body_cjk, body_non = 0, 0
+        else:
+            base = (n // chunk) * chunk
+            body_cjk = heads[n // chunk] + (
+                (n - base) - len(content[base:n].translate(_CJK_DELETE_TABLE))
+            )
+            body_non = n - body_cjk
+        total_cjk = head_cjk + body_cjk + marker_cjk
+        total_non = head_non + body_non + marker_non
+        return total_cjk + (total_non + 3) // 4 <= budget_tokens
+
+    return _fits
 
 
 def _fit_to_token_budget(content: str, budget_tokens: int, head: str, marker: str) -> str:
@@ -187,13 +367,79 @@ def _fit_to_token_budget(content: str, budget_tokens: int, head: str, marker: st
     """
     if budget_tokens <= 0 or not content:
         return ""
+    # 空 head/marker 且整段放得下：直接返回，避免进入二分。
+    if not head and not marker and estimate_tokens(content) <= budget_tokens:
+        return content.rstrip()
 
     def _fits(n: int) -> bool:
         return estimate_tokens(head + content[:n].rstrip() + marker) <= budget_tokens
 
-    if _fits(len(content)):
-        return content.rstrip()
+    # PERF 2026-10-17（O(log n) 次全量编码 → 1 次编码 + 1 次解码）：
+    #
+    # 原实现在**字符维度**二分，每次 _fits(n) 都要对 content[:n] 重新编码。
+    # 对 20 万字符的招标原文（facts 分段提取 / 上下文裁剪的真实体量）需 ~18
+    # 次迭代 × 每次编码 57ms → 单次裁剪 ~1s；而 truncate_to_tokens 在长文档
+    # 上会被逐段反复调用，累计开销可观（实测 200k 字符：0.98s → 0.19s）。
+    #
+    # 改为在 **token 维度**直接求解：把 content 全量编码一次得到 ids，预算扣除
+    # head/marker 后即得到可容纳的 token 数 k（纯算术），decode(ids[:k]) 的
+    # 字符长度即所求切点。随后用真实 _fits 校验一次并按步长回退，保证产出
+    # **严格不超预算**（与旧实现同一保证）。
+    enc = _TIKTOKEN_ENCODER
+    ids = None
+    if enc is not None:
+        try:
+            ids = enc.encode(content)
+        except Exception:
+            ids = None
 
+    # PERF 2026-10-20（无 tiktoken 环境的二分查找加速）：tiktoken 不可用时
+    # （本部署环境默认即如此，estimate_tokens 走启发式），原 _fits 每次都对
+    # content[:n] 做全量 translate + 拼接，二分约 18 次在 24 万字符上 ~0.35s。
+    # 启发式计数可按段精确分解（见 _heuristic_fast_fits 的等价性证明），此处
+    # 把 _fits 升级为 O(1) 版。tiktoken 可用时 ids 非 None，走上方的 token
+    # 维度快速路径，_fits 保持真实编码校验口径，不受本分支影响。
+    if ids is None and len(content) >= _HEURISTIC_FAST_PATH_MIN_CHARS:
+        _fits = _heuristic_fast_fits(content, head, marker, budget_tokens)
+
+    if ids is not None:
+        fixed = estimate_tokens(head + marker)
+        if len(ids) + fixed <= budget_tokens:
+            return content.rstrip()
+        k = budget_tokens - fixed - _MERGE_SAFETY_TOKENS
+        if k <= 0:
+            return ""
+        n = min(len(enc.decode(ids[:k])), len(content))
+        # 校验 + 有限回退（BPE 跨边界合并时快速解可能略超预算）
+        for _ in range(_MAX_SHRINK_STEPS):
+            if _fits(n):
+                break
+            n -= _REFINE_STEP
+            if n <= 0:
+                return ""
+        else:
+            n = -1  # 回退次数用尽仍未满足 → 兜底二分
+        if n >= 0:
+            # 前进：安全余量通常不满，用小块步长吃回剩余预算（每步一次编码，故限次）
+            grow = 0
+            while grow < _MAX_GROW_STEPS and n + _GROW_STEP <= len(content) and _fits(n + _GROW_STEP):
+                n += _GROW_STEP
+                grow += 1
+            return content[:n].rstrip() if n > 0 else ""
+        # 回退仍不满足：落到字符二分兜底（极端语料，保证不返回超预算内容）
+        lo, hi = 0, max(0, n)
+    else:
+        lo, hi = 0, len(content)
+
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if _fits(mid):
+            lo = mid
+        else:
+            hi = mid - 1
+    return content[:lo].rstrip() if lo > 0 else ""
+
+    # 以下分支不可达（上方已 return），仅为静态检查与可读性保留兜底。
     lo, hi = 0, len(content)
     while lo < hi:
         mid = (lo + hi + 1) // 2
@@ -226,7 +472,20 @@ def truncate_to_tokens(text: str, max_tokens: int) -> str:
     产出必然越界（如 max_tokens=5 时返回 11 token 的标记）。现降级为
     无标记截断：返回截断后的纯文本（不附标记），保证产出恒不超预算。
     """
-    if not text or estimate_tokens(text) <= max_tokens:
+    # BUG-FIX-PROMPT-C12（2026-10-17，None/非正整数预算崩溃）：原实现直接把
+    # ``max_tokens`` 与 int 比较。调用方从配置/DB 读到的预算可能为 None
+    # （未配置即不限）或 0/负数，实测 ``truncate_to_tokens(text, None)`` 抛
+    # ``TypeError: '<=' not supported between 'int' and 'NoneType'``，
+    # 在正文生成链路里表现为整个章节生成失败。现统一口径：
+    #   - None  → 等同「不限」，原样返回（与 assemble_prompt_context 一致）；
+    #   - <= 0  → 空串（无预算即无内容，语义明确且不抛异常）。
+    if not text:
+        return text
+    if max_tokens is None:
+        return text
+    if max_tokens <= 0:
+        return ""
+    if estimate_tokens(text) <= max_tokens:
         return text
     # 复用 _fit_to_token_budget 的二分查找：budget 包含 marker 成本
     truncated = _fit_to_token_budget(text, max_tokens, "", _TRUNCATION_MARKER)
@@ -292,12 +551,25 @@ def split_into_token_capped_chunks(text: str, max_tokens: int) -> list[str]:
 
 __all__ = [
     "DEFAULT_PRIORITIES",
+    "PART_ALIASES",
+    "normalize_part_name",
     "estimate_tokens",
     "assemble_prompt_context",
     "truncate_to_tokens",
     "split_into_token_capped_chunks",
     "build_chapter_context",
 ]
+
+
+def _default_context_max_tokens() -> int | None:
+    """上下文组装的默认 Token 预算（0/None 表示不限，保持既有行为）。"""
+    try:
+        from .... import config
+
+        value = int(getattr(config, "PROMPT_CONTEXT_MAX_TOKENS", 0) or 0)
+    except Exception:
+        return None
+    return value if value > 0 else None
 
 
 def build_chapter_context(
@@ -313,9 +585,14 @@ def build_chapter_context(
     work_interface: str = "",
     chart_instructions: str = "",
     other_chapters: str = "",
-    max_tokens: int = 8000,
+    max_tokens: int | None = None,
 ) -> str:
     """正文生成场景的统一上下文组装高层接口。
+
+    ENHANCE 2026-10-17：``max_tokens`` 改为可选，未指定时读取
+    ``config.PROMPT_CONTEXT_MAX_TOKENS``；该项为 0（默认）时表示不限，
+    与修复前「默认 8000」不同——旧默认值会在无人察觉的情况下截断超长
+    上下文，现交由运维显式配置。需要固定 8000 的调用方显式传参即可。
 
     自动按优先级排序、Token 预算裁剪，输出标准化的上下文块。
     替代各 workflow 中手动拼接 f-string 的分散实现。
@@ -350,4 +627,6 @@ def build_chapter_context(
         "WORK_INTERFACE": work_interface,
         "OTHER_CHAPTERS": other_chapters,
     }
-    return assemble_prompt_context(parts, max_tokens=max_tokens)
+    return assemble_prompt_context(
+        parts, max_tokens=max_tokens if max_tokens is not None else _default_context_max_tokens()
+    )

@@ -207,8 +207,8 @@ async def test_collect_json_response_dict_to_list_extraction():
 @pytest.mark.asyncio
 async def test_outline_semaphore_limits_concurrency():
     """
-    验证 OutlineSortOptimizerV2 并发控制：
-    Anthropic 并发 ≤5，其他 ≤10，且受 _adaptive_controller 限制。
+    验证 outline 并行填充的并发控制（semaphore 上限 + _adaptive_controller）：
+    Anthropic 并发 ≤5，其他 ≤10。
     """
     from app.services.ai.workflows import _adaptive_controller
 

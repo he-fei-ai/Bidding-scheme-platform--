@@ -19,6 +19,7 @@ from fastapi import HTTPException
 
 from ...config import AGNES_API_KEY, AGNES_BASE_URL, AGNES_MODEL
 from ...db import get_db, get_db_with_retry
+from ...logging_format import log_error as _log_error
 from ...utils.proxy_config import build_httpx_proxy_settings
 from ..crypto import decrypt_api_key, is_encrypted
 from . import provider_catalog
@@ -1076,6 +1077,15 @@ def create_provider_with_fallback(config: dict | None = None) -> tuple[Any, str]
             logger.debug("Provider %s 初始化失败: %s", entry.get("name", url), type(e).__name__)
 
     # 全部失败，返回主配置
+    # ENHANCE 2026-10-18（第三轮）：统一错误分类，便于告警按 error_code 聚合。
+    _log_error(
+        "所有 AI 提供商均不可用，回退到主配置 %s",
+        None,
+        error_code="AI_PROVIDER_UNAVAILABLE",
+        layer="service",
+        retryable=True,
+        primary_url=primary_url,
+    )
     logger.warning("所有 AI 提供商均不可用，回退到主配置 %s", primary_url)
     return _make_provider(
         api_key=api_key,
@@ -1215,6 +1225,15 @@ async def get_working_provider(primary_config: dict) -> tuple[Any, str]:
             continue
 
     # 全部失败，返回主配置
+    # ENHANCE 2026-10-18（第三轮）：统一错误分类，便于告警按 error_code 聚合。
+    _log_error(
+        "所有 AI 提供商均不可用，回退到主配置 %s",
+        None,
+        error_code="AI_PROVIDER_UNAVAILABLE",
+        layer="service",
+        retryable=True,
+        primary_url=primary_url,
+    )
     logger.warning("所有 AI 提供商均不可用，回退到主配置 %s", primary_url)
     return _make_provider(
         api_key=api_key,
@@ -1257,9 +1276,16 @@ async def _async_quick_health_check(base_url: str, api_key: str, model: str) -> 
         return True
     if resp.status_code == 429:
         logger.warning(
-            "Provider %s 返回 429 限流 (Retry-After=%s)，跳过",
+            "Provider %s 返回 429 限流 (Retry-After=%s)，跳过 | error_code=AI_RATE_LIMITED",
             base_url, resp.headers.get("Retry-After", "?"),
         )
     elif resp.status_code == 401:
-        logger.info("Provider %s 返回 401，跳过", base_url)
+        # ENHANCE 2026-10-18（第三轮）：401 多为**密钥/配置缺失**而非临时故障，
+        # 原以 INFO 输出会被海量调试日志淹没、根因不可见。提升为 WARNING 并附统一
+        # error_code，便于运维检索与告警聚合。
+        logger.warning(
+            "Provider %s 返回 401，跳过（多为 API 密钥未配置或无效）| "
+            "error_code=AI_AUTH_FAILED error_layer=service retryable=False",
+            base_url,
+        )
     return False

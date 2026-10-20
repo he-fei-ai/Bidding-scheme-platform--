@@ -374,6 +374,40 @@ _FACT_ONLY_LABELS: dict[str, str] = {
     "warranty": "质保期",
 }
 
+#: 仅事实字段的抽取关键词（同义词宽覆盖）。
+#: ENHANCE 2026-10-18（第二轮）：显式映射按「章节 → 所需事实」取事实时，
+#: 若只用标签窄匹配，「项目经理 / 技术负责人 / 劳动力计划」这类人员事实
+#: 会因标签不含「人员数量」四字而漏调（实证：E2E 八模块链中已确认的
+#: 项目经理事实进不了正文提示词）。标签本身仍是首个关键词，窄匹配不回归。
+#: 匹配顺序为字段名级优先、值级兜底（见 _match_fact），宽词只提升召回。
+FACT_ONLY_KEYWORDS: dict[str, list[str]] = {
+    "personnel_count": [
+        "人员数量", "人员", "劳动力", "管理人员", "作业人员",
+        "项目经理", "技术负责人", "项目班子", "人员配置", "人员配备",
+    ],
+    "equipment_model": [
+        "设备型号", "设备", "机械", "塔吊", "起重机械", "施工机械", "设备配置",
+    ],
+    "schedule_detail": [
+        "进度节点", "进度安排", "进度计划", "节点工期", "关键线路",
+    ],
+    "milestone": [
+        "里程碑", "节点目标", "关键节点", "重要节点",
+    ],
+    "quality_target": [
+        "质量目标", "质量标准", "验收标准", "质量等级",
+    ],
+    "safety_target": [
+        "安全目标", "安全等级", "安全标准",
+    ],
+    "response_time": [
+        "响应时间", "响应时限", "到场时间", "服务响应",
+    ],
+    "warranty": [
+        "质保期", "保修期", "质保", "保修",
+    ],
+}
+
 
 # ============================================================
 # 三、全局事实字段清单（按九大章节分类）
@@ -780,7 +814,9 @@ def select_fields_for_chapter(
         if meta:
             found = extraction_fields.get(fk) or _extract_from_facts(facts, meta)
         if not found and fk in _FACT_ONLY_LABELS:
-            found = _extract_from_facts(facts, {"fact_category": None, "fact_keywords": [_FACT_ONLY_LABELS[fk]]})
+            # 仅事实字段：宽关键词表（含同义词），标签窄匹配会漏调人员/设备类事实
+            _fk_kws = FACT_ONLY_KEYWORDS.get(fk) or [_FACT_ONLY_LABELS[fk]]
+            found = _extract_from_facts(facts, {"fact_category": None, "fact_keywords": _fk_kws})
         if found:
             fact_out[_lbl] = found
     return {

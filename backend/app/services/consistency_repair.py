@@ -304,6 +304,12 @@ def _load_all_project_content(conn, project_id: int) -> dict[int, str]:
     此时 `refresh_conflict_states` 的判据会退化为「全都不存在 → 全标已解决」，
     因此调用方必须在 update 之后、读失败时可感知 —— 故此处抛出而非静默吞掉，
     由外层 except 统一转成 report['message']。
+
+    排序口径（遗留加固 2026-10-19）：返回值是 `id → content` 的 dict，
+    本函数只做「冲突取值是否仍存在」的**集合**判定，与顺序无关，故不接入
+    目录树排序链路；但保留 `ORDER BY sort_order, id`（唯一权威的同父决胜键）
+    而非裸 `ORDER BY sort_order`，使将来若有调用方按插入序迭代时次序确定、
+    且与落库/展示/导出/正文生成的口径一致。
     """
     rows = conn.execute(
         "SELECT id, content FROM sections WHERE project_id = ? ORDER BY sort_order, id",

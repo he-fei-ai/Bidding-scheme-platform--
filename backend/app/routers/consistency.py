@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import threading
+import time
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
@@ -46,6 +47,13 @@ _CONSISTENCY_OP_LOCKS_MAX = 512
 #: 锁的插入序（用于 LRU 淘汰）。与 _CONSISTENCY_OP_LOCKS 同步维护。
 _CONSISTENCY_OP_LOCKS_ORDER: list[int] = []
 
+#: ENHANCE 2026-10-17（第八轮·§7.2-1 通用减载）：`consistency_audit_log` 整行随
+#: `/summary` 下发时，下列列**绝不**进入对外响应。当前仅 `conflicts_json`
+#: （大项目可达数十 KB，前端 `AuditSummaryCards` 从不消费）。集中在此声明，使「摘要
+#: 不返回大字段」成为显式契约，后续若再有类似重列，直接加进这个元组即可，避免回到
+#: 此前 `SELECT *` 默认全量下发的隐患。
+SUMMARY_EXCLUDED_COLUMNS: tuple[str, ...] = ("conflicts_json",)
+
 
 def _consistency_op_lock(project_id: int) -> asyncio.Lock:
     """取（必要时创建）该项目的操作锁；字典本身用线程锁保护。
@@ -64,7 +72,6 @@ def _consistency_op_lock(project_id: int) -> asyncio.Lock:
             _CONSISTENCY_OP_LOCKS_ORDER.remove(project_id)
         _CONSISTENCY_OP_LOCKS_ORDER.append(project_id)
         return lock
-
 
 def _evict_idle_locks_locked() -> None:
     """淘汰空闲锁直到低于上限（**调用方必须已持有** `_CONSISTENCY_OP_LOCKS_GUARD`）。
@@ -98,7 +105,20 @@ class _LockManager:
     """`async with _LockManager(project_id)` 语法糖（避免每处手写两行）。"""
 
     def __init__(self, project_id: int):
-        self._lock = _consistency_op_lock(project_id)
+        self._project_id = project_id
+        # BUG-FIX 2026-10-17（P3·锁表淘汰的隐性竞态窗口）：锁对象的获取从
+        # `__init__` 移到 `__aenter__`。原因是 LRU 淘汰只跳过 `locked()` 的锁，
+        # 而「`_consistency_op_lock` 返回锁 → `__aenter__` 真正 acquire」之间
+        # 存在一个窗口：这期间该锁既未持有、也无等待者，却已有一个请求拿着它
+        # 准备进临界区。当前单事件循环模型下 `async with _LockManager(pid)` 的
+        # 构造与 acquire 之间没有让出点、竞态不可达；但「淘汰安全性」此前只靠
+        # 这个**隐式调度保证**成立，`_evict_idle_locks_locked` 注释里「正在等待
+        # 或持有的锁不参与淘汰」对该窗口并不覆盖 —— 一旦将来有人在构造与进入
+        # 之间插入 await（如加等待日志/超时抢锁），同一项目的两个并发操作就会
+        # 各持一把不同的锁，临界区互斥被击穿。改为进入时**重新取字典里的规范
+        # 锁**：未发生淘汰时拿到的是同一对象（dict 命中，零行为变化）；发生过
+        # 淘汰时拿到的是新规范锁，互斥语义反而被保住。成本为一次 dict 查找。
+        self._lock: asyncio.Lock | None = None
         # BUG-FIX 2026-10-15（P2·可能 release 未持有的锁）：`asyncio.Lock.release()`
         # 在未持有时抛 `RuntimeError: not locked`。虽然 `acquire()` 被取消时不会
         # 留下持锁状态、`__aexit__` 也不会被调用，但 `_LockManager` 是**每个写
@@ -108,12 +128,16 @@ class _LockManager:
         self._acquired = False
 
     async def __aenter__(self):
+        # 进入时取规范锁（见 __init__ 的 BUG-FIX 2026-10-17 注释）。
+        # 两条路径都安全：无争用时 acquire 不让出、无淘汰窗口；有争用时该锁
+        # 已 `locked()`、不参与淘汰。
+        self._lock = _consistency_op_lock(self._project_id)
         await self._lock.acquire()
         self._acquired = True
         return self
 
     async def __aexit__(self, exc_type, exc, tb):
-        if self._acquired:
+        if self._acquired and self._lock is not None:
             self._lock.release()
             self._acquired = False
         return False
@@ -189,6 +213,7 @@ async def run_audit(project_id: int, user=Depends(get_current_user)):
     # ENHANCE 2026-09-29（P1 IDOR 收口）：审核/导出四路由统一接入项目属权校验，
     # 与 sections/facts/content_version 同口径；autofix 能改写正文，更不能裸奔。
     await enforce_project_access(project_id, user)
+    _audit_start = time.monotonic()
     try:
         # BUG-FIX 2026-09-18（P2）：run_full_audit 是同步重操作（全量读正文 +
         # 事实抽取），直接在事件循环里跑会阻塞整个服务（SSE/其他请求卡死）。
@@ -196,9 +221,15 @@ async def run_audit(project_id: int, user=Depends(get_current_user)):
         async with _LockManager(project_id):
             result = await asyncio.to_thread(consistency_auditor.run_full_audit, project_id)
         # T5 指标埋点（2026-10-16）：审计成功/失败计数。
-        from ..services.consistency_metrics import consistency_metrics
+        from ..services.consistency_metrics import consistency_metrics, record_audit
         consistency_metrics.inc(
             'audit_runs' if rules.is_audit_success(result.status) else 'audit_failed'
+        )
+        # ENHANCE 2026-10-17（第八轮·T7-3 监控埋点）：记录审计耗时与检出冲突数，
+        # 仅成功审计计入冲突数（失败审计无有效检出，conflicts_found=0 已兜底）。
+        record_audit(
+            int((time.monotonic() - _audit_start) * 1000),
+            result.conflicts_found if rules.is_audit_success(result.status) else 0,
         )
         # BUG-FIX 2026-10-08（P1·谎报成功）：`run_full_audit` 内部把异常吞掉并
         # 降级返回 `status='failed'` + 全 0，而本行此前**无条件**回 `status='ok'`。
@@ -247,6 +278,14 @@ async def run_audit(project_id: int, user=Depends(get_current_user)):
         }
     except Exception as e:
         logger.error('一致性审计失败: %s', e, exc_info=True)
+        # BUG-FIX 2026-10-17（P3·指标完整性）：异常路径此前不计 `audit_failed`
+        # —— 只有「内部降级为 failed 结果」的那条路径计数（见上方埋点）。于是
+        # 路由层直接抛异常（DB 连接失败 / to_thread 崩溃等）的 500 在
+        # `GET /consistency/metrics` 里完全观测不到，审计失败率被系统性低估。
+        # 两条失败路径现在都计数。
+        from ..services.consistency_metrics import consistency_metrics
+
+        consistency_metrics.inc('audit_failed')
         raise HTTPException(status_code=500, detail=f'审计失败: {e!s}') from e
 
 @router.get('/conflicts/{project_id}')
@@ -397,6 +436,19 @@ async def apply_autofix(
         修复报告（changed_sections / total_replacements / sections / skipped / message）
     """
     await enforce_project_access(project_id, user)
+    from ..services.consistency_metrics import record_autofix
+    # BUG-FIX 2026-10-17（P3·前后端口径不一致 / 防御深度）：AI 语义发现
+    # （`conflict_id` 以 `AI-` 开头，见 `consistency_rules` 冲突来源命名空间）
+    # 的 `values_json` 恒为 `'[]'` —— 没有任何可替换的旧值。前端已禁用其
+    # 「自动修复」按钮（2026-10-15 第六轮），但 API 层仍可调用并必然返回
+    # `no_change`：脚本 / 第三方调用方 / 未来的新 UI 入口拿到的一次注定失败
+    # 的写路径尝试。服务端显式拒绝并给出可读原因，与前端禁用提示同口径。
+    # 规则冲突（`conflict_` 前缀）不受影响，行为逐字不变。
+    if rules.is_ai_conflict_id(conflict_id):
+        raise HTTPException(
+            status_code=400,
+            detail='AI 语义发现没有结构化取值（统一不了具体数值），无法自动修复，请人工核对',
+        )
     # BUG-FIX 2026-10-13（L2 · 旁路写正文无守卫）：autofix 是裸 SQL 改写
     # sections.content 的旁路链路。目录生成进行中落文会被收尾的
     # DELETE+INSERT 静默覆盖（冲突被标已解决但正文实际被还原）。
@@ -446,12 +498,21 @@ async def apply_autofix(
             # 自相矛盾。现按 changed_sections 区分：有落文 → `partial`（部分完成，
             # 冲突保持未解决待人工处理）；无落文 → `no_change`。前端对非 ok 状态
             # 统一按 warning 展示并常驻结果卡片，两种状态都不再被误读为成功。
+            # ENHANCE 2026-10-17（第八轮·T7-3 监控埋点）：无正文改写的修复计入
+            # `autofix_no_change_total`，便于区分「真改了」与「没动静」。
+            record_autofix(no_change=True)
             if report.get('changed_sections'):
                 return {'status': 'partial', **report}
             return {'status': 'no_change', **report}
+        # ENHANCE 2026-10-17（第八轮·T7-3 监控埋点）：落文成功计入 `autofix_applied_total`，
+        # 并以 `total_replacements` 累积实际改写处数（autofix_edits_total）。
+        record_autofix(applied=True, edits=report.get('total_replacements', 0) or 0)
         return {'status': 'ok', **report}
     except Exception as e:
         logger.error('自动修复失败: %s', e, exc_info=True)
+        # ENHANCE 2026-10-17（第八轮·T7-3 监控埋点）：autofix 抛异常（HTTP 500）计入
+        # `autofix_failed_total`，与成功/无改动分开观测，避免失败率被低估。
+        record_autofix(failed=True)
         raise HTTPException(status_code=500, detail=f'修复失败: {e!s}') from e
 
 @router.post('/repair/{project_id}')
@@ -566,7 +627,23 @@ async def facts_backflow_proposals(
     await enforce_project_access(project_id, user)
     from ..services.consistency_backflow import propose_facts
 
-    result = await asyncio.to_thread(propose_facts, project_id, min_occurrences=min_occurrences)
+    # BUG-FIX 2026-10-17（P2·错误处理不一致）：本端点此前是模块内最后两个
+    # 「无 try/except + 无 logger」的端点之一（另一个是 rejection-coverage）——
+    # 2026-10-15 修过 facts_backflow_accept 的同类问题（裸 500），漏了这两个
+    # 只读端点。服务层异常会穿透到 FastAPI 默认 500：响应体是一句框架级别的
+    # "Internal Server Error"，日志里没有项目 ID / 参数 / 堆栈上下文，线上
+    # 用户报「扫描失败」时无从倒查。与模块内其余端点统一口径。
+    try:
+        result = await asyncio.to_thread(propose_facts, project_id, min_occurrences=min_occurrences)
+    except Exception as e:
+        logger.error(
+            '事实回流候选扫描失败: project=%s min_occurrences=%s: %s',
+            project_id,
+            min_occurrences,
+            e,
+            exc_info=True,
+        )
+        raise HTTPException(status_code=500, detail=f'候选事实扫描失败: {e!s}') from e
     return {'status': 'ok', **result}
 
 
@@ -642,7 +719,16 @@ async def rejection_answer_coverage_endpoint(
     await enforce_project_access(project_id, user)
     from ..services.rejection_coverage import rejection_answer_coverage
 
-    report = await asyncio.to_thread(rejection_answer_coverage, project_id)
+    # BUG-FIX 2026-10-17（P2·错误处理不一致）：与 facts_backflow_proposals 同源
+    # —— 本端点此前无 try/except + 无 logger，服务层异常穿透成框架级裸 500，
+    # 无项目上下文可倒查。统一补齐。
+    try:
+        report = await asyncio.to_thread(rejection_answer_coverage, project_id)
+    except Exception as e:
+        logger.error(
+            '废标条款应答覆盖率统计失败: project=%s: %s', project_id, e, exc_info=True
+        )
+        raise HTTPException(status_code=500, detail=f'覆盖率统计失败: {e!s}') from e
     return {'status': 'ok', **report}
 
 
@@ -668,6 +754,16 @@ async def get_audit_summary(project_id: int, user=Depends(get_current_user)):
               WHERE project_id = ?\
               ORDER BY audit_time DESC LIMIT 1', (project_id,)).fetchone()
             latest = dict(latest) if latest is not None else None
+            # ENHANCE 2026-10-17（第八轮·T7-1 技术债闭环 + §7.2-1 通用减载）：
+            # `consistency_audit_log` 的 `conflicts_json` 列在大项目下可达数十 KB，
+            # 而摘要卡片前端只消费 `audit_time` 与「是否确有审计记录」（见
+            # `AuditSummaryCards.tsx`：仅读 `summary.latest_audit?.audit_time` 与存在性）。
+            # 此前 `SELECT *` 把整列随响应下发，既浪费带宽也不必要。物化后立即按
+            # `SUMMARY_EXCLUDED_COLUMNS` 剔除——纯删字段、不改任何既有字段名/取值语义，
+            # 前端零改动、行为不变；后续若再有类似重列，加进该元组即可。
+            if latest is not None:
+                for _col in SUMMARY_EXCLUDED_COLUMNS:
+                    latest.pop(_col, None)
 
             unresolved = conn.execute('SELECT COUNT(*) as cnt FROM consistency_conflicts \
                WHERE project_id = ? AND COALESCE(resolved, 0) = 0', (project_id,)).fetchone()['cnt']

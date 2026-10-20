@@ -55,7 +55,14 @@ export default function AuditSummaryCards({ summary }: AuditSummaryCardsProps) {
             value={(summary.latest_audit?.audit_time as string) || "—"}
             valueStyle={{ fontSize: 18 }}
           />
-          {auditSourceLabel && (
+          {/*
+            BUG-FIX 2026-10-17（P3·来源标签误导）：`audit_source` 在后端无任何
+            审计记录时默认回落 'rule'（`consistency.py::get_audit_summary`），
+            此前这里照常渲染「规则审计」标签 —— 时间显示「—」却说来源是规则
+            审计，用户以为跑过一次审计且结论来自规则路径。仅在确有审计记录时
+            展示来源标签。
+          */}
+          {auditSourceLabel && summary.latest_audit && (
             <Tag color={auditSourceLabel.color} style={{ marginTop: 4 }}>
               {auditSourceLabel.text}
             </Tag>

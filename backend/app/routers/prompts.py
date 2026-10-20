@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import time
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -11,6 +12,8 @@ from ..services.ai.prompts import (
     extract_variables,
     reload_prompt_cache,
 )
+
+logger = logging.getLogger(__name__)
 
 
 # 增强 2026-09-29（安全）：提示词路由此前只有 PUT/reset 要求登录，GET 列表与详情
@@ -59,28 +62,21 @@ def _validate_prompt_content(key: str, content: str) -> None:
        AI 生成质量下降且难以排查）。允许通过 ?force=true 显式跳过（高级用户）。
 
     缺失变量以「默认模板变量 - 新内容变量」计算，大小写不敏感。
-    """
-    refs = _shared_refs(content)
-    bad_refs = [r for r in refs if _shared_target(r) is None]
-    if bad_refs:
-        raise HTTPException(
-            status_code=400,
-            detail=f"提示词引用了未注册的共享规则: {sorted(bad_refs)}",
-        )
 
-    default_vars = _default_variables(key)
-    new_vars = set(extract_variables(content))
-    # 大小写不敏感比较
-    new_vars_lower = {v.lower() for v in new_vars}
-    dropped = sorted(v for v in default_vars if v.lower() not in new_vars_lower)
-    if dropped:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"新内容删除了默认模板要求的变量占位符: {dropped}；"
-                f"这会导致对应上下文无法注入 AI。如确需删除，请使用 force=true 强制保存。"
-            ),
-        )
+    UNIFY 2026-10-17：具体规则下沉到 ``prompts._registry.validate_prompt_content``
+    （返回问题列表，便于单测与非 HTTP 场景复用），本函数只负责转成 400 响应，
+    避免两处各写一份判定逻辑导致口径漂移。
+    """
+    from ..services.ai.prompts import validate_prompt_content
+
+    problems = validate_prompt_content(key, content)
+    if not problems:
+        return
+    # 保留既有文案（前端与既有测试依赖），仅对新增项给出通用描述
+    detail = "；".join(problems)
+    if any(p.startswith("删除了默认模板要求的变量占位符") for p in problems):
+        detail += "；如确需删除，请使用 force=true 强制保存。"
+    raise HTTPException(status_code=400, detail=detail)
 
 
 def _shared_target(name: str) -> str | None:
@@ -267,12 +263,26 @@ async def get_prompts_overview():
     db_present = sum(1 for it in items if it["db_present"])
     total_calls = sum(it["calls"] for it in items)
 
+    # ENHANCE 2026-10-17（共享规则复用可观测性）：暴露 {shared:} 复用机制的
+    # 实际落地情况。审计发现注册表中无任何模板引用共享规则（adoption_rate=0），
+    # 即 SHARED_HEADING_RULES / SHARED_FORBIDDEN_WORDS / SHARED_OUTPUT_SPEC
+    # 三条规则从未注入任何提示词——「复用与覆盖」能力形同虚设。此处量化暴露，
+    # 便于持续跟踪收编进度（而非靠人工翻代码发现）。
+    try:
+        from ..services.ai.prompts import audit_shared_usage
+
+        shared_audit = audit_shared_usage()
+    except Exception as e:  # 审计失败不得影响主接口
+        logger.warning("shared usage audit failed: %s", e)
+        shared_audit = None
+
     return {
         "total": total,
         "db_present": db_present,
         "drifted": drifted_count,
         "total_calls": total_calls,
         "items": items,
+        "shared_usage": shared_audit,
     }
 
 
@@ -985,9 +995,18 @@ async def get_prompt_version(key: str, version_id: int):
 async def rollback_prompt(
     key: str,
     version_id: int,
+    force: bool = Query(False, description="跳过变量校验强制回滚"),
     current: User = Depends(get_current_user),
 ):
-    """回滚到指定历史版本：先把当前内容归档（source=rollback），再用历史版本覆盖。"""
+    """回滚到指定历史版本：先把当前内容归档（source=rollback），再用历史版本覆盖。
+
+    BUG-FIX-PROMPT-R8（2026-10-17，回滚绕过内容校验）：``PUT /{key}`` 保存时会
+    执行 ``_validate_prompt_content``（共享引用有效性 + 不得删除默认变量），
+    但回滚——本质上是「用历史内容覆盖当前内容」的**同种写操作**——却完全不校验。
+    于是历史版本中若存在无效 ``{shared:}`` 引用或缺失关键变量占位符，回滚会
+    把一份 PUT 都拒绝接受的坏内容写回生产，且管理页无任何提示，表现为
+    「回滚后 AI 输出突然劣化」。现与 PUT 同口径校验，并同样提供 force 逃生舱。
+    """
     changed_by = getattr(current, "username", "") or ""
 
     # PERF（2026-10-05）：读版本+归档+覆盖的整段同步 I/O 派发至工作线程；
@@ -1001,6 +1020,9 @@ async def rollback_prompt(
             if not target:
                 return None
             target = dict(target)
+            # R8：与 PUT 同口径校验（force=true 可跳过）
+            if not force:
+                _validate_prompt_content(key, target.get("content") or "")
             old = _current_row(conn, key)
             if old:
                 _archive_version(

@@ -1437,6 +1437,14 @@ export interface ContentOrchOptions {
   sectionPerSegment?: number;
 }
 
+/** 正文生成顺序模式（ENHANCE 2026-10-18 第二轮）：
+ *  parallel —— 一次性并发启动所有章节（旧行为，完成顺序不保证）
+ *  batch   —— 按目录树顺序分批，同父节点章节同批并行、批次间串行（默认）
+ *  serial  —— 逐节串行生成（最强上下文承接，最慢）
+ * 落库/展示/导出顺序始终与目录树顺序一致；batch/serial 额外校验实际生成顺序。
+ */
+export type ContentGenerationMode = "parallel" | "batch" | "serial";
+
 export function generateContentSSEUrl(
   projectId: number,
   writingLength: string = "standard",
@@ -1451,6 +1459,7 @@ export function generateContentSSEUrl(
   concurrency?: number,
   orchOptions?: ContentOrchOptions,
   useWordAdjust?: boolean | null,
+  generationMode?: ContentGenerationMode,
 ): string {
   const params = new URLSearchParams();
   params.set("writing_length", writingLength);
@@ -1506,6 +1515,11 @@ export function generateContentSSEUrl(
   if (useWordAdjust === true || useWordAdjust === false) {
     params.set("use_word_adjust", String(useWordAdjust));
   }
+  // ENHANCE 2026-10-18（第二轮）：顺序生成模式透传。不传 = 不下发该参数 →
+  // 走后端 Query 默认 "parallel"（与改动前行为逐字一致）。
+  if (generationMode && ["parallel", "batch", "serial"].includes(generationMode)) {
+    params.set("generation_mode", generationMode);
+  }
   return toSSEFullUrl(`/api/v1/projects/${projectId}/sections/generate-content?${params.toString()}`);
 }
 
@@ -1523,8 +1537,9 @@ export function createContentEventSource(
   concurrency?: number,
   orchOptions?: ContentOrchOptions,
   useWordAdjust?: boolean | null,
+  generationMode?: ContentGenerationMode,
 ): EventSource {
-  const url = generateContentSSEUrl(projectId, writingLength, regenerateIds, rootSectionId, regenerateMissing, level2Default, useOrchestration, useWordSampling, useFallbackExpand, useConsistencyAudit, concurrency, orchOptions, useWordAdjust);
+  const url = generateContentSSEUrl(projectId, writingLength, regenerateIds, rootSectionId, regenerateMissing, level2Default, useOrchestration, useWordSampling, useFallbackExpand, useConsistencyAudit, concurrency, orchOptions, useWordAdjust, generationMode);
   return new EventSource(url, { withCredentials: false });
 }
 
@@ -1546,6 +1561,7 @@ export function createContentStream(
   concurrency?: number,
   orchOptions?: ContentOrchOptions,
   useWordAdjust?: boolean | null,
+  generationMode?: ContentGenerationMode,
 ): {
   onopen: (() => void) | null;
   onmessage: ((event: { data: string }) => void) | null;
@@ -1555,7 +1571,7 @@ export function createContentStream(
   markTerminalEvent: () => void;
   promise: Promise<void>;
 } {
-  const url = generateContentSSEUrl(projectId, writingLength, regenerateIds, rootSectionId, regenerateMissing, level2Default, useOrchestration, useWordSampling, useFallbackExpand, useConsistencyAudit, concurrency, orchOptions, useWordAdjust);
+  const url = generateContentSSEUrl(projectId, writingLength, regenerateIds, rootSectionId, regenerateMissing, level2Default, useOrchestration, useWordSampling, useFallbackExpand, useConsistencyAudit, concurrency, orchOptions, useWordAdjust, generationMode);
 
   let aborted = false;
   let detached = false;
@@ -1878,7 +1894,17 @@ export async function getGenerationStatus(projectId: number): Promise<{
   cancelled_count?: number;
   started_at?: string;
   paused_at?: string;
-  sections?: Array<{ id: number; title: string; status: string; progress: number; quality_score?: number }>;
+  // 后端 get_project_progress 直接返回 `SELECT * FROM section_generation_progress`，
+  // 每行以 `section_id` 为主键、**无 title**（标题由前端从目录树映射）。
+  // 旧注解写成 `id`/`title` 与实际不符，重载恢复回填进度时读不到 section_id。
+  sections?: Array<{
+    section_id: number;
+    status: string;
+    progress: number;
+    retry_count?: number;
+    quality_score?: number | null;
+    last_error?: string | null;
+  }>;
 }> {
   const res = await http.get(`/projects/${projectId}/sections/generation-status`);
   return res.data;
@@ -2925,9 +2951,15 @@ export async function fetchPromptVersion(key: string, versionId: number): Promis
   return res.data;
 }
 
-/** 回滚到指定历史版本 */
-export async function rollbackPrompt(key: string, versionId: number): Promise<void> {
-  await http.post(`/prompts/${key}/versions/${versionId}/rollback`);
+/**
+ * 回滚到指定历史版本。
+ *
+ * 后端自 2026-10-17 起对回滚施加与「保存」相同的内容校验（共享引用有效性 +
+ * 不得删除默认变量占位符），阻止把 PUT 都拒绝接受的坏内容写回生产。
+ * 历史版本确实无法通过校验时，传 force=true 可显式跳过（与保存一致）。
+ */
+export async function rollbackPrompt(key: string, versionId: number, force = false): Promise<void> {
+  await http.post(`/prompts/${key}/versions/${versionId}/rollback${force ? "?force=true" : ""}`);
 }
 
 // ========== 提示词监控模块 ==========
@@ -3070,17 +3102,17 @@ export async function getBudgetPrediction(): Promise<any> {
   return res.data;
 }
 
-export async function getBudgetSuggestions(): Promise<any[]> {
+export async function getBudgetSuggestions(): Promise<any[] | { suggestions?: any[] }> {
   const res = await http.get("/prompts/budget/suggest");
   return res.data;
 }
 
-export async function getCostSuggestions(): Promise<any[]> {
+export async function getCostSuggestions(): Promise<any[] | { suggestions?: any[] }> {
   const res = await http.get("/prompts/cost/suggestions");
   return res.data;
 }
 
-export async function compareModelCosts(): Promise<any[]> {
+export async function compareModelCosts(): Promise<any[] | { comparison?: any[] }> {
   const res = await http.get("/prompts/cost/compare-models");
   return res.data;
 }
@@ -3453,7 +3485,16 @@ export async function runConsistencyAudit(projectId: number): Promise<AuditResul
   // 浏览器链接预取 / 代理重试都会静默跑一次全量正文重扫。后端已用
   // `api_route(methods=["GET","POST"])` 补上规范动词并保留 GET 兼容，
   // 此处切到 POST；响应体一字未变。
-  const res = await http.post<AuditResult>(`/consistency/audit/${projectId}`);
+  //
+  // BUG-FIX 2026-10-17（P2·前端超时与后端耗时量级不匹配）：http 实例默认
+  // 60s 超时，而确定性审计是「全量章节正文 × 7 类事实正则」的 O(全文长度)
+  // 扫描 —— 大项目（数十 MB 正文）在慢磁盘/低配机器上可能超过 60s。axios
+  // 超时只中断**前端**请求，后端 to_thread 里的审计仍在跑并最终落库：
+  // 用户看到「审计失败」，刷新后冲突却已经更新，体验上等于一次假失败。
+  // 提升到 300s（与 Agent 修复同量级），纯客户端配置、不影响后端契约。
+  const res = await http.post<AuditResult>(`/consistency/audit/${projectId}`, null, {
+    timeout: 300000,
+  });
   return res.data;
 }
 
@@ -3730,11 +3771,19 @@ export async function repairConsistencyWithAi(
   dryRun = false,
   sectionIds?: number[],
 ): Promise<AiRepairReport> {
+  // BUG-FIX 2026-10-17（P2·前端超时与后端耗时量级不匹配）：http 实例默认
+  // 60s 超时，而 AI 补丁修复是「逐批 AI 调用（单批 24K 字符）+ 失败回喂重试」
+  // 的不可预知耗时 —— 大项目多批次轻松超过 60s（姊妹端点
+  // `repairConsistencyWithAgent` 早就显式设了 600s，这里却用默认值）。
+  // 超时后 axios 中断前端请求，但后端 repair 仍在跑并最终落库 + 收敛冲突
+  // 状态：用户看到「AI 修复失败」，随后手动刷新却发现冲突已解决 —— 一次
+  // 假失败，且冲突列表不会自动刷新。提升到 600s 与 Agent 修复对齐。
   const res = await http.post<AiRepairReport>(`/consistency/repair/${projectId}`, null, {
     params: {
       dry_run: dryRun,
       ...(sectionIds && sectionIds.length ? { section_ids: sectionIds.join(",") } : {}),
     },
+    timeout: 600000,
   });
   return res.data;
 }
@@ -3845,6 +3894,27 @@ export interface FactProposal {
   occurrences_map: { value: string; count: number }[];
 }
 
+/**
+ * 采纳结果。
+ * ENHANCE 2026-10-13（第六轮·R-14 闭环）：新增 `skipped` —— 被「基准类别互斥」
+ * 规则挡下的候选会连同**可读原因**一并返回。此前这类候选要么被静默丢弃、要么
+ * 入库后与既有事实互判成「改正文也无法消解」的冲突；现在前端显式提示，避免
+ * 用户看到「采纳 0 条」却查不出原因。该字段可选（老后端不返回时不影响）。
+ */
+export interface FactProposalSkipped {
+  fact_name: string;
+  value: string;
+  category?: string;
+  reason: string;
+}
+
+export interface FactProposalAcceptResult {
+  status: string;
+  added: number;
+  merged_total: number;
+  skipped?: FactProposalSkipped[];
+}
+
 export async function proposeFactsFromConflicts(
   projectId: number,
   opts: { minOccurrences?: number } = {},
@@ -3868,8 +3938,8 @@ export async function proposeFactsFromConflicts(
 export async function acceptFactProposals(
   projectId: number,
   proposals: FactProposal[],
-): Promise<{ status: string; added: number; merged_total: number }> {
-  const res = await http.post<{ status: string; added: number; merged_total: number }>(
+): Promise<FactProposalAcceptResult> {
+  const res = await http.post<FactProposalAcceptResult>(
     `/consistency/facts/proposals/${projectId}/accept`,
     { proposals },
   );
@@ -4965,6 +5035,46 @@ export async function generateSingleChartPayload(
     chart_type,
     title_hint: title_hint || "",
     use_ai: use_ai || false,
+  });
+  return res.data;
+}
+
+/** 单章节自动编排闭环结果（2026-10-17，需求 1/3/4） */
+export interface AutoOrchestrateSectionResponse {
+  ok: boolean;
+  section_id: number;
+  analysis: {
+    needed: boolean;
+    chart_type: string;
+    confidence: number;
+    reason: string;
+    title_hint: string;
+    insert_after: string;
+    source: string;
+    insert_paragraph_index: number;
+  } | null;
+  inserted: boolean;
+  persisted_chart_field: string;
+  skipped_reason: string;
+  validation_errors: string[];
+  insert_paragraph_index: number;
+  payload: Record<string, unknown> | null;
+  fence: string;
+}
+
+/**
+ * 单章节图表自动编排闭环（全部自动生成，无人工配图按钮）：
+ * 分析 → 生成载荷 → 校验修复 → 围栏写入正文最佳位置 → 落库。
+ */
+export async function autoOrchestrateSection(
+  projectId: number,
+  sectionId: number,
+  insertIntoContent: boolean = true,
+): Promise<AutoOrchestrateSectionResponse> {
+  const res = await http.post("/charts/auto-orchestrate-section", {
+    project_id: projectId,
+    section_id: sectionId,
+    insert_into_content: insertIntoContent,
   });
   return res.data;
 }

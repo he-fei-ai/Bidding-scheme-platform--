@@ -17,6 +17,7 @@
  */
 import { describe, it, expect, vi, beforeAll } from "vitest";
 import type { DocumentCheckResult } from "../types";
+import { taskStore } from "../services/taskStore";
 
 const hasDom = typeof window !== "undefined" && typeof document !== "undefined";
 
@@ -200,6 +201,9 @@ describe.skipIf(!hasDom)("ExportConfigPage 组件级交互（导出链契约）"
     const rtl = await loadRtl();
     if (!rtl) return;
     exportDocxStreamMock.mockClear();
+    // FIX-E（2026-10-17）：钉住导出任务挂接全局 taskStore 的状态流转
+    const startSpy = vi.spyOn(taskStore, "startTask");
+    const completeSpy = vi.spyOn(taskStore, "completeTask");
 
     const Page = (await import("./ExportConfigPage")).default;
     rtl.render(<Page />);
@@ -216,8 +220,18 @@ describe.skipIf(!hasDom)("ExportConfigPage 组件级交互（导出链契约）"
     const [, cfg] = exportDocxStreamMock.mock.calls[0] as [number, Record<string, unknown>];
     expect(cfg).toHaveProperty("preset_id", "formal-binding");
     expect(cfg).toHaveProperty("strict_mode", false);
+    // FIX-E：任务启动时登记到全局 store（taskType=export，顶栏跨页面可见）
+    expect(startSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ projectId: 1, taskType: "export" }),
+    );
+    // FIX-E：完成后以终态收尾（taskId=export-<pid>，status=completed）
+    await vi.waitFor(() =>
+      expect(completeSpy).toHaveBeenCalledWith("export-1", "completed", expect.any(String)),
+    );
     // SSE 成功分支不应降级重跑同步接口
     expect(exportDocxMock).not.toHaveBeenCalled();
+    startSpy.mockRestore();
+    completeSpy.mockRestore();
     rtl.cleanup();
   });
 

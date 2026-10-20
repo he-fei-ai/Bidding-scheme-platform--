@@ -17,15 +17,36 @@
 按 300 字口径判，兜底扩写却按全局档位算阈值）。**每新增一个消费者就多一次分叉
 机会**，因此本次把公式收敛到本模块，5 处全部改为调用它。
 
-优先级（唯一公式，5 处共用）
----------------------------
-1. ``level < 3`` → ``None``（L1/L2 是父节点，不生成正文，不参与字数控制）；
-2. 单节点 ``target_words`` 精确覆盖 → 用户显式设置，最高优先级；
-3. 单节点 ``word_count_tier`` 档位覆盖 → 该档位 ``target_words`` / ``tolerance_ratio``；
-4. ``level == 3`` 且为「L3 自身正文」（默认口径；调用方已知有无下级章节时用
+统一优先级（合并后的唯一公式，体系 A/B 单一入口）
+------------------------------------------------
+本平台历史上存在**两套并列、互不覆盖**的字数控制体系：
+
+| 体系 | 口径 | 规则来源 | 历史入口 |
+| --- | --- | --- | --- |
+| A 档位（相对） | L3 自身 300±20% / 四档±10% / 单节覆盖 | ``word_count_tiers`` 表 + ``writing_length_config`` 常量 | 本模块五级公式 |
+| B 易标（绝对强控） | R5 ``[ceil(0.8S), floor(1.2S)]`` + R8 初稿倒推 | ``services/word_control.py`` 纯函数（零 DB/零 AI） | ``word_control_runtime.build_section_override`` 覆盖表 |
+
+2026-10-20 体系合并（第三轮）：体系 B 的强控覆盖作为**最高优先级项**
+（``strict_override``）收编进本模块统一公式，全部消费者（提示词侧、压缩侧、
+SSE 侧、校验页侧、兜底扩写侧、R12 回写侧）收敛为一次调用，不再各自维护
+「先查强控覆盖、未命中再走档位」的双分支。**公式零重复**——R5/R8 数值依旧
+全部来自 ``word_control.py`` 纯函数，本模块只做「装配后的区间选择」。
+
+优先级（唯一公式，所有消费者共用）：
+1. ``strict_override`` 命中（体系 B 快照派生 R5 区间）→ target=S、lo/hi=R5、
+   tolerance=0.20、source=``word_control_strict``（附带 R8 初稿锚点 generation_anchor）；
+2. ``level < 3`` → ``None``（L1/L2 是父节点，不生成正文，不参与字数控制）；
+3. 单节点 ``target_words`` 精确覆盖 → 用户显式设置，体系 A 内最高优先级
+   （2026-10-20 起生成侧同样尊重，移除旧「提示词侧契约 P-22」例外）；
+4. 单节点 ``word_count_tier`` 档位覆盖 → 该档位 ``target_words`` / ``tolerance_ratio``；
+5. ``level == 3`` 且为「L3 自身正文」（调用方已知有无下级章节时用
    ``is_l3_own`` 显式声明）→ ``L3_OWN_TARGET_WORDS``(300) ± ``L3_OWN_TOLERANCE_RATIO``(20%)；
-5. 全局 ``writing_length`` 档位 → 该档位配置；
-6. 默认档位（standard）。
+6. 全局 ``writing_length`` 档位 → 该档位配置；默认档位（standard）兜底。
+
+注：覆盖表由装配层 ``word_control_runtime.build_section_override`` 产出并由
+调用方传入（本模块不 import 装配层，避免反向依赖）。历史上本模块曾是
+ 5 份同构实现的收编点（sse_utils / word_count / workflows_sections /
+ workflows_expand / condense 内联解析），现已升级为两套体系的唯一入口。
 
 容差口径
 --------
@@ -49,6 +70,7 @@ from typing import Any, Mapping, Optional
 
 
 #: 目标来源标识（便于日志与 SSE payload 自描述，便于回归断言）。
+SOURCE_STRICT = "word_control_strict"
 SOURCE_SECTION_TARGET_WORDS = "section_target_words"
 SOURCE_SECTION_TIER = "section_tier"
 SOURCE_L3_OWN = "l3_own"
@@ -61,18 +83,24 @@ DEFAULT_SECTION_TOLERANCE = 0.10
 
 @dataclass(frozen=True)
 class SectionWordTarget:
-    """单节的字数控制口径解析结果（不可变）。"""
+    """单节的字数控制口径解析结果（不可变）。
+
+    ``generation_anchor``：仅体系 B 强控命中时非 0 —— R8 初稿倒推目标
+    （含装配侧 GUARD 钳制），供提示词侧取写作锚点；档位路径恒为 0。
+    """
 
     target: int
     lo: int
     hi: int
     tolerance: float
     source: str
+    generation_anchor: int = 0
 
     @property
     def label(self) -> str:
         """人类可读来源标签（提示词与前端 tooltip 用）。"""
         return {
+            SOURCE_STRICT: "强控快照（易标 R5）",
             SOURCE_SECTION_TARGET_WORDS: "单节目标覆盖",
             SOURCE_SECTION_TIER: "单节档位",
             SOURCE_L3_OWN: "L3 自身正文",
@@ -107,6 +135,39 @@ def _bounds(target: int, tolerance: float) -> tuple[int, int]:
     return int(target * (1 - tol)), int(target * (1 + tol))
 
 
+def _strict_from_override(
+    strict_override: Optional[Mapping],
+) -> Optional[SectionWordTarget]:
+    """体系 B 强控覆盖 → 统一口径对象（命中时短路，优先级最高）。
+
+    命中条件：``section_words > 0`` 且 ``hi > 0`` 且 ``lo > 0``（装配层
+    ``build_section_override`` 产物恒含四键；非法/缺键视为未命中，
+    由调用方回落体系 A 档位链）。tolerance 不信任入参，始终取
+    ``word_control.STRICT_SECTION_TOLERANCE`` 权威常量（公式零重复）。
+    """
+    if not strict_override or not isinstance(strict_override, Mapping):
+        return None
+    try:
+        section_words = int(strict_override.get("section_words") or 0)
+        lo = int(strict_override.get("lo") or 0)
+        hi = int(strict_override.get("hi") or 0)
+        anchor = int(strict_override.get("generation_target") or 0)
+    except (TypeError, ValueError):
+        return None
+    if section_words <= 0 or hi <= 0 or lo <= 0:
+        return None
+    try:
+        from .word_control import STRICT_SECTION_TOLERANCE
+
+        tol = float(STRICT_SECTION_TOLERANCE)
+    except Exception:
+        tol = 0.20
+    return SectionWordTarget(
+        target=section_words, lo=lo, hi=hi, tolerance=tol,
+        source=SOURCE_STRICT, generation_anchor=anchor,
+    )
+
+
 def resolve_section_word_target(
     *,
     level: Any = 3,
@@ -114,6 +175,7 @@ def resolve_section_word_target(
     word_count_tier: Any = None,
     writing_length: Any = None,
     is_l3_own: Optional[bool] = None,
+    strict_override: Optional[Mapping] = None,
 ) -> Optional[SectionWordTarget]:
     """解析单节的有效目标字数与达标区间（唯一权威口径）。
 
@@ -125,10 +187,18 @@ def resolve_section_word_target(
         is_l3_own: L3 是否为「自身正文」节点。``None`` 表示调用方无子节点信息，
             按既有多数派口径视为 True（L3 叶子是默认形态）；已知下级章节的调用方
             （正文提示词侧）应显式传 False，让该 L3 回落到四档「子树总字数」口径。
+        strict_override: 体系 B 强控覆盖（``word_control_runtime.
+            build_section_override`` 的逐节产物）；命中时短路返回 R5 区间，
+            优先于含 L1/L2 过滤在内的所有档位口径（覆盖表本就只装 L3+ 节）。
 
     Returns:
         ``SectionWordTarget``；``level < 3`` 时返回 ``None``（不参与控制）。
     """
+    # 0) 体系 B 强控覆盖（合并后最高优先级，2026-10-20）
+    strict = _strict_from_override(strict_override)
+    if strict is not None:
+        return strict
+
     try:
         lvl = int(level or 3)
     except (TypeError, ValueError):
@@ -187,8 +257,12 @@ def resolve_section_word_target_from_mapping(
     *,
     writing_length: Any = None,
     is_l3_own: Optional[bool] = None,
+    strict_override: Optional[Mapping] = None,
 ) -> Optional[SectionWordTarget]:
-    """从章节 dict / ORM 行解析目标字数（字段名兼容两种表达）。"""
+    """从章节 dict / ORM 行解析目标字数（字段名兼容两种表达）。
+
+    ``strict_override`` 为体系 B 强控覆盖（可选），命中时短路优先。
+    """
     if section is None:
         return None
     if isinstance(section, Mapping):
@@ -203,6 +277,7 @@ def resolve_section_word_target_from_mapping(
         word_count_tier=get("word_count_tier", None),
         writing_length=writing_length,
         is_l3_own=is_l3_own,
+        strict_override=strict_override,
     )
 
 
@@ -212,6 +287,7 @@ __all__ = [
     "SOURCE_L3_OWN",
     "SOURCE_SECTION_TARGET_WORDS",
     "SOURCE_SECTION_TIER",
+    "SOURCE_STRICT",
     "SOURCE_WRITING_LENGTH_TIER",
     "SectionWordTarget",
     "resolve_section_word_target",

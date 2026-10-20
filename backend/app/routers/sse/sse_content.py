@@ -8,7 +8,11 @@ import time
 from typing import Any
 from fastapi import HTTPException, Query
 from starlette.responses import StreamingResponse
-from ...config import SSE_HEARTBEAT_INTERVAL_SECS, SSE_QUEUE_POLL_INTERVAL_SECS
+from ...config import (
+    CONTENT_GENERATION_MODE,
+    SSE_HEARTBEAT_INTERVAL_SECS,
+    SSE_QUEUE_POLL_INTERVAL_SECS,
+)
 from ...db import get_db
 from ...services.ai.provider_factory import get_ai_config
 from ...models import SectionUpdate
@@ -54,7 +58,12 @@ from ...services.v51_state import (
 from ..task_control import _cancel_events, _cancel_events_lock, _cancel_tasks
 
 from .sse_charts import _auto_generate_charts_for_section
-from .sse_db_ops import _mark_sections_generating, _rollback_dirty_sections, _save_section_to_db
+from .sse_db_ops import (
+    _mark_sections_generating,
+    _rollback_dirty_sections,
+    _save_section_to_db,
+    check_analysis_stale_async,
+)
 from .sse_shared import SSE_TERMINAL_STATUSES, _background_tasks, logger
 from .sse_utils import _build_leaf_dicts, _fetch_project_data_async, _try_get_provider
 
@@ -105,6 +114,66 @@ def _should_emit_heartbeat(
         and (now - last_heartbeat_time) >= interval_secs
     )
 
+
+# BUG-FIX 2026-10-17（P1·SSE 整体进度越界）：章节终态计数器去重化。
+#
+# 旧实现是 saved/failed/cancelled 三个累加整数：主生成 failed 的章节经
+# BUG-C-04 重试成功后，`failed_count` 不递减、`saved_count` 再 +1，
+# overall_progress 的 `done = saved + failed + cancelled` 双计 → percent
+# 最高可达 200%（探针 scripts/_audit6_probe.py::A1 实证：2 章主生成全败、
+# 重试全成，事件序列 percent = 50→100→150→200）。重试循环末尾虽按
+# results 重算（原 :1722-1724），但救不回重试期间已推送的越界事件，且
+# cancelled_count 从不重算。
+#
+# 改为按 section_id 记录「最近一次终态」的映射，计数随时从映射派生：
+# 同一章节重复回调（重试成功）自动覆盖上一次终态，任意时刻
+# saved + failed + cancelled == 已终态回调的去重章节数，done ≤ total 恒成立。
+_TALLY_TERMINAL_STATUSES = ("completed", "failed", "cancelled")
+
+
+class _SectionTally:
+    """按 section_id 去重的章节终态计数器（纯逻辑，便于单测）。"""
+
+    __slots__ = ("_status",)
+
+    def __init__(self) -> None:
+        self._status: dict = {}
+
+    def record(self, section_id, status: str) -> None:
+        """登记一个章节终态；同一章节重复登记以最后一次为准（重试覆盖）。"""
+        if section_id is None:
+            return
+        self._status[section_id] = status
+
+    def recount(self, results: list) -> None:
+        """用最新 results 全量重算（重试循环结束后调用，修正全部终态）。"""
+        self._status = {
+            r.get("id"): r.get("status")
+            for r in (results or [])
+            if r.get("id") is not None and r.get("status") in _TALLY_TERMINAL_STATUSES
+        }
+
+    def _count(self, status: str) -> int:
+        return sum(1 for s in self._status.values() if s == status)
+
+    @property
+    def saved(self) -> int:
+        return self._count("completed")
+
+    @property
+    def failed(self) -> int:
+        return self._count("failed")
+
+    @property
+    def cancelled(self) -> int:
+        return self._count("cancelled")
+
+    @property
+    def done(self) -> int:
+        """已终态的去重章节数（= saved + failed + cancelled，绝不双计）。"""
+        return len(self._status)
+
+
 async def generate_content_impl(
 
     project_id: int,
@@ -148,6 +217,17 @@ async def generate_content_impl(
     # BUG-FIX 2026-10-05 同款约束：必须追加在**签名末尾**，否则
     # routers/sections.py::generate_content 的位置参数调用会整体错位。
     use_word_adjust: bool | None = Query(None),
+    # 2026-10-18 ENHANCE: generation mode for ordered batch processing
+    # BUG-FIX 2026-10-18（第二轮）：默认值必须是**普通字符串**而非 Query("parallel")。
+    # 本函数被 routers/sections.py::generate_content 以位置参数内部调用，
+    # 未经 FastAPI 解析时 Query 默认值会是原始 Query 对象（非 str），
+    # 一路透传到 SSE 事件 json.dumps 抛 TypeError，被主循环宽泛 except
+    # 误判为「客户端断开」提前断流。普通字符串默认值两种调用路径都安全。
+    # 第二轮统一：默认值取 config.CONTENT_GENERATION_MODE（导入时已校验合法，
+    # 默认 batch），使「系统默认 = 后端默认 = 前端默认」保持同一事实源。
+    # 注意：直接赋值常量而非 Query(常量) —— FastAPI 对带普通默认值的函数参数
+    # 同样按查询参数解析，且位置调用时拿到的是真字符串。
+    generation_mode: str = CONTENT_GENERATION_MODE,
 ):
 
     """SSE 并发生成正文（EventSource 只支持 GET）
@@ -185,9 +265,27 @@ async def generate_content_impl(
 
         concurrency: 并发数（覆盖AI配置的默认值）
 
+        generation_mode: 生成顺序模式 parallel/batch/serial。
+            默认取 config.CONTENT_GENERATION_MODE（batch）：按目录树顺序分批，
+            同父节点章节同批并行、批次间串行，实际生成顺序与目录树顺序一致。
+            serial=逐节串行（承接最强）；parallel=一次性并发（旧行为，
+            完成顺序不保证）。落库/展示/导出顺序在任何模式下均与目录树一致。
+
     """
 
-
+    # BUG-FIX 2026-10-18（第二轮）：防御性归一化 generation_mode。
+    # 任何非法的非字符串值（如历史调用路径漏传时的 Query 对象）或大小写/
+    # 空白变体一律回落 config.CONTENT_GENERATION_MODE（导入时已校验合法），
+    # 保证下游 _run_sections / SSE 事件负载类型安全。
+    if not isinstance(generation_mode, str):
+        generation_mode = ""
+    generation_mode = generation_mode.strip().lower()
+    if generation_mode not in ("parallel", "batch", "serial"):
+        logger.warning(
+            "[正文生成] generation_mode 非法值 %r，已回落为 %s",
+            generation_mode, CONTENT_GENERATION_MODE,
+        )
+        generation_mode = CONTENT_GENERATION_MODE
 
     # SSE 事件生成器
 
@@ -273,6 +371,24 @@ async def generate_content_impl(
 
                     yield f"data: {json.dumps({'status': 'error', 'message': '请先完成摘要和评分点识别'}, ensure_ascii=False)}\n\n"
 
+                    return
+
+                # A-2 2026-10-17 硬拦截：analysis 是否已因文件变更而过时
+                # 用 async helper（内部 asyncio.to_thread）避免 SSE 主循环阻塞
+                try:
+                    _is_stale, _stale_reason = await check_analysis_stale_async(project_id)
+                except Exception as _stale_e:
+                    logger.warning(
+                        "[正文生成] stale 检查异常，放行: project=%d err=%s",
+                        project_id, _stale_e,
+                    )
+                    _is_stale = False
+
+                if _is_stale and _stale_reason:
+                    yield f"data: {json.dumps({'status': 'error', 'message': _stale_reason}, ensure_ascii=False)}\n\n"
+                    logger.warning(
+                        "[正文生成] analysis 过时，拒绝生成 project=%d", project_id,
+                    )
                     return
 
                 summary = project_data.get("summary", "")
@@ -491,6 +607,75 @@ async def generate_content_impl(
             # 字段调用追溯：记录每个章节实际注入了哪些字段（供审计/自检）
             field_trace: list = []
 
+            # ENHANCE 2026-10-18（第二轮）：危大工程识别（正文阶段上下文注入）。
+            # 扫描招标文本命中危大工程关键词时，生成阶段向相关章节注入
+            # 「必含章节/表格/图表、安全阈值、适用规范」判定参数。
+            # 异常/无命中均不阻塞生成（无命中时下游不注入，行为不变）。
+            hazard_info: dict | None = None
+            try:
+                from ...config import CONTENT_HAZARD_SCAN as _HAZARD_SCAN
+
+                if _HAZARD_SCAN:
+                    from ...services.ai.hazard_projects import scan_hazard_projects
+
+                    _hazard_scan_text = "\n".join(
+                        [t for t in (tender_context or "", summary or "") if t]
+                    )
+                    _hazard_result = scan_hazard_projects(_hazard_scan_text)
+                    if _hazard_result.detected:
+                        hazard_info = {
+                            "detected": [
+                                {
+                                    "code": hp.code,
+                                    "name": hp.name,
+                                    "required_sections": hp.required_sections,
+                                    "required_tables": hp.required_tables,
+                                    "required_charts": hp.required_charts,
+                                    "safety_threshold": hp.safety_threshold,
+                                    "reference_standards": hp.reference_standards,
+                                }
+                                for hp in _hazard_result.detected
+                            ],
+                            "suggested_sections": _hazard_result.suggested_sections,
+                        }
+                        logger.info(
+                            "[正文生成] 危大工程识别: %d 类（%s）",
+                            len(_hazard_result.detected),
+                            ", ".join(hp.name for hp in _hazard_result.detected),
+                        )
+            except Exception as _hz_e:
+                logger.warning("[正文生成] 危大工程识别失败（跳过）: %s", _hz_e)
+
+            # ENHANCE 2026-10-18（第二轮）：适用规范清单（从招标文本确定性抽取
+            # GB/JGJ/CJJ 等标准编号），注入稳定上下文层。无命中 → 空列表 →
+            # 下游不注入，行为与改动前一致。
+            standards_list: list[dict] = []
+            try:
+                from ...config import CONTENT_STANDARDS_INJECT as _STD_INJECT
+
+                if _STD_INJECT:
+                    from ...services.ai.ordered_generation import (
+                        extract_standards_from_text,
+                    )
+
+                    standards_list = extract_standards_from_text(
+                        tender_context or "", max_items=20
+                    )
+                    if standards_list:
+                        logger.info(
+                            "[正文生成] 适用规范清单: %d 项（%s）",
+                            len(standards_list),
+                            ", ".join(s["code"] for s in standards_list[:5]),
+                        )
+            except Exception as _std_e:
+                logger.warning("[正文生成] 规范清单抽取失败（跳过）: %s", _std_e)
+
+            # 2026-10-18 ENHANCE（第二轮）：实际生成顺序追踪器（主生成 + 重试
+            # 共享同一实例），供生成后统一校验「实际顺序 vs 目录树顺序」。
+            from ...services.ai.ordered_generation import GenerationOrderTracker
+
+            _order_tracker = GenerationOrderTracker()
+
             # R14 硬门槛（易标字数控制 2026-10-12）：项目一旦配置了绝对字数
             # 目标（最少/最多/每节任一 > 0），生成正文前必须持有「与目录版本
             # 配对」的生效快照；未配置（全 0）时保持既有档位体系，不设门槛。
@@ -576,6 +761,11 @@ async def generate_content_impl(
 
 
 
+        # BUG-FIX 2026-10-17（P1·SSE 进度越界）：终态计数改由 _SectionTally
+        # 按 section_id 去重派生（重试成功的章节自动覆盖主生成的 failed），
+        # saved/failed/cancelled 三个快照变量保留供下游读取，每次登记后刷新。
+        _section_tally = _SectionTally()
+
         saved_count = 0
 
         failed_count = 0
@@ -594,6 +784,12 @@ async def generate_content_impl(
         # 每个 SSE 连接固定落在一个 worker 上，计数只服务于当前连接的
         # overall_progress 事件推送，无需共享状态。
         chart_enqueued_count = 0
+
+        # Risk-P3d FIX 2026-10-17：worker 在信号量内遇到 cancel_event 会
+        # `continue` 丢弃已取走的任务——该章被 chart_processed（= 入队 −
+        # 队列剩余）计为「已处理」，实为取消跳过。单列计数器，收尾日志
+        # 区分「已取走(含处理中)」与「取消跳过」，排障不再误导。
+        chart_skipped_count = 0
 
         # BUG-P2b FIX 2026-10-11：整体进度推送节流。
         # 防止每完成一个章节就推一次相同 percent 值 → 日志噪声。
@@ -748,6 +944,8 @@ async def generate_content_impl(
 
             """从 chart_queue 取章节，调配图引擎"""
 
+            nonlocal chart_skipped_count
+
             while not chart_done_event.is_set() or not chart_queue.empty():
 
                 # PERF-CHART-WORKER-EXIT: check done_event BEFORE queue.get()
@@ -779,6 +977,10 @@ async def generate_content_impl(
                 async with chart_semaphore_pipe:
 
                     if cancel_event.is_set():
+
+                        # Risk-P3d FIX 2026-10-17：取消跳过的任务单独计数，
+                        # 避免被 chart_processed 口径吞掉（见初始化处注释）。
+                        chart_skipped_count += 1
 
                         continue
 
@@ -1054,55 +1256,52 @@ async def generate_content_impl(
 
             async with results_lock:
 
-                if status == "completed":
-
-                    saved_count += 1
-
-                elif status == "failed":
-
-                    failed_count += 1
-
-                elif status == "cancelled":
-
-                    cancelled_count += 1
+                # BUG-FIX 2026-10-17（P1）：按 section_id 去重登记终态并刷新
+                # 快照——重试成功的章节在此覆盖主生成时的 failed，杜绝双计。
+                _section_tally.record(sid, status)
+                saved_count = _section_tally.saved
+                failed_count = _section_tally.failed
+                cancelled_count = _section_tally.cancelled
 
 
 
             wc = _count_words(content) if content else 0
 
-            # CONVERGE 2026-10-12：单章节事件补字数目标/区间，让前端
-            # ProgressPanel 直接显示「目标 N 字（lo~hi）· 实际 M 字 · 偏差 ±X」，
-            # 无需二次请求字数统计页。口径全部来自唯一权威解析器 +
-            # 强控覆盖表（_wc_override），与校验页 / R12 警告同源。
+            # CONVERGE 2026-10-12 + 体系合并 2026-10-20：单章节事件的目标/区间由
+            # **唯一权威解析器**一次给出——强控覆盖（体系 B R5）作为 strict_override
+            # 传入，命中即短路（source=word_control_strict），未命中走体系 A 档位链；
+            # 前端 ProgressPanel 直接显示「目标 N 字（lo~hi）· 实际 M 字 · 偏差 ±X」，
+            # 与提示词 / 压缩 / 校验页 / R12 警告同源同值。
             _target = _target_lo = _target_hi = _target_source = None
             try:
-                _ov = _wc_override.get(sid) if _wc_override else None
-                if _ov:
-                    _target = int(_ov.get("section_words") or 0)
-                    _target_lo = int(_ov.get("lo") or 0)
-                    _target_hi = int(_ov.get("hi") or 0)
-                    _target_source = "strict"
-                else:
-                    from ...services.word_target_resolver import (
-                        resolve_section_word_target_from_mapping as _resolve_wt,
-                    )
+                from ...services.word_target_resolver import (
+                    resolve_section_word_target_from_mapping as _resolve_wt,
+                )
 
-                    _sec_for_target = sections_by_id.get(sid) or {}
-                    _resolved = _resolve_wt(_sec_for_target, writing_length=writing_length)
-                    if _resolved:
-                        _target = int(_resolved.target)
-                        _target_lo = int(_resolved.lo)
-                        _target_hi = int(_resolved.hi)
-                        _target_source = _resolved.source
-                    else:
-                        # 兜底：未命中强控/解析器时使用章节默认目标
-                        _sec = sections_by_id.get(sid) or {}
-                        _lvl = _sec.get("level", 3)
-                        _default_t = 500 if _lvl == 1 else 300
-                        _target = _default_t
-                        _target_lo = int(max(0, _default_t * 0.8))
-                        _target_hi = _default_t
-                        _target_source = "fallback_default"
+                _ov = _wc_override.get(sid) if _wc_override else None
+                _sec_for_target = sections_by_id.get(sid) or {}
+                _lvl_for_target = int(_sec_for_target.get("level", 3) or 3)
+                _is_own_for_target = (
+                    (not children_map.get(sid)) if _lvl_for_target == 3 else None
+                )
+                _resolved = _resolve_wt(
+                    _sec_for_target,
+                    writing_length=writing_length,
+                    is_l3_own=_is_own_for_target,
+                    strict_override=_ov,
+                )
+                if _resolved:
+                    _target = int(_resolved.target)
+                    _target_lo = int(_resolved.lo)
+                    _target_hi = int(_resolved.hi)
+                    _target_source = _resolved.source
+                else:
+                    # 兜底：未命中强控/解析器（L1/L2）时使用章节默认目标
+                    _default_t = 500 if _lvl_for_target == 1 else 300
+                    _target = _default_t
+                    _target_lo = int(max(0, _default_t * 0.8))
+                    _target_hi = _default_t
+                    _target_source = "fallback_default"
             except Exception as _tgt_e:
                 logger.debug("[字数目标] 章节 %s 目标解析失败（忽略）: %s", sid, _tgt_e)
                 # 兜底：确保即使出错也有默认值，防止 frontend 显示 NaN
@@ -1154,7 +1353,10 @@ async def generate_content_impl(
             # generate_content_impl 的结构保证 leaf_dicts 恒定；若因极端边界（如
             # 生成早期回调）仍未定义，兜底使用 0 并由 max(_,1) 避免零Division。
             _total = len(leaf_dicts) if isinstance(leaf_dicts, list) else 0
-            _done = saved_count + failed_count + cancelled_count
+            # BUG-FIX 2026-10-17（P1）：done 直接取 tally 的去重计数，
+            # 不再由三个快照相加（重试期间快照虽已同步刷新，但取单一权威
+            # 口径可防未来某条路径漏刷新导致再次双计）。
+            _done = _section_tally.done
             _percent = round(_done / max(_total, 1) * 100)
             _now = _time.time()
             if _now - _last_overall_progress_event_at >= _OVERALL_PROGRESS_THROTTLE_SECS or _last_overall_progress_event_at == 0:
@@ -1605,6 +1807,13 @@ async def generate_content_impl(
 
                     # ENHANCE 2026-10-14（facts-ns P1-3）：缺值策略透传
                     facts_policy=facts_policy,
+                    # 2026-10-18 ENHANCE: generation mode for ordered batch processing
+                    generation_mode=generation_mode,
+                    # 2026-10-18 ENHANCE（第二轮）：危大工程判定参数 / 适用规范清单 /
+                    # 顺序追踪器（主生成与重试共享同一实例）
+                    hazard_info=hazard_info,
+                    standards_list=standards_list,
+                    order_tracker=_order_tracker,
 
                 )
 
@@ -1643,9 +1852,14 @@ async def generate_content_impl(
                         ld for ld in leaf_dicts if ld.get("id") in _failed_section_ids
                     ]
                     if _retry_sections:
+                        # BUG-FIX 2026-10-17（第七轮·SSE 进度语义）：首条
+                        # retry_round 的 round 字段旧为 0，而 message 文案是
+                        # "开始重试 Round 1/2"——前端 `d.round ?? 1`（空值
+                        # 合并不回退 0）展示「第 0/2 轮」（探针 P7 实证）。
+                        # 本事件宣告第 1 轮重试**开始**，round 置 1。
                         await queue.put({
                             "status": "retry_round",
-                            "round": 0,
+                            "round": 1,
                             "total_rounds": _MAX_RETRY_ROUNDS,
                             "retry_count": len(_retry_sections),
                             "message": f"主生成失败 {len(_retry_sections)} 章，开始重试 Round 1/{_MAX_RETRY_ROUNDS}",
@@ -1684,6 +1898,15 @@ async def generate_content_impl(
                                     word_control=_wc_override,
                                     # ENHANCE 2026-10-14（facts-ns P1-3）：缺值策略透传
                                     facts_policy=facts_policy,
+                                    # BUG-FIX 2026-10-18（第二轮）：重试必须透传
+                                    # generation_mode——缺失时重试静默回落 parallel，
+                                    # 丢失顺序生成模式与前序章节上下文注入。
+                                    generation_mode=generation_mode,
+                                    # 2026-10-18 ENHANCE（第二轮）：危大/规范/追踪器
+                                    # 与主生成保持一致（重试章节同样需要这些上下文）。
+                                    hazard_info=hazard_info,
+                                    standards_list=standards_list,
+                                    order_tracker=_order_tracker,
                                 )
                                 # 更新 results 中对应条目的状态（重试成功的替换掉 failed 条目）
                                 _retry_success_ids = {
@@ -1720,8 +1943,90 @@ async def generate_content_impl(
                                 continue
 
                 # 重新统计计数（重试后 updated）
-                saved_count = sum(1 for r in results if r.get("status") == "completed")
-                failed_count = sum(1 for r in results if r.get("status") == "failed")
+                # BUG-FIX 2026-10-17（P1）：经 _SectionTally.recount 全量重算，
+                # 一并修正 cancelled_count（旧实现只重算 saved/failed，
+                # cancelled 章节在 stopped/completed 终态事件里口径不准）。
+                _section_tally.recount(results)
+                saved_count = _section_tally.saved
+                failed_count = _section_tally.failed
+                cancelled_count = _section_tally.cancelled
+
+                # === 2026-10-18 ENHANCE（第二轮）：生成后综合校验（最终版）===
+                # 主生成 + 重试全部完成后，用共享顺序追踪器校验：
+                #   ① 实际生成顺序 vs 目录树顺序（serial/batch 严格、parallel 告警）；
+                #   ② 完整性（无缺失/重复生成）；
+                #   ③ 全局事实调用（章节→所需事实映射表完整性 + 与全局事实冲突）；
+                #   ④ 上下文注入（context_check 汇总）。
+                # 结果以 verification 事件推送（前端可展示），并记 INFO 日志。
+                try:
+                    from ...config import CONTENT_ORDER_VERIFY as _ORDER_VERIFY_FINAL
+
+                    if _ORDER_VERIFY_FINAL:
+                        from ...services.ai.ordered_generation import (
+                            verify_generation_completeness,
+                        )
+
+                        _expected_ids_final = [
+                            ld["id"] for ld in leaf_dicts if ld.get("id") is not None
+                        ]
+                        # 空追踪器守卫：_run_sections 被替换/未记录完成事件时
+                        # （如测试假件），不做顺序校验，回落 results 索引对齐口径，
+                        # 避免把「无顺序数据」误报为「章节缺失」。
+                        _tracker_for_verify = (
+                            _order_tracker if getattr(_order_tracker, "sequence", None) else None
+                        )
+                        _final_verification = verify_generation_completeness(
+                            [r for r in results if r is not None],
+                            _expected_ids_final,
+                            field_contract=field_contract,
+                            generation_mode=str(generation_mode),
+                            field_trace=field_trace,
+                            facts=global_facts,
+                            order_tracker=_tracker_for_verify,
+                        )
+                        _ctx_bad = [
+                            r.get("title") for r in results
+                            if isinstance(r, dict)
+                            and isinstance(r.get("context_check"), dict)
+                            and not r["context_check"].get("ok")
+                        ]
+                        if _ctx_bad:
+                            _final_verification.setdefault("warnings", []).append({
+                                "type": "context_injection_issue",
+                                "level": "warn",
+                                "detail": f"上下文注入校验未通过章节: {_ctx_bad[:10]}",
+                            })
+                        # BUG-FIX 2026-10-20（灰度开关观测闭环）：长上下文降级
+                        # 生效章节随 verification 事件上报——CONTENT_CONTEXT_
+                        # DEGRADE_ENABLED 开启后，用户/运维可实时看到「哪些章节
+                        # 的参考资料被裁剪」，作为默认值决策的采样依据。
+                        _degraded = [
+                            r.get("title") for r in results
+                            if isinstance(r, dict) and r.get("context_degraded")
+                        ]
+                        if _degraded:
+                            _final_verification.setdefault("warnings", []).append({
+                                "type": "context_degraded",
+                                "level": "warn",
+                                "detail": f"长上下文降级生效章节（参考资料已裁剪，共 {len(_degraded)} 节）: {_degraded[:10]}",
+                            })
+                            _final_verification["context_degraded_count"] = len(_degraded)
+                        if not _final_verification.get("ok"):
+                            logger.info(
+                                "[正文生成] 生成后综合校验(最终): %d 个错误, %d 个警告",
+                                len(_final_verification.get("issues", [])),
+                                len(_final_verification.get("warnings", [])),
+                            )
+                        await queue.put({
+                            "status": "verification",
+                            "ok": _final_verification.get("ok"),
+                            "issues": _final_verification.get("issues", []),
+                            "warnings": _final_verification.get("warnings", []),
+                            "order": _final_verification.get("order"),
+                            "generation_mode": str(generation_mode),
+                        })
+                except Exception as _final_ver_e:
+                    logger.warning("[正文生成] 生成后综合校验(最终)执行失败（忽略）: %s", _final_ver_e)
 
                 gen_elapsed = time.time() - gen_start_ts
 
@@ -1863,27 +2168,39 @@ async def generate_content_impl(
 
 
 
-                        # 兜底扩写阈值：基于各章节 effective target_words 的 80%，
-                        # 确保扩写不会停在远低于章节目标的位置
+                        # 兜底扩写阈值：基于各章节统一解析目标的 80%，
+                        # 确保扩写不会停在远低于章节目标的位置。
+                        # 体系合并 2026-10-20：强控覆盖（体系 B R5）同样交给
+                        # 统一解析器（strict_override 短路，target=S，与旧手工
+                        # _ov 分支逐值一致），删除平行分支。
+                        from ...services.word_target_resolver import (
+                            resolve_section_word_target_from_mapping as _resolve_wt,
+                        )
                         _section_effective_targets = []
                         for _r in results:
                             _sid = _r.get("id")
-                            # 易标 R5：强控生效时以快照 S 为基准（S×80% 恰为区间下限），
-                            # 保证扩写不会停在强控区间之外。
-                            _ov = _wc_override.get(_sid) if _wc_override else None
-                            if _ov:
-                                _section_effective_targets.append(int(_ov["section_words"]))
-                                continue
                             if _sid and _sid in sections_by_id:
                                 _sec = sections_by_id[_sid]
-                                _lvl = _sec.get("level", 3)
-                                if _lvl >= 2:
-                                    # 二级目录及以下：与正文生成一致，由写作长度模式控制
-                                    _section_effective_targets.append(level_target(writing_length, _lvl, 300))
-                                elif _tw := _sec.get("target_words"):
-                                    _section_effective_targets.append(_tw)
+                                _lvl = int(_sec.get("level", 3) or 3)
+                                # D5 修复 2026-10-20：兜底扩写达标线改走唯一权威解析器
+                                # word_target_resolver，与生成/校验/压缩/R12 同口径
+                                # （强控覆盖 > 单节 target_words > 单节档位 > L3 自身
+                                # 300±20% > 全局 writing_length > 默认档位），不再用
+                                # level_target 把 L3 自身叶子按全局档位（如 2000）判
+                                # 阈值；含下级的 L3 经 children_map 走四档子树口径；
+                                # 解析为空时回落 level_target 兜底。
+                                _is_own = (not children_map.get(_sid)) if _lvl == 3 else None
+                                _ov = _wc_override.get(_sid) if _wc_override else None
+                                _wt_r = _resolve_wt(
+                                    _sec,
+                                    writing_length=writing_length,
+                                    is_l3_own=_is_own,
+                                    strict_override=_ov,
+                                )
+                                if _wt_r and _wt_r.target:
+                                    _section_effective_targets.append(int(_wt_r.target))
                                 else:
-                                    _section_effective_targets.append(500 if _lvl == 1 else 300)
+                                    _section_effective_targets.append(level_target(writing_length, _lvl, 300))
 
                         if _section_effective_targets:
                             # 所有章节都应至少达到各自 target 的 80%
@@ -2023,11 +2340,19 @@ async def generate_content_impl(
 
                         results = expanded
 
-                        # BUG 修复：扩写后重新统计计数，避免 completed 事件报告的 success 数量不准确
-
-                        saved_count = sum(1 for r in results if r.get("status") == "completed")
-
-                        failed_count = sum(1 for r in results if r.get("status") == "failed")
+                        # BUG-FIX 2026-10-17（第七轮·计数单一权威）：扩写会
+                        # 整体替换 results，计数必须经 _SectionTally 全量重算
+                        # （与 BUG-C-04 重试循环结束时的 recount 同构）——旧实现
+                        # 直接 sum 重算 saved/failed、cancelled 从不重算，
+                        # 与 overall_progress（tally 口径）及 completed 终态
+                        # 事件存在结构性分叉风险：当前 expand_content_fallback
+                        # 不改 status 故数值巧合一致，一旦未来扩写路径改写
+                        # 状态（如扩写失败标记 failed），三个计数口径将立即
+                        # 互相矛盾（探针 P6 实证旧实现绕过 tally）。
+                        _section_tally.recount(results)
+                        saved_count = _section_tally.saved
+                        failed_count = _section_tally.failed
+                        cancelled_count = _section_tally.cancelled
 
                         # SSE payload 对称化（2026-10-12）：此前本事件只有
                         # status/message，而 word_count_condense 带 5 个统计字段，
@@ -2244,6 +2569,9 @@ async def generate_content_impl(
                             _wc_state,
                             results,
                             single_section=len(leaf_ids_for_generation) == 1,
+                            # 体系合并 2026-10-20：回写目标经统一解析器逐节解析
+                            # （strict_override 短路项，与生成/压缩/校验/SSE 同源）。
+                            override=_wc_override,
                         )
 
                         if _word_control_warning:
@@ -2418,8 +2746,9 @@ async def generate_content_impl(
 
                     logger.info(
                         "自动配图流水线完成: 总入队=%d, 已取走(含处理中)≈%d, "
-                        "队列剩余=%d, 落库成功章节=%d",
-                        _chart_enqueued, chart_processed, remaining, saved_count,
+                        "队列剩余=%d, 取消跳过=%d, 落库成功章节=%d",
+                        _chart_enqueued, chart_processed, remaining,
+                        chart_skipped_count, saved_count,
                     )
 
 
@@ -2605,7 +2934,20 @@ async def generate_content_impl(
 
                     stopped = True
 
-                    await queue.put({"status": "stopped", "total": len(results), "success": 0})
+                    # BUG-FIX 2026-10-17（第七轮·SSE 终态字段不对称）：全
+                    # cancelled 分支的 stopped 事件旧仅带 total/success，缺
+                    # cancelled/failed——前端 stopped 处理器
+                    # （SectionEditorPage.tsx:1016-1017）读 d.cancelled /
+                    # d.failed 得 undefined → 归零，进度面板把「全部取消」
+                    # 显示成「0 取消 0 失败」，与 CancelledError 分支的
+                    # stopped（带全字段）不对称（探针 P8 实证）。
+                    await queue.put({
+                        "status": "stopped",
+                        "total": len(results),
+                        "success": saved_count,
+                        "cancelled": cancelled_count,
+                        "failed": failed_count,
+                    })
 
                 elif cancelled_count > 0:
 
@@ -2810,13 +3152,23 @@ async def generate_content_impl(
 
                         logger.warning("[正文生成] 后台任务完成后 finalize_task 失败: %s", _fin_e)
 
+                # HARDEN 2026-10-17（P3 卫生性·非竞态修正）：统一为「容器存在
+                # 即尝试移除 → 移除后为空则删键」，与紧邻的 _cancel_tasks
+                # 清理保持同构。与旧写法**唯一**的行为差异：容器已为空列表时
+                # 也会删键（旧写法因 `and cancel_event in _evs` 短路而跳过）。
+                # 说明：这**不是**竞态修复 —— 此清理位于 run_generation 的
+                # finally 尾部、无条件执行，不存在「某分支跳过清理导致 Event
+                # 残留」的路径；stop/pause/disconnect 语义由 cancel_event 本身
+                # 与 generation_manager 状态机保证。此处仅消除空键驻留与写法漂移。
                 async with _cancel_events_lock:
 
                     _evs = _cancel_events.get(project_id)
 
-                    if _evs and cancel_event in _evs:
+                    if _evs:
 
-                        _evs.remove(cancel_event)
+                        if cancel_event in _evs:
+
+                            _evs.remove(cancel_event)
 
                         # BUG-FIX 2026-09-16（低）：空列表也要清键，防止残留
 
@@ -2929,6 +3281,14 @@ async def generate_content_impl(
 
                             "status": "slow_warning",
 
+                            # BUG-FIX 2026-10-17（P2 负数余量）：软告警阈值
+                            # _soft_warn_secs = estimated * 1.5，在大项目上会
+                            # **超过**硬熔断 14400s（300 章 / 并发 8 →
+                            # estimated≈18900s → soft≈28350s）。此时若仍按
+                            # `SSE_TOTAL_TIMEOUT - elapsed` 计算余量会得到负数，
+                            # 前端显示「距硬熔断还剩 -232 min」纯属误导。
+                            # 改为 clamp 到 0，并显式给出 soft/hard 两个阈值，
+                            # 让前端与测试都能判断「软告警是否已无意义」。
                             "message": (
 
                                 f"已生成 {saved_count}/{len(leaf_dicts)} 章，"
@@ -2939,13 +3299,28 @@ async def generate_content_impl(
 
                                 f"距硬熔断({SSE_TOTAL_TIMEOUT//60}min)还剩 "
 
-                                f"{int((SSE_TOTAL_TIMEOUT - elapsed_total)/60)} min"
+                                f"{max(0, int((SSE_TOTAL_TIMEOUT - elapsed_total)/60))} min"
 
                             ),
 
                             "elapsed": int(elapsed_total),
 
                             "estimated": int(_estimated_secs),
+
+                            "soft_warn_secs": _soft_warn_secs,
+
+                            "hard_timeout_secs": SSE_TOTAL_TIMEOUT,
+
+                            "remaining_to_hard_secs": max(
+
+                                0, int(SSE_TOTAL_TIMEOUT - elapsed_total)
+
+                            ),
+
+                            # True 表示软告警阈值已越过硬熔断阈值本身
+                            # （大项目估算过乐观），余量信息不再有意义，
+                            # 前端应改用「预计总时长」口径提示。
+                            "soft_warn_exceeds_hard": _soft_warn_secs >= SSE_TOTAL_TIMEOUT,
 
                             "saved": saved_count,
 
@@ -3602,7 +3977,7 @@ async def expand_content_impl(
 
                             all_rows = conn.execute(
 
-                                "SELECT id, parent_id, title, level, target_words, content, status FROM sections WHERE project_id = ? ORDER BY sort_order, id",
+                                "SELECT id, parent_id, title, level, sort_order, target_words, content, status FROM sections WHERE project_id = ? ORDER BY sort_order, id",
 
                                 (project_id,),
 
@@ -3693,13 +4068,26 @@ async def expand_content_impl(
 
                 sections_by_id = {r["id"]: dict(r) for r in all_rows}
 
+                # 2026-10-18 ENHANCE（第二轮·扩写顺序）：扩写逐章串行推进，
+                # 顺序决定「前一节摘要」注入与后续承接。旧实现按 all_rows 的
+                # SQL 顺序（ORDER BY sort_order, id）—— sort_order 是同父节点
+                # 兄弟序号，跨 L1 会重复（每个 L1 的第一个 L2 都是 1），
+                # 全局按它排序会把两棵子树交错（1.1, 2.1, 1.2, 2.2），即扩写
+                # 链路同样存在「跳章乱序」。现按目录树深度优先前序展开。
+                try:
+                    from ...services.ai.ordered_generation import order_tree_dfs
+
+                    _expand_order = order_tree_dfs([dict(r) for r in all_rows])
+                except ImportError:  # pragma: no cover - 防御性兜底
+                    _expand_order = [dict(r) for r in all_rows]
+
                 results = [
 
                     {"id": r["id"], "content": r["content"] or "", "status": r["status"] or ""}
 
-                    for r in all_rows
+                    for r in _expand_order
 
-                    if r["content"]  # sqlite3.Row 用下标/键访问
+                    if r["content"]  # sqlite3.Row 下标/键访问
 
                 ]
 
@@ -3905,9 +4293,13 @@ async def expand_content_impl(
 
                     _evs = _cancel_events.get(project_id)
 
-                    if _evs and cancel_event in _evs:
+                    # HARDEN 2026-10-17（P3 卫生性）：同上，统一为「容器存在
+                    # 即尝试移除 → 为空则删键」，消除空键驻留与写法漂移。
+                    if _evs:
 
-                        _evs.remove(cancel_event)
+                        if cancel_event in _evs:
+
+                            _evs.remove(cancel_event)
 
                         # BUG-FIX 2026-09-16（低）：空列表也要清键，防止残留
 
@@ -4081,13 +4473,17 @@ async def expand_content_impl(
                             del _cancel_tasks[project_id]
 
                 # 3) 清理取消事件记录
+                # HARDEN 2026-10-17（P3 卫生性）：同 run_generation finally，
+                # 统一为「容器存在即尝试移除 → 为空则删键」。
                 async with _cancel_events_lock:
 
                     _evs = _cancel_events.get(project_id)
 
-                    if _evs and cancel_event in _evs:
+                    if _evs:
 
-                        _evs.remove(cancel_event)
+                        if cancel_event in _evs:
+
+                            _evs.remove(cancel_event)
 
                         # BUG-FIX 2026-09-16（低）：空列表也要清键，防止残留
 

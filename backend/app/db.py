@@ -819,6 +819,7 @@ def init_db():
                 extracted_text_path TEXT,
                 message TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
                 FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
             );
 
@@ -904,6 +905,32 @@ def _migrate(conn: sqlite3.Connection):
         )
     except sqlite3.OperationalError:
         pass
+
+    # BUG-FIX 2026-10-17（GAP reclaim 误判）：uploaded_files 补 updated_at 列。
+    # 此前 reclaim_stale_parse_state 用 created_at 判 stale processing，
+    # 但 _persist_file_extraction（async-reparse 路径）改回 processing 时
+    # created_at 不变 → 立即被误判为 stale。新列追踪最近一次状态变更时间。
+    # BUG-FIX 2026-10-19（上传解析失败·第三层根因）：原写法
+    # `NOT NULL DEFAULT (datetime('now','localtime'))` 在 ALTER ADD COLUMN 里
+    # 是非法的——SQLite 只允许常量默认值，每次启动都抛
+    # "Cannot add a column with non-constant default"，又被 except pass 吞掉，
+    # 老库该列永远加不上。而 save_upload 的 INSERT 显式写 updated_at，
+    # 于是所有上传在提取成功后必然 "no column named updated_at" 失败并回滚删文件。
+    # 现改为常量默认值 + 回填 created_at（全部写路径均显式维护该列）。
+    try:
+        conn.execute(
+            "ALTER TABLE uploaded_files ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''"
+        )
+        conn.execute(
+            "UPDATE uploaded_files SET updated_at = created_at "
+            "WHERE updated_at IS NULL OR updated_at = ''"
+        )
+        logger.info("uploaded_files.updated_at 列已补齐并回填")
+    except sqlite3.OperationalError as e:
+        # 正常幂等：新库建表 DDL 已含该列 / 本次之前已迁移过（duplicate column）。
+        # 其余错误不再静默吞掉——上次就是这么把线上库漏列故障藏了 2 天。
+        if "duplicate column" not in str(e).lower():
+            logger.warning("uploaded_files.updated_at 迁移失败（上传保存将受影响）: %s", e)
 
     _ensure_table(
         conn,

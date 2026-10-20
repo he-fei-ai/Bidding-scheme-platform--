@@ -69,6 +69,18 @@ CONCUR_INITIAL = int(
 # 全局AI并发上限：跨所有项目限制的总并发AI请求数，防止provider过载
 GLOBAL_AI_CONCURRENCY_MAX = int(os.environ.get("GLOBAL_AI_CONCURRENCY_MAX", str(CONCUR_MAX)))
 
+# ========== BUG-2026-10-19-02（P1 生产修复）：AI 调用超时可配置 + 自适应 ==========
+# 背景：`collect_json_response`（workflows_base.py）内层 with_timeout 原先硬编码
+# 20s(json_mode)/30s(降级)，与 provider 自身的 max_tokens 自适应超时
+# （openai_compatible.chat：>=16000 tokens→180s、>=8000→120s）直接冲突——
+# 慢模型（生产实证 spark-x2.5-4b）生成 L1 目录（max_tokens=8192）需 >30s，
+# 外层提前熔断把整个目录生成任务判死（日志实证 3 连败 project=1871130，
+# 「目录生成AI调用超时(json_mode)（20秒）」，详见 logs/backend.log 22:59-23:03）。
+# 修复：两项超时改为环境变量可配；内容调用超时按 max_tokens 自适应抬高，
+# 外层上限永不低于 provider 自身预算（`_content_call_timeout` 实现）。
+AI_JSON_MODE_TIMEOUT = max(5, int(os.environ.get("AI_JSON_MODE_TIMEOUT", "20")))
+AI_CALL_TIMEOUT = max(10, int(os.environ.get("AI_CALL_TIMEOUT", "60")))
+
 
 # SSE 总超时时间（秒），防止长连接挂起
 # 目录生成默认15分钟
@@ -212,6 +224,17 @@ PPT_COM_TIMEOUT = int(os.environ.get("PPT_COM_TIMEOUT", "120"))
 #   默认 200；设为 0 表示不限制（保留旧行为）。
 PARSE_TASK_RETENTION = int(os.environ.get("PARSE_TASK_RETENTION", "200"))
 
+# PARSE_TASK_STALE_MINUTES：processing 停留超过该分钟数即判定为孤儿，由 beat 收敛为 failed。
+# 背景（GAP-FIX 2026-10-17）：图片上传（R-3）走「broker 派发 → worker 收尾」，下列任一情形
+# 都会让 uploaded_files 与 file_parse_tasks **永久停在 processing**：
+#   1. dispatch_task 把消息投给了 broker，但 worker 未运行 / 队列消息丢失；
+#   2. worker 进程被 SIGKILL（Celery time_limit 超时、容器重启），except 分支来不及执行；
+#   3. 任务重试耗尽前 worker 崩溃。
+# 此前没有任何回收路径：prune_parse_tasks 明确「在途 processing 行一律保留」，
+# cleanup_old_results（每小时 beat）也不碰这两张表 —— 前端进度条因此永久卡住，
+# 用户只能删除重传。默认 60 分钟（远大于大图 OCR 的正常耗时）；设为 0 可关闭回收。
+PARSE_TASK_STALE_MINUTES = int(os.environ.get("PARSE_TASK_STALE_MINUTES", "60"))
+
 
 # ========== 增强 10.1（P-2）：PDF 表格感知提取 ==========
 # True 时 PDF 优先走 pdfplumber 提取：按页加「--- 第 N 页 ---」页码标识，
@@ -219,6 +242,15 @@ PARSE_TASK_RETENTION = int(os.environ.get("PARSE_TASK_RETENTION", "200"))
 # pdfplumber 未安装或提取失败时自动回退 pypdf（原有行为），因此默认开启安全。
 # 设为 false 可强制走 pypdf 纯文本路径（pdfplumber 内存占用更高时用）。
 PDF_TABLE_EXTRACT_ENABLED = os.environ.get("PDF_TABLE_EXTRACT_ENABLED", "true").lower() == "true"
+
+# ========== BUG-FIX 2026-10-19：PDF 提取超时护栏 ==========
+# 与 PPT_COM_TIMEOUT / OCR_TIMEOUT 同一教训：解析在请求线程内同步执行，
+# 遇到病态 PDF（或日志风暴等环境放大）会挂 thousands 倍时长，前端超时判失败、
+# file_parse_tasks 永停 processing、uploaded_files 无任何记录。
+# 现给 _extract_pdf 整体加限时护栏：超时报错，由 save_upload 既有失败分支
+# 如实写任务行 failed + 文件行 failed，不再无限挂住上传请求。
+# 默认 600s（实测 278 页正常 PDF 全程 <60s，留 10 倍余量）；设为 0 关闭护栏。
+PDF_EXTRACT_TIMEOUT = int(os.environ.get("PDF_EXTRACT_TIMEOUT", "600"))
 
 # ========== 增强 10.2（P-4）：短标书「直出」目录生成 ==========
 # 易标规格二.2：短标书 + 强模型 → 直接输出 JSON 三级目录；
@@ -286,6 +318,83 @@ OUTLINE_L3_REPAIR_MAX_ROUNDS = max(
 OUTLINE_L3_MAX_PARENT_REUSE = max(
     0, int(os.environ.get("OUTLINE_L3_MAX_PARENT_REUSE", "3"))
 )
+# 一级章节数硬上限（2026-10-19 新增，修复《岳阳路园区科研南楼室内装修工程》事故）。
+# 背景：L1 章节数此前与「评分项数量严格对应」，评分项被拆出 22 条时目录直接
+# 生成 22 节（其中大量章节只有标题堆砌、几乎无正文），对 180 天工期的装修项目
+# 完全失控。现按行业惯例设硬上限（默认 15，8~15 节为投标文件合理区间）：
+#   - AI 生成阶段：提示词告知「评分项超出上限时按专业逻辑归并」；
+#   - 代码阶段：超过上限直接截断并记录 WARNING（评分覆盖允许牺牲，结构可控优先）；
+#   - 兜底路径 `_build_l1_from_scoring_items` 同样按上限截断。
+# 设为 0 表示关闭上限（退回历史行为，向后兼容）。
+OUTLINE_L1_MAX_CHAPTERS = max(
+    0, int(os.environ.get("OUTLINE_L1_MAX_CHAPTERS", "15"))
+)
+# ---------------------------------------------------------------------------
+# 2026-10-20 引入易标 Aligned/Free 双模式目录生成（任务规格二.2）：
+#   - "free"（默认）：现状行为——AI 根据评分要求生成 L1，完全向后兼容；
+#   - "aligned"：L1 由程序按评分项/专项方案类型直接构造（锁定顺序，
+#     节点回填 source_requirement_id/content_mode），模型只生成 L2/L3；
+#     评分项不可解析时自动回落 AI 生成，不阻断链路。
+# 非法值告警并回落 "free"（与 CONTENT_GENERATION_MODE 同一防御口径）。
+OUTLINE_ALIGNED_MODE = os.environ.get("OUTLINE_ALIGNED_MODE", "free").strip().lower()
+if OUTLINE_ALIGNED_MODE not in ("free", "aligned"):
+    # 注意：本位置早于模块级 `_logger` 定义（后方 L470），局部导入避免 NameError
+    import logging as _aligned_logging
+    _aligned_logging.getLogger(__name__).warning(
+        "OUTLINE_ALIGNED_MODE=%r 非法（应为 free/aligned），已回落为 free",
+        OUTLINE_ALIGNED_MODE,
+    )
+    OUTLINE_ALIGNED_MODE = "free"
+# 目录库/知识库参考条目截断长度配置化（2026-10-20 易标机制引入规格二.5：
+# 「参考条目的截断长度可配置，防止上下文溢出」）。默认值 = 历史硬编码值，
+# 不改变现有行为；非法值告警并回落默认。
+def _env_int_positive(name: str, default: int) -> int:
+    """读取正整数环境变量，非法/非正时回落默认值（导入期即校验，带告警）。"""
+    raw = os.environ.get(name, "")
+    if raw == "":
+        return default
+    try:
+        val = int(raw)
+    except ValueError:
+        import logging as _ei_logging
+        _ei_logging.getLogger(__name__).warning("%s=%r 非整数，已回落默认 %d", name, raw, default)
+        return default
+    if val <= 0:
+        import logging as _ei_logging
+        _ei_logging.getLogger(__name__).warning("%s=%d 应为正数，已回落默认 %d", name, val, default)
+        return default
+    return val
+
+
+# 知识素材目录（编排提示词）单条标题/摘要截断长度（原硬编码 [:60]/[:120]）
+KNOWLEDGE_CATALOG_TITLE_MAX = _env_int_positive("KNOWLEDGE_CATALOG_TITLE_MAX", 60)
+KNOWLEDGE_CATALOG_SUMMARY_MAX = _env_int_positive("KNOWLEDGE_CATALOG_SUMMARY_MAX", 120)
+# 目录库参考模板 JSON 注入 L1 提示词的最大字符数（原硬编码 [:3000]）
+OUTLINE_REFERENCE_JSON_MAX_CHARS = _env_int_positive("OUTLINE_REFERENCE_JSON_MAX_CHARS", 3000)
+# ---------------------------------------------------------------------------
+# 2026-10-20 易标机制引入规格三.7：长上下文降级策略。
+# 易标在消息总长超模型上下文 70% 时自动切 Agent 隔离环境；本软件无 Agent
+# 运行时，等效降级 = 生成前度量消息总长，超阈值时程序化裁剪参考资料段
+# （保留 system 铁律与章节定位信息），避免请求整条失败。
+#   - CONTENT_CONTEXT_LIMIT_CHARS：模型上下文字符容量估算（默认 120k 字，
+#     约合中英混合 6-8 万 token）；
+#   - CONTENT_CONTEXT_DEGRADE_RATIO：触发裁剪的占比阈值（默认 0.7，同易标）。
+# CONTENT_CONTEXT_DEGRADE_ENABLED 默认关闭：保持现有行为，验证后再灰度开启。
+CONTENT_CONTEXT_DEGRADE_ENABLED = _env_bool("CONTENT_CONTEXT_DEGRADE_ENABLED", "false")
+CONTENT_CONTEXT_LIMIT_CHARS = _env_int_positive("CONTENT_CONTEXT_LIMIT_CHARS", 120000)
+CONTENT_CONTEXT_DEGRADE_RATIO = float(os.environ.get("CONTENT_CONTEXT_DEGRADE_RATIO", "0.7"))
+if not (0 < CONTENT_CONTEXT_DEGRADE_RATIO <= 1):
+    CONTENT_CONTEXT_DEGRADE_RATIO = 0.7
+
+# 同一个三级标题在**同一个一级章内**最多允许出现在几个不同二级父级下
+# （2026-10-19 新增，修复「换了个 L2 标题，L3 标题完全照抄」的死循环重复形态）。
+# 背景：`OUTLINE_L3_MAX_PARENT_REUSE` 按全树不同父级实例计数、上限 3——
+# 「同一章内 3 个 L2 各挂同一批 L3」恰好卡在线内不触发（生产事故实录形态）。
+# 同章内跨 L2 复用比跨章复用更刺眼（读者同屏对照即穿帮），故单独设更严上限。
+# 设为 0 表示关闭该护栏（向后兼容）。
+OUTLINE_L3_INTRA_MAX_PARENTS = max(
+    0, int(os.environ.get("OUTLINE_L3_INTRA_MAX_PARENTS", "2"))
+)
 # 三级标题「泛化词干 × 维度词」组合识别开关（2026-10-15 第五轮新增）。
 # 背景：前四轮治理已拦住「专项6」「总体实施策划（2）」两个原始家族，但同一
 # 症状换了三副新面孔（复现见 backend/scripts/diag_l3_leaks.py 的 D1/D2/D3，
@@ -312,6 +421,34 @@ OUTLINE_L3_GENERIC_STEM_GUARD_ENABLED = (
 # 同时仍受 OUTLINE_L3_REPAIR_MAX 约束。
 OUTLINE_L3_REPAIR_QUOTA_BY_TASK = (
     os.environ.get("OUTLINE_L3_REPAIR_QUOTA_BY_TASK", "true").lower() == "true"
+)
+
+# ========== 2026-10-19：目录生成工作流程优化（并发/局部自检/质量评分） ==========
+# 对应《目录生成工作流程优化方案》优化 1 / 3 / 6 / 11。
+#
+# L2 并发生成并发上限（优化 1）。0 = 按 provider 自动（anthropic 16 / 其他 32），
+# 保持历史行为；>0 时强制使用该值，便于按模型速率限制调优（方案推荐 3-5，
+# 生产默认自动值远高于该推荐区间，是因为 provider 侧速率普遍宽裕）。
+OUTLINE_L2_CONCURRENCY = max(0, int(os.environ.get("OUTLINE_L2_CONCURRENCY", "0")))
+
+# 质量评分报告总开关（优化 6）。关闭后 `_self_check_v51` 不计算评分，
+# verdict 不含 quality_score，前端完成卡片不展示报告（向后兼容）。
+OUTLINE_QUALITY_SCORE_ENABLED = (
+    os.environ.get("OUTLINE_QUALITY_SCORE_ENABLED", "true").lower() == "true"
+)
+
+# AI 局部自检（优化 3）。开启后：有确定性问题时只把「疑似冲突区域」的最小
+# 上下文子树（含全部一级章节标题 + 冲突章完整展开 + 无冲突章仅留标题）送给 AI，
+# 而非全量目录树 —— 实测冲突占比通常 <20%，Token 消耗下降约 70%。
+# 无确定性问题时的全量审查不受影响（本就不该为无问题目录付费）。
+OUTLINE_AI_LOCAL_REVIEW_ENABLED = (
+    os.environ.get("OUTLINE_AI_LOCAL_REVIEW_ENABLED", "true").lower() == "true"
+)
+
+# 局部自检的焦点节点上限（优化 3 护栏）。疑似冲突节点数超过该值时，切片体积
+# 可能接近甚至超过全量送审，此时自动回退全量，保证 AI 判断力不受损。
+OUTLINE_AI_LOCAL_REVIEW_MAX_NODES = max(
+    1, int(os.environ.get("OUTLINE_AI_LOCAL_REVIEW_MAX_NODES", "120"))
 )
 
 
@@ -579,10 +716,11 @@ OUTLINE_NUMBERING_TEMPLATE = os.environ.get(
 # 易标 outlineGenerationTaskV2 「aligned」模式：从技术评分要求提取评分大类，
 # 程序构造 L1，锁死标题顺序与评分项关联，模型只生成 L2/L3。
 # 平台此前 L1 完全由 AI 生成，无法保证与评分项一一对应。
-# ALIGN_OUTLINE_TO_SCORING=false 保持现有行为。
-ALIGN_OUTLINE_TO_SCORING = os.environ.get(
-    "ALIGN_OUTLINE_TO_SCORING", "false"
-).lower() == "true"
+#
+# BUG-FIX 2026-10-20（死配置清理）：原 `ALIGN_OUTLINE_TO_SCORING` 开关自
+# 2026-10-12 实现起没有任何生产消费方（运维把它设 true 也不会产生对齐行为），
+# 对齐能力的正式入口是下面的 OUTLINE_ALIGNED_MODE（aligned/free 双模式），
+# 已删除该死开关；如确需独立关闭对齐，请使用 OUTLINE_ALIGNED_MODE=free。
 
 # 目录生成模式选择器
 #   'standalone-technical'：独立技术方案模式（默认，与现有行为一致）
@@ -598,6 +736,38 @@ OUTLINE_MODE_DEFAULT = os.environ.get(
 # SPLIT_PROMPT_LAYERS=false 保持现有 build_chapter_content_messages 行为；
 # =true 时启用 8 层消息栈（system/项目概述/全局事实/参考素材/编排/上级/同级/当前）。
 SPLIT_PROMPT_LAYERS = os.environ.get("SPLIT_PROMPT_LAYERS", "false").lower() == "true"
+
+# ========== 提示词模块增强（2026-10-17）==========
+# 以下开关默认全部保持「修复前的默认行为」，可独立开启，向后兼容。
+
+# 提示词变量值默认脱敏（邮箱/手机/身份证/银行卡/JWT/口令/IP …）。
+# PROMPT_DESENSITIZE_DEFAULT=false 保持既有「opt-in」语义：只有显式传
+# desensitize=True 的调用方（如 workflows_analysis 解析链路）才脱敏。
+# =true 时 get_prompt 全链路默认脱敏（安全性优先，可能掩码正文里的编号类信息）。
+PROMPT_DESENSITIZE_DEFAULT = (
+    os.environ.get("PROMPT_DESENSITIZE_DEFAULT", "false").lower() == "true"
+)
+
+# 提示词变量值默认元标记中和（{shared:NAME} / __VAR__）。
+# PROMPT_SANITIZE_DEFAULT=false 保持既有行为，避免改变历史渲染语义。
+PROMPT_SANITIZE_DEFAULT = (
+    os.environ.get("PROMPT_SANITIZE_DEFAULT", "false").lower() == "true"
+)
+
+# 注入风险自动包裹阈值：detect_injection_risk 得分达到该值即用
+# <<<USER_DATA_START/END>>> 包裹变量值。设为 0 表示始终包裹（会破坏需解析的
+# JSON/Mermaid 载荷，不建议）；设为很大的值（如 999）等于关闭自动包裹。
+PROMPT_INJECTION_WRAP_THRESHOLD = int(
+    os.environ.get("PROMPT_INJECTION_WRAP_THRESHOLD", "3")
+)
+
+# 上下文组装默认 Token 预算上限。None/0 表示不限（保持既有行为）。
+# 建议生产设为 8000~16000，避免超长招标原文撑爆上下文窗口。
+PROMPT_CONTEXT_MAX_TOKENS = int(os.environ.get("PROMPT_CONTEXT_MAX_TOKENS", "0"))
+
+# 提示词缓存加载失败后的冷却秒数（冷却期内直接走硬编码回退，避免 AI 热路径
+# 被失败的 DB 查询拖垮）。默认 60 秒，与修复前一致。
+PROMPT_CACHE_RETRY_INTERVAL = float(os.environ.get("PROMPT_CACHE_RETRY_INTERVAL", "60"))
 
 # ========== P1-1：配图预编排 ==========
 # 易标：正文生成前先全文级预编排配图（illustration-plan.json），
@@ -656,6 +826,84 @@ KNOWLEDGE_REFILL_TWO_ROUND = os.environ.get(
 KNOWLEDGE_REFILL_BATCH_SIZE = int(
     os.environ.get("KNOWLEDGE_REFILL_BATCH_SIZE", "10")
 )
+
+# ========== E-3：正文生成顺序控制（2026-10-18）==========
+# 正文生成模式（**系统默认值**，env 可覆盖；router/impl 的 Query 默认值均绑定本常量，
+# 保证「后端默认、显式传参、运维覆盖」三者的唯一事实源）：
+#   'batch'（默认，2026-10-18 第二轮起由 parallel 翻转）：按目录树顺序分批次生成，
+#     同父节点章节同批并行、批次间串行 —— 上下文承接自然、全局事实调用稳定、
+#     问题定位容易、缓存命中更高，且实际生成顺序与目录树顺序严格一致；
+#   'serial'：逐节串行生成（最强上下文承接，最慢）；
+#   'parallel'：asyncio.gather 一次性并发启动所有章节（旧行为，完成顺序不保证，
+#     仅集合完整性受校验）。需要严格旧行为时可显式传 parallel 或置本 env。
+CONTENT_GENERATION_MODE = os.environ.get("CONTENT_GENERATION_MODE", "batch")
+
+# 导入时校验：env 误配（拼写错误/大小写）时告警并回落 batch，
+# 避免把非法值当下_default 传给 router 的 pattern 校验导致 422 全拦截。
+if CONTENT_GENERATION_MODE not in ("parallel", "batch", "serial"):
+    _logger.warning(
+        "CONTENT_GENERATION_MODE=%r 非法（应为 parallel/batch/serial），已回落为 batch",
+        CONTENT_GENERATION_MODE,
+    )
+    CONTENT_GENERATION_MODE = "batch"
+
+# batch 模式下每批次最大章节数（按目录树顺序切分，不超过此值）
+CONTENT_BATCH_MAX_SECTIONS = int(os.environ.get("CONTENT_BATCH_MAX_SECTIONS", "4"))
+
+# 是否注入前一节内容摘要作为上下文（仅 batch/serial 模式生效）
+CONTENT_PREV_SECTION_CONTEXT = os.environ.get(
+    "CONTENT_PREV_SECTION_CONTEXT", "true"
+).lower() == "true"
+
+# 是否启用生成后顺序校验（落库顺序与目录树顺序一致性检查）
+CONTENT_ORDER_VERIFY = os.environ.get(
+    "CONTENT_ORDER_VERIFY", "true"
+).lower() == "true"
+
+# 是否启用「章节→所需事实」显式映射优先注入（替代纯关键词打分筛选）
+CONTENT_FACTS_EXPLICIT_MAP = os.environ.get(
+    "CONTENT_FACTS_EXPLICIT_MAP", "true"
+).lower() == "true"
+
+# ========== E-3b：正文生成顺序增强（2026-10-18 第二轮）==========
+# 目录树顺序排序：排序键为（path 前序, sort_order, id），只读不重排。
+# CONTENT_TREE_SORT_STRICT=true 时，_build_leaf_dicts 对未按目录树顺序
+# 排列的输入记 warning（默认开；关掉仅影响日志，不改变排序行为）。
+CONTENT_TREE_SORT_STRICT = os.environ.get(
+    "CONTENT_TREE_SORT_STRICT", "true"
+).lower() == "true"
+
+# batch/serial 模式下「批内失败按顺序重试」轮数（失败章节按目录树顺序
+# 立即重试，不跳过后移；重试仍失败标记待人工处理并继续后续节点）。
+# 0 = 关闭批内重试（回落到旧行为：失败章节留给 SSE 外层整批重试）。
+CONTENT_BATCH_RETRY_ROUNDS = int(
+    os.environ.get("CONTENT_BATCH_RETRY_ROUNDS", "2")
+)
+
+# 正文阶段危大工程识别与上下文注入：扫描招标文本命中危大工程关键词时，
+# 向相关章节注入「必含章节/表格/图表、安全阈值、适用规范」判定参数。
+# 默认开启；无法导入 hazard_projects 或扫描异常时自动跳过（不影响生成）。
+CONTENT_HAZARD_SCAN = os.environ.get(
+    "CONTENT_HAZARD_SCAN", "true"
+).lower() == "true"
+
+# 适用规范清单注入：从招标文本确定性抽取 GB/JGJ/CJJ 等标准编号，
+# 注入稳定上下文层（同项目内稳定，不影响缓存前缀）。无命中则不注入。
+CONTENT_STANDARDS_INJECT = os.environ.get(
+    "CONTENT_STANDARDS_INJECT", "true"
+).lower() == "true"
+
+# 上下文注入校验：生成前审计消息栈（层级齐全/长度未超限/未被截断），
+# 结果挂到章节结果 context_check 与生成后综合校验。默认开启。
+CONTENT_CONTEXT_AUDIT = os.environ.get(
+    "CONTENT_CONTEXT_AUDIT", "true"
+).lower() == "true"
+
+# 生成后全局事实调用校验（章节→所需事实映射表完整性 + 与全局事实冲突）。
+# 默认开启；校验结果进入 _verification 与 SSE verification 事件。
+CONTENT_FACT_VERIFY = os.environ.get(
+    "CONTENT_FACT_VERIFY", "true"
+).lower() == "true"
 
 # ========== E-1：九大章节字段契约注入 ==========
 # 已存在的 NINE_CHAPER_FIELDS 契约（content_field_contract.py:53-99）在此

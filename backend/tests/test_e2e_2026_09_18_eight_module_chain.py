@@ -264,26 +264,19 @@ class TestEightModuleChain:
         assert "施工组织设计" in user_prompt, "评分点必须进入提示词"
         assert "[{'item'" not in user_prompt, "提示词不得残留 Python list repr"
         assert "450 日历天" in user_prompt, "全局事实必须进入提示词"
-        # 2026-10-05（P-22）契约更新：L2+ 章节目标字数由写作长度模式（缺省
-        # standard）统一决定，显式 target_words 仅对 L1/异常层级生效。
-        # 按章节层级断言对应的字数区间进入提示词（公式与
-        # build_chapter_content_messages 保持一致）。
-        from app.services.ai.writing_length_config import level_target, normalize_writing_length
-        _ch_level = int(dict(sec_row).get("level") or 3)
-        _mode = normalize_writing_length("")
-        if _ch_level >= 2:
-            _mid = level_target(_mode, _ch_level, 300)
-            _expect_target = int(_mid)
-            _expect_hi = int(_mid * 1.1)
-            _expect_lo = max(50, int(_mid * 0.9))
-            # BUG-FIX 2026-10-11：字数格式从「1080-1320」改为
-            # 「约 {target} 字左右（硬性上限 {hi} 字，最低 {lo} 字）」
-            # —— 模型面对区间字符串倾向超长，改为锚点值+硬性上限后偏差显著降低。
-            assert f"约 {_expect_target} 字左右（硬性上限 {_expect_hi} 字，最低 {_expect_lo} 字）" in user_prompt, (
-                f"章节字数预算（{_mode} 模式 L{_ch_level}）必须进入提示词"
-            )
-        else:
-            assert "2975-4025" in user_prompt, "L1 章节显式 target_words 应生效"
+        # 体系合并 2026-10-20：移除旧「提示词侧契约 P-22」例外（L2+ 刻意忽略
+        # 单节 target_words），生成侧与校验 / 压缩 / SSE / R12 链同样尊重单节
+        # target_words（strict 强控覆盖优先级更高，本用例无强控快照不触发）。
+        # 该节显式 target_words=3500 → 统一解析器命中 section_target_words，
+        # 区间 ±10%（DEFAULT_SECTION_TOLERANCE）→ 提示词含
+        # 「约 3500 字左右（硬性上限 3850 字，最低 3150 字）」。
+        _tw = int(dict(sec_row).get("target_words") or 0)
+        assert _tw > 0, "本用例前提：章节已显式设置 target_words"
+        _expect_hi = int(_tw * 1.1)
+        _expect_lo = int(_tw * 0.9)
+        assert f"约 {_tw} 字左右（硬性上限 {_expect_hi} 字，最低 {_expect_lo} 字）" in user_prompt, (
+            "单节 target_words 必须作为最高优先级（strict 除外）进入提示词"
+        )
 
         quality = score_section_quality_local(SECTION_BODY, section_title, 3500)
         assert 0 <= quality["score"] <= 100 and quality["evaluator"] == "local"

@@ -30,6 +30,8 @@ import asyncio
 import json
 import re
 
+import pytest
+
 from app.db import get_db
 from app.services import consistency_rules as rules
 from app.services.ai import workflows_expand as wf
@@ -89,6 +91,41 @@ class _FakeProvider:
         return self.repair_text
 
 
+class _PatchProvider:
+    """补丁模式假 provider：审计请求返回冲突，补丁请求返回 old_text/new_text。
+
+    与 `_FakeProvider` 的区别只在补丁请求的应答格式（JSON 补丁数组），用于覆盖
+    `.env` 里 `CONSISTENCY_PATCH_REPAIR_ENABLED=1` 这条**生产实际路径**。
+    """
+
+    def __init__(
+        self,
+        conflicts: dict[int, list[dict]] | None = None,
+        patches: dict[str, tuple[str, str]] | None = None,
+    ) -> None:
+        self.conflicts = conflicts or {}
+        self.patches = patches or {}
+
+    async def chat(self, messages, temperature=0.0, cancel_event=None, **kwargs):
+        system = str(getattr(messages[0], "content", ""))
+        user = str(getattr(messages[1], "content", ""))
+        if "擅长发现正文中的矛盾" in system:
+            index = _group_index_from_prompt(user)
+            items = self.conflicts.get(index, [])
+            return json.dumps(
+                {"has_conflicts": bool(items), "conflicts": items}, ensure_ascii=False
+            )
+        return json.dumps(
+            {
+                "patches": [
+                    {"section_id": sid, "old_text": old, "new_text": new}
+                    for sid, (old, new) in self.patches.items()
+                ]
+            },
+            ensure_ascii=False,
+        )
+
+
 def _seed_deterministic_conflict(project_id: int) -> str:
     """插一条确定性审计口径的冲突行（`conflict_` 前缀）。"""
     conflict_id = f"conflict_{project_id}_总工期_x"
@@ -126,6 +163,74 @@ def _run_audit(pid: int, provider, results: list[dict], sections: dict) -> list[
     return asyncio.run(
         wf.consistency_audit_content(pid, provider, results, sections, "事实", "")
     )
+
+
+@pytest.fixture(autouse=True)
+def _pin_repair_mode(monkeypatch):
+    """把 AI 审计修复模式钉在**整节重写**（开关 `CONSISTENCY_PATCH_REPAIR_ENABLED`
+    的文档默认值「关」）。
+
+    BUG-FIX 2026-10-13（第六轮·测试隔离）：该开关读**环境变量**，而仓库
+    `backend/.env` 里已置 `CONSISTENCY_PATCH_REPAIR_ENABLED=1`。于是任何先
+    `import app.main`（会加载 .env）的测试文件都会把本文件切到「精确补丁」模式，
+    4 个用例随之变红 —— 实测：
+
+        pytest tests/test_g1_g2_...py                      → 14 passed
+        pytest <任意导入 app.main 的文件> tests/test_g1_...py → 4 failed
+
+    即本文件的通过与否取决于**它被放在命令行的第几个**，是多文件运行里那批
+    「单跑绿、合跑红」失败的根源（已用探针脚本复现：导入 app.main 后同一场景
+    从「已修复 1 节」变为「已修复 0 节 + JSON 解析失败」）。本文件断言的是重写
+    路径的落库/防护契约，故显式钉住默认模式，使结果与环境无关。补丁模式由下方
+    `TestPatchRepairModeFindingsPersisted` 单独覆盖（它才是 .env 当前的实际路径）。
+    """
+    monkeypatch.setenv("CONSISTENCY_PATCH_REPAIR_ENABLED", "0")
+
+
+class TestPatchRepairModeFindingsPersisted:
+    """补丁模式（`.env` 当前的实际路径）下的落库契约。
+
+    与重写模式共享同一组不变量：**发现必须落库**，且「是否标 resolved」只取决于
+    正文是否真的被改写——不允许在补丁解析失败时谎报已修复。
+    """
+
+    def test_findings_persisted_even_when_patch_parse_fails(self, monkeypatch):
+        """补丁模式下 provider 返回非补丁 JSON：修复静默失败，但发现仍落库且
+        保持未解决（真实状态），不得因解析失败而吞掉整条审计。"""
+        monkeypatch.setenv("CONSISTENCY_PATCH_REPAIR_ENABLED", "1")
+        pid = _new_project("G1-补丁模式-解析失败")
+        results = [{"id": 1, "status": "completed", "content": "甲" * 200}]
+        provider = _FakeProvider(
+            {1: [{"section_id": "1", "issue": "x", "suggestion": "y"}]},
+            repair_text="乙" * 200,  # 非补丁 JSON → 补丁路径必然解析失败
+        )
+
+        _run_audit(pid, provider, results, {1: {"title": "第一章"}})
+
+        rows = _ai_conflicts(pid)
+        assert len(rows) == 1, "补丁模式同样必须落库 AI 发现"
+        assert rows[0]["resolved"] == 0, "正文未被改写 → 不得标已解决"
+        assert results[0]["content"] == "甲" * 200, "解析失败不得污染正文"
+
+    def test_patch_mode_repaired_when_patches_apply(self, monkeypatch):
+        """补丁模式下 provider 给出可唯一命中的补丁：正文改写 + 标已解决。"""
+        monkeypatch.setenv("CONSISTENCY_PATCH_REPAIR_ENABLED", "1")
+        pid = _new_project("G1-补丁模式-修复成功")
+        # old_text 必须在正文里**唯一**命中（补丁口径：不唯一即拒绝），
+        # 故「300 天」只出现一次，其余用无关长文本凑够长度。
+        body = "本项目总工期为 300 天。" + "其余章节内容保持不变，无需修改。" * 20
+        results = [{"id": 1, "status": "completed", "content": body}]
+        provider = _PatchProvider(
+            {1: [{"section_id": "1", "issue": "工期与事实不一致", "suggestion": "统一为 450 天"}]},
+            {"1": ("300 天", "450 天")},
+        )
+
+        _run_audit(pid, provider, results, {1: {"title": "第一章"}})
+
+        assert "450 天" in results[0]["content"], "可唯一命中的补丁必须真实落文"
+        rows = _ai_conflicts(pid)
+        assert len(rows) == 1
+        assert rows[0]["resolved"] == 1, "真实落文后才标 resolved"
 
 
 # ==================== G1：AI 审计发现落库 ====================

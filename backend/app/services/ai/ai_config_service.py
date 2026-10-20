@@ -70,7 +70,7 @@ def startup() -> None:
     # 1. 预热配置缓存（首次调用 get_ai_config 加载到内存）
     try:
         cfg = get_ai_config()
-        logger.info(
+        logger.debug(
             "AI 配置已加载: provider=%s, model=%s",
             cfg.get("provider_name", "N/A"),
             cfg.get("model", "N/A"),

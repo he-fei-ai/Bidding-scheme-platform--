@@ -17,7 +17,7 @@ import {
 } from "./utils";
 
 describe("reduceOutlineGeneratingEvent（目录生成 SSE → UI 进度）", () => {
-  const total = OUTLINE_STEPS_V51.length; // 8
+  const total = OUTLINE_STEPS_V51.length; // 13（2026-10-19 起：并发+增量+智能自检口径）
 
   it("outline_phase：按 outline_step 计算百分比并回填阶段标签", () => {
     const patch = reduceOutlineGeneratingEvent({

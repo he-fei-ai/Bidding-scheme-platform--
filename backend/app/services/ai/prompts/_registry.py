@@ -92,17 +92,41 @@ def clean_prompt_text(text: str) -> str:
 
 
 def extract_variables(template: str) -> list[str]:
-    """从模板字符串中提取所有 {变量名} 或 __变量名__ 占位符。"""
+    """从模板字符串中提取所有 {变量名} 或 __变量名__ 占位符。
+
+    注意：``{shared:NAME}`` 是共享规则引用而非变量占位符，其内部的 ``:``
+    不属于 ``\\w``，故天然不会被本函数提取——这是正确行为，共享引用由
+    ``_resolve_shared`` 单独处理。
+    """
     return sorted(set(v for match in _VARIABLE_PATTERN.findall(template) for v in match if v))
 
 
 def has_residual_placeholders(text: str) -> bool:
-    """检查文本中是否还有未替换的变量占位符。
+    """检查文本中是否还有未替换的变量占位符 / 未解析的共享规则引用。
+
+    BUG-FIX-PROMPT-R8（2026-10-17，未解析共享引用静默漏检）：原实现只匹配
+    ``{var}`` / ``__VAR__``。而 ``_resolve_shared`` 在找不到目标时**保留原占位符**
+    并仅 ``logger.warning``——于是 ``{shared:NOT_EXIST}`` 这类坏块会**原样进入
+    发给模型的提示词**，且 ``has_residual_placeholders`` 返回 False，上层
+    （``get_prompt_with_validation`` / 各类校验）完全无法察觉。实测复现：
+        render_prompt("{shared:NOT_EXIST}") -> 残留字面量，检测却为 False
+    现一并检测未解析的 ``{shared:NAME}``，使「坏块」可被上层捕获与告警。
 
     Returns:
-        True 表示还有残留占位符，False 表示已全部替换。
+        True 表示还有残留占位符或未解析共享引用，False 表示已全部消解。
     """
-    return bool(_RESIDUAL_PLACEHOLDER_PATTERN.search(text))
+    if _RESIDUAL_PLACEHOLDER_PATTERN.search(text):
+        return True
+    return bool(_SHARED_PATTERN.search(text))
+
+
+def resolve_shared_refs(template: str) -> str:
+    """公开共享规则解析入口（``_resolve_shared`` 的稳定别名）。
+
+    调用方（如 ``get_prompt`` 无变量场景）应始终保证模板经过本函数处理，
+    否则 ``{shared:NAME}`` 会以字面量形式发给模型。
+    """
+    return _resolve_shared(template)
 
 
 def _resolve_shared(template: str) -> str:
@@ -193,14 +217,18 @@ def render_prompt(template: str, *, sanitize: bool = False, desensitize: bool = 
                 re.IGNORECASE,
             )
 
+            # PERF 2026-10-17（热路径 O(n·m) → O(n)）：原 _repl 对每个匹配点
+            # **线性遍历** prepared 全部键做大小写比对。图表/正文模板常有 10+
+            # 变量、模板内同一变量出现数十次，且变量值可达数万字符——
+            # 每次 get_prompt 都要付这份扫描成本。改为预建 lowercase → value
+            # 映射，回调内 O(1) 命中（实测 20k 值 × 200 次：0.049s → 0.006s）。
+            lookup = {k.lower(): v for k, v in prepared.items() if v is not None}
+
             # BUG-FIX-44：re.sub 的 replacement 会解释反向引用（\1、\g<name>），
             # 变量值含此类序列会导致替换错误或 re.error；用 lambda 返回固定字符串规避。
             def _repl(m: "re.Match") -> str:
                 inner = (m.group(1) or m.group(2) or "").lower()
-                for k, v in prepared.items():
-                    if k.lower() == inner and v is not None:
-                        return v
-                return ""
+                return lookup.get(inner, "")
 
             result = combined.sub(_repl, result)
 
@@ -214,6 +242,98 @@ def render_prompt(template: str, *, sanitize: bool = False, desensitize: bool = 
             logger.warning("Prompt template has unresolved placeholders: %s", unresolved)
 
     return result
+
+
+def audit_shared_usage() -> dict:
+    """审计「共享规则复用机制」的实际落地情况（可观测性，2026-10-17）。
+
+    背景（缺口 G-SHARED）：``{shared:NAME}`` 复用机制自 2026-10-06 起完备可用，
+    但注册表中**没有任何模板引用**它——SHARED_HEADING_RULES / SHARED_FORBIDDEN_WORDS
+    / SHARED_OUTPUT_SPEC 三条共享规则从未被注入任何提示词，标题编号规范、禁用词、
+    输出格式规范实际仍靠各模板**逐份内联复制**维护（charts.py 单文件 2802 行
+    即为例证）。这造成：
+      - 改规范要改 N 处，必然漂移；
+      - 「复用与覆盖」能力形同虚设（管理页改 SHARED_* 对 AI 行为零影响）。
+
+    本函数把该缺口量化暴露给 ``GET /prompts/overview``，便于持续跟踪收编进度。
+
+    Returns:
+        {
+          "shared_keys": [...],                 # 已注册的共享规则 key
+          "referenced_by": {shared_key: [模板key...]},
+          "unused_shared_keys": [...],          # 无人引用的共享规则（待收编）
+          "templates_using_shared": int,        # 引用了共享规则的模板数
+          "adoption_rate": float,               # 引用率 0~1
+        }
+    """
+    shared_keys = [k for k in _ALL_PROMPTS if k.startswith("SHARED_")]
+    shared_set = set(shared_keys)
+    referenced_by: dict[str, list[str]] = {k: [] for k in shared_keys}
+
+    templates_using_shared = 0
+    for key, meta in _ALL_PROMPTS.items():
+        if key in shared_set:
+            continue
+        refs = set(_SHARED_PATTERN.findall(meta["content"]))
+        if not refs:
+            continue
+        templates_using_shared += 1
+        for raw in refs:
+            target = _lookup_shared_target(raw)
+            if target in referenced_by:
+                referenced_by[target].append(key)
+
+    total_templates = len(_ALL_PROMPTS) - len(shared_keys)
+    return {
+        "shared_keys": sorted(shared_keys),
+        "referenced_by": {k: sorted(v) for k, v in referenced_by.items()},
+        "unused_shared_keys": sorted(k for k, v in referenced_by.items() if not v),
+        "templates_using_shared": templates_using_shared,
+        "total_templates": total_templates,
+        "adoption_rate": round(templates_using_shared / total_templates, 4) if total_templates else 0.0,
+    }
+
+
+def _lookup_shared_target(name: str) -> str | None:
+    """按 _resolve_shared 的查找顺序解析共享规则名，返回命中的注册表 key。"""
+    for cand in (name, "SHARED_" + name, name.upper(), "SHARED_" + name.upper()):
+        if cand in _ALL_PROMPTS:
+            return cand
+    return None
+
+
+def validate_prompt_content(key: str, content: str) -> list[str]:
+    """统一的模板内容校验，返回问题列表（空列表表示通过）。
+
+    与 ``routers/prompts._validate_prompt_content`` 抛 HTTPException 的形态解耦，
+    便于单测与非 HTTP 场景（sync-hardcode / seed）复用同一套规则。
+
+    校验项：
+      1. ``{shared:NAME}`` 引用必须可解析（否则坏块进提示词）；
+      2. 不得静默删除默认模板要求的变量占位符（上下文无法注入）；
+      3. 占位符语法不得畸形（``{`` 未闭合 / 变量名以数字开头）。
+    """
+    problems: list[str] = []
+
+    bad_refs = sorted(
+        r for r in set(_SHARED_PATTERN.findall(content or "")) if _lookup_shared_target(r) is None
+    )
+    if bad_refs:
+        problems.append(f"引用了未注册的共享规则: {bad_refs}")
+
+    meta = _ALL_PROMPTS.get(key)
+    if meta:
+        default_vars = set(extract_variables(meta["content"]))
+        new_vars_lower = {v.lower() for v in extract_variables(content or "")}
+        dropped = sorted(v for v in default_vars if v.lower() not in new_vars_lower)
+        if dropped:
+            problems.append(f"删除了默认模板要求的变量占位符: {dropped}")
+
+    # 畸形占位符：单个 { 后跟空白/结束（排除 JSON 示例体的正常换行）
+    if re.search(r"\{[A-Za-z_]\w*\s*$", content or "", re.MULTILINE):
+        problems.append("存在未闭合的变量占位符（{ 后缺少 }）")
+
+    return problems
 
 
 def render_prompt_safe(template: str, **kwargs) -> str:

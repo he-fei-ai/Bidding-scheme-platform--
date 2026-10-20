@@ -183,7 +183,10 @@ _fig_counter_ctx_var: contextvars.ContextVar[dict | None] = contextvars.ContextV
     "export_fig_counter_ctx", default=None
 )
 
-_FIG_NO_PREFIX_RE = re.compile(r"^图\d+-\d+\s*")
+# L-6（2026-10-17）：分隔符可配置后，图题可能是「图3-1 标题」（空格）或
+# 「图3-1：标题」（冒号）。剥离前缀的正则对两者均兼容：先吃掉图号本体，
+# 再吃掉可选的全角/半角冒号与空白。
+_FIG_NO_PREFIX_RE = re.compile(r"^图\d+-\d+\s*[：:]?\s*")
 
 
 def _figure_counter_key(parent_section: str, project_id: int | None) -> str:

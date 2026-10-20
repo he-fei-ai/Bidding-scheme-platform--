@@ -20,6 +20,7 @@ from .logging_context import (
     section_id_var,
     task_id_var,
 )
+from .logging_format import JsonFormatter
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
@@ -121,10 +122,35 @@ _file_formatter = logging.Formatter(
 _file_handler.setFormatter(_file_formatter)
 _file_handler.addFilter(ContextFilter())
 
+
+# 结构化日志开关（P2，2026-10-18）：
+#   LOG_JSON=1 时控制台与文件均输出单行 JSON（含 rid/pid/sid/tid 与 extra 字段），
+#   便于日志采集与聚合分析；默认关闭，保持既有文本格式，**向后兼容**。
+def _log_json_enabled() -> bool:
+    return os.getenv("LOG_JSON", "0").strip().lower() in ("1", "true", "yes", "on")
+
+
+if _log_json_enabled():
+    _json_fmt = JsonFormatter()
+    _console_handler.setFormatter(_json_fmt)
+    _file_handler.setFormatter(_json_fmt)
+
+
 # 移除已有处理器避免重复
 _root_logger.handlers.clear()
 _root_logger.addHandler(_console_handler)
 _root_logger.addHandler(_file_handler)
+
+# BUG-FIX 2026-10-19（上传解析卡死）：根 logger 为 DEBUG（保留细粒度排障能力），
+# 但文件处理器同样收 DEBUG——pdfminer/pdfplumber/pypdf 逐 token 打 DEBUG，
+# 解析一份 278 页招标 PDF 会产生 >50MB 日志（实测约 1MB/8s 轮转风暴）。
+# RotatingFileHandler 每条记录持锁写盘+flush，4 个并发上传线程互相放大后
+# 解析被拖慢两个数量级：请求侧超时判失败、任务行永停 processing、
+# uploaded_files 零记录（其 INSERT 在提取之后）。与 PPT_COM/OCR 护栏同教训：
+# 第三方库日志默认降噪到 WARNING，需要排障时用 THIRD_PARTY_LOG_LEVEL=DEBUG 打开。
+_TP_LOG_LEVEL = os.getenv("THIRD_PARTY_LOG_LEVEL", "WARNING").upper()
+for _tp_name in ("pdfminer", "pdfplumber", "pypdf", "PIL", "urllib3", "httpx", "openpyxl"):
+    logging.getLogger(_tp_name).setLevel(getattr(logging, _TP_LOG_LEVEL, logging.WARNING))
 
 
 # 全局未捕获异常钩子：记录到文件
@@ -867,9 +893,18 @@ async def health():
 async def enhanced_health_check():
     """增强版健康检查（包含所有增强服务状态）"""
     try:
+        from .config_diagnostics import collect_config_gaps
         from .services.enhancement_orchestrator import enhancement_orchestrator
 
         status = await enhancement_orchestrator.health_check()
+        # ENHANCE 2026-10-18（第三轮）：把「运行期配置缺口」并入增强健康检查，
+        # 让运维在一个端点即可看到缺失项与补齐动作，无需从散落的 401/不可用日志里人工拼。
+        try:
+            gaps = collect_config_gaps()
+            if isinstance(status, dict):
+                status["config_gaps"] = gaps
+        except Exception as _gap_err:  # 诊断绝不能影响健康检查本体
+            logger.debug("[silent-except] main.py: config_gaps - %s", _gap_err)
         return status
     except Exception as e:
         return {

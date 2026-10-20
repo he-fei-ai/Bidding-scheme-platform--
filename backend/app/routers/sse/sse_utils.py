@@ -472,7 +472,11 @@ async def _fetch_project_data_async(project_id: int) -> dict | None:
 
                     # ENHANCE 2026-10-14（facts-ns P1-3）：补读 facts_policy，供正文生成
                     # 按缺失值策略追加缺值口径铁律（口径同 routers/ai.py::_sync_get_analysis）。
-                    "SELECT summary_json, scoring_points_json, global_facts_json, construction_method_json, extraction_fields_json, COALESCE(facts_policy, 'fabricate') AS facts_policy FROM analysis WHERE project_id = ?",
+                    # A-5 2026-10-17：补 confirmed_summary/confirmed_scoring 软闸门
+                    "SELECT summary_json, scoring_points_json, global_facts_json, construction_method_json, extraction_fields_json, "
+                    "COALESCE(facts_policy, 'fabricate') AS facts_policy, "
+                    "confirmed_summary, confirmed_scoring "
+                    "FROM analysis WHERE project_id = ?",
 
                     (project_id,),
 
@@ -511,7 +515,11 @@ async def _fetch_project_data_async(project_id: int) -> dict | None:
                 row = conn.execute(
 
                     # ENHANCE 2026-10-14（facts-ns P1-3）：补读 facts_policy（同上）。
-                    "SELECT summary_json, scoring_points_json, global_facts_json, construction_method_json, extraction_fields_json, COALESCE(facts_policy, 'fabricate') AS facts_policy FROM analysis WHERE project_id = ?",
+                    # A-5 2026-10-17：补 confirmed_summary/confirmed_scoring 软闸门
+                    "SELECT summary_json, scoring_points_json, global_facts_json, construction_method_json, extraction_fields_json, "
+                    "COALESCE(facts_policy, 'fabricate') AS facts_policy, "
+                    "confirmed_summary, confirmed_scoring "
+                    "FROM analysis WHERE project_id = ?",
 
                     (project_id,),
 
@@ -577,6 +585,27 @@ async def _fetch_project_data_async(project_id: int) -> dict | None:
 
         scoring_points = []
 
+    # A-5 BUG-FIX 2026-10-17（软闸门）：confirmed_summary/confirmed_scoring 读取。
+    # 正文生成链路（与目录链路同口径）——数据非空但未确认时 logger.warning +
+    # 返回值带 is_confirmed 标志，不硬拦截（行为兼容）但让消费方可观测。
+    # 注意：sse_utils 的 row 是原始 sqlite3.Row（无 .get()，与 sse_db_ops 转 dict 不同），
+    # 但列名在两条 SELECT 中都显式列出，下标访问安全。
+    _confirmed_summary = bool(row["confirmed_summary"])
+    _confirmed_scoring = bool(row["confirmed_scoring"])
+    _has_summary = bool(summary) and summary not in ("{}", "", "待AI解析")
+    _has_scoring = isinstance(scoring_points, list) and len(scoring_points) > 0
+    _is_confirmed = _confirmed_summary and _confirmed_scoring
+    if _has_summary and not _confirmed_summary:
+        logger.warning(
+            "[正文生成] summary 非空但未确认 (confirmed_summary=0)，"
+            "将基于未确认摘要生成正文 project=%d", project_id,
+        )
+    if _has_scoring and not _confirmed_scoring:
+        logger.warning(
+            "[正文生成] scoring_points 非空但未确认 (confirmed_scoring=0)，"
+            "将基于未确认评分点生成正文 project=%d", project_id,
+        )
+
 
 
     industry = project_row["industry"] if project_row else ""
@@ -611,6 +640,42 @@ async def _fetch_project_data_async(project_id: int) -> dict | None:
         pid = r["parent_id"]
 
         children_map.setdefault(pid, []).append(dict(r))
+
+    # 2026-10-18 ENHANCE（第二轮）：同级顺序不依赖 SQL ORDER BY。
+    # `_get_path_and_ancestors` 用「节点在同级列表中的下标 +1」派生编号 path，
+    # 旧实现依赖 `ORDER BY sort_order, id` 的 SQL 结果 —— 一旦上游查询改写排序
+    # （或改走缓存源），path 编号即错位，正文生成顺序随之错乱。
+    # 现显式按唯一权威 sibling_sort_key=(sort_order, id) 排序每个同级桶，
+    # 使 path 派生口径与 SQL 层解耦。
+    try:
+        from ...services.ai.ordered_generation import (
+            audit_children_map,
+            sibling_sort_key,
+        )
+
+        for _bucket in children_map.values():
+            _bucket.sort(key=sibling_sort_key)
+    except ImportError:  # pragma: no cover - 防御性兜底（等价旧口径）
+        for _bucket in children_map.values():
+            _bucket.sort(key=lambda s: (s.get("sort_order") or 0, s.get("id") or 0))
+        audit_children_map = None
+
+    # 遗留加固（2026-10-19）：桶表自检（无论走哪条排序分支都执行）。
+    # path 由「节点在同级桶中的下标 +1」派生，桶表是唯一依据。上面只保证了
+    # **本次构建**的桶是有序的；若未来有其它代码路径绕过 `_load_project_data`
+    # 直接改写 children_map（增删节点、外部重建桶），path 会静默错位且生成
+    # 结果里极难察觉 —— 此处做只读自检并留日志（不阻断生成）。
+    if audit_children_map is not None:
+        try:
+            _cm_audit = audit_children_map(all_rows, children_map)
+            if not _cm_audit["ok"]:
+                logger.warning(
+                    "[children-map] project=%d 桶表自检未通过: %s",
+                    project_id,
+                    [(i["type"], i["detail"]) for i in _cm_audit["issues"]],
+                )
+        except Exception as _cm_e:  # pragma: no cover - 自检本身不得阻断生成
+            logger.debug("[silent-except] children_map 自检失败: %s", _cm_e)
 
 
 
@@ -649,6 +714,11 @@ async def _fetch_project_data_async(project_id: int) -> dict | None:
         # → 经 build_field_contract 的 extraction_fields 显式直供通道消费；
         # 列缺失/旧格式（None）时契约模块自动回落运行时启发式派生。
         "extraction_fields": (parse_extraction_fields_record(row["extraction_fields_json"]) or {}).get("fields"),
+
+        # A-5 2026-10-17 软闸门标志（与目录链路同口径）
+        "is_confirmed": _is_confirmed,
+        "confirmed_summary": _confirmed_summary,
+        "confirmed_scoring": _confirmed_scoring,
 
     }
 
@@ -1080,7 +1150,8 @@ def _build_leaf_dicts(
                 # 「避免与同级章节重复」这条铁律从未真正下发给 AI。
 
                 "parent_id": leaf.get("parent_id"),
-
+                # 2026-10-18 ENHANCE: carry DB sort_order for stable tree ordering
+                "sort_order": leaf.get("sort_order"),
                 "status": leaf.get("status", ""),
 
                 "section_type": leaf["section_type"],
@@ -1094,6 +1165,10 @@ def _build_leaf_dicts(
                 "level": leaf.get("level", 3),
 
                 "target_words": effective_target,
+                # 体系合并 2026-10-20：生成侧契约需要 DB 原始 target_words
+                # （``target_words`` 字段存的是解析后的有效目标，供面板/落库展示）；
+                # 旧「提示词侧契约 P-22」移除后，单节显式覆盖由统一解析器首项尊重。
+                "target_words_raw": leaf.get("target_words"),
 
                 # 2026-10-08 新增：字数档位信息（用于提示词注入与前端展示）
                 "word_count_tier": leaf.get("word_count_tier"),
@@ -1127,38 +1202,84 @@ def _build_leaf_dicts(
 
 
 
-    # BUG-CONCURRENCY-ORDER: 按目录树 path 自然排序，确保生成顺序严格按目录树前序遍历
+    # 2026-10-18 ENHANCE（第二轮）：目录树顺序排序 —— 生成顺序的唯一决定点。
+    # 排序字段：节点 ID、编号（path）、父节点 ID、兄弟节点序号（sort_order）；
+    # 排序规则由目录生成模块写入（sections.sort_order 1 起连续），
+    # 正文生成只读不重排，排序结果必须稳定。
+    #
+    # BUG-FIX 2026-10-18（第二轮）：首轮增强误用 `(sort_order, path)` 作排序键 ——
+    # sort_order 是**同父节点下**的兄弟序号，不同父节点下会重复（每个 L2 的第一个
+    # 子节 sort_order 都是 1），按它做主键会把两个 L2 子树交错排序
+    # （1.1.1, 1.2.1, 1.1.2, 1.2.2），即「跳章乱序」。正确口径：编号 path 是
+    # 位置派生编号（逐级拼接 sort_order），按 path 元组升序即严格的深度优先
+    # 前序（L1→L7 层级顺序、同级按编号升序）；sort_order 与 id 仅在同 path
+    # 前缀下决胜，保证排序稳定。权威实现：ordered_generation.tree_sort_key。
+    try:
+        from ...services.ai.ordered_generation import (
+            sort_sections_by_tree_order,
+            verify_tree_order,
+        )
+        # 先校验输入顺序（告警用），再按目录树顺序重排（只读 sort_order，不改变值）
+        _pre_order = verify_tree_order(leaf_dicts)
+        if not _pre_order.get("ok", True):
+            logger.warning(
+                "[section-sort] 叶子输入未按目录树顺序排列（已按树序重排）: %s",
+                _pre_order.get("violations", [])[:5],
+            )
+        leaf_dicts = sort_sections_by_tree_order(leaf_dicts)
+    except ImportError:  # pragma: no cover - 防御性兜底（与权威实现等价）
+        def _sort_key(d: dict) -> tuple:
+            parts = d.get("path", "0")
+            try:
+                path_tuple = tuple(int(p) for p in parts.split("."))
+            except ValueError:
+                path_tuple = (99999,)
+            so = d.get("sort_order")
+            so_val = int(so) if isinstance(so, (int, float)) else 0
+            return (path_tuple, so_val, d.get("id") or 0)
 
-    # path 格式为 "1.2.3"（兄弟在 children 列表中的位置索引），
-
-    # 解析为 [1, 2, 3] 整数元组做排序，解决 "1.10" < "1.2" 字符串排序问题
-
-    def _path_sort_key(d: dict) -> tuple:
-
-        parts = d.get("path", "0")
-
-        try:
-
-            return tuple(int(p) for p in parts.split("."))
-
-        except ValueError:
-
-            return (99999,)
-
-
-
-    leaf_dicts.sort(key=_path_sort_key)
+        leaf_dicts.sort(key=_sort_key)
 
     logger.info(
-
-        "[章节排序] 已按目录树 path 排序，首条=%s, 末条=%s",
-
+        "[section-sort] 目录树顺序（path 前序）: n=%d, first=%s(sort=%s), last=%s(sort=%s)",
+        len(leaf_dicts),
         leaf_dicts[0].get("path") if leaf_dicts else "-",
-
+        leaf_dicts[0].get("sort_order") if leaf_dicts else "-",
         leaf_dicts[-1].get("path") if leaf_dicts else "-",
-
+        leaf_dicts[-1].get("sort_order") if leaf_dicts else "-",
     )
 
+    # 断点续生成：记录「最后成功节点 → 下一节点」定位（只读日志，不改变选集）。
+    # regenerate_missing / 主生成续跑都按此口径从下一节点按顺序继续。
+    # 口径：对**全部叶子**（按目录树顺序）找第一个未完成节点。
+    try:
+        from ...services.ai.ordered_generation import find_resume_point
 
+        # 原始行无 path 字段，用权威 path 计算补齐后按目录树顺序排全部叶子
+        _all_leaves_with_path = []
+        for _s in all_leaves:
+            _p, _ = _get_path_and_ancestors(_s["id"], sections_by_id, children_map)
+            _all_leaves_with_path.append({**_s, "path": _p})
+        _all_leaves_sorted = sorted(_all_leaves_with_path, key=lambda s: (
+            tuple(int(p) if p.isdigit() else 99999
+                  for p in str(s.get("path") or "0").split(".")),
+            int(s.get("sort_order") or 0),
+            s.get("id") or 0,
+        ))
+        _all_leaf_ids = [s["id"] for s in _all_leaves_sorted]
+        _done_ids = [
+            s["id"] for s in _all_leaves_sorted
+            if s.get("status") == "completed" and _has_valid_content(s)
+        ]
+        _resume = find_resume_point(_all_leaf_ids, _done_ids)
+        if not _resume.get("all_completed"):
+            logger.info(
+                "[section-resume] 断点续生定位: 叶子总数=%d, 已完成=%d, "
+                "下一未完成节点 index=%d id=%s",
+                len(_all_leaf_ids), len(_done_ids),
+                _resume.get("next_index"), _resume.get("next_id"),
+            )
+    except Exception as _resume_e:  # pragma: no cover - 防御性
+        logger.debug("[section-resume] 断点定位失败（忽略）: %s", _resume_e)
 
     return leaf_dicts

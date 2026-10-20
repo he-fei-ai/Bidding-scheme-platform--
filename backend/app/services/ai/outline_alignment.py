@@ -6,12 +6,14 @@ ENHANCE 2026-10-12（P0-2）：移植自 OpenBidKit 易标「aligned」模式。
 本模块提供对齐工具：从技术评分要求提取评分大类 → 程序构造 L1 → 锁死顺序
 → 模型只生成 L2/L3 → 最后校验 L1 与评分大类一致。
 
-STATUS 2026-10-13（L6 · 死代码评估结论，**有意保留不删**）：
-本模块当前**无生产调用方**（`generate_outline_v51` 尚未接入 aligned 形态判别），
-由 `tests/test_2026_10_12_enhance_modules.py` 成体系覆盖（评分提取 / L1 构造 /
-一致性校验）。作为「已实现未接线」的能力保留：将来接入目录生成主链时可直接启用，
-无需重新实现。接线前置条件：L1 由程序构造的章节同样须过
-`outline_common._is_dirty_l3_title` 口径的标题校验（2026-10-13 加固）。
+STATUS 2026-10-20（易标机制引入 P0-1/P0-2）：本模块已接入生产链路——
+`config.OUTLINE_ALIGNED_MODE="aligned"` 时，`workflows_outline_v51._generate_level1_v51`
+直接采用程序构造的 L1（评分项→锁定章节，模型只生成 L2/L3），并由
+`augment_aligned_l1` 回填易标 OutlineItem 扩展字段（content_mode/
+source_requirement_id/locked）。默认 `"free"` 保持历史行为不变。
+历史评估结论（2026-10-13 L6）：接线前置条件——程序构造的章节同样须过
+`outline_common._is_dirty_l3_title` 口径的标题校验，由调用方在构造后统一
+走 `normalize_outline_items + outline_gate` 门禁满足。
 """
 
 from __future__ import annotations
@@ -208,4 +210,76 @@ def merge_aligned_l1_with_children(
         result.append(new_l1)
 
     return result
+
+
+def augment_aligned_l1(l1_items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """为程序构造的对齐 L1 回填易标 OutlineItem 扩展字段（2026-10-20 P0-2）。
+
+    对齐参考软件 client/src/shared/types/outline.ts 的 OutlineItem 结构：
+      - source_requirement_id：目录节点→评分项回溯标识（与 ScoringItem.id 同口径 R{n}）；
+      - content_mode：默认 "ai-generate"（易标四种模式 ai-generate/template-fill/
+        point-to-point/other 中，本链路生成的章节均为 AI 生成）；
+      - locked：标记 L1 由程序构造，下游（审核/重生成）不得改写一级顺序。
+
+    幂等：已有值不覆盖（允许调用方预先定制 content_mode 等字段）；
+    向后兼容：旧数据无这些字段时仅新增，不修改既有字段，导出链路不感知。
+    """
+    for index, node in enumerate(l1_items or [], 1):
+        if not isinstance(node, dict):
+            continue
+        if not node.get("source_requirement_id"):
+            node["source_requirement_id"] = f"R{index}"
+        if not node.get("source_requirement_title"):
+            node["source_requirement_title"] = str(node.get("title") or "")
+        if not node.get("content_mode"):
+            node["content_mode"] = "ai-generate"
+        node.setdefault("locked", True)
+    # None 入参归一化为 []（与全仓防御口径一致），list 入参原地修改后原样返回
+    return l1_items if l1_items is not None else []
+
+
+# ---------------------------------------------------------------------------
+# 建筑工程专项施工方案「九大章节标准」（2026-10-20 易标机制引入适配层，
+# 任务规格四.1：参考软件的「评分大类」对齐逻辑适配为本平台的
+# 「专项方案类型/主要施工内容」对齐；目录九大章节标准必须保留）。
+#
+# 适用场景：aligned 模式下无评分项的专项方案编写（高支模/基坑/脚手架等
+# 专项方案往往没有评分表，方案名称即唯一需求）——一级目录由程序直接
+# 按行业标准构造，模型只生成 L2/L3；章节顺序由 locked 标记保护，
+# 不受门禁 zone 重排（见 workflows_outline_v51._l1_locked）。
+# ---------------------------------------------------------------------------
+
+#: 九大章节标准（标题, 职责描述）——顺序即行业标准顺序，不得重排
+NINE_CHAPTER_STANDARD: List[tuple] = [
+    ("工程概况", "专项方案对应分部分项工程介绍、规模参数与项目特征描述"),
+    ("编制依据", "编制所依据的法规、规范标准、施工图与专项方案类型相关的设计文件清单"),
+    ("施工计划", "进度计划、材料与劳动力等资源配置安排、施工顺序与流水段划分"),
+    ("施工工艺技术", "工艺原理、施工工艺流程、操作要点与关键技术参数（含验算）"),
+    ("安全保证措施", "风险辨识与分级管控、组织保障、技术措施、监测与检查制度"),
+    ("人员配备", "管理架构与作业班组配置、岗位职责、持证要求与培训安排"),
+    ("验收要求", "验收标准与依据、过程验收与竣工验收程序、整改闭环要求"),
+    ("应急处置措施", "易引发突发事件的危险源辨识、应急组织、响应程序与物资储备"),
+    ("计算书与图纸", "稳定性/强度等验算计算书与相关施工图纸、节点大样"),
+]
+
+
+def build_nine_chapter_l1() -> List[Dict[str, Any]]:
+    """按建筑工程专项施工方案九大章节标准程序构造一级目录。
+
+    节点字段与 `build_aligned_l1` 同构（易标 OutlineItem 对齐）：
+    source_requirement_id 取「S{n}」（S=standard，与评分项 R{n} 命名空间
+    区分）；content_mode=ai-generate；locked=True（顺序由标准锁定）。
+    """
+    result: List[Dict[str, Any]] = []
+    for index, (title, description) in enumerate(NINE_CHAPTER_STANDARD, 1):
+        result.append({
+            "id": str(index),
+            "title": title,
+            "description": description,
+            "source_requirement_id": f"S{index}",
+            "source_requirement_title": title,
+            "children": [],
+            "locked": True,
+        })
+    return augment_aligned_l1(result)
 

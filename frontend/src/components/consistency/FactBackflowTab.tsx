@@ -6,7 +6,7 @@ import {
   CheckOutlined, ReloadOutlined, ShareAltOutlined, WarningOutlined,
 } from "@ant-design/icons";
 import { proposeFactsFromConflicts, acceptFactProposals } from "../../api";
-import type { FactProposal } from "../../api";
+import type { FactProposal, FactProposalSkipped } from "../../api";
 import { extractApiError } from "../../utils";
 
 const { Text } = Typography;
@@ -32,6 +32,8 @@ export default function FactBackflowTab({ projectId }: FactBackflowTabProps) {
   const [selectedKeys, setSelectedKeys] = useState<React.Key[]>([]);
   const [minOccurrences, setMinOccurrences] = useState(3);
   const [scannedInfo, setScannedInfo] = useState<{ scanned: number; skipped: number } | null>(null);
+  /** 采纳时被「基准类别互斥」挡下的候选（后端回传，带可读原因） */
+  const [skipped, setSkipped] = useState<FactProposalSkipped[]>([]);
 
   // 响应竞态保护
   const loadSeqRef = useRef(0);
@@ -77,9 +79,18 @@ export default function FactBackflowTab({ projectId }: FactBackflowTabProps) {
     try {
       const res = await acceptFactProposals(projectId, picked);
       if (res.status === "ok") {
-        message.success(
-          `已采纳 ${res.added} 条候选（合并进入 ${res.merged_total} 个全局事实）`,
-        );
+        // ENHANCE 2026-10-13（第六轮·R-14 闭环）：被基准类别互斥挡下的候选
+        // 必须显式告知 —— 否则用户看到「采纳 0 条」无从得知是被冲突规则拦了。
+        setSkipped(res.skipped ?? []);
+        if (res.skipped?.length) {
+          message.warning(
+            `已采纳 ${res.added} 条；另有 ${res.skipped.length} 条未采纳（与既有事实冲突）`,
+          );
+        } else {
+          message.success(
+            `已采纳 ${res.added} 条候选（合并进入 ${res.merged_total} 个全局事实）`,
+          );
+        }
         await load();
       } else {
         message.warning(`采纳完成但返回非 ok 状态：${res.status}`);
@@ -191,6 +202,27 @@ export default function FactBackflowTab({ projectId }: FactBackflowTabProps) {
           </Space>
         }
       >
+        {skipped.length > 0 && (
+          <Alert
+            type="warning"
+            showIcon
+            icon={<WarningOutlined />}
+            style={{ marginBottom: 12 }}
+            message={`${skipped.length} 条候选未采纳（与既有事实冲突）`}
+            description={
+              <Space direction="vertical" size={2}>
+                {skipped.map((it, i) => (
+                  <Text key={i} type="secondary" style={{ fontSize: 12 }}>
+                    · {it.fact_name}={it.value} —— {it.reason}
+                  </Text>
+                ))}
+              </Space>
+            }
+            closable
+            onClose={() => setSkipped([])}
+          />
+        )}
+
         {scannedInfo && scannedInfo.scanned === 0 && proposals.length === 0 && (
           <Alert
             type="warning"

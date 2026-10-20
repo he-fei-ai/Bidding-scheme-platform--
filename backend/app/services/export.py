@@ -129,6 +129,7 @@ from .export_chart_pipeline import (  # noqa: F401
 #: 导出端防御性清洗器（复用实例；ContentCleaner 无状态，实例开销可忽略）
 _EXPORT_CONTENT_CLEANER = ContentCleaner()
 from .sections import build_tree, list_sections
+from .ai.ordered_generation import load_sections_in_tree_order  # noqa: E402
 from .ai.writing_length_config import get_l3_own_range, get_l3_own_target
 from .ai.outline_common import _strip_legacy_redundant_suffix
 
@@ -349,13 +350,32 @@ def sanitize_for_docx(text, max_chars: int | None = None) -> str:
     `_add_section_heading` 抛 ValueError，被逐节点兜底 except 捕获后
     **标题完全不落盘**，正文变成「本小节内容渲染异常」占位符，目录也少一项；
     重试两轮必然重复失败，因为重试走的是同一条路径。
+
+    BUG-FIX 2026-10-19（岳阳路事故·Markdown 残留）：AI 产物偶发把
+    「## 图1-1 …」「### 一、…」这类 Markdown 前缀写进标题/图题并落库，
+    导出后整个文档标题带井号。统一在本清洗入口剥离字符串开头的
+    Markdown 标题符号（仅开头，避免误伤正文中间合法的 # 字符）。
     """
     if not text:
         return ""
     cleaned = _XML_UNSAFE_PATTERN.sub("", text if isinstance(text, str) else str(text))
+    # 剥离开头的 Markdown 标题前缀（^#{1,6} + 空白）
+    cleaned = re.sub(r"^#{1,6}\s+", "", cleaned)
     if max_chars is not None and len(cleaned) > max_chars:
         cleaned = cleaned[:max_chars] + "…"
     return cleaned
+
+
+#: 前端快速建项目的默认占位名模式（「招投标项目 2026/10/19 20:44:41」等）
+_PLACEHOLDER_PROJECT_NAME_RE = re.compile(
+    r"^(招投标项目|未命名项目|新建项目)\s*\d{4}[-/年]"
+)
+
+
+def _is_placeholder_project_name(name: str) -> bool:
+    """判断项目名是否为前端快速建项的占位名（页眉/封面兜底解析的真实名依据）。"""
+    n = (name or "").strip()
+    return bool(n) and bool(_PLACEHOLDER_PROJECT_NAME_RE.match(n))
 
 
 def _set_cell_text(
@@ -1232,6 +1252,11 @@ def _add_image_placeholder(
     run.font.color.rgb = RGBColor(180, 180, 180)
     run.font.italic = True
     if caption:
+        # 图号会话隔离（P1 修复·图号虚跳）：占位符代表「渲染/插入失败」，该图号
+        # 会被 _add_inline_chart 回滚复用。若仍携带「图X-Y」前缀，正文会出现两张
+        # 同号图（一张假占位说明 + 一张真图）。与 _render_commercial 渲染失败说明
+        # 路径（_FIG_NO_PREFIX_RE 剥离前缀）口径一致：占位符永不占号。
+        _cap_text = _FIG_NO_PREFIX_RE.sub("", caption or "").strip()
         cap_p = doc.add_paragraph()
         cap_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
         cap_p.paragraph_format.space_before = Pt(2)
@@ -1239,7 +1264,7 @@ def _add_image_placeholder(
         # BUG-FIX 2026-10-04（P1 特殊字符）：caption 来自章节 *_json 图表标题，
         # 未经正文链路清洗；含 XML 不安全字符时 add_run 直接抛 ValueError，
         # 「降级占位符」这条最后防线也会炸，整张图静默消失。
-        cap_run = cap_p.add_run(sanitize_for_docx(caption))
+        cap_run = cap_p.add_run(sanitize_for_docx(_cap_text))
         _apply_font(cap_run, config.font_body, config.size_body - 1, bold=True)
         cap_run.font.italic = True
 
@@ -1743,6 +1768,23 @@ def _render_commercial(
     return False
 
 
+def _figure_caption(fig_no: str, title_text: str, config: "ExportConfig | None") -> str:
+    """图题拼接：图号 + 分隔符 + 标题（L-6，2026-10-17）。
+
+    分隔符来自 `config.figure_no_separator`，仅接受 " " / "：" / ":" / ""；
+    其余取值（含 None）回退默认空格，保证历史口径「图3-1 标题」不变。
+    `fig_no` 为空时不输出分隔符（避免「　标题」开头带空白）。
+    """
+    sep = getattr(config, "figure_no_separator", " ")
+    if sep is None:
+        sep = " "
+    if str(sep) not in (" ", "：", ":", ""):
+        sep = " "
+    if fig_no and title_text:
+        return f"{fig_no}{sep}{title_text}"
+    return title_text or fig_no
+
+
 def _add_inline_chart(
     doc,
     chart_type: str,
@@ -1895,9 +1937,7 @@ def _add_inline_chart(
                 )
                 if isinstance(source, dict):
                     source["fig_no"] = fig_no
-                final_caption = (
-                    f"{fig_no} {title_text}" if (fig_no and title_text) else (title_text or fig_no)
-                )
+                final_caption = _figure_caption(fig_no, title_text, config)
                 logger.info("[图表导出] %s: %s", fig_no, title_text or ctype)
                 # 商业级 v2 渲染器（真实数据，无降级）
                 # P2：透传渲染结果，上层（预渲染计数/失败重试）才能感知成败
@@ -2004,9 +2044,7 @@ def _add_inline_chart(
         )
         if isinstance(inline_data, dict):
             inline_data["fig_no"] = fig_no
-        fb_caption = (
-            f"{fig_no} {chart_desc}" if (fig_no and chart_desc) else (chart_desc or fig_no)
-        )
+        fb_caption = _figure_caption(fig_no, chart_desc, config)
         # P2：透传渲染结果（原裸 return 永远 None，调用方无法感知失败）
         # P1 修复 2026-09-29：渲染失败回滚图号
         # FIX 2026-10-08（P1 图号虚跳）：同上，异常路径也必须回滚（见上方注释）。
@@ -2338,10 +2376,38 @@ def _add_section_heading(doc, text: str, level: int, config: ExportConfig, numbe
             logger.debug("标题章框装饰线应用失败（非致命）: %s", e)
 
 
-def _add_toc_field(doc, config: ExportConfig):
+def _collect_toc_entries(tree: list, max_level: int = 4) -> list[tuple[int, str]]:
+    """从章节树收集静态目录条目（level, title），L1~L4（与 TOC 域 \\o "1-4" 一致）。
+
+    ENHANCE 2026-10-19（岳阳路事故·目录修复）：目录页此前只有「请右键更新域」
+    占位文本，用户不手动更新域时目录完全空白。导出时预生成静态条目作为
+    TOC 域的缓存结果，Word 打开即见完整章节结构。
+    """
+    entries: list[tuple[int, str]] = []
+
+    def _walk(nodes: list, level: int) -> None:
+        for node in nodes:
+            title = (getattr(node, "title", "") or "").strip()
+            if title:
+                entries.append((level, title))
+            children = getattr(node, "children", None)
+            if children and level < max_level:
+                _walk(children, level + 1)
+
+    if isinstance(tree, list):
+        _walk(tree, 1)
+    return entries
+
+
+def _add_toc_field(doc, config: ExportConfig, static_entries: list[tuple[int, str]] | None = None):
     """在文档中插入 Word 自动目录域（TOC \\o "1-4" \\h \\z \\u），
     仅包含 L1~L4 目录标题；L5+ 不出现在目录中但仍保留 Heading 样式名和大纲级别
-    （Word 导航面板/折叠照常工作）。标记 w:dirty 确保 Word 打开时提示更新目录页码。"""
+    （Word 导航面板/折叠照常工作）。标记 w:dirty 确保 Word 打开时提示更新目录页码。
+
+    ENHANCE 2026-10-19（岳阳路事故·目录修复）：static_entries 非空时，将其渲染为
+    TOC 域的**缓存结果**（域结果可跨段落，Word 标准形态）——用户不更新域也能看到
+    完整章节结构；更新域后被带页码的实时目录替换。条目为空时保持原有占位文案。
+    """
     p = doc.add_paragraph()
 
     run1 = p.add_run()
@@ -2358,6 +2424,24 @@ def _add_toc_field(doc, config: ExportConfig):
     run3 = p.add_run()
     fld_separate = parse_xml(f'<w:fldChar {nsdecls("w")} w:fldCharType="separate"/>')
     run3._element.append(fld_separate)
+
+    if static_entries:
+        # 域缓存结果：每个条目独立段落（TOC 域的标准跨段落形态）
+        for level, title in static_entries[:400]:
+            ep = doc.add_paragraph()
+            ep.alignment = WD_ALIGN_PARAGRAPH.LEFT
+            _set_paragraph_indent_chars(ep, first_line_chars=0, left_chars=(level - 1) * 2)
+            er = ep.add_run(sanitize_for_docx(title))
+            if level == 1:
+                _apply_font(er, config.font_title, config.size_title_3, bold=True)
+            else:
+                _apply_font(er, config.font_body, config.size_body, bold=False)
+        end_p = doc.add_paragraph()
+        end_run = end_p.add_run()
+        end_run._element.append(
+            parse_xml(f'<w:fldChar {nsdecls("w")} w:fldCharType="end"/>')
+        )
+        return
 
     run4 = p.add_run("请右键此处选择「更新域」以生成目录")
     _apply_font(run4, config.font_body, config.size_body)
@@ -2679,7 +2763,7 @@ def _verify_docx_integrity(path: str) -> None:
         raise RuntimeError(f"导出的 DOCX 内条目损坏: {bad}")
 
 
-def _atomic_save_docx(doc, output_path: str) -> None:
+def _atomic_save_docx(doc, output_path: str) -> str:
     """原子写盘：写同目录临时文件 → 大小校验 → os.replace 替换为最终路径。
 
     ATOMIC-SAVE（2026-10-06）：原 `doc.save(output_path)` 直写最终路径。docx 打包是
@@ -2713,7 +2797,28 @@ def _atomic_save_docx(doc, output_path: str) -> None:
         # `build_docx` 只 stat 大小因此看不出来，用户下载到打不开的文件。
         # docx 本质是 ZIP：校验 EOCD 签名 + 用 zipfile 打开一次即可拦住截断件。
         _verify_docx_integrity(tmp_save_path)
-        os.replace(tmp_save_path, output_path)
+        # ENHANCE 2026-10-17（P2·临时文件替换失败）：Windows 上目标文件被其它进程
+        # 占用（如用户正在下载上一版 .docx，路由持有句柄）时 os.replace 会抛
+        # PermissionError，原实现直接失败 → 本次导出整体失败。现做有限重试 +
+        # 独立文件名兜底，确保导出不因目标被占用而整体失败（兜底产物仍以 .docx
+        # 结尾，可被孤儿清理识别）。
+        final_path = output_path
+        _max_retry = 3
+        for _attempt in range(_max_retry):
+            try:
+                os.replace(tmp_save_path, final_path)
+                break
+            except PermissionError:
+                if _attempt < _max_retry - 1:
+                    logger.warning("原子替换被占用，重试 (%d/%d): %s", _attempt + 1, _max_retry, final_path)
+                    time.sleep(0.4 * (_attempt + 1))
+                    continue
+                _ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+                final_path = f"{output_path}.gen{_ts}.docx"
+                logger.warning("目标文件被占用，降级写入独立文件: %s", final_path)
+                os.replace(tmp_save_path, final_path)
+                break
+        return final_path
     except Exception as e:
         logger.error("保存文档失败: %s", e)
         # 清理可能残留的临时件，避免 exports/ 目录堆积半成品
@@ -2872,6 +2977,34 @@ def _build_docx_impl(
                 bidder_name = config.bidder_name or (
                     project_row["bidder_name"] if project_row["bidder_name"] else ""
                 )
+            # BUG-FIX 2026-10-19（岳阳路事故·页眉修复）：项目名是前端快速建项的
+            # 占位名（「招投标项目 <时间戳>」）时，从分析事实里解析真实项目名兜底，
+            # 避免页眉/封面把「招投标项目 2026/10/19 20:44:41」原样印进投标文件。
+            try:
+                if _is_placeholder_project_name(project_name):
+                    _facts_row = conn.execute(
+                        "SELECT global_facts_json FROM analysis WHERE project_id = ?",
+                        (project_id,),
+                    ).fetchone()
+                    if _facts_row and _facts_row["global_facts_json"]:
+                        _facts_items = json.loads(_facts_row["global_facts_json"])
+                        if isinstance(_facts_items, list):
+                            for _it in _facts_items:
+                                if isinstance(_it, dict) and str(_it.get("key") or "") in (
+                                    "projectName",
+                                    "project_name",
+                                    "项目名称",
+                                ):
+                                    _real = str(_it.get("value") or "").strip()
+                                    if _real:
+                                        logger.info(
+                                            "导出项目名占位兜底: %r → %r (project=%d)",
+                                            project_name, _real, project_id,
+                                        )
+                                        project_name = _real
+                                    break
+            except Exception as _pn_e:
+                logger.debug("导出项目名占位兜底失败（沿用原名）: %s", _pn_e)
     except Exception as e:
         logger.error("获取项目信息失败: %s", e)
 
@@ -2914,6 +3047,15 @@ def _build_docx_impl(
         except Exception as e:
             logger.error("添加封面失败: %s", e)
 
+    # ENHANCE 2026-10-19（岳阳路事故·目录修复）：提前构建章节树，用于
+    # 生成 TOC 域的静态缓存结果（用户不更新域也能看到完整目录）。
+    # 树对象随后在正文写入段复用，避免重复查询；构建失败时目录退化为占位文案。
+    tree = None
+    try:
+        tree = build_tree(project_id)
+    except Exception as e:
+        logger.warning("章节树预构建失败（目录退化、正文段将重试）: %s", e)
+
     # 添加目录
     if config.show_toc:
         _progress("toc", "添加目录...", 0.15)
@@ -2924,7 +3066,8 @@ def _build_docx_impl(
             run = toc_heading.add_run("目  录")
             _apply_font(run, config.font_title, config.size_title_1, bold=True)
 
-            _add_toc_field(doc, config)
+            static_entries = _collect_toc_entries(tree) if tree is not None else None
+            _add_toc_field(doc, config, static_entries=static_entries)
 
             # ENHANCE 2026-09-14：一级标题另起页时，由 pageBreakBefore 负责分页，
             # 此处再插一个硬分页会产生整页空白。
@@ -2937,7 +3080,9 @@ def _build_docx_impl(
     _progress("content_start", "开始写入正文内容...", 0.2)
     content_start_time = time.time()
     try:
-        tree = build_tree(project_id)
+        # ENHANCE 2026-10-19：目录段已预构建章节树时直接复用（仅构建失败过才重试）
+        if tree is None:
+            tree = build_tree(project_id)
         # 批量预加载所有有正文的章节详情（含非叶子），消除 N+1 查询
         content_ids = _collect_content_node_ids(tree)
         detail_index = _batch_load_section_details(project_id, content_ids) if content_ids else {}
@@ -3096,6 +3241,16 @@ def _build_docx_impl(
             except Exception as e:
                 logger.error("创建输出目录失败: %s", e)
         filename = os.path.basename(output_path)
+        # L-5（2026-10-17，P4·路径长度边缘）：自定义 output_path 与自动命名
+        # 同口径截断文件名段（stem ≤80 字符、保留扩展名）。长文件名叠加
+        # `.tmp.<pid>.<8hex>` 临时名后缀（约 +25 字符）可能突破 Windows
+        # 255 文件名 / 260 路径上限，doc.save() 直接 OSError。
+        if len(filename) > 84:
+            _stem, _ext = os.path.splitext(filename)
+            _stem = _stem[:80].strip("_.-") or "project"
+            filename = f"{_stem}{_ext}"
+            output_path = os.path.join(output_dir, filename) if output_dir else filename
+            logger.info("自定义导出文件名超长，已截断: %s", filename)
 
     # ========== 修复3: 导出前文档结构校验 ==========
     _progress("validate", "校验文档结构...", 0.96)
@@ -3115,16 +3270,18 @@ def _build_docx_impl(
     _progress("save_start", "正在打包 DOCX 文件...", 0.97)
     _save_start = time.time()
     # ATOMIC-SAVE（2026-10-06）：原子写盘收口到 _atomic_save_docx，可独立单元测试。
-    _atomic_save_docx(doc, output_path)
+    # ENHANCE 2026-10-17：_atomic_save_docx 现在返回**实际落盘路径**（目标被占用时会
+    # 降级为带时间戳的独立文件名），下游记录/缓存/返回必须用该返回值。
+    final_path = _atomic_save_docx(doc, output_path)
     logger.info("doc.save() 耗时: %.3fs (project_id=%d)", time.time() - _save_start, project_id)
 
     _progress("save_done", "正在校验导出结果...", 0.99)
     # ========== 修复3: 导出后文件大小校验 ==========
     try:
-        file_size = Path(output_path).stat().st_size
+        file_size = Path(final_path).stat().st_size
         if file_size == 0:
             logger.error("导出文件大小为 0，导出失败")
-            raise RuntimeError(f"导出文件大小为 0: {output_path}")
+            raise RuntimeError(f"导出文件大小为 0: {final_path}")
         logger.info("导出文件大小: %d bytes", file_size)
     except OSError as e:
         logger.error("校验导出文件大小失败: %s", e)
@@ -3133,19 +3290,23 @@ def _build_docx_impl(
     # 记录导出信息
     export_id = None
     try:
-        if cache_key:
-            _set_cached_export_path(cache_key, output_path)
-        export_id = _record_export(project_id, filename, output_path, config, start_time)
+        # ENHANCE 2026-10-17（缓存/DB 一致性）：先写 exports 表、成功后再登记缓存索引。
+        # 旧实现先 set_cached 再 record，record 失败会留下「缓存有记录、DB 无记录」的
+        # 幽灵缓存项。现仅当 DB 写入成功（export_id 非空）才登记缓存，避免幽灵缓存。
+        export_id = _record_export(project_id, os.path.basename(final_path), final_path, config, start_time)
+        if export_id is not None and cache_key:
+            _set_cached_export_path(cache_key, final_path)
     except Exception as e:
         logger.error("记录导出信息失败: %s", e)
+        export_id = None
 
     _progress("done", "导出完成", 1.0)
     # 性能日志：记录导出总耗时
     total_elapsed = time.time() - start_time
     logger.info(
-        "DOCX导出完成: 总耗时 %.2fs, 文件=%s, 大小=%d bytes", total_elapsed, output_path, file_size
+        "DOCX导出完成: 总耗时 %.2fs, 文件=%s, 大小=%d bytes", total_elapsed, final_path, file_size
     )
-    return output_path, export_id
+    return final_path, export_id
 
 
 # ====== V7.0 导出缓存辅助 ======
@@ -3169,7 +3330,10 @@ _EXPORT_ORPHAN_MIN_AGE_SECONDS = 7 * 24 * 3600
 # `<数据目录>/<pid>/exports/`，但此前 `_is_safe_export_artifact` 只认 .docx/.doc、
 # `_iter_export_artifacts` 只 glob *.docx → HTML/PDF 孤儿文件永不清理，长期运行
 # 磁盘只增不减。此处统一为后缀白名单常量，两处判据保持同源。
-_EXPORT_ARTIFACT_SUFFIXES = (".docx", ".doc", ".html", ".pdf")
+# X-B（2026-10-17）：白名单补齐 `.dotx`，与 routers/export.py:694 的下载白名单
+# {'.docx','.dotx','.doc','.html','.pdf'} 收敛一致；避免 PDF 转换源 .dotx 或模板类
+# 产物成为永不清理的孤儿（旧白名单缺 .dotx）。
+_EXPORT_ARTIFACT_SUFFIXES = (".docx", ".doc", ".dotx", ".html", ".pdf")
 
 
 def _is_safe_export_artifact(p: Path) -> bool:
@@ -3360,15 +3524,23 @@ def _compute_content_fingerprint(project_id: int) -> str | None:
                 for field in ("name", "bidder_name"):
                     h.update(field.encode("utf-8"))
                     h.update(str(proj[field] or "").encode("utf-8"))
-            rows = conn.execute(
-                """SELECT id, title, content, parent_id, level, sort_order,
-                          flowchart_json, gantt_json, architecture_json,
-                          labor_json, comparison_json, layout_json, timeline_json,
-                          inlined_chart_json
-                   FROM sections WHERE project_id = ?
-                   ORDER BY id""",
-                (project_id,),
-            ).fetchall()
+            # 2026-10-18 ENHANCE（第二轮·顺序口径单一权威）：指纹行序改用目录树
+            # 深度优先前序，与正文生成 / DOCX 写入 / HTML 展示共用
+            # ordered_generation.order_tree_dfs 同一实现。旧口径 ORDER BY id 是
+            # 创建序（仅当插入顺序恰好等于目录顺序时正确），且逐行 h.update 对
+            # 行序敏感 —— 行序不稳定会让「内容未变却指纹变化」的假失效，或反向
+            # 掩盖真实的目录重排。现按树序遍历，重排目录必然改指纹（正确失效），
+            # 内容不变则指纹稳定（正确命中）。
+            rows = load_sections_in_tree_order(
+                conn,
+                project_id,
+                columns=(
+                    "id, title, content, parent_id, level, sort_order,"
+                    " flowchart_json, gantt_json, architecture_json,"
+                    " labor_json, comparison_json, layout_json, timeline_json,"
+                    " inlined_chart_json"
+                ),
+            )
         for row in rows:
             for field in (
                 "title",
@@ -3426,14 +3598,36 @@ def _get_cached_export_path(cache_key: str) -> str | None:
     """获取缓存的导出文件路径（若存在）
 
     V3.0 增强：命中率统计，支持缓存监控。
+
+    L-4（2026-10-17，P3·统计精度/命中完整性）加固：
+    ① 命中率计数并入 `_EXPORT_CACHE_LOCK`——原实现裸 `+=`，并发导出下
+       丢计数仅造成统计偏差，但既然持锁成本为零就一并收敛；
+    ② 存在性 + 完整性校验收敛到取值侧：
+       - 索引有键但文件已被删 → 按 miss 处理（原实现 HIT 已先自增，统计虚高）；
+       - 文件存在但不是有效 ZIP（磁盘写满/进程被杀留下的截断件）→ 按 miss
+         处理，调用方将重建并覆盖该键，避免把打不开的 DOCX 直接下发。
+       校验只读 ZIP 的 EOCD + 中央目录（zipfile 构造器行为），不做逐条目
+       解压，毫秒级开销；本函数唯一调用点 build_docx 已在线程池中执行。
     """
     global _EXPORT_CACHE_HITS, _EXPORT_CACHE_MISSES
     index = _load_export_cache_index()
     path = index.get(cache_key)
-    if path:
+    if not path or not Path(path).exists():
+        with _EXPORT_CACHE_LOCK:
+            _EXPORT_CACHE_MISSES += 1
+        return None
+    try:
+        import zipfile as _zipfile
+
+        with _zipfile.ZipFile(path):
+            pass
+    except Exception as _e:
+        logger.warning("导出缓存完整性校验失败，按 miss 重建: %s (%s)", path, _e)
+        with _EXPORT_CACHE_LOCK:
+            _EXPORT_CACHE_MISSES += 1
+        return None
+    with _EXPORT_CACHE_LOCK:
         _EXPORT_CACHE_HITS += 1
-    else:
-        _EXPORT_CACHE_MISSES += 1
     return path
 
 
@@ -3469,7 +3663,14 @@ def _set_cached_export_path(cache_key: str, file_path: str) -> None:
                 # 此处删文件会导致历史记录点击即 404。磁盘回收统一由启动时
                 # `_cleanup_orphaned_export_files`（白名单 = 索引 ∪ exports 表，
                 # 且只删修改超 7 天的真孤儿）负责。
-                _ = old_path  # 仅作淘汰日志用途，不删文件
+                if old_path:
+                    # R-2（2026-10-17，P3·可观测性）：第四轮遗留——淘汰路径只有
+                    # 注释没有日志，索引条目被静默挤掉时无法从日志侧感知。补告警
+                    # （key 仅前 8 位，避免刷屏）；磁盘文件仍不删（见上注释）。
+                    logger.warning(
+                        "导出缓存索引超上限，淘汰最旧条目（文件保留供历史下载）: key=%s… path=%s",
+                        str(k)[:8], old_path,
+                    )
         # 在锁内同步持久化
         # BUG-FIX：必须走 _save_export_cache_index（临时文件 + os.replace 原子替换），
         # 不能用 open("w") 直接截断写。本项目已在 _save_export_cache_index 的 docstring 中

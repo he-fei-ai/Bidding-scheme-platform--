@@ -122,7 +122,29 @@ from .providers.base import AIMessage
 logger = logging.getLogger(__name__)
 
 
-from .workflows_base import call_ai_text, collect_json_response, with_timeout
+from .workflows_base import call_ai_text, collect_json_response
+
+
+def _stage_timeout(provider: Any, floor: int) -> int:
+    """P1-CFG 接线（2026-10-19）：单阶段 AI 调用超时预算跟随厂商配置 timeout。
+
+    背景：provider_factory 已把 ai_config/text_provider_configs 的 timeout（生产
+    实测 120s，范围 [5,600]）透传给 provider（openai_compatible 的 HTTP 层按
+    effective_timeout、read=1.5x 等待），但要点提取各业务阶段仍用裸硬编码
+    （第一阶段 60s）——日志实证 2026-10-19 21:30 项目 1871130：59~90s 区间的
+    慢而成功响应被业务层在配置允许完成之前提前误杀。
+    口径：max(阶段下限, provider.timeout)。下限维持原硬编码值（摘要/第一阶段
+    60s、第二阶段 120s），保证无 timeout 属性的老 provider 行为不变；用户在
+    文本模型配置模块调大 timeout 即整体放宽，无需改码。
+    注意预算约束：/ai/scoring 最坏耗时 = 各阶段 (timeout × 2次尝试) 之和，
+    需保留在前端 httpPostLong（600s）预算之内。
+    """
+    configured = getattr(provider, "timeout", 0) or 0
+    try:
+        configured = int(configured)
+    except (TypeError, ValueError):
+        configured = 0
+    return max(floor, configured)
 
 
 async def generate_tender_summary(provider: Any, tender_context: str) -> str:
@@ -134,9 +156,10 @@ async def generate_tender_summary(provider: Any, tender_context: str) -> str:
 
     # F-P0-2（2026-10-07）：改用 call_ai_text，空响应显式告警+重试+抛错，
     # 避免空摘要被静默落库（日志曾出现"响应长度: 0 字符"）。
+    # P1-CFG 接线（2026-10-19）：与评分点两阶段同口径，超时预算跟随厂商配置。
     raw_response = await call_ai_text(
         provider, messages,
-        timeout=60, max_tokens=4096,
+        timeout=_stage_timeout(provider, 60), max_tokens=4096,
         require_nonempty=True, retries=1, context="[AI摘要]",
     )
     logger.info("[AI摘要] 生成完成，响应长度: %d 字符", len(raw_response or ""))
@@ -230,11 +253,28 @@ async def extract_scoring_points(provider: Any, tender_context: str, summary: st
     # provider 抛网络异常（httpx.ConnectError 等），均不在 (ValueError, RuntimeError)
     # 内 → 最常见的超时场景降级完全失效。改用 Exception 兜底
     # （asyncio.CancelledError 属 BaseException，不会被误吞，取消语义不受影响）。
+    # BUG-FIX 2026-10-19（要点提取瞬时超时）：生产日志 21:30 项目 1871130 ——
+    # 第一阶段 provider.chat 恰好越过 60s 阈值即被裸 with_timeout 取消，
+    # 无重试直接降级 [] → 路由 502；21:32 重试同Provider 59s 就成功。
+    # 同模块摘要早已用 call_ai_text(retries=1) 吸收瞬时抖动（F-P0-2），
+    # 评分点两阶段此前是同模块唯一的"零重试"裸调用口径。统一改走
+    # call_ai_text：瞬时超时重试一次。require_nonempty=False 是刻意保留
+    # 原语义——空响应不判失败（旧行为：解析为空后仍继续第二阶段审查，
+    # 由审查阶段兜底产出），本修复只吸收 TimeoutError 这一种瞬时抖动。
+    # 加固（P1-CFG 接线，2026-10-19）：超时预算经 _stage_timeout 跟随厂商
+    # 配置 timeout（生产 120s），不再裸 60s 误杀 59~90s 的慢而成功响应。
     try:
-        first_raw = await with_timeout(provider.chat(first_messages), timeout=60)
+        first_raw = await call_ai_text(
+            provider,
+            first_messages,
+            timeout=_stage_timeout(provider, 60),
+            retries=1,
+            require_nonempty=False,
+            context="[评分点]第一阶段",
+        )
         first_points = _extract_array_from_response(extract_json_from_text(first_raw))
     except Exception as e:
-        logger.warning("[评分点] 第一阶段失败（返回空列表降级）: %s", e)
+        logger.warning("[评分点] 第一阶段失败（重试耗尽，返回空列表降级）: %s", e)
         return []
 
     existing_points_json = json.dumps(first_points, ensure_ascii=False, indent=2)
@@ -255,7 +295,17 @@ async def extract_scoring_points(provider: Any, tender_context: str, summary: st
     ]
 
     try:
-        review_content = await with_timeout(provider.chat(review_messages), timeout=120)
+        # BUG-FIX 2026-10-19：与第一阶段同口径，改走 call_ai_text 吸收瞬时超时
+        # （require_nonempty=False 同第一阶段：空响应维持旧降级语义，不判失败）；
+        # 超时预算经 _stage_timeout 跟随厂商配置（下限维持原 120s）。
+        review_content = await call_ai_text(
+            provider,
+            review_messages,
+            timeout=_stage_timeout(provider, 120),
+            retries=1,
+            require_nonempty=False,
+            context="[评分点]第二阶段",
+        )
         review_points = _extract_array_from_response(extract_json_from_text(review_content))
         logger.info(
             "[评分点] 第二阶段完成：补充 %d 个评分点，总计 %d 个",

@@ -117,10 +117,22 @@ class TestGenerateContentImplParamGate:
         from app.routers import sections
         from app.routers.sse import sse_content
 
-        router_params = _query_param_names(sections.generate_content)
-        impl_params = _query_param_names(sse_content.generate_content_impl)
+        # ENHANCE 2026-10-18（门禁口径修正）：原逻辑只比对 **Query 默认值**参数名，
+        # 但 `generation_mode` 在 router 侧用 Query(...)（需 FastAPI 校验 pattern），
+        # 在 impl 侧刻意用**普通字符串**默认值（见 BUG-FIX 2026-10-18 第二轮：
+        # impl 被 sections.py 以位置参数内部调用，不走 FastAPI 解析时 Query 默认值
+        # 会是 Query 对象而非 str，透传到 SSE json.dumps 抛 TypeError）。
+        # 这是**两侧合法且必须存在的差异**，不该被判为漂移；故改为比对形参名序列
+        #（router 侧剔除 FastAPI 注入的 request/current_user），既消除误报，
+        # 又保留「参数顺序必须一致」这一真正的防线。
+        _router_only = {"request", "current_user"}
+        router_params = [
+            n for n in inspect.signature(sections.generate_content).parameters
+            if n not in _router_only
+        ]
+        impl_params = list(inspect.signature(sse_content.generate_content_impl).parameters)
         assert router_params == impl_params, (
-            "router 与 impl 的 Query 参数必须完全一致且同序；"
+            "router 与 impl 的参数名序列必须完全一致且同序；"
             f"router={router_params} impl={impl_params}"
         )
         assert len(router_params) >= 14, "参数数量异常，签名可能被误改"
@@ -133,7 +145,14 @@ class TestGenerateContentImplParamGate:
         """
         from app.routers.sse import sse_content
 
-        expected = 1 + len(_query_param_names(sse_content.generate_content_impl))
+        # ENHANCE 2026-10-18（门禁口径修正）：原公式 `1 + len(Query 参数)` 假设
+        # project_id 之后**每个**形参都带 Query 默认值。但 `generation_mode`
+        # 按 BUG-FIX 2026-10-18（第二轮）必须用**普通字符串**默认值（本函数
+        # 被 sections.py 以位置参数内部调用，不经过 FastAPI 解析时 Query 默认值
+        # 会是 Query 对象而非 str，透传到 SSE json.dumps 抛 TypeError）。
+        # 因此改为直接比对 impl 的**形参总数**，既覆盖新增的普通默认值参数，
+        # 又保留「调用点必须按位置传全」这一真正的漂移检测意图。
+        expected = len(inspect.signature(sse_content.generate_content_impl).parameters)
         actual = _positional_call_arg_count(
             BACKEND_DIR / "app" / "routers" / "sections.py", "generate_content_impl"
         )
@@ -223,6 +242,9 @@ class TestGenerateContentImplParamWiring:
             orch_prefer_mermaid,
             orch_section_per_segment,
             use_word_adjust,
+            # 2026-10-18 新增：正文顺序生成模式（batch/serial/parallel）。
+            # 必须与 generate_content_impl 末位保持一致，否则位置传参整体错位。
+            generation_mode=None,
         ):
             captured["project_id"] = project_id
             captured["use_word_adjust"] = use_word_adjust

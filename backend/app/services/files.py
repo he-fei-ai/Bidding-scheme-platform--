@@ -3,6 +3,7 @@ import hashlib
 import logging
 import os
 import re
+import sqlite3
 from pathlib import Path
 import shutil
 import threading
@@ -18,6 +19,7 @@ from ..config import (
     OCR_MAX_FILE_SIZE_MB,
     OCR_TIMEOUT,
     PARSE_TASK_RETENTION,
+    PARSE_TASK_STALE_MINUTES,
     PDF_TABLE_EXTRACT_ENABLED,
     PPT_COM_ENABLED,
     PPT_COM_TIMEOUT,
@@ -119,6 +121,7 @@ from .extractors import (
     _extract_image_ocr,
     _extract_legacy_ole_chain,
     _extract_pdf,
+    _extract_pdf_impl,
     _extract_pdf_pdfplumber,
     _extract_ppt,
     _extract_pptx,
@@ -287,6 +290,107 @@ def prune_parse_tasks(project_id: int | None = None, max_rows: int | None = None
     except Exception as e:
         logger.warning("裁剪文件解析任务失败（不影响核心功能）: %s", e)
     return deleted
+
+
+def reclaim_stale_parse_state(*, stale_minutes: int | None = None) -> dict[str, int]:
+    """回收长时间停留在 processing 的解析状态（beat 每小时调用一次）。
+
+    GAP-FIX 2026-10-17（孤儿 processing 永不回收）：图片上传（R-3）走
+    「broker 派发 → worker 收尾」，下列任一情形都会让行**永久停在 processing**：
+
+      1. dispatch_task 把消息投给了 broker，但 worker 未运行 / 队列消息丢失；
+      2. worker 进程被 SIGKILL（Celery time_limit 超时、容器重启），
+         except 分支来不及执行，终态 UPDATE 不会发生；
+      3. 任务重试耗尽前 worker 崩溃。
+
+    此前没有任何回收路径：
+
+      - ``prune_parse_tasks`` 明确「在途 processing 行一律保留」；
+      - ``cleanup_old_results``（每小时 beat）只清 task_lock / task_snapshot /
+        generation_tasks，再加一次 prune，不碰这两张表；
+      - 本文件 M-4 注释还引用了一个**全仓并不存在**的 ``_recover_stale_tasks``，
+        把「启动期会回收」当成了事实陈述。
+
+    后果：前端 ``classifyUploadResult`` 判为「解析中」，进度条永久卡住，用户只能
+    删除重传。本函数把超时的 processing 收敛为 failed 并写明原因，把「永久等待」
+    变成「可自助重试」。
+
+    时钟说明：``uploaded_files`` 只有 created_at（无 updated_at），而**唯一**写
+    processing 的位置是 ``_persist_file_extraction``（本文件内），
+    ``re_extract_text`` 不会把行改回 processing —— 因此用 created_at 判陈旧
+    不会对「老文件重新提取」产生假阳性。
+
+    幂等与可自愈：重复调用只影响仍在 processing 且超时的行；迟到的 worker 完成后
+    照常把终态覆盖为 success（``_persist_file_extraction`` 的终态 UPDATE 不带
+    ``status='processing'`` 过滤），因此即便阈值设得过短导致误判，也会在 worker
+    追上后自动纠正。
+
+    Args:
+        stale_minutes: 覆盖配置 ``PARSE_TASK_STALE_MINUTES``；<= 0 表示关闭回收。
+
+    Returns:
+        {"uploaded_files_failed": int, "parse_tasks_failed": int}
+    """
+    minutes = PARSE_TASK_STALE_MINUTES if stale_minutes is None else stale_minutes
+    if minutes <= 0:
+        return {"uploaded_files_failed": 0, "parse_tasks_failed": 0}
+
+    stale_msg = (
+        f"后台解析未在 {minutes} 分钟内完成（worker 未运行或任务已丢失），"
+        "已自动标记失败，请重新解析"
+    )[:500]
+    result: dict[str, int] = {"uploaded_files_failed": 0, "parse_tasks_failed": 0}
+    try:
+        with get_db() as conn:
+            # BUG-FIX 2026-10-17（GAP reclaim 误判）：uploaded_files 只有 created_at，
+            # 此前用 created_at 判 stale 会让 async-reparse 路径立即被误判：
+            # 文件上传后 created_at=T0，async-reparse 触发时 _persist_file_extraction
+            # 把行改回 status='processing' 但 created_at 不变 → beat 下一轮立即判定
+            # 「过期」并标记 failed，worker 正常完成后才覆盖回来。现改用 updated_at：
+            #   - 有 updated_at 列（新 schema）→ 用 updated_at 判 stale（正确语义：
+            #     最近一次状态变更时间，async-reparse 刚改回 processing 时 updated_at=现在）
+            #   - 无 updated_at 列（老 DB）→ 降级用 created_at，避免 SQLite
+            #     "no such column" 错误，同时触发 logger.warning 提示升级 schema。
+            try:
+                cur = conn.execute(
+                    """UPDATE uploaded_files
+                       SET status = 'failed', message = ?
+                       WHERE status = 'processing'
+                         AND datetime(updated_at, ?) < datetime('now', 'localtime')""",
+                    (stale_msg, f"{int(minutes)} minutes"),
+                )
+            except sqlite3.OperationalError:
+                # 老 DB 缺 updated_at 列：降级用 created_at + 告警引导迁移
+                logger.warning(
+                    "uploaded_files 缺 updated_at 列，reclaim_stale_parse_state 降级用 created_at "
+                    "（async-reparse 路径可能被误判为 stale）—— 请执行 DB 迁移。"
+                )
+                cur = conn.execute(
+                    """UPDATE uploaded_files
+                       SET status = 'failed', message = ?
+                       WHERE status = 'processing'
+                         AND datetime(created_at, ?) < datetime('now', 'localtime')""",
+                    (stale_msg, f"{int(minutes)} minutes"),
+                )
+            result["uploaded_files_failed"] = int(cur.rowcount or 0)
+
+            cur = conn.execute(
+                """UPDATE file_parse_tasks
+                   SET status = 'failed', progress = 50, error_message = ?,
+                       completed_at = datetime('now', 'localtime'),
+                       updated_at = datetime('now', 'localtime')
+                   WHERE status = 'processing'
+                     AND datetime(updated_at, ?) < datetime('now', 'localtime')""",
+                (stale_msg, f"{int(minutes)} minutes"),
+            )
+            result["parse_tasks_failed"] = int(cur.rowcount or 0)
+    except Exception as e:
+        logger.warning("回收孤儿解析状态失败（不影响核心功能）: %s", e)
+        return {"uploaded_files_failed": 0, "parse_tasks_failed": 0}
+
+    if result["uploaded_files_failed"] or result["parse_tasks_failed"]:
+        logger.info("回收孤儿解析状态: %s", result)
+    return result
 
 
 def _create_parse_task(project_id: int, filename: str, file_type: str = ""):
@@ -651,8 +755,8 @@ def save_upload(project_id: int, filename: str, content: bytes, file_role: str =
             cursor = conn.execute(
                 """INSERT INTO uploaded_files
                    (project_id, filename, path, file_type, file_role,
-                    status, extracted_text_path, message)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    status, extracted_text_path, message, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now', 'localtime'))""",
                 (
                     project_id,
                     filename,
@@ -745,7 +849,8 @@ def _persist_file_extraction(
         _create_parse_task(project_id, filename, ext)
     with get_db() as conn:
         conn.execute(
-            "UPDATE uploaded_files SET status = 'processing' WHERE id = ? AND project_id = ?",
+            "UPDATE uploaded_files SET status = 'processing', "
+            "updated_at = datetime('now', 'localtime') WHERE id = ? AND project_id = ?",
             (file_id, project_id),
         )
     try:
@@ -796,7 +901,8 @@ def _persist_file_extraction(
     stored_text_path = str(text_path) if text_written else ""
     with get_db() as conn:
         conn.execute(
-            "UPDATE uploaded_files SET status = ?, extracted_text_path = ?, message = ? "
+            "UPDATE uploaded_files SET status = ?, extracted_text_path = ?, message = ?, "
+            "updated_at = datetime('now', 'localtime') "
             "WHERE id = ? AND project_id = ?",
             (_status, stored_text_path, _msg, file_id, project_id),
         )
@@ -869,8 +975,9 @@ def _save_upload_image_async(
             cursor = conn.execute(
                 """INSERT INTO uploaded_files
                    (project_id, filename, path, file_type, file_role,
-                    status, extracted_text_path, message)
-                   VALUES (?, ?, ?, ?, ?, 'processing', '', '')""",
+                    status, extracted_text_path, message, updated_at)
+                   VALUES (?, ?, ?, ?, ?, 'processing', '', '',
+                           datetime('now', 'localtime'))""",
                 (
                     project_id,
                     filename,
@@ -907,15 +1014,18 @@ def _save_upload_image_async(
                 # POST /files 于是返回 200 + status='processing'：
                 #   · 前端 classifyUploadResult 判为「解析中」，进度条永久卡住；
                 #   · 文件行的 message 为空，用户看不到失败原因；
-                #   · 该状态也不再被任何清洗逻辑回收（区别于启动期的
-                #     _recover_stale_tasks，进程存活期间永不回收）。
+                #   · 此前**没有任何**清洗逻辑回收该状态（本注释原引用的
+                #     `_recover_stale_tasks` 在全仓并不存在），进程存活期间永不回收。
+                #     现另有 reclaim_stale_parse_state()（beat 每小时）兜底：即便此处置顶
+                #     失败失败，超过 PARSE_TASK_STALE_MINUTES 的 processing 也会被收敛为 failed。
                 # 现与 save_upload 同步路径的 `文本提取失败: {e}` 口径对齐，
                 # 同时把失败写进文件行与任务行。
                 _fail_msg = f"文本提取失败: {_pe}"[:500]
                 try:
                     with get_db() as conn:
                         conn.execute(
-                            "UPDATE uploaded_files SET status = 'failed', message = ? "
+                            "UPDATE uploaded_files SET status = 'failed', message = ?, "
+                            "updated_at = datetime('now', 'localtime') "
                             "WHERE id = ? AND project_id = ?",
                             (_fail_msg, file_id, project_id),
                         )
@@ -1726,12 +1836,14 @@ def set_file_role(project_id: int, file_id: int, role: str) -> dict:
             demoted = [r["id"] for r in downgraded]
             if demoted:
                 conn.execute(
-                    "UPDATE uploaded_files SET file_role = 'supporting' "
+                    "UPDATE uploaded_files SET file_role = 'supporting', "
+                    "updated_at = datetime('now', 'localtime') "
                     "WHERE project_id = ? AND file_role = 'main' AND id != ?",
                     (project_id, file_id),
                 )
         conn.execute(
-            "UPDATE uploaded_files SET file_role = ? WHERE id = ? AND project_id = ?",
+            "UPDATE uploaded_files SET file_role = ?, updated_at = datetime('now', 'localtime') "
+            "WHERE id = ? AND project_id = ?",
             (role, file_id, project_id),
         )
         # REVIEW-FIX 2026-10-04（m2）：主文件选择实际换源（新旧角色不同）且
@@ -1769,7 +1881,8 @@ def _promote_next_main(conn, project_id: int) -> int | None:
         (r["id"] for r in remaining if r["status"] == "success"), remaining[0]["id"]
     )
     conn.execute(
-        "UPDATE uploaded_files SET file_role = 'main' WHERE id = ? AND project_id = ?",
+        "UPDATE uploaded_files SET file_role = 'main', updated_at = datetime('now', 'localtime') "
+        "WHERE id = ? AND project_id = ?",
         (target, project_id),
     )
     return target
@@ -1902,7 +2015,8 @@ def clear_project_texts(project_id: int) -> dict:
             with get_db() as conn:
                 cur = conn.execute(
                     "UPDATE uploaded_files SET status = 'pending', message = '', "
-                    "extracted_text_path = '' WHERE project_id = ?",
+                    "extracted_text_path = '', updated_at = datetime('now', 'localtime') "
+                    "WHERE project_id = ?",
                     (project_id,),
                 )
                 files_reset = cur.rowcount or 0
@@ -2062,7 +2176,8 @@ def re_extract_text(project_id: int, file_id: int) -> dict:
 
     with get_db() as conn:
         conn.execute(
-            "UPDATE uploaded_files SET status = ?, message = ?, extracted_text_path = ? "
+            "UPDATE uploaded_files SET status = ?, message = ?, extracted_text_path = ?, "
+            "updated_at = datetime('now', 'localtime') "
             "WHERE id = ? AND project_id = ?",
             (status, message, str(text_path) if text_written else "", file_id, project_id),
         )

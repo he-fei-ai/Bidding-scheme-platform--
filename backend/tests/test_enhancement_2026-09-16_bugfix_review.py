@@ -142,7 +142,13 @@ def test_generate_section_content_empty_section_ids():
 # ============================================================================
 
 class _BrokenProvider:
-    """provider 本体不会被调用（with_timeout 被 monkeypatch）"""
+    """provider 本体不会被调用（call_ai_text 被 monkeypatch）
+
+    迁移说明 2026-10-19：评分点两阶段调用口径由裸 with_timeout 统一改走
+    call_ai_text（瞬时超时重试一次，见 test_bugfix_2026_10_19_scoring_retry.py），
+    本组用例的 mock 接缝随之从 with_timeout 迁移到 call_ai_text，
+    断言契约（任何异常降级、第二阶段失败保留第一阶段结果）保持不变。
+    """
 
     def chat(self, messages):
         raise AssertionError("provider.chat 不应被触达")
@@ -153,17 +159,17 @@ def test_extract_scoring_points_degrades_on_first_stage_failure(exc):
     """第一阶段任何异常（含 TimeoutError）都返回空列表降级，不向上抛。"""
     from app.services.ai import workflows_analysis
 
-    async def _always_timeout(_awaitable, timeout=60):
+    async def _always_fail(*_args, **_kwargs):
         raise exc
 
-    orig = workflows_analysis.with_timeout
-    workflows_analysis.with_timeout = _always_timeout
+    orig = workflows_analysis.call_ai_text
+    workflows_analysis.call_ai_text = _always_fail
     try:
         result = asyncio.run(
             workflows_analysis.extract_scoring_points(_BrokenProvider(), "上下文", "摘要")
         )
     finally:
-        workflows_analysis.with_timeout = orig
+        workflows_analysis.call_ai_text = orig
     assert result == []
 
 
@@ -173,32 +179,20 @@ def test_extract_scoring_points_second_stage_failure_falls_back_to_first_stage()
 
     calls = {"n": 0}
 
-    async def _timeout_on_second(_awaitable, timeout=60):
+    async def _fail_on_second(*_args, **_kwargs):
         calls["n"] += 1
         if calls["n"] >= 2:
             raise TimeoutError("second stage timeout")
         return '[{"name": "工期保障", "weight": 10}]'
 
-    class _Provider:
-        def chat(self, messages):
-            class _Coro:
-                def __await__(self):
-                    if False:
-                        yield
-                def send(self, _v):
-                    return '[{"name": "工期保障", "weight": 10}]'
-                def throw(self, e):
-                    raise e
-            return _Coro()
-
-    orig = workflows_analysis.with_timeout
-    workflows_analysis.with_timeout = _timeout_on_second
+    orig = workflows_analysis.call_ai_text
+    workflows_analysis.call_ai_text = _fail_on_second
     try:
         result = asyncio.run(
-            workflows_analysis.extract_scoring_points(_Provider(), "上下文", "摘要")
+            workflows_analysis.extract_scoring_points(_BrokenProvider(), "上下文", "摘要")
         )
     finally:
-        workflows_analysis.with_timeout = orig
+        workflows_analysis.call_ai_text = orig
     # 第一阶段结果被保留（normalize 后非空，且不含第二阶段内容）
     assert isinstance(result, list)
     assert len(result) >= 1

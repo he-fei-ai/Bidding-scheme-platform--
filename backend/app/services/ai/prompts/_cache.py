@@ -17,6 +17,7 @@ import threading
 import time
 from pathlib import Path
 
+from ....logging_format import log_error as _log_error
 from ._registry import (
     _ALL_PROMPTS,
     clean_prompt_text,
@@ -28,6 +29,26 @@ from ._context import assemble_prompt_context, estimate_tokens, truncate_to_toke
 
 
 logger = logging.getLogger(__name__)
+
+
+def _cfg(name: str, default):
+    """读取 config 同名配置，config 不可用（如极简环境/单测隔离）时回落默认值。"""
+    try:
+        from .... import config
+
+        return getattr(config, name, default)
+    except Exception:
+        return default
+
+
+# ENHANCE 2026-10-17：安全默认值开关。默认均为 False —— 即保持「opt-in」的
+# 既有语义，调用方显式传参优先；运维可通过环境变量全局开启（见 config.py 注释）。
+_CFG_PROMPT_SANITIZE_DEFAULT = bool(_cfg("PROMPT_SANITIZE_DEFAULT", False))
+_CFG_PROMPT_DESENSITIZE_DEFAULT = bool(_cfg("PROMPT_DESENSITIZE_DEFAULT", False))
+
+# render_prompt 的控制参数名（非模板变量）：变量校验时必须排除，否则会
+# 把「渲染开关」误当作已提供的变量，掩盖真实缺失。
+_RENDER_CONTROL_KEYS = frozenset({"sanitize", "desensitize"})
 
 # 模块级缓存，使用锁保护
 _prompt_cache: dict[str, str] | None = None
@@ -877,7 +898,9 @@ def _check_hardcode_drift() -> None:
 # （每个章节、每次 JSON 修复、每次图表编排都会调用），DB 异常时会退化成
 # "100 章节 = 100 次失败查询 + 100 次异常构造"，且这些查询还要抢全局写锁、
 # 阻塞整个事件循环。修复：失败后进入冷却期，冷却期内直接走硬编码回退。
-_PROMPT_CACHE_RETRY_INTERVAL = 60.0
+# ENHANCE 2026-10-17：可通过 config.PROMPT_CACHE_RETRY_INTERVAL 覆盖（默认 60s
+# 与修复前一致）。缓存加载失败后进入冷却，冷却期内直接走硬编码回退。
+_PROMPT_CACHE_RETRY_INTERVAL = float(_cfg("PROMPT_CACHE_RETRY_INTERVAL", 60.0))
 _load_failed_at: float | None = None
 
 
@@ -921,8 +944,20 @@ def get_prompt(key: str, **kwargs) -> str:
     BUG-FIX (并发安全): 原实现用 if _prompt_cache is None 无锁检查，
     高并发下可能多个线程同时看到 None → 并发查 DB → 无谓 I/O。
     改为在锁内做一次性检查，同时保证 _prompt_cache 的可见性。
+
+    ENHANCE 2026-10-17（安全默认值可配置）：调用方未显式指定 sanitize /
+    desensitize 时，回落到 ``config.PROMPT_SANITIZE_DEFAULT`` /
+    ``config.PROMPT_DESENSITIZE_DEFAULT``。两者默认均为 False，与修复前
+    行为完全一致（opt-in 语义不变）；运维可按部署环境一键开启全链路加固。
     """
     global _prompt_cache, _load_failed_at
+    # 仅在确有变量值需要处理时套用默认开关；无变量调用（抓取原始模板的编排/审核
+    # 场景）不加这两个键，否则会被下面的「变量缺失」校验当成变量名而刷噪声告警
+    # （回归：tests/test_prompts_module_2026_10_04.py::test_fetch_raw_template_no_warning）。
+    # 语义上也成立：sanitize/desensitize 作用于「变量值」，无变量即无需清洗。
+    if kwargs:
+        kwargs.setdefault("sanitize", _CFG_PROMPT_SANITIZE_DEFAULT)
+        kwargs.setdefault("desensitize", _CFG_PROMPT_DESENSITIZE_DEFAULT)
     # 锁内检查 + 加载，保证并发安全
     with _cache_lock:
         if _prompt_cache is None:
@@ -952,6 +987,16 @@ def get_prompt(key: str, **kwargs) -> str:
                         # 自动比对硬编码与DB内容差异（2026-10-06 增强）
                         _check_hardcode_drift()
                 except Exception as e:
+                    # ENHANCE 2026-10-18（第三轮）：统一错误分类（error_code /
+                    # error_layer / retryable），便于按码聚合告警与检索。保留原 WARNING
+                    # 文案以免破坏既有日志检索脚本。
+                    _log_error(
+                        "Failed to load prompt cache from DB: %s",
+                        e,
+                        error_code="PROMPT_CACHE_DB_UNAVAILABLE",
+                        layer="db",
+                        retryable=True,
+                    )
                     logger.warning("Failed to load prompt cache from DB: %s", e)
                     _prompt_cache = None  # 保持 None，冷却期后重试
                     _load_failed_at = time.time()
@@ -997,7 +1042,11 @@ def get_prompt(key: str, **kwargs) -> str:
     # 且仅在需要渲染（有 kwargs）时执行，避免抓取原始模板的调用方（如编排/审核）产生噪声。
     if kwargs:
         required_vars = extract_variables(prompt)
-        passed_lower = {k.lower() for k, v in kwargs.items() if v is not None}
+        # 排除 render_prompt 的控制参数：它们是「渲染开关」而非「变量值」，
+        # 计入 passed_lower 会掩盖真实同名变量的缺失告警。
+        passed_lower = {
+            k.lower() for k, v in kwargs.items() if v is not None and k.lower() not in _RENDER_CONTROL_KEYS
+        }
         missing = [v for v in required_vars if v.lower() not in passed_lower]
         if missing:
             logger.warning(
@@ -1005,6 +1054,18 @@ def get_prompt(key: str, **kwargs) -> str:
             )
         # 变量替换（统一走 render_prompt：兼容 {var} 与 __VAR__，大小写不敏感）
         prompt = render_prompt(prompt, **kwargs)
+    else:
+        # BUG-FIX-PROMPT-D4（2026-10-17，无变量时共享引用不解析）：
+        # ``render_prompt`` 内部才会调用 ``_resolve_shared``，而上面只在
+        # ``if kwargs:`` 分支调用它——于是**无变量调用**时模板里的
+        # ``{shared:NAME}`` 会以字面量形式直接发给模型。实测复现：
+        #     get_prompt('X')            -> 含字面量 "{shared:HEADING_RULES}"  ✗
+        #     get_prompt('X', A='1')     -> 已解析                              ✓
+        # 该缺陷此前未暴露，是因为注册表中尚无模板引用共享规则；一旦收编
+        # 复用（管理页改 SHARED_* 即全局生效），无变量模板就会收到坏块。
+        # 这里显式补上：无变量时也做一次共享引用解析（纯静态替换，开销可忽略）。
+        if "{shared:" in prompt:
+            prompt = render_prompt(prompt)
 
     return prompt
 

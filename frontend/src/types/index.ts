@@ -205,6 +205,11 @@ export interface ExportConfig {
   image_dpi?: number;
   gantt_max_columns?: number;
   strict_mode?: boolean;
+  // D5 加固（2026-10-07）：图表标题兜底补图开关（此前前端发送但类型缺失）
+  auto_fallback_charts?: boolean;
+  // L-6（2026-10-17）：图题编号分隔符（" " 空格=默认历史口径 / "：" 冒号），
+  // 与后端 ExportConfig.figure_no_separator 对齐，非法取值由后端回退空格
+  figure_no_separator?: string;
   // ===== ENHANCE 2026-09-14：导出格式预设体系（移植自易标 exportFormatPresets）=====
   preset_id?: string;
   theme_id?: string;

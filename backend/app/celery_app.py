@@ -258,12 +258,13 @@ def cleanup_old_results() -> dict[str, Any]:
     过期生成任务只增不减 —— 僵尸锁会把同一项目的后续任务永久拦在门外
     （`task_lock.acquire` 撞上未回收的 active 行即报冲突）。
 
-    现在真实执行三步清理，并返回各步的实际条数（失败的步骤单独记录，
+    现在真实执行五步清理，并返回各步的实际条数（失败的步骤单独记录，
     不因一步出错中断其余清理）。
 
     Returns:
         {"status": "ok"|"failed", "locks_reclaimed": int, "snapshots_interrupted": int,
-         "generation_tasks_deleted": int, "errors": [str, ...]}
+         "generation_tasks_deleted": int, "parse_tasks_pruned": int,
+         "parse_state_reclaimed": int, "errors": [str, ...]}
     """
     result: dict[str, Any] = {
         "status": "ok",
@@ -271,6 +272,7 @@ def cleanup_old_results() -> dict[str, Any]:
         "snapshots_interrupted": 0,
         "generation_tasks_deleted": 0,
         "parse_tasks_pruned": 0,
+        "parse_state_reclaimed": 0,
         "errors": [],
     }
     logger.info("开始清理过期的任务状态...")
@@ -318,6 +320,23 @@ def cleanup_old_results() -> dict[str, Any]:
     except Exception as exc:  # pragma: no cover
         logger.warning("裁剪文件解析任务失败: %s", exc, exc_info=True)
         result["errors"].append(f"file_parse_tasks: {exc}")
+
+    # 5) GAP-FIX 2026-10-17：回收孤儿 processing（uploaded_files + file_parse_tasks）。
+    #    图片上传走「broker 派发 → worker 收尾」，worker 未运行 / 消息丢失 / 被 SIGKILL
+    #    都会让行永久停在 processing：prune 只淘汰终态行，前端进度条因此永久卡住。
+    #    放在 prune 之后：先由 prune 淘汰终态行，再把超时的在途行收敛为 failed，
+    #    下一轮 prune 才能将其一并裁掉。
+    try:
+        from .services.files import reclaim_stale_parse_state
+
+        _reclaimed = reclaim_stale_parse_state() or {}
+        result["parse_state_reclaimed"] = int(
+            _reclaimed.get("uploaded_files_failed", 0)
+            + _reclaimed.get("parse_tasks_failed", 0)
+        )
+    except Exception as exc:  # pragma: no cover
+        logger.warning("回收孤儿解析状态失败: %s", exc, exc_info=True)
+        result["errors"].append(f"reclaim_stale_parse_state: {exc}")
 
     if result["errors"]:
         result["status"] = "failed"

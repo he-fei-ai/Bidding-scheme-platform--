@@ -53,8 +53,6 @@ from .writing_length_config import (
     WRITING_LENGTH_RANGE,
     WRITING_LENGTH_LABEL,
     normalize_writing_length,
-    get_l3_own_tolerance,
-    get_l3_own_target,
     level_target,
     get_tier_config,
     get_default_tier_config,
@@ -85,6 +83,19 @@ except ImportError:  # pragma: no cover - 兜底路径
     format_global_dictionary_for_prompt = None
     format_chapter_fields_for_prompt = None
     select_fields_for_chapter = None
+# 2026-10-18 ENHANCE: ordered batch generation utilities
+try:
+    from .ordered_generation import (
+        build_generation_batches,
+        extract_section_summary,
+        inject_previous_section_context,
+        verify_generation_order,
+    )
+except ImportError:  # pragma: no cover
+    build_generation_batches = None
+    extract_section_summary = None
+    inject_previous_section_context = None
+    verify_generation_order = None
 
 # BUG-FIX 2026-10-15（P1·图表围栏 mask 口径分叉）：
 # 本模块的压缩前置保护（_mask_chart_fences_for_compression）原先自带一份手写
@@ -380,6 +391,45 @@ def _normalize_priority_for_prompt(priority: Any) -> int:
     except Exception:  # pragma: no cover
         return int(priority or 0)
     return normalize_priority(priority, needed=True)
+
+
+#: 本平台**已知不可渲染**的配图类型 → 最接近的可消费类型降级映射
+#: （2026-10-20 遗留项加固：易标 HTML 配图类）。
+#:
+#: 背景：易标 illustration type 含第四类 "html"（AI 生成自包含 HTML 图表），
+#: 但本平台导出/渲染链路只消费 mermaid 围栏 / chart-json / AI 图片三类——
+#: `export.py` 全文 grep 证实无任何 HTML→图片/Word 的渲染能力
+#: （mermaid 走专用渲染服务，非通用 HTML 引擎）。若编排/落库出现 "html"，
+#: 原实现 `_ill_type == "mermaid"` / `== "ai"` 两分支都不命中 → 模型收不到
+#: 任何配图意图，既无图也无告警，即"死数据"。
+#:
+#: 策略：不静默丢弃、不引入无消费方的类型——把 "html" 降级为 "ai"
+#: （AI 配图可表达任意图示，是语义最接近的可消费类型）并告警留痕。
+#: 只处理**已知不可渲染**的值：`generate-illustration` 路由写入的图片
+#: 风格串（engineering_diagram 等）与本判定无关，原样返回，不做值域收敛，
+#: 避免把风格串误判为非法值刷告警。
+#:
+#: 未来导出端建立 HTML 图表消费能力后：删除本映射，并在下方提示词分支补
+#: "HTML图: 计划配图（自包含 HTML，导出时渲染为图片）" 即可，无需改其它代码。
+_UNRENDERABLE_ILLUSTRATION_MAP = {"html": "ai"}
+
+
+def _degrade_unrenderable_illustration(value: Any) -> Any:
+    """把本平台无法渲染的配图类型降级为最接近的可消费类型（2026-10-20）。
+
+    只映射 `_UNRENDERABLE_ILLUSTRATION_MAP` 中的已知不可渲染值（当前仅
+    易标 "html"）；其余值（含图片风格串）原样返回，行为零变化。
+    """
+    v = str(value or "").strip().lower()
+    if v in _UNRENDERABLE_ILLUSTRATION_MAP:
+        degraded = _UNRENDERABLE_ILLUSTRATION_MAP[v]
+        logger.warning(
+            "[配图降级] illustration_type=%r 本平台无渲染消费方，已降级为 %r"
+            "（配图意图不丢失；待导出端具备 HTML 图表渲染能力后可恢复原类型）",
+            value, degraded,
+        )
+        return degraded
+    return value
 
 
 def _format_chapter_list(chapters: list) -> str:
@@ -782,6 +832,8 @@ def build_chapter_content_messages(chapter_info: dict, facts: Any = None,
     # 从 kwargs 提取（精简后）增强上下文
     kw_summary = (kwargs.get("summary") or "")[:800]
     kw_writing_length = kwargs.get("writing_length") or ""
+    # 2026-10-18 ENHANCE: previous section summaries for ordered context continuation
+    kw_prev_sections = kwargs.get("previous_sections_summary") or ""
 
     # ENHANCE 2026-10-05（P-9）：招标文件已提取的「工程作法/施工方案」原文。
     # 对齐易标规格五「已有方案 vs 无方案差异化流程」：
@@ -897,6 +949,27 @@ def build_chapter_content_messages(chapter_info: dict, facts: Any = None,
             f"招标文件已载明的工程作法（原文摘录，本方须承接扩写而非另起炉灶）: "
             f"{safe_cm}"
         )
+    # ENHANCE 2026-10-18（第二轮）：适用规范清单 —— 从招标文本确定性抽取的
+    # GB/JGJ/CJJ 等标准编号（ordered_generation.extract_standards_from_text）。
+    # 项目级稳定上下文：同项目内跨章节不变，不影响 [0]+[1] 缓存前缀。
+    # 无命中（空列表）时不注入，行为与改动前一致。
+    kw_standards = kwargs.get("standards_list")
+    if isinstance(kw_standards, list) and kw_standards:
+        _std_lines = []
+        for _st in kw_standards[:20]:
+            if not isinstance(_st, dict):
+                continue
+            _code = str(_st.get("code") or "").strip()
+            _title = str(_st.get("title") or "").strip()
+            if not _code:
+                continue
+            _std_lines.append(f"  - {_code}" + (f"《{_title}》" if _title else ""))
+        if _std_lines:
+            _safe_std = sanitize_prompt_value("\n".join(_std_lines)) if sanitize_prompt_value else "\n".join(_std_lines)
+            stable_parts.append(
+                "适用规范清单（招标文件载明的标准编号，技术参数与验收标准"
+                "须与这些规范一致，不得引用清单外标准）:\n" + _safe_std
+            )
     # ENHANCE 2026-10-07：全局数据字典（关键一致性字段权威值，全文唯一）→ 注入稳定上下文。
     # 放在 [1] 使缓存命中区间 [0]+[1] 不受影响；正文必须「一字不差引用」字典值，
     # 这是「前后数据一致性」的核心机制：同一字段在所有章节读取同一权威值。
@@ -905,6 +978,20 @@ def build_chapter_content_messages(chapter_info: dict, facts: Any = None,
         _dict_text = format_global_dictionary_for_prompt(_field_contract.get("global_dictionary") or {})
         if _dict_text:
             stable_parts.append(_dict_text)
+    # ENHANCE 2026-10-19（岳阳路事故·专业隔离）：项目类型锁定 + 域外术语禁入。
+    # 装修项目正文此前被含地勘术语的标题误导，强行往「地质勘察」上扯。
+    # 注入 [1] 稳定上下文层：同项目跨章节不变，不破坏 [0]+[1] 缓存前缀。
+    try:
+        from .outline_common import (
+            _build_professional_isolation_block,
+            _detect_project_type,
+        )
+        _p_type = _detect_project_type(kw_summary or "", facts)
+        _iso_block = _build_professional_isolation_block(_p_type)
+        if _iso_block:
+            stable_parts.append(_iso_block.strip())
+    except Exception as e:  # pragma: no cover - 防御性（与事实筛选同一兜底策略）
+        logger.debug("专业隔离约束注入失败（跳过）: %s", e)
     if stable_parts:
         messages.append(AIMessage(role="user", content="\n\n".join(stable_parts)))
 
@@ -935,6 +1022,22 @@ def build_chapter_content_messages(chapter_info: dict, facts: Any = None,
                         _inc_metrics("fact_resolve_misses", len(_sel_titles))
         except Exception as e:  # pragma: no cover - 防御性
             logger.debug("编排选事实通道不可用，回退打分筛选: %s", e)
+
+        # ENHANCE 2026-10-18: 显式字段映射优先注入（替代纯关键词打分筛选）
+        if not _chapter_facts:
+            try:
+                from ...config import CONTENT_FACTS_EXPLICIT_MAP
+                if CONTENT_FACTS_EXPLICIT_MAP:
+                    from .ordered_generation import select_facts_by_chapter_map
+                    _explicit_facts = select_facts_by_chapter_map(
+                        title, facts, kwargs.get("field_contract", {}).get("extraction_fields") if kwargs.get("field_contract") else None,
+                        industry=kwargs.get("industry"),
+                    )
+                    if _explicit_facts:
+                        _chapter_facts = _explicit_facts
+            except Exception as e:  # pragma: no cover - 防御性
+                logger.debug("显式字段映射不可用，回退打分筛选: %s", e)
+
         if not _chapter_facts:
             _chapter_facts = _select_facts_for_section(facts, title, section_summary)
         if _chapter_facts:
@@ -959,14 +1062,21 @@ def build_chapter_content_messages(chapter_info: dict, facts: Any = None,
         if _cf_text:
             safe_cf = sanitize_prompt_value(_cf_text) if sanitize_prompt_value else _cf_text
             messages.append(AIMessage(role="user", content=safe_cf))
-        # 可追溯：记录本章实际注入的字段（键 / 来源），供生成后自检与审计。
+        # 可追溯：记录本章实际注入的字段（标签 / 来源 / 值预览），
+        # 供生成后自检与「章节 → 所需事实」调用完整性审计（二.3）。
         if isinstance(_field_trace, list):
-            _ext_keys = [k for k, v in _chapter_fields.get("extraction", {}).items() if v]
-            _fac_keys = [k for k, v in _chapter_fields.get("facts", {}).items() if v]
-            for _k in _ext_keys:
-                _field_trace.append({"chapter": title, "field": _k, "source": "extraction"})
-            for _k in _fac_keys:
-                _field_trace.append({"chapter": title, "field": _k, "source": "facts"})
+            for _lbl, _val in (_chapter_fields.get("extraction") or {}).items():
+                if _val:
+                    _field_trace.append({
+                        "chapter": title, "field": _lbl, "source": "extraction",
+                        "value": str(_val)[:60],
+                    })
+            for _lbl, _val in (_chapter_fields.get("facts") or {}).items():
+                if _val:
+                    _field_trace.append({
+                        "chapter": title, "field": _lbl, "source": "facts",
+                        "value": str(_val)[:60],
+                    })
 
     # --- [2] 上级章节（承接关系）---
     if parent_chapters:
@@ -991,6 +1101,24 @@ def build_chapter_content_messages(chapter_info: dict, facts: Any = None,
             messages.append(AIMessage(
                 role="user", content="同级章节（请避免内容重复，突出本章节独特性）:\n" + "\n".join(_s_lines)
             ))
+
+    # --- [3.2] 2026-10-18 ENHANCE: 章节位置与必含要素 ---
+    # 注入当前章节在目录树中的位置信息（第几章第几节）和九大章节必含要素清单，
+    # 帮助 AI 明确章节定位、避免跨章节内容、确保要素齐全。
+    try:
+        from .ordered_generation import build_chapter_position_context, build_nine_chapter_elements
+        _pos_ctx = build_chapter_position_context(chapter_info, kwargs.get("sections_by_id", {}).values() if kwargs.get("sections_by_id") else [])
+        _nine_elem = build_nine_chapter_elements(title, industry=kwargs.get("industry"))
+        _pos_parts = []
+        if _pos_ctx:
+            _pos_parts.append(f"章节位置: {_pos_ctx}")
+        if _nine_elem:
+            _pos_parts.append(_nine_elem)
+        if _pos_parts:
+            _safe_pos = sanitize_prompt_value("\n\n".join(_pos_parts)) if sanitize_prompt_value else "\n\n".join(_pos_parts)
+            messages.append(AIMessage(role="user", content=_safe_pos))
+    except Exception as e:  # pragma: no cover - 防御性
+        logger.debug("章节位置/必含要素注入不可用: %s", e)
 
     # --- [3.5] 下级目录章节（仅作交叉引用，禁止复述）---
     _child_chapters = chapter_info.get("child_chapters") or []
@@ -1031,6 +1159,47 @@ def build_chapter_content_messages(chapter_info: dict, facts: Any = None,
                         "骨架不含数据，具体数据以全局事实为准）:\n" + _safe_skel
                     ),
                 ))
+
+    # --- [3.75] 2026-10-18 ENHANCE: 前序章节内容摘要（顺序生成时上下文承接）---
+    if kw_prev_sections:
+        _safe_prev = sanitize_prompt_value(kw_prev_sections) if sanitize_prompt_value else kw_prev_sections
+        messages.append(AIMessage(
+            role="user",
+            content=(
+                "前序章节内容摘要（请自然承接，保持行文连贯，避免与前节内容重复）:\n"
+                + _safe_prev
+            ),
+        ))
+
+    # --- [3.8] 2026-10-18 ENHANCE（第二轮）：危大工程判定参数（按章节相关性注入）---
+    # 编排/生成前由 sse_content 扫描招标文本识别危大工程（hazard_projects），
+    # 此处仅对**相关章节**注入「必含章节/表格/图表、安全阈值、适用规范」，
+    # 不把全部危大信息注入每一章（按需注入）。
+    kw_hazard = kwargs.get("hazard_info")
+    if kw_hazard and isinstance(kw_hazard, dict):
+        try:
+            from .hazard_projects import (
+                HAZARD_PROJECTS,
+                format_hazard_context,
+                match_hazards_for_chapter,
+            )
+
+            _detected = [
+                hp for hp in HAZARD_PROJECTS
+                if hp.code in {d.get("code") for d in (kw_hazard.get("detected") or [])}
+            ]
+            _matched = match_hazards_for_chapter(
+                title,
+                chapter_info.get("ancestors") or [],
+                detected=_detected or None,
+            )
+            if _matched:
+                _hazard_text = format_hazard_context(_matched)
+                if _hazard_text:
+                    _safe_hz = sanitize_prompt_value(_hazard_text) if sanitize_prompt_value else _hazard_text
+                    messages.append(AIMessage(role="user", content=_safe_hz))
+        except Exception as e:  # pragma: no cover - 防御性
+            logger.debug("危大工程上下文注入失败（跳过）: %s", e)
 
     # --- [3.8] 编排选定的知识库素材（E-2）---
     # ENHANCE 2026-10-09：补齐易标规格 D7 的 knowledge.item_ids 通道 —— 编排阶段
@@ -1079,48 +1248,77 @@ def build_chapter_content_messages(chapter_info: dict, facts: Any = None,
     #   - L1/L2 是父节点，不生成正文，不注入字数指令。
     _chapter_level = int(chapter_info.get("level", 3) or 3)
     _mode = normalize_writing_length(kw_writing_length)
-    # CONVERGE 2026-10-12：本处曾是 5 份「有效目标字数」同构实现中的第 3 份
-    # （另 4 份：sse_utils._get_effective_target_words、word_count._resolve_target_for_section、
-    #  workflows_expand.section_expand_threshold、condense_overlong_results 内联解析）。
-    # 历史上多次出现「生成按 detailed 写、校验按 standard 判」的分叉故障，现把
-    # target / tolerance 统一取自 services/word_target_resolver.py。提示词话术与
-    # 数字格式逐字不变，仅数值来源收敛；is_l3_own 是本函数独有信息（有下级章节的
-    # L3 走四档「子树总字数」口径），显式传入避免被误判为 L3 自身正文。
+    # 体系合并 2026-10-20：体系 A（档位五级优先级）与体系 B（易标强控覆盖
+    # R5/R8）合并为**单一优先级链**，唯一入口 ``services/word_target_resolver.py``
+    # （``strict_override`` 命中即短路返回 R5 区间，source=word_control_strict）；
+    # 本处不再维护「先查覆盖表、未命中再走档位」的双分支。
+    # 契约变更（D6 取消）：旧「提示词侧契约 P-22」（L2+ 忽略显式 target_words）
+    # 已移除，生成侧与校验/压缩/R12 链同样尊重单节 ``target_words``。
+    # 注：叶子装配（_build_leaf_dicts）的 ``target_words`` 字段写的是解析后的
+    # 有效目标（历史行为，供面板/落库展示），生成侧契约只认 ``target_words_raw``
+    # （DB 原始值；键缺失时兼容直接传 DB 行的旧调用方）。
+    _wc_ov = _resolve_word_control_override(kwargs.get("word_control"), chapter_info)
     _wc_resolved = None
+    _strict_hit = False
     if _chapter_level >= 3:
         from ..word_target_resolver import (
+            SOURCE_L3_OWN as _SRC_L3_OWN,
+            SOURCE_SECTION_TARGET_WORDS as _SRC_SECTION_TW,
+            SOURCE_STRICT as _SRC_STRICT,
             resolve_section_word_target_from_mapping as _resolve_wt,
         )
 
         _wc_resolved = _resolve_wt(
             {
                 "level": _chapter_level,
-                # # 提示词侧契约 P-22：显式 target_words 不参与生成目标（与权威解析器的唯一差异，见下）。
-                # 权威优先级首项是单节点 target_words（校验 / 压缩 / R12 按它判达标），
-                # 但生成侧刻意不采用：2026-10-05 契约 P-22 规定「L2+ 目标字数由写作
-                # 长度模式统一决定，显式 target_words 仅对 L1 / 异常层级生效」，避免
-                # 历史遗留的 target_words 值把整批正文拉偏。此处显式传 None，
-                # 其余优先级与 word_target_resolver 完全一致。
-                "target_words": None,
+                "target_words": (
+                    chapter_info.get("target_words_raw")
+                    if "target_words_raw" in chapter_info
+                    else chapter_info.get("target_words")
+                ),
                 "word_count_tier": chapter_info.get("word_count_tier"),
             },
             writing_length=_mode,
             is_l3_own=(
                 bool(chapter_info.get("is_l3_own")) if _chapter_level == 3 else None
             ),
+            strict_override=_wc_ov,
         )
-    if _chapter_level == 3 and chapter_info.get("is_l3_own"):
-        # L3 叶子：自身正文 300 ± 20%
+        _strict_hit = bool(_wc_resolved and _wc_resolved.source == _SRC_STRICT)
+    if not _strict_hit:
+        # 覆盖表未命中/非法（缺键、S<=0、hi<=0）时不启用强控话术，与旧行为一致。
+        _wc_ov = None
+    if _strict_hit:
+        # 体系 B 强控：R5 区间 + R8 初稿锚点（与 build_strict_section_requirement
+        # 同口径）；倒推目标 G（可能为 0=未设全文上限）作锚点，无 G 时用标称 S。
+        _wc_anchor = int(_wc_resolved.generation_anchor) or int(_wc_resolved.target)
         _tier_key = None
-        _tier_label = "L3 自身正文"
-        _tier_target = get_l3_own_target()
-        _tolerance = float(get_l3_own_tolerance())
+        _tier_label = "强控"
+        _tier_target = int(_wc_resolved.target)
+        _tolerance = float(_wc_resolved.tolerance)
+    elif _chapter_level == 3 and chapter_info.get("is_l3_own") and (
+        _wc_resolved is None or _wc_resolved.source in (_SRC_L3_OWN, _SRC_SECTION_TW)
+    ):
+        # L3 叶子：自身正文 300 ± 20%；用户显式设了单节 target_words 时尊重
+        # 覆盖（解析器首项，区间 ±10%）。
+        _tier_key = None
+        _tier_label = (
+            "单节目标覆盖"
+            if _wc_resolved is not None and _wc_resolved.source == _SRC_SECTION_TW
+            else "L3 自身正文"
+        )
+        _tier_target = int(_wc_resolved.target) if _wc_resolved is not None else 300
+        _tolerance = float(_wc_resolved.tolerance) if _wc_resolved is not None else 0.20
     elif _chapter_level >= 3 and _wc_resolved is not None:
         # L3 非叶子：四档子树总字数（含下级目录章节）；
         # L4+ 深层叶子跟随同一档位，测量口径为自身正文。
         _tier_key = chapter_info.get("word_count_tier") or _mode
         _tier_cfg = get_tier_config(_tier_key) or get_default_tier_config()
-        _tier_label = _tier_cfg.get("label", _mode)
+        _tier_label = (
+            "单节目标覆盖"
+            if _wc_resolved.source == _SRC_SECTION_TW
+            else _tier_cfg.get("label", _mode)
+        )
         _tier_target = int(_wc_resolved.target)
         _tolerance = float(_wc_resolved.tolerance)
     elif _chapter_level == 2:
@@ -1140,42 +1338,26 @@ def build_chapter_content_messages(chapter_info: dict, facts: Any = None,
 
     lo = int(_tier_target * (1 - _tolerance))
     hi = int(_tier_target * (1 + _tolerance))
+    if _strict_hit:
+        # 强控区间是 R5 ceil/floor 派生，不重算，直取统一解析结果。
+        lo, hi = int(_wc_resolved.lo), int(_wc_resolved.hi)
     # BUG-FIX 2026-10-11（字数偏差控制）：将「240-360」范围表达改为
     # 「约 300 字左右（硬性上限 360 字，最低 240 字）」—— 实测 10 个 L3 章节
     # 平均偏差 +34.2%、100% 系统性偏高、最极端 +120%。根因：模型面对
     # 「240-360」区间时会按「至少 240」理解，倾向超长。改为「约 N 字 + 硬性
     # 上限 M」后，模型有明确锚点值与不可逾越的上限，超长倾向显著降低。
-    target_wc = f"约 {_tier_target} 字左右（硬性上限 {hi} 字，最低 {lo} 字）"
-    target_note = (
-        f"（{_tier_label}档位·目标 {_tier_target} 字，"
-        f"允许浮动 \u00b1{int(_tolerance * 100)}%）"
-    )
-
-    # 易标 R5/R8（2026-10-12）：强控覆盖 —— 项目配置了「每节字数 + 强控」并已
-    # 固化生效快照时，本节按快照派生的 ±20% 硬性区间控制，优先于既有档位口径。
-    # 覆盖表经 context['word_control'] 透传；未命中（未配置/未强控/章节不在
-    # 本次生成集合）时下面全部逻辑与既往行为逐字一致。
-    _wc_ov = _resolve_word_control_override(kwargs.get("word_control"), chapter_info)
-    if _wc_ov and _chapter_level >= 3:
-        _wc_s = int(_wc_ov.get("section_words") or 0)
-        _wc_lo_v = int(_wc_ov.get("lo") or 0)
-        _wc_hi_v = int(_wc_ov.get("hi") or 0)
-        if _wc_s > 0 and _wc_hi_v > 0:
-            from ..word_control import STRICT_SECTION_TOLERANCE
-
-            # 倒推目标 G（R8，可能为 0=未设全文上限）作为初稿锚点；
-            # 无 G 时以每节目标 S 为锚点（build_strict_section_requirement 同口径）。
-            _wc_anchor = int(_wc_ov.get("generation_target") or 0) or _wc_s
-            _tier_target = _wc_s
-            _tolerance = float(STRICT_SECTION_TOLERANCE)
-            lo, hi = _wc_lo_v, _wc_hi_v
-            target_wc = f"约 {_wc_anchor} 字左右（硬性上限 {hi} 字，最低 {lo} 字）"
-            target_note = (
-                f"（强控·每节目标 {_wc_s} 字，硬性区间 {lo}~{hi} 字，"
-                f"允许浮动 \u00b1{int(_tolerance * 100)}%）"
-            )
-        else:
-            _wc_ov = None
+    if _strict_hit:
+        target_wc = f"约 {_wc_anchor} 字左右（硬性上限 {hi} 字，最低 {lo} 字）"
+        target_note = (
+            f"（强控·每节目标 {_tier_target} 字，硬性区间 {lo}~{hi} 字，"
+            f"允许浮动 \u00b1{int(_tolerance * 100)}%）"
+        )
+    else:
+        target_wc = f"约 {_tier_target} 字左右（硬性上限 {hi} 字，最低 {lo} 字）"
+        target_note = (
+            f"（{_tier_label}档位·目标 {_tier_target} 字，"
+            f"允许浮动 \u00b1{int(_tolerance * 100)}%）"
+        )
 
     # 字数控制核心指令
     if _chapter_level >= 3:
@@ -1266,9 +1448,20 @@ def build_chapter_content_messages(chapter_info: dict, facts: Any = None,
     # 标书智能体（六）：注入编排决策（plan + illustration_type），
     # 让 AI 知道本章节表格/图片意图，正文与配图不两张皮
     _plan = chapter_info.get("plan") or {}
-    _ill_type = chapter_info.get("illustration_type")
+    # BUG-FIX 2026-10-20（遗留项·HTML 配图防死数据）：已知不可渲染的类型
+    # （易标 html）降级为最接近的可消费类型（ai）并告警，绝不让配图意图
+    # 静默丢失。详见 _degrade_unrenderable_illustration 的说明。
+    _ill_type = _degrade_unrenderable_illustration(
+        chapter_info.get("illustration_type")
+    )
 
-    if _plan:
+    # BUG-FIX 2026-10-20（配图意图未传递）：原判据是 `if _plan:`——编排返回
+    # 空 plan（{}）时，即使 illustration_type 已裁定为 ai/mermaid，配图意图
+    # 也整体不进正文提示词（用户规格五「配图意图未传递」的残留形态）。
+    # illustration_type 是程序侧裁定的独立结论，不应被 plan 是否为空 gate 掉；
+    # 两者任一有信息量就应注入。plan 为空且类型为 none/None 时行为不变
+    # （无任何编排信息，不注入"正文编排决策"块）。
+    if _plan or _ill_type not in (None, "", "none"):
         _tbl = _plan.get("table") or {}
         _mmd = _plan.get("mermaid") or {}
         _img = _plan.get("image") or {}
@@ -1290,6 +1483,28 @@ def build_chapter_content_messages(chapter_info: dict, facts: Any = None,
 
         if orch_lines:
             prompt_parts.append("正文编排决策:\n" + "\n".join(orch_lines))
+
+    # --- [4.5] 2026-10-18 ENHANCE: 顺序约束与输出结构约束 ---
+    # 明确当前节点在目录树中的位置，禁止跨章节内容，确保编号继承与图表同步。
+    # 第二轮增强：显式给出「第几章第几节 / 目录树第几个节点」位置信息，
+    # 与上级章节逻辑相承、避免与同级章节重复、承接前一节自然过渡。
+    _order_lines = [
+        "① 本章节内容必须严格限定在当前章节范围内，不得提前写后续章节内容；"
+        "② 正文编号继承目录编号体系（如目录为 1.2.3，正文小标题按 1.2.3.1、1.2.3.2 递增）；"
+        "③ 图表与正文同步，图号不虚跳（如引用图 1-1 则必须有对应图 1-1）；"
+        "④ 提供的全局事实数据必须优先使用，不得前后矛盾；"
+        "⑤ 未提供具体数据时，不要主动编造人员数量、工期、设备型号、质保期等关键数据；"
+        "⑥ 关键数据必须与全局事实一致，确保全文数据统一。"
+    ]
+    _tree_index = kwargs.get("tree_index")
+    _tree_total = kwargs.get("tree_total")
+    if _tree_index and _tree_total:
+        _order_lines.append(
+            f"⑦ 本章为按目录树顺序生成的第 {_tree_index}/{_tree_total} 个章节，"
+            "须与上级章节逻辑相承、避免与同级章节内容重复"
+            + ("，并自然承接前一节内容" if kw_prev_sections else "") + "。"
+        )
+    prompt_parts.append("【顺序与结构约束】\n" + "\n".join(_order_lines))
 
     messages.append(AIMessage(role="user", content="\n\n".join(prompt_parts)))
 
@@ -1426,9 +1641,10 @@ async def condense_overlong_results(
         max_rounds: 最多压缩轮数
         enabled: 总开关（None 时从 config 读）
         cancel_event: 取消事件
-        word_control: 强控覆盖表（易标 R5/R8，2026-10-12）。命中的章节以
-            R1 可读字数计量、目标 S、容差 ±20%，超过硬性上限（1.2S）即触发
-            压缩；未命中回落既有档位/单节目标逻辑（口径不变）。
+        word_control: 强控覆盖表（易标 R5/R8）。体系合并 2026-10-20：作为
+            统一解析器的 ``strict_override`` 输入，命中章节短路返回 R5 区间
+            （目标 S、容差 ±20%，超过硬性上限 1.2S 即触发压缩）；未命中
+            回落体系 A 档位/单节目标逻辑（逐值不变）。
 
     Returns:
         dict: {
@@ -1442,15 +1658,11 @@ async def condense_overlong_results(
         }
     """
     from .writing_length_config import (
-        get_l3_own_target,
-        get_l3_own_tolerance,
         get_tier_config,
         get_default_tier_config,
         DEFAULT_WORD_COUNT_TIER,
     )
-    from ...services.sections import _count_words as _cw
     from ...utils import count_readable_words as _crw
-    from ..word_control import STRICT_SECTION_TOLERANCE
     from ..word_control_runtime import resolve_override as _resolve_ov
     from ...config import (
         CONTENT_USE_WORD_COUNT_ENFORCEMENT_DEFAULT,
@@ -1481,6 +1693,12 @@ async def condense_overlong_results(
         # 显式维护 condensed_ids，让调用方按需精确落库。
         "condensed_ids": [],
     }
+    # BUG-FIX 2026-10-17（第七轮·P2 压缩落库口径分叉）：压缩结果与主生成
+    # 落库共用同一清洗器（ContentCleaner.clean），消除 AI 残留重复标题 /
+    # ## 标记 / 首行编号直写 DB 的缺口。单例复用，避免逐章节构造。
+    from ...services.content_cleaning import ContentCleaner as _ContentCleaner
+
+    _condense_cleaner = _ContentCleaner()
     if not enabled or max_rounds <= 0:
         return summary
 
@@ -1497,48 +1715,58 @@ async def condense_overlong_results(
         if sec_level < 3:
             continue
 
-        # 易标 R5（2026-10-12）：强控覆盖优先于档位/单节目标——命中章节以
-        # R1 可读字数计量（与校验侧/R12 警告同口径），目标 S、容差 ±20%，
-        # 超过硬性上限（hi=1.2S）即触发压缩。
+        # 体系合并 2026-10-20：强控覆盖（体系 B R5）与档位链（体系 A）合流为
+        # 单一优先级链——统一解析器 ``strict_override`` 命中即短路返回 R5 区间；
+        # 计量全程用 R1 可读字数（D2 已收敛，与校验页 / R9R10 / R12 同事实源）。
         _ov = None
         try:
             _ov = _resolve_ov(word_control, sec)
         except Exception:
             _ov = None
         r_content = r.get("content") or ""
-        if _ov:
-            r_wc = _crw(r_content) if r_content else 0
-        else:
-            r_wc = _cw(r_content) if r_content else 0
+        r_wc = _crw(r_content) if r_content else 0
         if r_wc == 0:
             continue
 
         # 解析目标字数与容差（与 sse_utils._get_effective_target_words 同口径）
-        target = None
-        tolerance = 0.10
-        if _ov:
-            target = int(_ov["section_words"])
-            tolerance = float(STRICT_SECTION_TOLERANCE)
-            thr = float(_ov["hi"])
-        else:
-            # CONVERGE 2026-10-12：转发唯一权威口径 services/word_target_resolver.py；
-            # 本处曾是第 5 份同构实现（顺序与生成/校验/扩写三侧曾不一致）。
-            from ..word_target_resolver import (
-                resolve_section_word_target_from_mapping as _resolve_wt,
-            )
+        from ..word_target_resolver import (
+            SOURCE_STRICT as _SRC_STRICT,
+            resolve_section_word_target_from_mapping as _resolve_wt,
+        )
 
-            _resolved = _resolve_wt(
-                sec, writing_length=writing_length or DEFAULT_WORD_COUNT_TIER
-            )
-            if _resolved:
-                target = int(_resolved.target)
-                tolerance = float(_resolved.tolerance)
-            thr = target * threshold if target else 0
+        _resolved = _resolve_wt(
+            sec,
+            writing_length=writing_length or DEFAULT_WORD_COUNT_TIER,
+            strict_override=_ov,
+        )
+        target = int(_resolved.target) if _resolved else 0
+        tolerance = float(_resolved.tolerance) if _resolved else 0.10
+        if _resolved is not None and _resolved.source == _SRC_STRICT:
+            # 强控（体系 B）：超过硬性上限 hi=1.2S 即触发压缩（R5 硬区间）。
+            thr = float(_resolved.hi)
+        else:
+            # BUG-FIX 2026-10-17（第七轮·P2 压缩触发即空转）：外层触发阈值
+            # target×threshold 与 condense_overlong_content 内部 early-return
+            # 阈值 int(target×(1+tolerance)) 曾是两份独立口径。当容差较大时
+            # （L3 自身正文 0.20 → 内部 hi=1.2×target > 外部 1.15×target），
+            # 介于两者之间的章节「触发了压缩流程但内部直接返回原文」——既不进
+            # condensed_count 也不进 fail_count，前端 word_count_condense
+            # 事件显示 0，CONTENT_WORD_COUNT_CONDENSE_THRESHOLD 对 L3 实际
+            # 失效（探针 _audit7_probe.py::P3 实证：hi=360 > 触发=345）。
+            # 修复：外层触发阈值取「配置阈值」与「内部 hi 区间上限」的较大者，
+            # 保证「触发必压缩、无需压缩必不触发」；档位路径（tol=0.10 →
+            # hi=1.1t < 1.15t）行为逐值不变。
+            thr = max(target * threshold, int(target * (1 + tolerance))) if target else 0
         if not target or target <= 0:
             continue
 
         summary["total_before"] += r_wc
         if r_wc > thr:
+            # BUG-FIX 2026-10-17（第七轮·P2 口径分叉）：压缩全程（触发判定 /
+            # 内部 early-return / 多轮进度 / 结果计量）与**触发侧**共用同一
+            # 计量口径。D2 修复 2026-10-20：强控/非强控统一改用易标 R1 可读字数
+            # （原「强控 _crw / 非强控 _cw」双口径合并），与校验侧 / R12 同事实源。
+            _wc_fn = _crw
             try:
                 condensed, meta = await condense_overlong_content(
                     r_content,
@@ -1548,6 +1776,7 @@ async def condense_overlong_results(
                     section_title=sec.get("title", ""),
                     max_rounds=max_rounds,
                     cancel_event=cancel_event,
+                    count_fn=_wc_fn,
                 )
                 if meta.get("condensed") and condensed:
                     # HARDEN 2026-10-12：AI 压缩返回值可能带 \r\n（AI 网关在
@@ -1555,7 +1784,18 @@ async def condense_overlong_results(
                     # 必须在接受判定前显式归一，否则会把 CRLF 写回 DB，
                     # 让下游围栏识别 / parse_content 再次踩坑（BUG-2 同源问题）。
                     condensed = normalize_newlines(condensed)
-                    new_wc = _cw(condensed)
+                    # BUG-FIX 2026-10-17（第七轮·P2 压缩落库口径分叉）：压缩
+                    # 结果此前以裸 SQL 直写 DB（sse_content._batch_update_condensed），
+                    # 未经 ContentCleaner——AI 不遵守压缩提示词时（"不要重复章节
+                    # 标题、不要输出标题标记"），重复标题 / ## 标记 / 首行编号
+                    # 会残留落库，与主生成落库（_save_section_to_db 必经
+                    # ContentCleaner.clean）口径不一致（探针 P5 实证旧路径
+                    # 无清洗）。现在接受压缩后统一过同一清洗器；清洗把正文
+                    # 洗空的极端病理（全文即重复标题）保留未清洗版本。
+                    _cleaned = _condense_cleaner.clean(sec.get("title", ""), condensed)
+                    if _cleaned and _cleaned.strip():
+                        condensed = _cleaned
+                    new_wc = _wc_fn(condensed)
                     r["content"] = condensed
                     r["original_content"] = r_content
                     r["original_wc"] = r_wc
@@ -1598,6 +1838,7 @@ async def condense_overlong_content(
     timeout_seconds: int = 120,
     max_rounds: int = 1,
     cancel_event: Any = None,
+    count_fn: Callable | None = None,
 ) -> tuple[str, dict]:
     """将超长正文压缩到目标字数区间内（异步）。
 
@@ -1611,6 +1852,11 @@ async def condense_overlong_content(
         timeout_seconds: 单次 AI 调用超时
         max_rounds: 最多压缩轮数（默认 1）
         cancel_event: asyncio.Event，取消事件（与主生成共享）
+        count_fn: 字数计量函数（默认 count_words）。BUG-FIX 2026-10-17
+            （第七轮·P2 口径分叉）：调用方 condense_overlong_results 的
+            触发判定用可读字数（强控）或 count_words（非强控），旧实现内部
+            恒用 count_words → 强控章节可能「可读字数触发、内部字数判定
+            已达标」而静默空转。现触发与压缩全程共用同一口径。
 
     Returns:
         tuple[str, dict]:
@@ -1633,8 +1879,20 @@ async def condense_overlong_content(
         "condensed": False,
         "error": "",
     }
+    # BUG-FIX 2026-10-17（第七轮·P2 计量口径统一）：见 count_fn 参数说明。
+    _wc_fn = count_fn if callable(count_fn) else count_words
+    # BUG-FIX 2026-10-17（第七轮·P2 未闭合围栏裸露送压缩 AI）：
+    # 本函数的输入可能是 DB 历史正文 / 编辑写入的正文（未经主链路的
+    # _force_close_unclosed_chart_fence 双保险），而
+    # _mask_chart_fences_for_compression 只保护**已闭合**图表围栏
+    # （scan_chart_fence_blocks 不返回未闭合块）——未闭合围栏的
+    # mermaid / chart-json 源码会裸露送给压缩 AI，被截断/篡改后图表
+    # 静默损坏（探针 _audit7_probe.py::P10 实证）。入口统一兜底闭合
+    # （幂等）；压缩失败时函数尾部返回的是入参原 content，
+    # 「保留原文」契约不变。
+    content, _entry_closed = _force_close_unclosed_chart_fence(content)
     try:
-        _wc = count_words(content) if content else 0
+        _wc = _wc_fn(content) if content else 0
     except Exception:
         _wc = len(content or "")
     meta["original_wc"] = _wc
@@ -1682,14 +1940,19 @@ async def condense_overlong_content(
             # 占位符自身是简单文本，字数远小于原始图表代码块——把目标字数
             # 相应下调，否则 AI 看到的正文偏短、会错误扩张图表块的占位符
             # （虽然无法真正扩张，但可能把占位符字面量写进压缩后正文）。
-            _charts_delta = _wc - count_words(_masked_content)
+            # BUG-FIX 2026-10-17（P2·多轮压缩基准陈旧）：_charts_delta 旧按
+            # **首轮**原始值 _wc 计算，第 2 轮起 current_content 已变（首轮
+            # 已压缩），偏移量系统性偏大 → _effective_target 过小、提示词
+            # 「原文 N 字」播报陈旧。改为按**本轮** current_content 计算。
+            _cur_wc = _wc_fn(current_content) if current_content else 0
+            _charts_delta = max(_cur_wc - _wc_fn(_masked_content), 0)
             _effective_target = max(target_words - _charts_delta, 100)
 
             user_msg = (
                 f"章节标题：{section_title}\n\n"
                 f"目标字数：约 {_effective_target} 字（允许浮动 ±{int(tolerance_ratio * 100)}%，"
                 f"区间 {max(meta['lo'] - _charts_delta, 50)}~{max(meta['hi'] - _charts_delta, 100)} 字）。\n\n"
-                f"以下是当前正文（{count_words(_masked_content)} 字，原文 {_wc} 字），超出目标区间，请压缩到目标区间内，"
+                f"以下是当前正文（{_wc_fn(_masked_content)} 字，原文 {_cur_wc} 字），超出目标区间，请压缩到目标区间内，"
                 f"保留必含要素、数据、结构与小标题，删除空话套话与冗余表述：\n\n"
                 f"{_masked_content}"
             )
@@ -1718,6 +1981,19 @@ async def condense_overlong_content(
             if not condensed_masked:
                 meta["error"] = "AI 返回空内容"
                 break
+            # BUG-FIX 2026-10-17（P1）：还原前校验占位符存在性 + 唯一性。
+            # AI 删除占位符 → 图表静默丢失；AI 复制占位符 → 图表重复插入。
+            # 二者都不报错但数据坏，必须拒绝压缩、保留原文（见函数文档）。
+            _ph_ok, _ph_reason = _validate_chart_placeholders(
+                condensed_masked, _chart_originals
+            )
+            if not _ph_ok:
+                logger.warning(
+                    "[压缩] 第 %d 轮图表占位符校验失败（%s），拒绝本次压缩、保留原文",
+                    _round + 1, _ph_reason,
+                )
+                meta["error"] = f"AI 破坏图表占位符（{_ph_reason}），保留原文"
+                break
             # BUG-P1b FIX 2026-10-11：压缩后还原图表代码块。
             condensed = _restore_chart_fences_after_compression(
                 condensed_masked, _chart_originals
@@ -1736,15 +2012,32 @@ async def condense_overlong_content(
                 )
                 meta["error"] = "AI 篡改占位符导致还原失败，保留原文"
                 break
-            _new_wc = count_words(condensed) if condensed else 0
-            # 关键：仅当压缩后字数 ≤ 原字数 且 ≤ 目标上限时才接受
-            if _new_wc <= current_wc and _new_wc <= threshold:
+            _new_wc = _wc_fn(condensed) if condensed else 0
+            # BUG-FIX 2026-10-17（P2·多轮压缩结构性不可达 + 部分成果被丢弃）：
+            # 旧判定 `_new_wc <= threshold` 与紧随的 `if _new_wc <= meta["hi"]:
+            # break` 中，threshold 与 meta["hi"] 是同式（int(target*(1+tol))）
+            # → 第 2 轮起要么因「达标」break、要么因「未达标」break，
+            # max_rounds>1 是死配置；且「有进展但未进区间」的压缩稿被整体
+            # 丢弃、保留更长原文（探针 _audit6_probe.py::C1 实证只跑 1 轮）。
+            # 新判定：只要相对上一轮有实质压缩进展就接受本轮成果；已进
+            # hi 区间或轮数用尽才退出；毫无进展才报错并保留上一版。
+            if _new_wc <= current_wc:
                 current_content = condensed
                 current_wc = _new_wc
                 if _new_wc <= meta["hi"]:
                     break
+                if _round + 1 >= max(1, max_rounds):
+                    logger.info(
+                        "[压缩] 第 %d 轮后 %d 字仍超上限 %d，轮数用尽，保留已压缩成果",
+                        _round + 1, _new_wc, meta["hi"],
+                    )
+                    break
+                logger.info(
+                    "[压缩] 第 %d 轮后 %d 字仍超上限 %d，继续第 %d 轮",
+                    _round + 1, _new_wc, meta["hi"], _round + 2,
+                )
             else:
-                meta["error"] = f"压缩后字数未减少（原 {_wc} → 新 {_new_wc}）"
+                meta["error"] = f"压缩后字数未减少（上轮 {current_wc} → 新 {_new_wc}）"
                 break
         except Exception as _e:
             meta["error"] = f"压缩第 {_round + 1} 轮异常: {_e}"
@@ -2064,6 +2357,58 @@ def _restore_chart_fences_after_compression(masked_content: str, originals: list
     return restored
 
 
+# 压缩占位符字面量（与 _mask_chart_fences_for_compression 产出一一对应）
+_CHART_PLACEHOLDER_RE = re.compile(r"<<CHART_BLOCK_(\d+)>>")
+
+
+def _validate_chart_placeholders(masked_content: str, originals: list[str]) -> tuple[bool, str]:
+    """校验 AI 压缩返回中每个图表占位符**恰好出现一次**。
+
+    BUG-FIX 2026-10-17（P1·压缩环节图表静默丢失/重复插入）：
+    ``_restore_chart_fences_after_compression`` 用 ``str.replace`` 按序还原，
+    对 AI 破坏占位符毫无抵抗力：
+      · AI **删除**某占位符 → 对应图表静默丢失。还原后残留正则
+        （``<<...BLOCK...>>``）只能发现「被篡改」，不能发现「被删除」
+        （探针 scripts/_audit6_probe.py::B1 实证：chart-json 载荷消失且
+        残留检测不报警）；
+      · AI **复制**占位符 → 同一图表被重复插入正文（B1b 实证）。
+    二者都是「不报错但数据坏」的静默故障，故在还原前做存在性 + 唯一性校验。
+
+    Args:
+        masked_content: AI 压缩返回（尚未还原占位符的文本）
+        originals: mask 时保护的原始图表块列表
+
+    Returns:
+        tuple[bool, str]: (是否通过, 失败原因)；通过时原因为空串。
+    """
+    if not originals:
+        return True, ""
+    counts: dict[int, int] = {}
+    for m in _CHART_PLACEHOLDER_RE.finditer(masked_content or ""):
+        idx = int(m.group(1))
+        counts[idx] = counts.get(idx, 0) + 1
+    missing = [i for i in range(1, len(originals) + 1) if counts.get(i, 0) == 0]
+    if missing:
+        return False, f"占位符被删除: {missing}"
+    duplicated = sorted(i for i, c in counts.items() if c > 1)
+    if duplicated:
+        return False, f"占位符被复制: {duplicated}"
+    return True, ""
+
+
+# BUG-FIX 2026-10-17（第七轮·列表样式被拍平）：续写内容的结构标记行首
+# 判定（列表 / ATX 标题 / 引用）。用于 _auto_continue_on_length 的合并
+# 换行决策，详见该处注释。
+_CONTINUE_STRUCT_LINE_START_RE = re.compile(
+    r"^(?:"
+    r"[-*+][ \t]"                    # 无序列表：- / * / + + 空白
+    r"|\d{1,4}[.、．)）][ \t]"       # 有序列表：1. / 1、/ 1) + 空白
+    r"|#{1,6}[ \t]*[^#\s]"           # ATX 标题：## 小标题（排除裸 ###）
+    r"|>[ \t]?"                      # 引用块：> text
+    r")"
+)
+
+
 async def _auto_continue_on_length(
     provider: Any,
     existing_content: str,
@@ -2083,7 +2428,6 @@ async def _auto_continue_on_length(
     from .providers.base import AIMessage as _AIMessage
     import logging as _logging
     _logger = _logging.getLogger(__name__)
-
     final_content = existing_content
     writing_length = context.get("writing_length", "detailed")
     cancel_event = context.get("cancel_event")
@@ -2098,6 +2442,23 @@ async def _auto_continue_on_length(
                 final_content.__len__() * 2,
                 max(1500, final_content.__len__() + 2000),
             )
+            # ENHANCE 2026-10-17（P2·续写与字数控制对齐）：target_chars 原按
+            # 「字符数 ×2 / +2000」翻倍，L3 章节（目标 300 字）因 finish_reason
+            # ==length 被截断续写时越写越长，随后又被 condense_overlong_content
+            # 压回硬区间，形成「续写涨→压缩删」的无效往返（多一次 AI 调用、
+            # 过程中偏离 [lo,hi]）。当章节带 target_words（_build_leaf_dicts
+            # 已为叶子装配）时，按「剩余字数预算 + 200 余量」收敛续写目标；
+            # 无 target_words（L1/L2 叶子等）时行为与旧实现逐字一致。
+            _wc_target = None
+            try:
+                _wt = section.get("target_words") if isinstance(section, dict) else None
+                if _wt:
+                    _wc_target = int(_wt)
+            except (TypeError, ValueError):
+                _wc_target = None
+            if _wc_target and _wc_target > 0:
+                _remain = _wc_target - (count_words(final_content) if final_content else 0)
+                target_chars = min(target_chars, max(200, _remain + 200))
             # ENHANCE 2026-10-06：超长章节逐轮把全部已写内容回灌会撑爆上下文窗口。
             # 续写只需「最近尾部」即可无缝衔接，故超过上限只取末尾 _MAX_CONTINUE_CONTEXT_CHARS。
             _existing_for_prompt = (
@@ -2190,7 +2551,17 @@ async def _auto_continue_on_length(
             _logger.info("[续写] 第 %d 轮返回重复内容，停止续写", round_num)
             break
 
-        final_content = final_content.rstrip() + extra
+        # BUG-FIX 2026-10-17（第七轮·列表样式被拍平）：续写内容以列表 / 标题 /
+        # 引用等**结构标记**开头时必须插换行——AI 被 length 截断后，续写轮
+        # 常以新列表项或小标题起笔，旧实现直接字符串拼接会把「…要求如下：」
+        # 与「- 材料准备」粘成同一行，导出端列表被拍平为段落文本（用户修复
+        # 重点「列表样式被拍平」）。无缝接续的普通句子仍不插换行（中英文
+        # 截断续写不应被强行断行）。有序列表分支要求「分隔符 + 空白」，
+        # 不误伤 "1.8米" / "2026年" / "1) " 之外的数字开头正文。
+        if _CONTINUE_STRUCT_LINE_START_RE.match(extra):
+            final_content = final_content.rstrip() + "\n" + extra
+        else:
+            final_content = final_content.rstrip() + extra
         _logger.info(
             "[续写] 第 %d 轮完成，新增 %d 字，总 %d 字 (finish_reason=%s)",
             round_num, len(extra), len(final_content), next_finish,
@@ -2205,6 +2576,89 @@ async def _auto_continue_on_length(
 
     return final_content
 
+
+
+def _degrade_long_context_messages(messages: list, section: dict) -> list:
+    """长上下文确定性降级（2026-10-20 易标机制引入，规格三.7）。
+
+    易标在消息总长超模型上下文 70%（AGENT_CONTEXT_THRESHOLD_RATIO）时自动
+    切 Agent 隔离环境处理；本软件无 Agent 运行时，等效降级策略：
+      1. 总长 ≤ limit×ratio 阈值 → 原样返回（零开销路径，默认关闭时不进本函数）；
+      2. 超阈值 → 从最长的非 system 消息开始裁剪参考资料段（保留 system
+         铁律与章节定位信息），逐条削减直到总长回到阈值内；
+      3. 被裁剪的消息尾部追加「已截断」标记，避免模型把半截资料当完整资料；
+      4. section['_context_degraded'] 留痕，供上游 SSE verification 事件上报。
+
+    保守性：只减参考性长段（user 消息），绝不删消息、绝不动 system；
+    AIMessage/dict 两种形态都支持；任何异常回落原始 messages（宁可不降级，
+    不能降坏）。调用方受 CONTENT_CONTEXT_DEGRADE_ENABLED 开关控制，默认关闭。
+    """
+    try:
+        from ...config import (
+            CONTENT_CONTEXT_DEGRADE_RATIO,
+            CONTENT_CONTEXT_LIMIT_CHARS,
+        )
+
+        threshold = int(CONTENT_CONTEXT_LIMIT_CHARS * CONTENT_CONTEXT_DEGRADE_RATIO)
+
+        def _content_of(m: Any) -> str:
+            if isinstance(m, dict):
+                return str(m.get("content") or "")
+            return str(getattr(m, "content", "") or "")
+
+        def _total_len(ms: list) -> int:
+            return sum(len(_content_of(m)) for m in ms)
+
+        total = _total_len(messages)
+        if total <= threshold:
+            return messages
+
+        overflow = total - threshold
+        truncated_any = False
+        # 非 system 消息按长度降序：优先削减最长的参考资料段
+        candidates = [
+            (i, _content_of(m)) for i, m in enumerate(messages)
+            if getattr(m, "role", None) != "system" and not (
+                isinstance(m, dict) and m.get("role") == "system"
+            )
+        ]
+        candidates.sort(key=lambda x: -len(x[1]))
+        for idx, content in candidates:
+            if overflow <= 0:
+                break
+            # 每条最多削减自身 80%，保留主体语境；预留 12 字标记位
+            cut = min(len(content) - 200 if len(content) > 400 else 0,
+                      overflow + 12, int(len(content) * 0.8))
+            if cut <= 0:
+                continue
+            new_content = (
+                content[: len(content) - cut]
+                + "\n…（参考资料因超出模型上下文已截断，以完整资料页为准）"
+            )
+            m = messages[idx]
+            if isinstance(m, dict):
+                m["content"] = new_content
+            else:
+                try:
+                    m.content = new_content
+                except Exception:
+                    messages[idx] = type(m)(role=getattr(m, "role", "user"), content=new_content)
+            truncated_any = True
+            overflow = _total_len(messages) - threshold
+
+        if truncated_any:
+            section["_context_degraded"] = True
+            logger.warning(
+                "[长上下文降级] 章节 %s 消息总长超阈值 %.0f%%，已裁剪至 %d 字（阈值 %d）",
+                section.get("id", "?"),
+                CONTENT_CONTEXT_DEGRADE_RATIO * 100,
+                _total_len(messages),
+                threshold,
+            )
+        return messages
+    except Exception as _dg_e:  # pragma: no cover - 防御性：降级失败不阻断生成
+        logger.warning("[长上下文降级] 执行异常，保持原消息: %s", _dg_e)
+        return messages
 
 
 async def _do_generate_section_with_optimizations(
@@ -2242,6 +2696,37 @@ async def _do_generate_section_with_optimizations(
         record_store("section_content", False)
 
     messages = build_chapter_content_messages(section, **context)
+
+    # 2026-10-20 易标机制引入（规格三.7）：长上下文降级。
+    # 默认 CONTENT_CONTEXT_DEGRADE_ENABLED=false 保持现有行为；开启后消息
+    # 总长超 limit×ratio（易标同口径 70%）时裁剪参考资料段，避免请求撑爆
+    # 上下文整条失败（本软件无 Agent 隔离运行时，裁剪为等效降级）。
+    try:
+        from ...config import CONTENT_CONTEXT_DEGRADE_ENABLED as _CC_DEGRADE
+
+        if _CC_DEGRADE:
+            messages = _degrade_long_context_messages(messages, section)
+    except Exception as _cc_e:  # pragma: no cover - 防御性
+        logger.debug("[silent-except] 长上下文降级开关读取失败（忽略）: %s", _cc_e)
+
+    # ENHANCE 2026-10-18（第二轮）：上下文注入校验（生成前审计）。
+    # 检查消息栈层级齐全 / 长度未超限 / 未被截断 / 顺序模式下前序摘要存在，
+    # 结果挂到 section["_context_check"]（_gen_one 收进 result.context_check），
+    # 供生成后汇总与 SSE verification 事件。纯本地计算，零 AI 调用。
+    try:
+        from ...config import CONTENT_CONTEXT_AUDIT as _CTX_AUDIT
+
+        if _CTX_AUDIT:
+            from .ordered_generation import audit_message_stack
+
+            section["_context_check"] = audit_message_stack(
+                messages,
+                section,
+                field_contract=context.get("field_contract"),
+                require_previous=bool(context.get("previous_sections_summary")),
+            )
+    except Exception as _ctx_audit_e:  # pragma: no cover - 防御性
+        logger.debug("[silent-except] 上下文注入校验失败（忽略）: %s", _ctx_audit_e)
 
     # 2) 透传 cancel_event + max_retries 到 provider.chat
     chat_kwargs: dict[str, Any] = {}
@@ -2343,6 +2828,10 @@ async def generate_sections(
     context: dict = None,
     progress_callback: Callable | None = None,
     concurrency: int = 3,
+    # generation_mode 默认 None → 回落 config.CONTENT_GENERATION_MODE（batch）。
+    # 2026-10-18 第二轮统一：不再硬编码 "parallel"，保证「系统默认 = 后端
+    # 默认 = 前端默认」同一事实源；显式传 "parallel" 仍是旧行为（向后兼容）。
+    generation_mode: str | None = None,
     **kwargs: Any,
 ) -> list:
     """并发生成多个章节的正文
@@ -2391,6 +2880,13 @@ async def generate_sections(
         # ENHANCE 2026-10-14（facts-ns P1-3）：缺失值策略透传，供正文 system
         # 追加 omit/placeholder 缺值口径铁律（fabricate/缺省不追加，行为不变）。
         "facts_policy": "facts_policy",
+        # 2026-10-18 ENHANCE: generation mode for ordered batch processing
+        "generation_mode": "generation_mode",
+        # 2026-10-18 ENHANCE（第二轮）：危大工程判定参数 / 适用规范清单。
+        # 必须在此登记——漏登记会被静默丢弃（kwargs 不进 merged_context），
+        # 表现为「扫描到了但正文永远注入不到」的幽灵功能。
+        "hazard_info": "hazard_info",
+        "standards_list": "standards_list",
     }
     # P0-TEXT-FLOW: 注入同级/上级章节映射（防车轱辘话、承上启下）
     # 从 sections_by_id + children_map 计算，每个 _gen_one 时按需取用
@@ -2449,6 +2945,21 @@ async def generate_sections(
     # --- 执行主体 ---
     semaphore = asyncio.Semaphore(max(1, min(concurrency, len(sections))))
     results: list[dict | None] = [None] * len(sections)
+
+    # 2026-10-18 ENHANCE: previous section summaries for ordered context injection
+    prev_summaries_map: dict[int, str] = {}
+
+    # 2026-10-18 ENHANCE（第二轮）：实际生成顺序追踪器。
+    # 调用方（SSE 主循环）可经 kwargs 传入共享实例，使主生成 + 重试的完成
+    # 顺序进入同一序列，供生成后统一校验；未提供时本函数自建（仅覆盖本次）。
+    _order_tracker = kwargs.get("order_tracker")
+    if _order_tracker is None:
+        try:
+            from .ordered_generation import GenerationOrderTracker
+
+            _order_tracker = GenerationOrderTracker()
+        except Exception:  # pragma: no cover - 防御性
+            _order_tracker = None
 
     async def _gen_one(idx: int, section: dict) -> None:
         """为单个章节生成正文并填充 results[idx]"""
@@ -2510,6 +3021,15 @@ async def generate_sections(
                 _local_ctx["sibling_chapters"] = _siblings_map[_sid_now]
             if _sid_now in _parents_map:
                 _local_ctx["parent_chapters"] = _parents_map[_sid_now]
+            # 2026-10-18 ENHANCE: 前序章节摘要（顺序生成时上下文承接，
+            # 单一实现见 ordered_generation.inject_previous_section_context）
+            if _sid_now in prev_summaries_map:
+                _local_ctx["previous_sections_summary"] = prev_summaries_map[_sid_now]
+            # 2026-10-18 ENHANCE（第二轮）：目录树位置（第几章第几节 / 第几个节点），
+            # 供提示词明确顺序约束；不改变任何生成行为。
+            if idx is not None:
+                _local_ctx["tree_index"] = idx + 1
+                _local_ctx["tree_total"] = len(sections)
             try:
                 content = await generate_section_content(
                     provider, section, _local_ctx, None
@@ -2568,7 +3088,29 @@ async def generate_sections(
                 "error": error_msg,
                 "quality": _quality,
             }
+            # 2026-10-18 ENHANCE（第二轮）：上下文注入校验结果（生成前审计，
+            # 由 build_chapter_content_messages 挂到 section 上）。
+            _ctx_check = section.get("_context_check")
+            if _ctx_check is not None:
+                result["context_check"] = _ctx_check
+            # BUG-FIX 2026-10-20（灰度开关观测闭环）：长上下文降级留痕随结果
+            # 上报。此前 `_degrade_long_context_messages` 只把
+            # `section['_context_degraded']` 挂在 section 上就再无消费方——
+            # 开关开启后运维只有一条 WARNING 日志，SSE/前端完全不可见，
+            # 无法回答「哪些章节被裁剪、裁了多少」，而这正是把
+            # CONTENT_CONTEXT_DEGRADE_ENABLED 从默认关推向默认开所必需的
+            # 采样数据。现在随 result 上报，由 sse_content 汇总进
+            # verification 事件（与 context_check 同一模式）。
+            if section.get("_context_degraded"):
+                result["context_degraded"] = True
             results[idx] = result
+
+            # 2026-10-18 ENHANCE（第二轮）：记录实际完成顺序（含并发/重试），
+            # 供生成后校验「实际生成顺序 vs 目录树顺序」。
+            try:
+                _order_tracker.record(sid, final_status)
+            except Exception:  # pragma: no cover - 防御性
+                pass
 
             # 5) 进度回调：生成完成
             # BUG-FIX 2026-09-16（P2 计数翻倍）：SSE 主链路上「章节终态」由
@@ -2599,28 +3141,117 @@ async def generate_sections(
                         title, cb_exc,
                     )
 
-    # --- 并发调度（gather + return_exceptions，让异常章节不拖累整体）---
-    tasks = [
-        asyncio.create_task(
-            _gen_one(i, s),
-            name=f"section-gen-{s.get('id')}-{i}",
-        )
-        for i, s in enumerate(sections)
-    ]
-    gathered = await asyncio.gather(*tasks, return_exceptions=True)
+    # --- 并发调度 ---
+    # 2026-10-18 ENHANCE: support three generation modes:
+    #   parallel (default): asyncio.gather all at once (legacy behavior)
+    #   batch: ordered batches, parallel within batch, sequential across batches
+    #   serial: one section at a time, with previous section context injection
+    #
+    # 第二轮增强（顺序异常处理）：
+    #   * 批内章节失败 → 按目录树顺序立即重试（不跳过后移），重试仍失败才
+    #     标记待人工处理并继续后续批次，不阻塞整体流程；
+    #   * 前序摘要统一走 ordered_generation.inject_previous_section_context
+    #     （单一实现，消除内联漂移）。
+    _gen_mode = str(merged_context.get("generation_mode") or "").strip().lower()
+    if _gen_mode not in ("parallel", "batch", "serial"):
+        # 未传/非法 → 回落系统默认（config.CONTENT_GENERATION_MODE，导入时已校验）
+        try:
+            from ...config import CONTENT_GENERATION_MODE as _default_mode
 
-    # 任何意外异常的兜底处理
-    for i, item in enumerate(gathered):
-        if isinstance(item, BaseException):
-            logger.error("[正文生成] _gen_one 未捕获异常 idx=%d: %s", i, item)
-            section = sections[i]
-            results[i] = {
-                "id": section.get("id"),
-                "title": section.get("title", ""),
-                "status": "failed",
-                "content": "",
-                "error": f"内部错误: {item}",
-            }
+            _gen_mode = _default_mode
+        except Exception:  # pragma: no cover - 防御性
+            _gen_mode = "batch"
+    _prev_summaries: list[dict] = []
+    gathered: list = []
+
+    # id → 原始下标（O(1) 定位，替代 sections.index 的 O(n²) 值比较）
+    _idx_by_id = {s.get("id"): i for i, s in enumerate(sections)}
+
+    # 批内失败按顺序重试轮数（config 可配，0 = 关闭回落旧行为）
+    _batch_retry_rounds = 0
+    try:
+        from ...config import CONTENT_BATCH_RETRY_ROUNDS as _brr
+
+        _batch_retry_rounds = max(0, int(_brr))
+    except Exception:  # pragma: no cover - 防御性
+        _batch_retry_rounds = 0
+
+    async def _run_batch_sections(batch_sections: list[dict]) -> None:
+        """并发执行一批章节（保持目录树顺序创建任务）。"""
+        _batch_tasks = []
+        for _sec in batch_sections:
+            _orig_idx = _idx_by_id.get(_sec.get("id"))
+            if _orig_idx is None:  # 防御性：批次外的脏数据
+                continue
+            _batch_tasks.append(asyncio.create_task(
+                _gen_one(_orig_idx, _sec),
+                name=f"section-gen-{_sec.get('id')}-{_orig_idx}",
+            ))
+        if _batch_tasks:
+            _batch_gathered = await asyncio.gather(*_batch_tasks, return_exceptions=True)
+            gathered.extend(_batch_gathered)
+
+    if _gen_mode in ("batch", "serial") and build_generation_batches is not None:
+        # Ordered generation mode
+        _batch_size = 1 if _gen_mode == "serial" else max(1, min(concurrency, 8))
+        _batches = build_generation_batches(sections, max_batch_size=_batch_size)
+
+        for _batch_idx, _batch in enumerate(_batches):
+            # Inject previous section summaries into context for this batch
+            # （单一实现：ordered_generation.inject_previous_section_context）
+            if _prev_summaries:
+                for _b_sec in _batch:
+                    _b_sid = _b_sec.get("id")
+                    _ctx_probe = inject_previous_section_context(
+                        {}, list(_prev_summaries)
+                    )
+                    if "previous_sections_summary" in _ctx_probe:
+                        prev_summaries_map[_b_sid] = _ctx_probe["previous_sections_summary"]
+
+            await _run_batch_sections(_batch)
+
+            # 顺序异常处理：批内失败章节按目录树顺序立即重试，不跳过后移。
+            # 重试仍失败 → 保留 failed 状态（标记待人工处理），继续后续批次。
+            if _batch_retry_rounds > 0:
+                for _round in range(_batch_retry_rounds):
+                    _failed_in_batch = [
+                        s for s in _batch
+                        if isinstance(results[_idx_by_id[s["id"]]], dict)
+                        and results[_idx_by_id[s["id"]]].get("status") == "failed"
+                    ]
+                    if not _failed_in_batch or (
+                        cancel_event is not None and cancel_event.is_set()
+                    ):
+                        break
+                    logger.info(
+                        "[正文生成] 批 %d/%d 内 %d 章失败，按顺序重试 Round %d/%d",
+                        _batch_idx + 1, len(_batches), len(_failed_in_batch),
+                        _round + 1, _batch_retry_rounds,
+                    )
+                    await asyncio.sleep(1.0 * (2 ** _round))
+                    await _run_batch_sections(_failed_in_batch)
+
+            # Extract summaries from completed sections in this batch
+            if extract_section_summary is not None:
+                for _batch_sec in _batch:
+                    _bsid = _batch_sec.get("id")
+                    _r = results[_idx_by_id[_bsid]] if _bsid in _idx_by_id else None
+                    if isinstance(_r, dict) and _r.get("status") == "completed" and _r.get("content"):
+                        _prev_summaries.append({
+                            "title": _batch_sec.get("title", ""),
+                            "summary": extract_section_summary(_r["content"]),
+                        })
+                    prev_summaries_map.pop(_bsid, None)
+    else:
+        # Legacy parallel mode: all tasks start at once
+        tasks = [
+            asyncio.create_task(
+                _gen_one(i, s),
+                name=f"section-gen-{s.get('id')}-{i}",
+            )
+            for i, s in enumerate(sections)
+        ]
+        gathered = await asyncio.gather(*tasks, return_exceptions=True)
 
     # --- 生成后自检（ENHANCE 2026-10-07）---
     # 有字段契约时，对每个成功章节做「占位标记 / 与全局数据字典冲突 / 过短」自检，
@@ -2641,6 +3272,38 @@ async def generate_sections(
                 )
         except Exception as _sc_e:
             logger.warning("[正文生成] 生成后自检执行失败（忽略）: %s", _sc_e)
+
+    # --- 2026-10-18 ENHANCE: 生成后综合校验（顺序/完整性/一致性/事实调用）---
+    try:
+        from ...config import CONTENT_ORDER_VERIFY
+        if CONTENT_ORDER_VERIFY:
+            from .ordered_generation import verify_generation_completeness
+            _expected_ids = [s.get("id") for s in sections if s.get("id") is not None]
+            _verify_result = verify_generation_completeness(
+                [r for r in results if r is not None],
+                _expected_ids,
+                field_contract=merged_context.get("field_contract"),
+                generation_mode=_gen_mode,
+                field_trace=merged_context.get("field_trace"),
+                facts=merged_context.get("facts"),
+                order_tracker=_order_tracker,
+            )
+            # 实际完成顺序随结果透传（SSE 复核试后的最终顺序用）
+            _clean_results = [r for r in results if r is not None]
+            if _clean_results:
+                _clean_results[0]["_verification"] = _verify_result
+                if _order_tracker is not None:
+                    _clean_results[0]["_completion_order"] = list(
+                        getattr(_order_tracker, "sequence", []) or []
+                    )
+            if not _verify_result.get("ok"):
+                logger.info(
+                    "[正文生成] 生成后综合校验: %d 个错误, %d 个警告",
+                    len(_verify_result.get("issues", [])),
+                    len(_verify_result.get("warnings", [])),
+                )
+    except Exception as _verify_e:
+        logger.warning("[正文生成] 生成后综合校验执行失败（忽略）: %s", _verify_e)
 
     # 最终返回干净的 list[dict]（过滤掉 None 异常占位）
     return [r for r in results if r is not None]

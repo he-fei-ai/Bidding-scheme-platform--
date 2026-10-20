@@ -62,31 +62,65 @@ _DECISION_KEYWORDS = (
 
 
 def _parse_mermaid_flowchart(mermaid_code: str) -> list[str] | None:
-    """解析 Mermaid 流程图代码，提取节点标签列表"""
+    """解析 Mermaid 流程图代码，提取节点标签列表
+
+    BUG-FIX 2026-10-19（岳阳路事故·流程图截断）：旧实现只匹配**独立节点定义行**
+    （`^\\w+\\s*\\[...\\]`），而 AI 生成的流程图绝大多数是**纯连线行**
+    （`A1["开始"] --> B1["工序"]`）——连线行两侧的节点标签全部漏采，
+    兜底渲染只剩零星几个独立定义节点，产出「开始 → 某节点」式残缺图。
+    现补齐连线行两侧标签提取：按 `-->` 拆分，对每侧复用
+    `_extract_mermaid_node_label` 提取标签，按出现顺序去重合并，
+    保证兜底节点列表覆盖流程图全部节点。
+    """
     nodes = []
+    seen: set[str] = set()
+
+    def _append_label(label: str | None) -> None:
+        if not label:
+            return
+        # 剥离包裹引号与边缘残留
+        clean = label.strip().strip('"').strip("'").strip()
+        if not clean or clean in seen:
+            return
+        if _looks_like_edge_artifact(clean):
+            return
+        seen.add(clean)
+        nodes.append(clean)
+
     lines = mermaid_code.strip().split("\n")
     for line in lines:
         line = line.strip()
         if not line or line.startswith("graph") or line.startswith("flowchart"):
             continue
+        # 1) 连线行：A["甲"] --> B["乙"]（可带 |边标签|）
+        if "-->" in line or "---" in line:
+            _edge_parts = re.split(r"-{2,}>|---", line)
+            for _part in _edge_parts:
+                _part = _part.strip()
+                # 剥离边标签 |文字| 与节点 ID 前缀
+                _part = re.sub(r"^\|[^|]*\|", "", _part).strip()
+                _label = _extract_mermaid_node_label(_part)
+                if _label:
+                    _append_label(_label)
+                    continue
+                # 无括号裸节点 ID（A --> B）：跳过——无标签可渲染
+            continue
         node_match = re.match(r"^\w+\s*\[([^\]]*)\]", line)
         if node_match:
-            label = node_match.group(1).strip()
-            if label:
-                nodes.append(label)
+            _append_label(node_match.group(1))
             continue
         node_match = re.match(r"^\w+\s*\{([^}]*)\}", line)
         if node_match:
-            label = node_match.group(1).strip()
-            if label:
-                nodes.append(label)
+            _append_label(node_match.group(1))
             continue
         node_match = re.match(r"^\w+\s*\(\(([^)]*)\)\)", line)
         if node_match:
-            label = node_match.group(1).strip()
-            if label:
-                nodes.append(label)
+            _append_label(node_match.group(1))
             continue
+        # 4) 独立节点定义行（含圆角/菱形等扩展语法）
+        _label = _extract_mermaid_node_label(line)
+        if _label:
+            _append_label(_label)
     return nodes if len(nodes) >= 2 else None
 
 def _is_decision_label(label: str) -> bool:

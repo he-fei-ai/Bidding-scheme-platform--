@@ -470,23 +470,9 @@ def test_smart_merge_preserves_28_chapter_order():
 # ─────────────────────────────────────────────────────────────────────────────
 # 10. _safe_asyncio_run 统一替换旧模式的验证
 # ─────────────────────────────────────────────────────────────────────────────
-
-
-def test_outline_sort_optimizer_uses_safe_asyncio_run():
-    """
-    outline_sort_optimizer._call_provider 不再使用 get_event_loop() + run_until_complete()
-    旧代码在 Python 3.10+ 下 get_event_loop() 会创建新 loop 而非返回 running loop，
-    导致 is_running() 判断错误。现已统一改用 _safe_asyncio_run。
-    """
-    from pathlib import Path
-
-    src = Path(__file__).parent.parent / "app" / "services" / "ai" / "outline_sort_optimizer.py"
-    text = src.read_text(encoding="utf-8")
-
-    assert "get_event_loop().run_until_complete" not in text, \
-        "outline_sort_optimizer 仍使用 get_event_loop() + run_until_complete() 旧模式"
-    assert "_safe_asyncio_run" in text, \
-        "outline_sort_optimizer 应使用 _safe_asyncio_run"
+# 注：outline_sort_optimizer 模块已于 2026-10-18 整体删除（两个排序器类无生产
+# 调用方，常量迁入唯一消费方 outline_gate.py），其源码扫描用例随之移除；
+# _safe_asyncio_run 的旧模式防护由下方全项目扫描用例兜底。
 
 
 def test_enhancement_orchestrator_uses_safe_asyncio_run():
@@ -532,40 +518,6 @@ def test_no_get_event_loop_run_until_complete_anywhere():
         if "get_event_loop().run_until_complete" in text:
             rel = py_file.relative_to(app_dir)
             raise AssertionError(f"{rel} 仍使用 get_event_loop().run_until_complete() 旧模式")
-
-
-@pytest.mark.asyncio
-async def test_call_provider_uses_safe_asyncio_run():
-    """
-    OutlineSortOptimizer._call_provider 在已有 running loop 的线程中调用时，
-    应通过 _safe_asyncio_run 正确执行，不抛 RuntimeError。
-    """
-    import asyncio
-    from unittest.mock import MagicMock
-    from app.services.ai.outline_sort_optimizer import OutlineSortOptimizer
-
-    optimizer = OutlineSortOptimizer(provider=None, max_retries=1)
-    # mock provider.chat 为 async 函数
-    mock_provider = MagicMock()
-
-    async def mock_chat(messages):
-        return '{"chapters": [{"title": "测试"}]}'
-
-    mock_provider.chat = mock_chat
-    optimizer.provider = mock_provider
-
-    # 辅助函数：在有 running loop 的线程中同步调用 _call_provider
-    def sync_call():
-        # _call_provider 返回 str 或 None，不是 coroutine
-        return optimizer._call_provider([MagicMock()])
-
-    async def host():
-        # 通过 to_thread 模拟：在已有 running loop 的线程中同步调用
-        return await asyncio.to_thread(sync_call)
-
-    result = await host()
-    # _call_provider 应返回字符串（AI 响应）或 None，不抛异常
-    assert result is None or isinstance(result, str)
 
 
 # 10. 9步 phase_callback 顺序验证

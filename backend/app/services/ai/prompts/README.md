@@ -27,7 +27,17 @@ backend/app/services/ai/prompts/
 └── industry.py        # 1 个：行业树（INDUSTRY_GENERATE_CHILDREN_SYSTEM）
 ```
 
-合计 **57 个**提示词常量（含 3 个 SHARED_* 共享规则，注册到管理界面只读展示，可经 `{shared:NAME}` 注入其他提示词）。
+合计 **77 个**提示词常量（62 子模块 + 12 收编 `_integrate.py` + 3 个 SHARED_* 共享规则；
+注册到管理界面只读展示，可经 `{shared:NAME}` 注入其他提示词）。
+
+> **数量以代码为准**：本节曾长期写「57 个」而实际已增至 77 个（2026-10-17 修正）。
+> 如需核对，运行 `python -c "from app.services.ai.prompts import _ALL_PROMPTS; print(len(_ALL_PROMPTS))"`，
+> 或调用 `GET /prompts/overview` 读取 `total` 与 `shared_usage`。
+>
+> **复用现状（重要）**：`{shared:NAME}` 机制可用，但注册表中**尚无模板引用**它
+> （`audit_shared_usage()["adoption_rate"] == 0`）。三条共享规则目前只作为「管理页
+> 可查看的只读条目」存在，标题编号规范/禁用词/输出格式规范仍由各模板**逐份内联**
+> 维护。收编时须注意：改为 `{shared:}` 引用会改变模板实际内容，需同步回归验证。
 
 ### 1.2 公共 API
 

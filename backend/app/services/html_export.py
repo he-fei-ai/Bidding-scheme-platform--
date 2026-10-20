@@ -165,22 +165,30 @@ def _render_markdown_table(markdown: str) -> str:
 # ========== 核心构建链 ==========
 
 def _load_sections_for_html(project_id: int) -> list[dict]:
-    """加载项目全部章节（含 content + 图表 JSON），供 HTML 渲染消费。"""
-    from ..models import Section
+    """加载项目全部章节（含 content + 图表 JSON），供 HTML 渲染消费。
 
+    2026-10-18 ENHANCE（第二轮·展示顺序）：排序改为目录树深度优先前序，
+    与正文生成 / DOCX 导出 / 缓存指纹共用 ``ordered_generation`` 的唯一实现。
+    旧口径 ``ORDER BY level, sort_order, id`` 是**广度优先**，且 ``sort_order``
+    是同父节点下的兄弟序号 —— 跨 L1 父节点会重复（每个 L1 的第一个 L2 子节
+    sort_order 都是 1），按它做全局二级排序会把两棵 L1 子树交错
+    （1.1, 2.1, 1.2, 2.2），即「展示顺序跳章乱序」。现按 (parent_id,
+    sort_order, id) 前序遍历，与正文生成顺序一致。
+    """
+    from ..models import Section  # noqa: F401  (保留显式引用，便于字段契约对照)
+    from .ai.ordered_generation import load_sections_in_tree_order
+
+    columns = (
+        "id, title, level, parent_id, sort_order, content,"
+        " flowchart_json, gantt_json, architecture_json,"
+        " labor_json, comparison_json, layout_json, timeline_json,"
+        " inlined_chart_json"
+    )
     with get_db() as conn:
-        rows = conn.execute(
-            """SELECT id, title, level, parent_id, sort_order, content,
-                      flowchart_json, gantt_json, architecture_json,
-                      labor_json, comparison_json, layout_json, timeline_json,
-                      inlined_chart_json
-               FROM sections WHERE project_id = ?
-               ORDER BY level, sort_order, id""",
-            (project_id,),
-        ).fetchall()
+        sections = load_sections_in_tree_order(conn, project_id, columns=columns)
 
-    # 按 parent_id 分组建树
-    sections = [dict(r) for r in rows]
+    # 按 parent_id 分组建树（渲染侧仍走 build_tree 的树遍历，此处顺序供
+    # sections_by_id 与任何直接消费扁平列表的下游使用）
     return sections
 
 

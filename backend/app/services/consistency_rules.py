@@ -132,6 +132,26 @@ CRITICAL_FACT_NAMES: frozenset[str] = frozenset(
 #: 「不同取值数超过此值」即升格为 `high`
 SEVERITY_HIGH_DISTINCT_THRESHOLD = 2
 
+#: 已确认事实基准（`analysis.global_facts_json`）的 category → 审计器事实名。
+#: ENHANCE 2026-09-29（双轨制）+ ENHANCE 2026-10-13（第六轮·单一来源）：
+#: 本映射原先只挂在 `ConsistencyAuditor.FACT_BASELINE_CATEGORIES` 上，而**回流侧**
+#: （`consistency_backflow`）要判断「两条事实会不会互判冲突」时必须反过来查它 ——
+#: 服务层之间只能靠 `ConsistencyAuditor` 这个类属性互相引用，权限/顺序耦合且不
+#: 好测试。现上移到本命名空间，审计器保留同名类属性做**别名**（向后兼容既有
+#: 调用 `ConsistencyAuditor.FACT_BASELINE_CATEGORIES` 的路由与测试）。
+#:
+#: 语义：只纳入可与正则抽取结果直接比较的三类（人员/技术类事实口径不同不纳入）。
+#: **同一 category 下只允许存在一种取值**：审计器按 category 收基准，并把该事实名
+#: 下**所有**值收进 `all_facts` 互比（没有「首条胜出」），因此同一 category 里若
+#: 有两条取值不同的事实，它们会互相判成冲突，且该冲突来自 global_facts 本身、
+#: 用户改正文也无法消解。回流侧据此在采纳时拦截（见 `consistency_backflow`
+#: 的 R-14 注释）。
+FACT_BASELINE_CATEGORIES: dict[str, str] = {
+    "schedule": FACT_DURATION,
+    "quality": FACT_QUALITY,
+    "safety": FACT_SAFETY,
+}
+
 
 def is_critical_fact(fact_name: Any) -> bool:
     """该事实项是否属于「一冲突即严重」的关键事实。"""
@@ -313,36 +333,64 @@ AUTOFIX_KEYWORD_WINDOW_AFTER = 6
 #: 会被当成「共 20 人」改写。改用结构校验后这类无关数字一律拦下；上限 4 个汉字
 #: 保证「钢筋直径 20 mm，共 20 人到场」里的钢筋 20 仍被拦（其后 4 字内无「人」）。
 #:
-#: ⚠️ 口径**有意宽于**抽取正则（HARDEN 2026-10-11·R-13，勿按「对齐」收紧）：
-#: 抽取侧 `consistency_auditor.FACT_PATTERNS["人员数量"]` 需要「岗位词 + 数字 + 人」
-#: 或「总括词 + 数字 + 人」；本闸门只认「数字 + （≤4 汉字）+ 人」，因此会放行
-#: 抽取侧看不见的写法，例如「共安排 5 人值守」（总括词后接非岗位词 + 数字）。
-#: 这是**故意的**：闸门若与抽取完全等宽，则「抽取时合法、措辞稍变即被拦」的取值
-#: 会被整批误拦，用户明明采纳了建议却「没有可替换的位置」（F-2 修复前正是这个
-#: 失败模式）。代价是：若正文里另有一个合法的「人员数量」冲突值恰好等于某个子集
-#: 短语里的数字，修复时可能把该子集短语一并改掉——触发需「子集短语 + 同值合法
-#: 短语 + 另一总人数」三者同篇共存，概率低。要收紧请同时评估误拦代价，并同步
-#: 收敛抽取侧总括分支的动词表（见 `consistency_auditor` 的 R-1 注释）。
-_PERSONNEL_VALUE_TAIL_RE = re.compile(r"\s*[一-鿿]{0,4}?\s*人")
+#: == 人员取值口径：抽取侧与闸门侧的**唯一来源**（BUG-FIX 2026-10-13 第六轮·R-13 收敛）==
+#:
+#: 历史形态：抽取侧在 `consistency_auditor.FACT_PATTERNS["人员数量"]` 写一套正则，
+#: 闸门侧在这里写另一套**近似**正则（「数字 + ≤4 汉字 + 人」+ 岗位词回看）。两侧
+#: 只能靠注释互相提醒（原 R-13 注释：闸门「有意宽于」抽取，勿按对齐收紧），结果是
+#: 一条常驻的口径裂缝 —— **检测看不见、修复却在改**：例如「共安排 5 人值守」
+#: 抽取侧不认（动词表已按 R-1 收窄），闸门侧却放行；修复因此可能改到抽取根本
+#: 没看到的短语。
+#:
+#: 收敛后：两侧共用下面这组片段。抽取侧直接用 `PERSONNEL_FACT_PATTERN`；闸门侧用
+#: 同一批片段编译出的 `_PERSONNEL_CONTEXT_RE`（带命名组，按**取值字符跨度**精确
+#: 比对）。于是「闸门放行某个出现位置」⟺「抽取能在同一位置抽到该取值」，
+#: 口径一致性从「注释约定」升级为「代码约束」。
+#:
+#: 误拦代价已重新评估（原 R-13 的主要顾虑）：autofix 的待替换值来自冲突，而冲突
+#: 来自抽取——凡是抽取抽不到的取值，压根不会成为 autofix 的目标值，因此「闸门
+#: 与抽取等宽」不会新增「用户采纳了建议却没位置可改」的失败模式。该等价性由
+#: `tests/test_consistency_round6_2026_10_13.py::TestPersonnelGateMatchesExtraction`
+#: 用事实抽取语料库逐条交叉验证（抽取抽得到 → 闸门放行；抽取抽不到 → 闸门拒绝）。
+_PERSONNEL_ROLE_ALT = "|".join(re.escape(r) for r in (*PERSONNEL_ROLE_PREFIXES, "人员"))
+#: 岗位词与数值之间的允许间隔：可选冒号 + 可选的「为/是/约」（与工期分支同口径）。
+_PERSONNEL_MODIFIERS = r"\s*[:：]?\s*(?:为|是|约)*\s*"
+#: 总括词前缀（共/合计/…）+ 可选动词（投入/配备/组织/动员），动词表按 R-1 收窄。
+#: 收窄动词表正是「共安排 5 人值守」这类**子集**写法被排除的原因：安排/参与
+#: 不在动词表里，前缀匹配不上，整条总括分支不命中（与后段宽松无关）。
+_PERSONNEL_TOTAL_PREFIX = r"(?:共计|总计|合计|总共|共)\s*(?:投入|配备|组织|动员)?\s*"
+#: 数字与人数单位之间的允许间隔：量词「名/位」或岗位词（「共 20 名施工人员到场」）。
+#: BUG-FIX 2026-10-13（第六轮·补抽取而非收闸门）：R-13 收敛把闸门收得与抽取等宽后，
+#: 「共 20 名施工人员到场」这类**合法**人数写法两侧同时失效（原闸门靠
+#: 「数字 + ≤4 汉字 + 人」能认，抽取不认）。按最优解是补**抽取**：间隔最多 4 个
+#: 汉字，与旧闸门同宽。安全性由前缀与单位守卫共同保证 —— 前缀要求总括词（且
+#: 其后的动词不在表内即不命中），守卫禁止「人」后紧跟 天/次/月/年/工/时/受/死/失/
+#: 遇/被，故「共安排 5 人值守」（前缀不命中）、「共 3 人受伤」（守卫）、
+#: 「共投入 45 人天」（守卫）依旧全部排除。
+_PERSONNEL_VALUE_GAP = r"\s*[一-鿿]{0,4}?\s*"
+#: 「人」之后禁止紧跟单位/事故量词：排除 人天/人月/人次/人年/人工，
+#: 以及事故伤亡类复合词（人受伤/人死亡/人失踪/人遇难/人被被困）。
+_PERSONNEL_UNIT_GUARD = r"(?!\s*[天次年月工时受死失遇被])"
 
-#: 取值前紧邻岗位词的判定（捕获组 1 = 具体岗位名）。
-#: BUG-FIX 2026-10-10（P1·跨岗位串改）：「人员」是「技术人员 / 管理人员 /
-#: 作业人员 / 施工人员」的**子串**，「人」又被 `KEYWORD_MATCH_MIN_LEN=2` 过滤，
-#: 于是人员数量类事实的所有闸门（标签词就近 + 取值后紧跟「人」）都区分不了
-#: 「本项目人员 20 人」和「技术人员 20 人」。实测：把人员数量 20 改成 30，
-#: 同章「技术人员 20 人」被一起改写成「技术人员 30 人」——不同岗位的编制被
-#: 静默串改，而冲突因「替换成功」被标为已解决。
-#: 同理，「技术人员数量」的标签词「人员」也会命中「管理人员 5 人」，所以本
-#: 校验对**所有**人员类事实生效：取值前紧邻的岗位必须与该事实声明的岗位一致。
-#: 允许岗位词与数值之间隔至多 4 个非数字字符（「技术人员约 20 人」「管理人员：5 人」）。
-_PERSONNEL_ROLE_PREFIX_RE = re.compile(
-    r"(" + "|".join(re.escape(role) for role in PERSONNEL_ROLE_PREFIXES) + r")[^0-9]{0,4}$"
+#: 岗位分支 / 总括分支 / 二者合成（**抽取侧**使用，见 `consistency_auditor.FACT_PATTERNS`）
+PERSONNEL_ROLE_PATTERN = (
+    rf"({_PERSONNEL_ROLE_ALT}){_PERSONNEL_MODIFIERS}(\d+)\s*人{_PERSONNEL_UNIT_GUARD}"
+)
+PERSONNEL_TOTAL_PATTERN = (
+    rf"{_PERSONNEL_TOTAL_PREFIX}(\d+){_PERSONNEL_VALUE_GAP}人{_PERSONNEL_UNIT_GUARD}"
+)
+PERSONNEL_FACT_PATTERN = PERSONNEL_ROLE_PATTERN + "|" + PERSONNEL_TOTAL_PATTERN
+
+#: **闸门侧**使用：与抽取完全同口径，但带命名组 —— 按取值跨度精确判定归属。
+_PERSONNEL_CONTEXT_RE = re.compile(
+    rf"(?P<role>{_PERSONNEL_ROLE_ALT}){_PERSONNEL_MODIFIERS}"
+    rf"(?P<role_value>\d+)\s*人{_PERSONNEL_UNIT_GUARD}"
+    rf"|{_PERSONNEL_TOTAL_PREFIX}(?P<total_value>\d+){_PERSONNEL_VALUE_GAP}人{_PERSONNEL_UNIT_GUARD}"
 )
 
-#: 岗位词回看半径（字符）。与 `autofix_keyword_window_before` 同口径，
-#: 取同一量级即可覆盖「岗位词—数值」的常态间距，同时避免把更远处的
-#: 另一句岗位描述误判为当前取值的归属。
-_PERSONNEL_ROLE_LOOKBACK = 12
+#: 兼容旧引用的别名：闸门曾按「取值后 ≤4 汉字内出现『人』」判定，现由
+#: `_PERSONNEL_CONTEXT_RE` 取代；保留常量名仅为避免历史补丁脚本/引用断裂。
+_PERSONNEL_VALUE_TAIL_RE = re.compile(r"\s*[一-鿿]{0,4}?\s*人")
 
 
 def is_personnel_fact_name(fact_name: Any) -> bool:
@@ -390,6 +438,36 @@ def personnel_fact_keywords(fact_name: Any) -> frozenset[str]:
     return frozenset()
 
 
+def _personnel_occurrence_matches_fact(
+    text: str, start: int, end: int, fact_name: Any
+) -> bool:
+    """人员类事实的出现位置归属判定 —— 与抽取正则同口径（BUG-FIX 2026-10-13·R-13）。
+
+    Returns:
+        True 仅当该出现位置正是抽取正则会在**同一字符跨度**抽出的那个人数取值，
+        且取值归属的事实名一致：
+
+          * 命中岗位分支 → 归「<岗位>数量」；角色词为裸「人员」时归「人员数量」；
+          * 命中总括分支（共/合计/…）→ 只归通用「人员数量」；
+          * 两个分支都不命中 → 拒绝（抽取也看不见它）。
+
+    这同时继承了 2026-10-10 的跨岗位保护：岗位不一致（如用「技术人员数量」去改
+    「管理人员 5 人」）必然落在 `m.group("role") != fact_role` 上被拒。
+    """
+    fact_name_text = str(fact_name or "").strip()
+    fact_role = "" if fact_name_text == FACT_PERSONNEL else fact_name_text[: -len("数量")]
+    for m in _PERSONNEL_CONTEXT_RE.finditer(text):
+        role_value = m.group("role_value")
+        if role_value is not None and (m.start("role_value"), m.end("role_value")) == (start, end):
+            # 具体岗位事实只认领同名岗位；通用「人员数量」只认领裸「人员」写法
+            return (m.group("role") == fact_role) if fact_role else (m.group("role") == "人员")
+        total_value = m.group("total_value")
+        if total_value is not None and (m.start("total_value"), m.end("total_value")) == (start, end):
+            # 总括式归通用桶，具体岗位事实不得认领
+            return not fact_role
+    return False
+
+
 def fact_has_keyword_nearby(
     content: str,
     occurrence_start: int,
@@ -428,21 +506,15 @@ def fact_has_keyword_nearby(
     # 出现在「共 20 人」里 → 合法取值被整批误拦；而放宽长度下限到 1 又会因
     # 「钢筋直径 20 mm」邻近「…共 20 人参与施工」而被放行。结构校验同时满足两侧。
     if is_personnel_fact_name(fact_name):
-        if not bool(_PERSONNEL_VALUE_TAIL_RE.match(text, int(occurrence_end))):
-            return False
-        # BUG-FIX 2026-10-10（P1·跨岗位串改）：取值前紧邻岗位词时，该取值属于
-        # 对应的「<岗位>数量」事实，只有岗位一致才放行。裸「人员数量」不认领
-        # 任何具体岗位；「技术人员数量」也不能认领「管理人员 5 人」。
-        head = text[
-            max(0, int(occurrence_start) - _PERSONNEL_ROLE_LOOKBACK)
-            : int(occurrence_start)
-        ]
-        matched = _PERSONNEL_ROLE_PREFIX_RE.search(head)
-        if not matched:
-            return True
-        fact_name_text = str(fact_name or "").strip()
-        fact_role = "" if fact_name_text == FACT_PERSONNEL else fact_name_text[: -len("数量")]
-        return matched.group(1) == fact_role
+        # 与抽取同口径的结构校验（R-13 收敛，见上方「人员取值口径」注释）。
+        # 原实现分两步：① 取值后 ≤4 汉字内有「人」；② 取值前回看岗位词是否一致。
+        # ① 比抽取宽（会放行抽取看不见的写法，如「共安排 5 人值守」）；② 用回看
+        # 窗口近似判定归属（「技术人员约 20 人」靠 `[^0-9]{0,4}` 勉强覆盖）。
+        # 现按**取值字符跨度**精确匹配：命中岗位分支必须岗位一致，命中总括分支
+        # 只能归通用桶，未命中任何分支一律拒绝。
+        return _personnel_occurrence_matches_fact(
+            text, int(occurrence_start), int(occurrence_end), fact_name
+        )
 
     keywords = personnel_fact_keywords(fact_name)
     if not keywords:

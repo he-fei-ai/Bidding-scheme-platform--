@@ -11,6 +11,7 @@ import {
 import { getProject, checkDocument, exportDocx, exportDocxStream, getExportHistory, getExportDownloadUrl, getLatestExportUrl, getExportPresets, exportPdf, exportHtml } from "../api";
 import { extractApiError, formatExportFileSize, reduceExportProgressEvent, classifyExportFailure } from "../utils";
 import type { DocumentCheckResult, ExportRecord, ExportResult, ExportPresetCatalog } from "../types";
+import { taskStore } from "../services/taskStore";
 
 const { Text, Title } = Typography;
 
@@ -101,6 +102,9 @@ export default function ExportConfigPage() {
   const [strictMode, setStrictMode] = useState(false);
   // D5 加固（2026-10-07）：图表标题兜底补图开关。开启后章节无图表数据时按标题本地模板自动补图。
   const [autoFallbackCharts, setAutoFallbackCharts] = useState(false);
+  // L-6（2026-10-17）：图题编号分隔符（图3-1 标题 / 图3-1：标题），默认空格=历史口径，
+  // 非法取值由后端 _figure_caption 回退空格
+  const [figureNoSeparator, setFigureNoSeparator] = useState<string>(" ");
   // ENHANCE 2026-09-14：导出格式预设（版式 + 主题），移植自易标 exportFormatPresets
   const [presetCatalog, setPresetCatalog] = useState<ExportPresetCatalog | null>(null);
   const [presetId, setPresetId] = useState("");
@@ -218,6 +222,8 @@ export default function ExportConfigPage() {
     strict_mode: strictMode,
     // D5 加固（2026-10-07）：图表标题兜底补图（仅命中强关键词的图表相关章节，不伪造数据）
     auto_fallback_charts: autoFallbackCharts,
+    // L-6（2026-10-17）：图题编号分隔符透传后端（" " / "："）
+    figure_no_separator: figureNoSeparator,
     // ENHANCE 2026-09-14：把预设 id 传给后端。颜色/页边距/纸张/页码/分页等
     // 未在此显式列出的字段，由后端按 preset_id + theme_id 解析补全，
     // 这样新增预设项不必每次都改前端传参清单。
@@ -226,11 +232,24 @@ export default function ExportConfigPage() {
   });
 
   const handleExport = async () => {
+    const exportTaskId = `export-${projectId}`;
     setExporting(true);
     setExportProgress(0);
     setExportPhase("");
     cancelRequestedRef.current = false;
     exportAbortRef.current = null;
+    // ENHANCE 2026-10-17（后台任务挂接）：把导出任务登记到全局 taskStore，
+    // 使顶栏 TaskStatusBar 可跨页面展示导出进度，切走页面后返回仍能看到状态。
+    taskStore.startTask({
+      taskId: exportTaskId,
+      projectId,
+      taskType: "export",
+      status: "running",
+      progress: 0,
+      message: "正在导出文档...",
+      startedAt: Date.now(),
+      lastUpdated: Date.now(),
+    });
     try {
       const config = buildExportConfig();
 
@@ -248,6 +267,7 @@ export default function ExportConfigPage() {
           if (ui) {
             if (evt.event === "progress") setExportProgress(ui.progress);
             setExportPhase(ui.phase);
+            taskStore.updateTask(exportTaskId, { progress: ui.progress, message: ui.phase });
           }
         });
         // BUG-EXPORT-03 修复：保存 abort 句柄，供"取消导出"按钮调用
@@ -281,6 +301,7 @@ export default function ExportConfigPage() {
         }
         message.success(`导出成功: ${result.filename}`);
         loadData();
+        taskStore.completeTask(exportTaskId, "completed", `导出成功: ${result.filename}`);
       } catch (sseErr: any) {
         // ENHANCE 2026-10-04：取消/冲突/降级三分支判定抽取为纯函数
         // classifyExportFailure（行为与原内联逻辑逐分支一致）。
@@ -308,11 +329,13 @@ export default function ExportConfigPage() {
         setCheckResult(result.check);
         message.success(`导出成功: ${result.filename}`);
         loadData();
+        taskStore.completeTask(exportTaskId, "completed", `导出成功: ${result.filename}`);
       }
     } catch (e: any) {
       // BUG-EXPORT-03 修复：用户主动取消时静默处理，不弹错误提示
       if (e?.__cancelled || cancelRequestedRef.current) {
         setExportPhase("已取消");
+        taskStore.stopTracking(exportTaskId);
         return;
       }
       // BUG-FIX 2026-09-15（中）：组锁冲突用专门的「导出冲突」对话框，
@@ -324,6 +347,7 @@ export default function ExportConfigPage() {
           icon: <WarningOutlined />,
         });
         setExportPhase("");
+        taskStore.stopTracking(exportTaskId);
         return;
       }
       setExportProgress(0);
@@ -334,6 +358,7 @@ export default function ExportConfigPage() {
         icon: <WarningOutlined />,
       });
       message.error(detail || "导出失败");
+      taskStore.completeTask(exportTaskId, "failed", detail || "导出失败");
     } finally {
       setExporting(false);
       setExportPhase("");
@@ -354,11 +379,23 @@ export default function ExportConfigPage() {
   // 后端已按导出组锁串行化同项目导出，冲突（409）直接提示，不重试。
   const handleExportHtml = async () => {
     if (htmlLoading || exporting) return;
+    const exportTaskId = `export-html-${projectId}`;
     setHtmlLoading(true);
+    taskStore.startTask({
+      taskId: exportTaskId,
+      projectId,
+      taskType: "export",
+      status: "running",
+      progress: 0,
+      message: "正在导出 HTML...",
+      startedAt: Date.now(),
+      lastUpdated: Date.now(),
+    });
     try {
       await exportHtml(projectId, buildExportConfig());
       message.success("HTML 已下载");
       loadData();
+      taskStore.completeTask(exportTaskId, "completed", "HTML 已下载");
     } catch (e: any) {
       if (e?.status === 409) {
         Modal.error({
@@ -366,8 +403,10 @@ export default function ExportConfigPage() {
           content: e?.message || "当前已有导出任务在进行，请稍候再试",
           icon: <WarningOutlined />,
         });
+        taskStore.stopTracking(exportTaskId);
       } else {
         message.error(extractApiError(e) || "HTML 导出失败");
+        taskStore.completeTask(exportTaskId, "failed", extractApiError(e) || "HTML 导出失败");
       }
     } finally {
       setHtmlLoading(false);
@@ -644,6 +683,22 @@ export default function ExportConfigPage() {
                   <Switch checked={autoFallbackCharts} onChange={setAutoFallbackCharts} />
                   <Text type="secondary" style={{ fontSize: 12 }}>
                     开启后：章节无图表数据时，按标题本地模板自动补图（仅图表相关章节）
+                  </Text>
+                </Space>
+              </Descriptions.Item>
+              <Descriptions.Item label="图题分隔符">
+                <Space direction="vertical" size={0}>
+                  <Select
+                    value={figureNoSeparator}
+                    onChange={setFigureNoSeparator}
+                    style={{ width: 180 }}
+                    options={[
+                      { value: " ", label: "空格（图3-1 标题）" },
+                      { value: "：", label: "冒号（图3-1：标题）" },
+                    ]}
+                  />
+                  <Text type="secondary" style={{ fontSize: 12 }}>
+                    图表编号与标题间的分隔符；默认空格（历史口径）
                   </Text>
                 </Space>
               </Descriptions.Item>

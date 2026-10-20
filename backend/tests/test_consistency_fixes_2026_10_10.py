@@ -1218,33 +1218,56 @@ class TestMergeFactProposalsPure:
         assert added == 2
         assert [it["key"] for it in items] == ["b1", "b2", "audit_c1", "audit_c2"]
 
-    def test_same_label_different_value_both_kept(self):
-        """R-14 已知限制：同 label 不同 value 不会被 dedup 拦下，两条都留。
+    def test_same_label_different_value_in_baseline_category(self):
+        """R-14（2026-10-13 第六轮闭环）：**基准类别**内同 label 不同 value
+        只留第一条，第二条被拒并给出原因。
 
-        R-14 已知限制：同 label 不同 value 不会被 dedup 拦下，两条都留。
+        原行为（本用例此前钉死的「已知限制」）是两条都留：`dedup_key` 只比较
+        key/label、不含 value，故用户跨轮确认「同一事实名的两个不同取值」时会
+        落下两条同 label 的基准事实。下游按 **category**（不是 label）收基准，
+        并把该事实名下**所有**值都收进 `all_facts` 互比（没有「首条胜出」），
+        于是用户自己确认的两条会互相判成冲突，且该冲突来自 global_facts 本身、
+        **无法靠改正文消解** —— 后果比「冗余」重。
 
-        `dedup_key` 只比较 key（无 key 时退化为 label）、不含 value；而候选的
-        key 恒为 `audit_<conflict_id>`，故用户跨轮确认「同一事实名的两个不同
-        取值」时会落下两条同 label 的基准事实。下游
-        `consistency_auditor.FACT_BASELINE_CATEGORIES` 按 category 收基准、并把
-        同名下**所有**值都收进 `all_facts` 互比（没有「首条胜出」），于是用户
-        自己确认的两条会互相判成冲突，且该冲突来自 global_facts 本身、无法靠
-        改正文消解。判定不改语义（label 去重会静默丢弃用户明确确认的候选），
-        此处把该行为钉死以免被无意「修好」。
+        2026-10-11 判定不改的理由是「label 去重会静默丢弃用户明确确认的候选」；
+        现按更优解落地：**不静默丢弃，而是拦截并回传可读原因**（`plan_fact_merge`
+        的第三返回值 → accept 响应的 `skipped`）。本用例随之从「钉死旧行为」改为
+        「钉死新契约」；非基准类别的「两条并存」由下一条用例守住。
         """
-        from app.services.consistency_backflow import merge_fact_proposals
+        from app.services.consistency_backflow import plan_fact_merge
 
-        items, added = merge_fact_proposals(
+        items, added, skipped = plan_fact_merge(
             [],
             [
                 {"fact_name": "工期", "value": "450 日历天", "conflict_id": "c1"},
                 {"fact_name": "工期", "value": "460 日历天", "conflict_id": "c2"},
             ],
         )
+        assert added == 1
+        assert [(it["label"], it["value"]) for it in items] == [("工期", "450 日历天")]
+        assert len(skipped) == 1
+        assert skipped[0]["value"] == "460 日历天"
+        assert "工期=450 日历天" in skipped[0]["reason"], "拒绝原因必须指名冲突的既有事实"
+
+    def test_same_label_different_value_both_kept_outside_baseline(self):
+        """非基准类别（basic 等）：审计器不拿它们互比，两条并存合法且必须保留。
+
+        这是 R-14 收口时特意保留的边界——只对 `FACT_BASELINE_CATEGORIES`
+        声明的三类做互斥，避免误伤「同一事实名下并存多条」的合法用法。
+        """
+        from app.services.consistency_backflow import merge_fact_proposals
+
+        items, added = merge_fact_proposals(
+            [],
+            [
+                {"fact_name": "项目经理", "value": "张三", "category": "basic", "conflict_id": "c1"},
+                {"fact_name": "项目经理", "value": "李四", "category": "basic", "conflict_id": "c2"},
+            ],
+        )
         assert added == 2
         assert [(it["label"], it["value"]) for it in items] == [
-            ("工期", "450 日历天"),
-            ("工期", "460 日历天"),
+            ("项目经理", "张三"),
+            ("项目经理", "李四"),
         ]
 
     def test_empty_inputs(self):

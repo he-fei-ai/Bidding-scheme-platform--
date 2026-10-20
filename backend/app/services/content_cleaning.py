@@ -136,6 +136,11 @@ LIST_PAREN_PATTERN = re.compile(
 _LIST_PAREN_YEAR_RE = re.compile(r"^[（(]\s*\d{4}\s*[)）]\s*(?:年|月|日|号|版|年度|版次|年版)", re.MULTILINE)
 LIST_BULLET_PATTERN = re.compile(r"^[-•·▪■●○]\s*(.+)$")
 TABLE_PATTERN = re.compile(r"^<<表格[:：]")
+# BUG-FIX 2026-10-17（P2·长表格静默截断）：`<<表格：...>>` 块寻找闭合标记
+# 的扫描窗口。合法长表格（设备清单/人员配置表常达 100+ 行）在此窗口内可
+# 完整入块；超出窗口视为未闭合坏块，回退 60 行安全上限 + WARNING（见
+# parse_content 表格收集分支）。
+_TABLE_CLOSE_SCAN_LIMIT = 300
 MD_TABLE_PATTERN = re.compile(r"^\|.+\|.+$")
 # CHART-MARKER-UNIFY 2026-09-16：
 # - 描述部分放开为 `(.*?)`（允许 `<<GANTT:>>` / `<<CHART:>>` 这类「类型提示标记」）
@@ -341,7 +346,7 @@ def _classify_fence_line(line: str) -> tuple[str, str]:
     return _FENCE_KIND_OTHER, info.strip().lower()
 
 
-def plan_chart_fence_lines(lines: list[str]) -> list[tuple[str, str, list[str], int]]:
+def plan_chart_fence_lines(lines: list[str]) -> list[tuple[str, str, list[str], int, list[str]]]:
     """**单一权威**的图表围栏行规划器（纯函数，供三处消费方共用）。
 
     历史上 `_protect_chart_fences` / `parse_content` / `iter_chart_fences`
@@ -352,21 +357,27 @@ def plan_chart_fence_lines(lines: list[str]) -> list[tuple[str, str, list[str], 
         lines: 已按 "\\n" 切分、且无 "\\r" 的行列表。
 
     Returns:
-        [(action, lang, lines, consumed), ...]
+        [(action, lang, lines, consumed, prose), ...]
           action:  "keep"  普通行，原样保留（lang 为空串）
                    "block" 图表围栏载荷（lang ∈ {"mermaid","chart-json"}）
                    "bad"   未闭合/病态坏块的载荷（调用方按需尝试渲染，失败则删除）
           lines:   该条目的行内容（keep=原文，block/bad=载荷行，不含围栏标记行）
           consumed: 该条目消耗的**源行数**（keep=len(lines)；block=开+载荷+闭；
                    bad=开+载荷）。parse_content 据此一次性跳到下一行。
+          prose:   **载荷之后被误吞进围栏体的正文段**（BUG-FIX 2026-10-17 第七轮）。
+                   `_split_fence_body` 可能同时返回非空载荷与非空正文段（AI 把
+                   图表说明文字写进围栏内），此时正文段随本条目的第 5 个元素
+                   返回、**不参与** lines（载荷纯度）也不计入 consumed（区间
+                   连续性由本条目整体覆盖）。消费方须将 prose 按普通正文输出
+                   （见 `_protect_chart_fences`）；非混合场景恒为空列表。
     """
-    plan: list[tuple[str, str, list[str], int]] = []
+    plan: list[tuple[str, str, list[str], int, list[str]]] = []
     i = 0
     n = len(lines)
     while i < n:
         m = CHART_FENCE_OPEN_PATTERN.match(lines[i].strip())
         if not m:
-            plan.append(("keep", "", [lines[i]], 1))
+            plan.append(("keep", "", [lines[i]], 1, []))
             i += 1
             continue
         lang = _normalize_fence_lang(m.group(1))
@@ -401,15 +412,24 @@ def plan_chart_fence_lines(lines: list[str]) -> list[tuple[str, str, list[str], 
         payload, prose = _split_fence_body(body)
         action = "block" if closed else "bad"
         # consumed：起始行(1) + 闭合行(1，仅闭合块) + body 行数
+        # （body = 载荷 + 误吞正文段；本条目整体覆盖，prose 不单独占区间）
         consumed = 1 + len(body) + (1 if closed else 0)
         if payload:
-            plan.append((action, lang, payload, consumed))
+            # BUG-FIX 2026-10-17（第七轮·P1 围栏吞正文）：旧实现只登记载荷，
+            # `consumed` 却覆盖全部 body 行 → 载荷与正文段并存时（AI 把图表
+            # 说明文字写进围栏内、闭合行补在正文之后），正文段在
+            # `_protect_chart_fences` 与 `parse_content` 两侧被**静默吞掉**
+            # （探针 _audit7_probe.py::P2 实证：说明文字在 plan 与解析结果
+            # 中均丢失）。现正文段随第 5 元素透出，由消费方按普通正文输出；
+            # mask 侧（scan_chart_fence_blocks）区间不变——整个混合块（含
+            # 正文段与闭合行）仍被占位符整体保护，还原后交下游清洗归一。
+            plan.append((action, lang, payload, consumed, prose))
         elif prose:
             # 载荷被清空但尾部仍有正文段：正文按普通行保留，围栏行本身丢弃
-            plan.append(("keep", "", prose, 1 + len(body)))
+            plan.append(("keep", "", prose, 1 + len(body), []))
         else:
             # 空载荷 / 纯病态：整块删除
-            plan.append(("bad", lang, [], consumed))
+            plan.append(("bad", lang, [], consumed, []))
         i = j
     return plan
 
@@ -547,7 +567,7 @@ def _iter_plan_regions(lines: Sequence[str]):
     遍历骨架——两个公开函数共享同一次规划结果，不可能再各自漂移。
     """
     start = 0
-    for action, lang, payload, consumed in plan_chart_fence_lines(_as_lines(lines)):
+    for action, lang, payload, consumed, _prose in plan_chart_fence_lines(_as_lines(lines)):
         yield start, action, lang, payload, consumed
         start += consumed
 
@@ -706,7 +726,7 @@ def iter_chart_fences(content: str):
     """
     if not content:
         return
-    for action, lang, blines, _consumed in plan_chart_fence_lines(content.split("\n")):
+    for action, lang, blines, _consumed, _prose in plan_chart_fence_lines(content.split("\n")):
         if action != "block":
             continue
         body = "\n".join(blines).strip()
@@ -1217,7 +1237,7 @@ def _protect_chart_fences(text: str) -> str:
     plan = plan_chart_fence_lines(text.split("\n"))
     out: list[str] = []
     blocks: list[str] = []
-    for action, _lang, blines, _consumed in plan:
+    for action, _lang, blines, _consumed, prose in plan:
         if action == "keep":
             out.extend(blines)
         elif action == "block":
@@ -1230,7 +1250,17 @@ def _protect_chart_fences(text: str) -> str:
             # _protect_chart_fences 存 body（含开/闭行）的口径一致。
             blocks.append(f"```{_lang}\n" + "\n".join(blines) + "\n```")
             out.append(f"{_FENCE_PLACEHOLDER_PREFIX}{len(blocks) - 1}\x00")
+            # BUG-FIX 2026-10-17（第七轮·P1 围栏吞正文）：载荷之后被误吞进
+            # 围栏体的正文段按普通正文输出（紧跟占位符之后，顺序不变）；
+            # 混合块的闭合行已被本条目的 consumed 整体覆盖、不进输出，
+            # 占位符还原时由 blocks 里的完整围栏块补回。
+            if prose:
+                out.extend(prose)
         # action == "bad"：未闭合/病态坏块 → 载荷删除（不保护、不输出）
+        # 注：bad 条目同样可能携带 prose（未闭合混合块），正文段照常输出，
+        # 仅删除图表载荷——与 _split_fence_body 的设计意图一致。
+        elif prose:
+            out.extend(prose)
     _fence_cache.blocks.extend(blocks)
     return "\n".join(out)
 
@@ -1623,7 +1653,14 @@ def strip_heading_numbering_from_content(content: str) -> str:
     #     「3 天」「5 万」「2026 年」这类数量短语不再命中；
     #   · 三层小数点（1.1.1）保留无分隔符兼容（AI 偶发 `### 1.1.1标题`）。
     _ATX_HEADING_RE = re.compile(
-        r"^(#{1,6})\s+("  # group 1: # 前缀; group 2: 编号前缀（待剥离）
+        # BUG-FIX 2026-10-17（第七轮·编号冲突）：`#` 后空白由 `\s+` 放宽为
+        # `[ \t]*`——AI 偶发输出 `##1.1 工程概况`（无空格）时旧正则不命中，
+        # 章节重排后该标题编号残留，与导出端按目录结构重编号的口径冲突
+        # （探针 _audit7_probe.py::P9 实证）。编号分支本身的分隔符必需 +
+        # 量词负向前瞻不变（B11 保护不回退），故不会误伤「##2026年计划」
+        # 「##1.8米净高」这类正文行；附带消除 `\s+` 吞换行把两行拼一行的
+        # 边缘风险。
+        r"^(#{1,6})[ \t]*("  # group 1: # 前缀; group 2: 编号前缀（待剥离）
         r"\d{1,4}(?:\.\d+){2,}\s*[、．.]?\s*"  # 1.1.1 阿拉伯编号（三层小数点，分隔符可选）
         r"|\d{1,4}\.\d+(?!\.\d)(?:\s*[、．.]\s*|\s+(?![" + _UNIT_LEAD_CHARS + r"])(?=[一-鿿]))"  # 1.1（两层，分隔符必需，空格分支排量词）
         r"|\d{1,4}(?!\.\d)(?:\s*[、．.]\s*|\s+(?![" + _UNIT_LEAD_CHARS + r"])(?=[一-鿿]))"  # 1（单层，分隔符必需，空格分支排量词）
@@ -1661,18 +1698,27 @@ def strip_heading_numbering_from_content(content: str) -> str:
     # 遍历 lines：ATX 标题行直接处理；Setext 需要同时看当前行和下一行
     lines = content.split("\n")
     in_code_block = False
-    code_fence_char = None
+    _open_marker: tuple[str, int] = ("", 0)
     result_lines = []
     for i, line in enumerate(lines):
         stripped = line.strip()
-        # 围栏检测
-        if stripped.startswith("```") or stripped.startswith("~~~"):
+        # BUG-FIX 2026-10-17（P2·围栏骨架误判导致围栏内编号被误剥）：
+        # 旧实现 `code_fence_char = stripped[:3]` 取前 3 字符当闭合标记，
+        # ```` ````mermaid ````（4 反引号，嵌套代码块常见写法）会被内嵌的
+        # 3 反引号行误闭合 → 围栏内文本被当成正文做编号剥离；且与权威规划器
+        # plan_chart_fence_lines / scan_chart_fence_blocks 的「同字符且长度
+        # 不小于」口径分叉（探针 scripts/_audit6_probe.py::D1 实证：
+        # '## 1.2 围栏内的标题' 被剥成 '## 围栏内的标题'）。改为复用唯一权威
+        # fence_marker：开启记 (字符, 长度)，闭合须同字符且长度 >= 开启标记
+        # （CommonMark 语义；与 _scan_chart_fence_blocks 完全同源）。
+        _marker = fence_marker(stripped)
+        if _marker[0]:
             if not in_code_block:
                 in_code_block = True
-                code_fence_char = stripped[:3]
-            elif code_fence_char and stripped.startswith(code_fence_char):
+                _open_marker = _marker
+            elif _marker[0] == _open_marker[0] and _marker[1] >= _open_marker[1]:
                 in_code_block = False
-                code_fence_char = None
+                _open_marker = ("", 0)
             result_lines.append(line)
             continue
         if in_code_block:
@@ -1965,7 +2011,12 @@ def parse_content(raw: str, base_level: int = 0) -> list[DocumentBlock]:
         #            失败则删除（绝不把 mermaid 源码当正文输出成乱码）
         # 依据 consumed 一次性跳到下一行，剩余行继续正常解析。
         if CHART_FENCE_OPEN_PATTERN.match(stripped):
-            _fence_action, _lang, _fence_lines, _fence_consumed = plan_chart_fence_lines(
+            # BUG-FIX 2026-10-17（第七轮）：规划器条目为 5 元组，第 5 元素是
+            # 载荷后被误吞的正文段。parse_content 的输入必先经
+            # clean_generated_content → _protect_chart_fences 归一（混合块在
+            # 那里已拆为「完整围栏 + 后续正文」），故此处取首条时 prose 恒空；
+            # 防御性仍将其按段落输出，避免未来调用方绕过清洗直入时静默丢文。
+            _fence_action, _lang, _fence_lines, _fence_consumed, _fence_prose = plan_chart_fence_lines(
                 lines[i:]
             )[0]
             _payload_text = "\n".join(_fence_lines).strip()
@@ -1993,6 +2044,12 @@ def parse_content(raw: str, base_level: int = 0) -> list[DocumentBlock]:
                     )
             else:
                 logger.info("[图表跳过] 空图表围栏代码块（坏块已删除）: lang=%s", _lang)
+            # 防御性输出（正常路径 prose 恒空，见上方注释）：混合块中被误吞
+            # 的正文段按段落块输出，绝不静默丢弃。
+            if _fence_prose:
+                for _pl in _fence_prose:
+                    if _pl.strip():
+                        blocks.append(DocumentBlock(type="paragraph", text=_pl.strip()))
             i += max(1, _fence_consumed)
             continue
 
@@ -2089,27 +2146,63 @@ def parse_content(raw: str, base_level: int = 0) -> list[DocumentBlock]:
             if stripped.endswith(">>"):
                 blocks.append(DocumentBlock(type="table", text="\n".join(table_lines)))
                 continue
-            while i < len(lines):
-                tline = lines[i].strip()
-                if tline.endswith(">>"):
-                    table_lines.append(tline)
-                    i += 1
+            # BUG-FIX 2026-10-17（P2·长表格静默截断）：旧实现 60 行硬上限，
+            # 80 行设备清单实测 table 块仅收 60 行、其余 20 行**静默**降级为
+            # 段落块（探针 _audit6_probe.py::E1 实证），导出文档表格从中间
+            # 断裂、后半变正文。改为两阶段收集：
+            #   ① 先在 _TABLE_CLOSE_SCAN_LIMIT 窗口内寻找闭合 `>>`（与旧循环
+            #      同套硬边界：图表标记 / MD 表格 / [[ / <<）——合法长表格
+            #      （≤300 行）完整入块；
+            #   ② 窗口内找不到闭合 → 维持旧 60 行安全上限并 WARNING 告警，
+            #      防止伪造 `<<表格：` 标记无限吞正文（安全属性不变）。
+            _close_idx = -1
+            _scan_end = min(i + _TABLE_CLOSE_SCAN_LIMIT, len(lines))
+            _j = i
+            while _j < _scan_end:
+                _tl = lines[_j].strip()
+                if _tl.endswith(">>"):
+                    _close_idx = _j
                     break
-                if not tline:
-                    i += 1
-                    continue
                 if (
-                    CHART_MARKER_PATTERN.match(tline)
-                    or MD_TABLE_PATTERN.match(tline)
-                    or tline.startswith("[[")
-                    or tline.startswith("<<")
+                    CHART_MARKER_PATTERN.match(_tl)
+                    or MD_TABLE_PATTERN.match(_tl)
+                    or _tl.startswith("[[")
+                    or _tl.startswith("<<")
                 ):
                     break
-                table_lines.append(tline)
-                i += 1
-                # P1 修复：无闭合 `>>` 的表格块设置行数上限，防止吞掉到 EOF
-                if len(table_lines) >= 60:
-                    break
+                _j += 1
+            if _close_idx >= 0:
+                table_lines.extend(
+                    lines[_k].strip() for _k in range(i, _close_idx + 1)
+                    if lines[_k].strip()
+                )
+                i = _close_idx + 1
+            else:
+                while i < len(lines):
+                    tline = lines[i].strip()
+                    if tline.endswith(">>"):
+                        table_lines.append(tline)
+                        i += 1
+                        break
+                    if not tline:
+                        i += 1
+                        continue
+                    if (
+                        CHART_MARKER_PATTERN.match(tline)
+                        or MD_TABLE_PATTERN.match(tline)
+                        or tline.startswith("[[")
+                        or tline.startswith("<<")
+                    ):
+                        break
+                    table_lines.append(tline)
+                    i += 1
+                    # P1 修复：无闭合 `>>` 的表格块设置行数上限，防止吞掉到 EOF
+                    if len(table_lines) >= 60:
+                        logger.warning(
+                            "[parse_content] <<表格：>> 块超过 %d 行仍未闭合，"
+                            "按安全上限截断（后续行按段落处理）", 60,
+                        )
+                        break
             table_text = "\n".join(table_lines)
             blocks.append(DocumentBlock(type="table", text=table_text))
             continue
@@ -2269,6 +2362,24 @@ _NUMBERING_PREFIX = re.compile(
 # Markdown 标题标记正则：匹配行首 # 到 ######
 _MARKDOWN_HEADING = re.compile(r"^\s*#{1,6}\s*")
 
+# 首行 / 标题编号前缀剥离（BUG-FIX 2026-10-17·P5 残留）：与 clean_generated_content
+# 内的 _NUMBER_PREFIX_RE **同源口径**——此前 ContentCleaner 用的是上面的弱
+# _NUMBERING_PREFIX（只剥单层 `\d+[.、．,]`），"1.1 概述" 被剥成 "1 概述"（残留
+# 孤立数字），而 clean_generated_content 的 _NUMBER_PREFIX_RE 能正确剥多层
+# （"## 1.1 概述"→"概述"）。两套实现重复且分叉正是 P5 残留的根因，故抽出同源
+# 正则统一之；分隔符必需 + 量词负向前瞻 (B11) 不变，不会误伤 "1.8米"/"2026年"。
+_LEADING_NUMBERING_RE = re.compile(
+    r"^\s*(?:"
+    r"\d{1,4}(?:\.\d+){2,}\s*[、．.]?\s*"  # 1.1.1 三层及以上小数点
+    r"|\d{1,4}\.\d+(?!\.\d)(?:\s*[、．.]\s*|\s+(?![" + _UNIT_LEAD_CHARS + r"])(?=[一-鿿]))"  # 1.1 两层，分隔符必需
+    r"|\d{1,4}(?!\.\d)(?:\s*[、．.]\s*|\s+(?![" + _UNIT_LEAD_CHARS + r"])(?=[一-鿿]))"  # 1 单层，分隔符必需 + 排量词
+    r"|[一二三四五六七八九十百千]+[、．.]\s*"  # 一、二、中文编号
+    r"|第[一二三四五六七八九十百千万0-9]+[章节]\s*[、．.．]?\s*"  # 第X章/第X节
+    r"|[\(（]\d+[\)）]\s*[、．.]?\s*"  # （1）/ (1) 全括号对
+    r"|\d+\s*[)）]\s*[、．.]?\s*"  # 1）/ 1) 仅右括号
+    r"|[a-z]\s*[、．.]\s*)"  # a、字母+顿号
+)
+
 
 class ContentCleaner:
     """正文清洗器：移除 AI 生成内容中的重复标题与格式残留。
@@ -2343,8 +2454,8 @@ class ContentCleaner:
             if not line:
                 continue
 
-            # 移除编号前缀后比较
-            line_clean = _NUMBERING_PREFIX.sub("", line).strip()
+            # 移除编号前缀后比较（与 clean 同源 _LEADING_NUMBERING_RE）
+            line_clean = _LEADING_NUMBERING_RE.sub("", line).strip()
             # 也移除 Markdown 标题标记
             line_clean = _MARKDOWN_HEADING.sub("", line_clean).strip()
 
@@ -2388,7 +2499,9 @@ class ContentCleaner:
             return content
 
         first_line = lines[0]
-        cleaned_first = _NUMBERING_PREFIX.sub("", first_line).strip()
+        # BUG-FIX 2026-10-17（第七轮·P5 残留）：改用同源 _LEADING_NUMBERING_RE，
+        # 正确剥多层编号（"1.1 概述"→"概述"），不再残留孤立数字 "1 "。
+        cleaned_first = _LEADING_NUMBERING_RE.sub("", first_line).strip()
         lines[0] = cleaned_first
 
         return "\n".join(lines)

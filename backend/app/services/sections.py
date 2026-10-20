@@ -852,10 +852,39 @@ graph_suitable=bool(r["graph_suitable"]),
         else:
             roots.append(node)
 
-    for node in by_id.values():
-        node.children.sort(key=lambda x: (x.sort_order, x.created_at))
+    # 2026-10-18 ENHANCE（第二轮）：兄弟序号口径单一权威化。
+    # 旧口径 (sort_order, created_at)：created_at 秒级精度可能并列 → 同父节点下
+    # 两个同秒创建的兄弟顺序不确定，且与正文生成的 tree_sort_key（path 前序 +
+    # id 决胜）不是同一实现，脏数据（sort_order 重复）时两条链路会给出不同结果，
+    # 违反「排序规则统一由目录生成模块写入、下游只读不重排」。
+    # 现统一为 ordered_generation.sibling_sort_key = (sort_order, id)：id 为自增
+    # 主键单调递增，决胜确定；且与 body 生成 / 导出 / HTML 展示 / 缓存指纹共用
+    # 同一权威实现，保证落库 = 展示 = 导出 = 生成 四方顺序一致。
+    try:
+        from .ai.ordered_generation import (
+            find_duplicate_sibling_sort_orders,
+            sibling_sort_key,
+        )
 
-    roots.sort(key=lambda x: (x.sort_order, x.created_at))
+        for _n in by_id.values():
+            _n.children.sort(key=sibling_sort_key)
+        roots.sort(key=sibling_sort_key)
+
+        # 脏数据可观测：sort_order 重复会让决胜落到 id（结果仍确定），
+        # 但与目录写入的兄弟序号语义脱节，须告警而非静默。
+        # 注意：SectionTreeNode **无 parent_id 字段**（见 models.py），
+        # 必须用原始 rows 分组，否则全部节点会被归到 parent_id=None 一组、
+        # 跨层级误判重复。
+        _dup_so = find_duplicate_sibling_sort_orders(rows)
+        if _dup_so:
+            logger.warning(
+                "[section-sort] 同父节点下 sort_order 重复（排序稳定性前置条件被破坏，"
+                "已回落 id 决胜）: project=%s, %s", project_id, _dup_so[:5],
+            )
+    except ImportError:  # pragma: no cover - 防御性兜底（等价旧口径，id 决胜）
+        for _n in by_id.values():
+            _n.children.sort(key=lambda x: (x.sort_order, x.id))
+        roots.sort(key=lambda x: (x.sort_order, x.id))
 
     # 累计字数：每节点的 cumulative_word_count = 自身 word_count + 子树全部后代
     # word_count（控制层级 L1/L2 使用该累计值作为累计统计）。

@@ -32,6 +32,18 @@ logger = logging.getLogger(__name__)
 # 但内容前缀污染仍可能干扰下游解析。改为 ``[\w-]*`` 兼容连字符。
 _FENCE_PATTERN = re.compile(r"```(?:[\w-]*)\s*\n?(.*?)\n?```", re.DOTALL)
 
+# BUG-FIX-PROMPT-O6：Mermaid 图类型声明必须位于行首（允许前导空白、围栏残留
+# 与 "1. " 之类序号）。与 image_engine.validate_mermaid 的合法类型表一致。
+_MERMAID_TYPES = (
+    r"flowchart|graph|gantt|sequenceDiagram|classDiagram"
+    r"|stateDiagram(?:-v2)?|erDiagram|pie|xychart(?:-beta)?|timeline|journey"
+    r"|mindmap|sankey-beta|quadrantChart|requirementDiagram|gitGraph|C4Context"
+)
+_MERMAID_DECL_PATTERN = re.compile(
+    rf"^[ \t>]*(?:```)?[ \t]*(?:[-*]\s|\d+[.)]\s)?({_MERMAID_TYPES})\b",
+    re.IGNORECASE | re.MULTILINE,
+)
+
 
 def strip_code_fences(text: str) -> str:
     """剥离 Markdown 代码围栏（```json ... ```）。
@@ -222,13 +234,17 @@ def validate_output_format(output: str, expected_type: str = "json") -> tuple[bo
         # timeline/journey，而这六类在 image_engine.validate_mermaid 中均为
         # 合法类型。AI 输出这六类时本函数误报失败 → 调用方误判输出非法。
         # 现补齐全部合法类型，与 validate_mermaid 的判定范围一致。
-        if not re.search(
-            r"flowchart|graph|gantt|sequenceDiagram|classDiagram"
-            r"|stateDiagram|erDiagram|pie|xychart|timeline|journey",
-            output,
-            re.IGNORECASE,
-        ):
-            return False, "未找到 Mermaid 图类型声明"
+        #
+        # BUG-FIX-PROMPT-O6（2026-10-17，宽松子串误判为合法图）：
+        # 原用 ``re.search`` 在**全文任意位置**做子串匹配，于是任何碰巧含
+        # 关键字的普通文本都被判为合法 Mermaid。实测复现：
+        #   validate_output_format("这是一段普通文字，提到 pie 这个词","mermaid") -> (True,"")
+        #   validate_output_format("some text about graph theory","mermaid")     -> (True,"")
+        # 后果：真正的非法输出（模型拒答、纯散文）被放行进入图表管线，
+        # 下游才炸，错误定位成本极高。改为按**行首声明**锚定匹配——
+        # Mermaid 的图类型声明必然位于某行行首（允许前导空白与序号/围栏残留）。
+        if not _MERMAID_DECL_PATTERN.search(output):
+            return False, "未找到 Mermaid 图类型声明（须位于行首）"
         return True, ""
 
     return True, ""

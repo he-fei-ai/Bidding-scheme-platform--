@@ -107,8 +107,6 @@ class ConsistencyAuditor:
         #      `(?!\s*[天次年月工时受死失遇被])`，岗位分支同样漏网。两处口径
         #      现已对齐；抽取面放宽仅限「岗位词 + 间隔词 + 数字 + 人」这一形态，
         #      不影响既有用例（语料库 test_consistency_fact_corpus 全量钉住）。
-        "人员数量": r"(项目经理|技术负责人|技术人员|管理人员|作业人员|施工人员|人员)"
-        r"\s*[:：]?\s*(?:为|是|约)*\s*(\d+)\s*人(?!\s*[天次年月工时受死失遇被])"
         # BUG-FIX 2026-10-11（P2·「本项目共 N 人」整类漏抽）：原式只有「岗位词 + 数字 + 人」
         # 一种写法，于是「本项目共 20 人参与施工」「合计 30 人到岗」这类**总括式**表述
         # 一个都抽不出来（中文里总括词在数字前、没有岗位词）。而自动修复侧的结构校验
@@ -131,19 +129,18 @@ class ConsistencyAuditor:
         # 与 2026-10-04 修的「不同岗位归一桶」是同一类结构性误报。现只保留表示
         # **项目级人力投放**的 投入/配备/组织/动员，剔除表示排班/参与子集的 安排/参与。
         # 注意动词组是**可选**的，故「共 20 人参与施工」（总括词后无动词）不受影响。
-        # 副作用（HARDEN 2026-10-11·R-13，已知且接受）：R-1 收窄后本分支比 autofix
-        # 的取值结构校验闸门 `rules._PERSONNEL_VALUE_TAIL_RE`（唯一消费者是
-        # `rules.fact_has_keyword_nearby`，rules:431）更窄，「共安排 5 人值守」这类
-        # 写法对**抽取**不可见、对**autofix 就近校验**仍可见——即 2026-10-11 P2 修过
-        # 的「检测看不见、修复会改」在这个子集写法上部分回归。注意 AI 修复通道
-        # `consistency_repair.repair_with_ai` 已无人员数量专用分支（走通用补丁），
-        # 故该不对称只落在 autofix 一条路上。之所以不改闸门：闸门放宽是 F-2 的
-        # 刻意取舍（等宽会把措辞稍变的合法取值整批误拦，用户采纳建议后
-        # 「没有可替换的位置」），而此处触发需「子集短语 + 同值合法短语 + 另一总
-        # 人数」三者同篇共存。完整权衡见 `rules._PERSONNEL_VALUE_TAIL_RE` 的 R-13
-        # 注释；要彻底消除须同时收紧闸门并收敛这里的动词表，两侧同步。
-        r"|(?:(?:共计|总计|合计|总共|共)\s*(?:投入|配备|组织|动员)?\s*)"
-        r"(\d+)\s*人(?!\s*[天次年月工时受死失遇被])",
+        #
+        # BUG-FIX 2026-10-13（第六轮·R-13 收敛，原「副作用」已消除）：
+        # R-1 收窄后本分支比 autofix 的取值结构校验闸门更窄，「共安排 5 人值守」
+        # 这类写法对**抽取**不可见、对**autofix 就近校验**仍可见 —— 即 2026-10-11
+        # P2 修过的「检测看不见、修复会改」在该子集写法上部分回归，此前记为
+        # 「已知且接受」的遗留项。现在岗位分支与总括分支的正则本体一并上移到
+        # `rules`（`PERSONNEL_ROLE_PATTERN` / `PERSONNEL_TOTAL_PATTERN` 合成的
+        # `PERSONNEL_FACT_PATTERN`），闸门侧用同一批片段编译、按取值字符跨度精确
+        # 比对，两侧口径**由代码保证一致**，遗留项闭环。误拦代价已重新评估：
+        # autofix 的目标值来自冲突、冲突来自抽取，故等宽不会新增「采纳了建议却
+        # 没位置可改」。完整说明见 `consistency_rules` 顶部「人员取值口径」注释。
+        "人员数量": rules.PERSONNEL_FACT_PATTERN,
         # BUG-FIX 2026-10-10（P1·「资质等级：一级」全部漏抽）：原值捕获组
         # `([甲乙丙]+[一二三级]?)` 要求以甲/乙/丙开头，于是「资质等级：一级」
         # 「资质等级：一级建筑业企业」「企业资质：施工总承包一级」这些最标准写法
@@ -167,11 +164,10 @@ class ConsistencyAuditor:
     #: 后果：正文把工期写错时，审计器只拿“正文里已错的两个值”互比，既看不见
     #: 基准值、也无法判断哪个该改成哪个，“以事实为准”的主张在链路里落空。
     #: 现在只纳入可与正则抽取结果直接比较的三类（人员/技术类事实口径不同不纳入）。
-    FACT_BASELINE_CATEGORIES: ClassVar[dict[str, str]] = {
-        "schedule": "工期",
-        "quality": "质量标准",
-        "safety": "安全标准",
-    }
+    #: ENHANCE 2026-10-13（第六轮）：本体上移到 `consistency_rules.FACT_BASELINE_
+    #: CATEGORIES`（回流侧需要用同一份映射判定事实冲突），这里保留为别名以兼容
+    #: 既有调用方（`consistency_repair`、路由与测试）。
+    FACT_BASELINE_CATEGORIES: ClassVar[dict[str, str]] = rules.FACT_BASELINE_CATEGORIES
 
     def extract_facts_from_text(self, text: str) -> list[FactVariable]:
         """从文本中提取事实变量
@@ -734,7 +730,9 @@ class ConsistencyAuditor:
 
         机器可直接采纳的纯目标值请用 :meth:`suggest_fix_target_value`。
         """
-        target_value, text = self._load_suggestion_payload(conflict_id, project_id)
+        # 只需要文案；目标值由 `suggest_fix_target_value` 单独取（下划线前缀表明
+        # 此处有意不解包使用，避免 RUF059 之类告警掩盖真正的未使用变量）。
+        _target_value, text = self._load_suggestion_payload(conflict_id, project_id)
         return text
 
     def suggest_fix_target_value(self, conflict_id: str, project_id: int) -> str | None:
@@ -764,6 +762,10 @@ class ConsistencyAuditor:
             if row:
                 raw_values = row["values_json"] or "[]"
                 raw_sources = row["sources_json"] or "[]"
+                # 注意：**必须**用 `row.keys()`。sqlite3.Row 是序列，`"x" in row`
+                # 比较的是**值**而不是列名，改成 `in row` 会让这两行永远取 None
+                # （AI 发现的修复建议回退随即失效）。此处保留 `.keys()` 写法，
+                # 宁可留着 ruff SIM118 告警也不牺牲正确性。
                 raw_description = row["description"] if "description" in row.keys() else None
                 raw_fact_name = row["fact_name"] if "fact_name" in row.keys() else None
 

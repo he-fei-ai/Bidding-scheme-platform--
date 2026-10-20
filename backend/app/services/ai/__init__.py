@@ -62,14 +62,14 @@ from .mermaid_renderer import (
     _render_labor_image_v2,
     render_mermaid_to_bytes,
 )
-from .outline_sort_optimizer import (
+
+# 工程逻辑分区常量（2026-10-18 起随唯一生产消费方落在 outline_gate；
+# 原 outline_sort_optimizer 模块的排序器类无生产调用方，已整体删除）
+from .outline_gate import (
     CORE_28_CHAPTERS,
     CORE_TITLE_SET,
     CORE_ZONE_MAP,
     ZONE_ORDER,
-    OutlineSortOptimizer,
-    OutlineSortOptimizerV2,
-    extract_score_weights,
 )
 from .providers.anthropic_compatible import AnthropicCompatibleProvider
 from .providers.base import AIMessage
@@ -83,14 +83,11 @@ __all__ = [
     "HeadingNumberingGeneratorV2",
     "HEADING_STYLE_CONFIG",
     "build_heading_spec_prompt",
-    # outline_sort_optimizer
-    "OutlineSortOptimizer",
-    "OutlineSortOptimizerV2",
+    # outline_gate（工程逻辑分区常量；原 outline_sort_optimizer 已删除）
     "CORE_28_CHAPTERS",
     "CORE_TITLE_SET",
     "CORE_ZONE_MAP",
     "ZONE_ORDER",
-    "extract_score_weights",
     # mermaid_renderer
     "render_mermaid_to_bytes",
     "ChartCache",

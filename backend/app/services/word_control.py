@@ -35,6 +35,11 @@ R1–R15 共 15 条可执行的数值标准，本模块是其在**本软件**侧
     R13 内容优先级      SECTION_WORD_CONTENT_PRESERVATION_CLAUSE
     R14 配置快照        normalize_outline_word_control_options / derive_snapshot_bounds
     R15 可研报告下限    normalize_target_words
+
+体系合并（2026-10-20 第三轮）：R5 强控区间 / R8 初稿倒推目标的**消费入口**
+统一到 `services/word_target_resolver.py`（作为 `strict_override` 最高优先级项
+短路返回，source=word_control_strict）；本模块仍是这些数值的**唯一公式源**
+（resolver 只装配区间选择，不重写公式，容差亦恒取本模块 STRICT_SECTION_TOLERANCE）。
 """
 
 from __future__ import annotations

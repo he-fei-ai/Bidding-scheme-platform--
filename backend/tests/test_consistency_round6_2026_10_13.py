@@ -21,13 +21,38 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from app.db import get_db, init_db
 from app.services import consistency_rules as rules
 from app.services.consistency_auditor import consistency_auditor
 from app.services.consistency_repair import refresh_conflict_states
 
 
+def _load_fact_corpus() -> list[tuple[str, list[tuple[str, str]]]]:
+    """按文件路径加载事实抽取语料库（R-13 双向断言复用同一份基线）。
+
+    不走 `import` 是刻意的：pytest 的 `sys.path` 注入行为随 import mode 配置
+    变化，而语料库与本文件是同目录兄弟文件，按路径加载在任何配置下都成立。
+    """
+    import importlib.util
+    from pathlib import Path
+
+    path = Path(__file__).with_name("test_consistency_fact_corpus_2026_10_13.py")
+    spec = importlib.util.spec_from_file_location("_consistency_fact_corpus", path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.CORPUS
+
+
+CORPUS = _load_fact_corpus()
+
+
 OWNER = 3501
+
+#: 与语料库测试同名的审计器实例别名（两文件对同一单例的称呼保持一致）
+AUDITOR = consistency_auditor
 
 
 def _new_project(name: str) -> int:
@@ -508,6 +533,274 @@ class TestAutofixPartialStatus:
                 "SELECT content FROM sections WHERE project_id = ? ORDER BY id", (pid,)
             ).fetchall()
         assert [row["content"] for row in rows] == ["本工程工期 20天。", "本工程工期 20 天。"]
+
+
+# ============================================================================
+# R-14 闭环（遗留项）：禁止把「会互判冲突」的事实写进基准
+# ============================================================================
+
+
+class TestBackflowBaselineConflictGuard:
+    """原 R-14（2026-10-11 记为「有意不改」的遗留项）：跨轮同名不同 value 的候选
+    能通过 dedup，于是用户自己确认的两条事实会互相判成冲突 —— 且该冲突来自
+    global_facts 本身，**改正文无法消解**（审计器按 category 收基准，并把该事实名
+    下所有值收进 `all_facts` 互比，没有「首条胜出」）。
+
+    2026-10-11 不改的理由是「label 去重会静默丢弃用户明确确认的候选（UI 回报
+    0 条新增却查不出原因）」。本轮的最优解同时避开两头：**不静默丢弃，而是拦截
+    并回传可读原因**（`plan_fact_merge` 第三返回值 → `accept_fact_proposals` 的
+    `skipped` 字段）。拦截判据复用审计器自身的等价判定 `_distinct_values`，
+    因此「拦不拦」与「审计器会不会判冲突」永远一致。
+    """
+
+    def test_baseline_category_rejects_different_value(self):
+        from app.services.consistency_backflow import plan_fact_merge
+
+        existing = [{"key": "a", "label": "工期", "value": "450", "category": "schedule"}]
+        items, added, skipped = plan_fact_merge(
+            existing,
+            [{"fact_name": "工期", "value": "60", "category": "schedule", "conflict_id": "c1"}],
+        )
+        assert added == 0
+        assert len(skipped) == 1
+        assert skipped[0]["fact_name"] == "工期"
+        assert "工期=450" in skipped[0]["reason"], "拒绝原因必须指名与之冲突的既有事实"
+        assert items == existing, "被拒绝的候选不得进清单"
+
+    def test_baseline_category_allows_same_value(self):
+        """同值（含金额单位换算）不被拦：拦了才是真正的过度拦截。"""
+        from app.services.consistency_backflow import plan_fact_merge
+
+        items, added, skipped = plan_fact_merge(
+            [{"key": "a", "label": "金额", "value": "1200万元", "category": "basic"}],
+            [
+                {
+                    "fact_name": "合同价",
+                    "value": "12000000元",
+                    "category": "basic",
+                    "conflict_id": "c1",
+                }
+            ],
+        )
+        assert added == 1
+        assert skipped == []
+
+    def test_non_baseline_category_allows_multiple(self):
+        """非基准类别（basic 等）本就允许多条并存，审计器不拿它们互比。"""
+        from app.services.consistency_backflow import plan_fact_merge
+
+        items, added, skipped = plan_fact_merge(
+            [{"key": "a", "label": "项目经理", "value": "张三", "category": "basic"}],
+            [
+                {
+                    "fact_name": "项目经理",
+                    "value": "李四",
+                    "category": "basic",
+                    "conflict_id": "c1",
+                }
+            ],
+        )
+        assert added == 1 and skipped == []
+
+    def test_batch_internal_conflict_keeps_first_only(self):
+        """同一批里两条同类别异值候选：只留第一条，第二条带原因返回。"""
+        from app.services.consistency_backflow import plan_fact_merge
+
+        items, added, skipped = plan_fact_merge(
+            [],
+            [
+                {"fact_name": "质量标准", "value": "合格", "category": "quality", "conflict_id": "c1"},
+                {"fact_name": "质量标准", "value": "优良", "category": "quality", "conflict_id": "c2"},
+            ],
+        )
+        assert added == 1
+        assert [it["value"] for it in items] == ["合格"]
+        assert len(skipped) == 1 and skipped[0]["value"] == "优良"
+
+    def test_legacy_two_tuple_contract_preserved(self):
+        """`merge_fact_proposals` 的二元组契约不变（既有调用方与测试）。"""
+        from app.services.consistency_backflow import merge_fact_proposals
+
+        items, added = merge_fact_proposals(
+            [], [{"fact_name": "工期", "value": "450", "conflict_id": "c1"}]
+        )
+        assert added == 1 and len(items) == 1
+
+    def test_accept_returns_skipped_and_does_not_persist_conflict(self):
+        """端到端：accept 回传 skipped，且冲突值不落库（不产生无法消解的冲突）。"""
+        from app.services.consistency_backflow import accept_fact_proposals
+
+        pid = _new_project("R6-R14-accept")
+        with get_db() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO analysis (project_id, global_facts_json) VALUES (?, ?)",
+                (
+                    pid,
+                    json.dumps(
+                        [{"key": "a", "label": "工期", "value": "450", "category": "schedule"}],
+                        ensure_ascii=False,
+                    ),
+                ),
+            )
+
+        result = accept_fact_proposals(
+            pid,
+            [
+                {"fact_name": "工期", "value": "60", "category": "schedule", "conflict_id": "c1"},
+                {"fact_name": "质量标准", "value": "合格", "category": "quality", "conflict_id": "c2"},
+            ],
+        )
+        assert result["added"] == 1, "只有质量标准应入库"
+        assert len(result["skipped"]) == 1
+        assert "工期=450" in result["skipped"][0]["reason"]
+
+        with get_db() as conn:
+            row = conn.execute(
+                "SELECT global_facts_json FROM analysis WHERE project_id = ?", (pid,)
+            ).fetchone()
+        stored = json.loads(row["global_facts_json"])
+        assert [it["value"] for it in stored if it["category"] == "schedule"] == ["450"], (
+            "工期不得出现两个互相冲突的取值"
+        )
+
+    def test_guard_matches_auditor_verdict(self):
+        """结构约束：拦不拦必须与审计器的等价判定一致（单一判据）。"""
+        from app.services.consistency_backflow import plan_fact_merge
+
+        for existing_value, new_value, should_block in [
+            ("450", "450", False),
+            ("450", "60", True),
+            ("450", "450 日历天", True),  # 审计器判为异值 → 一并入库必然互判冲突
+        ]:
+            _items, added, skipped = plan_fact_merge(
+                [{"key": "a", "label": "工期", "value": existing_value, "category": "schedule"}],
+                [
+                    {
+                        "fact_name": "工期",
+                        "value": new_value,
+                        "category": "schedule",
+                        "conflict_id": "c1",
+                    }
+                ],
+            )
+            blocked = bool(skipped) or added == 0
+            assert blocked is should_block, f"{existing_value} vs {new_value}"
+            # 与审计器自身判定逐条对齐
+            distinct = AUDITOR._distinct_values([existing_value, new_value], fact_name="工期")
+            assert (len(distinct) > 1) is should_block
+
+
+# ============================================================================
+# R-13 收敛（遗留项闭环）：人员取值「抽取侧 ⟺ 闸门侧」口径一致
+# ============================================================================
+
+
+class TestPersonnelGateMatchesExtraction:
+    """原 R-13（2026-10-11 记为「已知且接受」的遗留项）：autofix 的取值结构闸门
+    比抽取正则宽，导致「检测看不见、修复却在改」——例如「共安排 5 人值守」对抽取
+    不可见（动词表已按 R-1 收窄），对闸门却放行。
+
+    修复后两侧共用 `consistency_rules` 的同一批正则片段：抽取用
+    `PERSONNEL_FACT_PATTERN`，闸门用同片段编译的 `_PERSONNEL_CONTEXT_RE` 并按
+    **取值字符跨度**精确比对。本组用例把「一致」钉成可执行断言（双向）：
+
+      1. 抽取抽到的人员取值 → 闸门必须在同一位置放行；
+      2. 闸门放行的位置 → 抽取必须抽得到同值同事实名（不得放宽）。
+
+    第 2 条是真正的闭环：它同时禁止将来再以「放宽闸门」的方式悄悄退回旧行为。
+    """
+
+    #: 语料库里出现过的全部人员类事实名（通用桶 + 各岗位桶）
+    FACT_NAMES = (
+        rules.FACT_PERSONNEL,
+        *[f"{role}数量" for role in rules.PERSONNEL_ROLE_PREFIXES],
+    )
+
+    @staticmethod
+    def _occurrences(text: str, value: str) -> list[int]:
+        from app.services import text_patch
+
+        return list(text_patch.find_value_occurrences(text, value))
+
+    @pytest.mark.parametrize(
+        ("text", "expected"),
+        [(t, e) for t, e in CORPUS],
+        ids=[t[:24] if t else "<empty>" for t, _ in CORPUS],
+    )
+    def test_gate_and_extraction_agree_both_ways(self, text: str, expected):
+        import re as _re
+
+        extracted = [
+            (name, value)
+            for name, value in ((f.name, f.value) for f in AUDITOR.extract_facts_from_text(text))
+            if rules.is_personnel_fact_name(name)
+        ]
+        expected_personnel = [
+            (name, value) for name, value in expected if rules.is_personnel_fact_name(name)
+        ]
+        assert extracted == expected_personnel
+
+        # 方向 1：抽得到 → 闸门放行（否则用户采纳建议后「没有可替换的位置」）
+        for name, value in expected_personnel:
+            occurrences = self._occurrences(text, value)
+            assert occurrences, f"语料库期望 {name}={value}，但正文里找不到该取值：{text!r}"
+            assert any(
+                rules.fact_has_keyword_nearby(text, pos, pos + len(value), name)
+                for pos in occurrences
+            ), f"抽取抽到了 {name}={value}，闸门却在全部出现位置拒绝：{text!r}"
+
+        # 方向 2：闸门放行 → 抽取抽得到（否则「检测看不见、修复却在改」回归）
+        for match in _re.finditer(r"\d+", text):
+            value, start, end = match.group(), match.start(), match.end()
+            for name in self.FACT_NAMES:
+                if not rules.fact_has_keyword_nearby(text, start, end, name):
+                    continue
+                assert (name, value) in expected_personnel, (
+                    f"闸门放行了 {name}={value}（位置 {start}），抽取却抽不到：{text!r} "
+                    "—— 这正是 R-13 的「检测看不见、修复却在改」"
+                )
+
+    @pytest.mark.parametrize(
+        ("text", "fact_name", "expected"),
+        [
+            # 原 R-13 的裂缝形态：子集动词对抽取不可见，闸门此前却放行
+            ("共安排 5 人值守", "人员数量", False),
+            ("共参与 12 人投标评审", "人员数量", False),
+            ("共计安排 10 人轮流值班", "人员数量", False),
+            # 项目级投放动词：两侧都认
+            ("共投入 30 人施工", "人员数量", True),
+            ("合计 30 人到岗", "人员数量", True),
+            # 岗位归属：岗位一致放行，跨岗位拒绝
+            ("技术人员 20 人", "技术人员数量", True),
+            ("施工人员约 12 人", "施工人员数量", True),
+            ("管理人员是 5 人", "管理人员数量", True),
+            ("技术人员 20 人", "人员数量", False),
+            ("技术人员 20 人", "管理人员数量", False),
+            # 工时单位与伤亡复合词：两侧都不认
+            ("人工 12 人天", "人员数量", False),
+            ("技术人员 5 人天", "技术人员数量", False),
+            ("累计 5 人受伤", "人员数量", False),
+            # 无关数字
+            ("钢筋直径 20 mm。", "人员数量", False),
+        ],
+        ids=lambda v: str(v)[:20],
+    )
+    def test_gate_verdicts(self, text: str, fact_name: str, expected: bool):
+        import re as _re
+
+        match = _re.search(r"\d+", text)
+        assert match is not None
+        assert (
+            rules.fact_has_keyword_nearby(text, match.start(), match.end(), fact_name)
+            is expected
+        ), text
+
+    def test_gate_constants_share_single_source(self):
+        """结构约束：抽取侧用的正则必须**就是** rules 的常量（防止再复制一份）。"""
+        assert AUDITOR.FACT_PATTERNS["人员数量"] == rules.PERSONNEL_FACT_PATTERN
+        assert rules.PERSONNEL_FACT_PATTERN == (
+            rules.PERSONNEL_ROLE_PATTERN + "|" + rules.PERSONNEL_TOTAL_PATTERN
+        )
 
 
 # ============================================================================

@@ -28,7 +28,11 @@ from ...services.v51_state import (
 )
 from ..task_control import _cancel_events_lock, _cancel_tasks
 
-from .sse_db_ops import _extract_project_context_with_retry, _save_and_finalize_outline
+from .sse_db_ops import (
+    _extract_project_context_with_retry,
+    _save_and_finalize_outline,
+    check_analysis_stale_async,
+)
 from .sse_shared import SSE_TERMINAL_STATUSES, SSE_TOTAL_TIMEOUT_DEFAULT, _NotifyQueue, logger
 from .sse_utils import _try_get_provider, _try_get_provider_with_retry
 
@@ -497,7 +501,10 @@ async def generate_outline_sse_impl(
 
             project_id=project_id,
 
-            total_steps=8,
+            # 2026-10-19 优化：步骤口径与前端 OUTLINE_STEPS_V51 对齐（13 步：
+            # 读资料→L1→L1校验→L2→L2校验→L3→L3局部校验→AI局部自检→
+            # 规则全局校验→自动修复→质量评分→保存→最终审核）
+            total_steps=13,
 
         )
 
@@ -762,6 +769,51 @@ async def generate_outline_sse_impl(
 
                     context = await _extract_project_context_with_retry(project_id)
 
+                    # A-2 2026-10-17 硬拦截：analysis 是否已因文件变更而过时
+                    # 用 async helper（内部 asyncio.to_thread）避免 SSE 主循环阻塞
+                    try:
+                        _is_stale, _stale_reason = await check_analysis_stale_async(project_id)
+                    except Exception as _stale_e:
+                        logger.warning(
+                            "[目录生成] stale 检查异常，放行: project=%d err=%s",
+                            project_id, _stale_e,
+                        )
+                        _is_stale = False
+
+                    if _is_stale and _stale_reason:
+                        await _qput(
+                            {
+                                "status": "error",
+                                "phase": "context",
+                                "outline_step": 1,
+                                "message": _stale_reason,
+                            }
+                        )
+                        logger.warning(
+                            "[目录生成] analysis 过时，拒绝生成 project=%d", project_id,
+                        )
+                        return
+
+                    # A-5-harden 2026-10-17：SSE 主循环消费 confirmed_* 软闸门。
+                    # 目录生成上下文已返回 is_confirmed 标志——若非 True 则推送 warning 事件
+                    # 让前端可观测（不阻断生成，行为兼容，软闸门）。
+                    _is_confirmed = context.get("is_confirmed")
+                    if _is_confirmed is False:
+                        _unconfirmed_parts = []
+                        if not context.get("confirmed_summary"):
+                            _unconfirmed_parts.append("项目摘要")
+                        if not context.get("confirmed_scoring"):
+                            _unconfirmed_parts.append("评分点")
+                        await _qput(
+                            {
+                                "type": "warning",
+                                "phase": "context",
+                                "outline_step": 1,
+                                "message": f"注意：{'、'.join(_unconfirmed_parts)}尚未确认，"
+                                           f"目录生成将基于未确认数据继续，请生成后仔细复核。",
+                            }
+                        )
+
                     summary = context["summary"]
 
                     scoring_points = context["scoring_points"]
@@ -940,7 +992,17 @@ async def generate_outline_sse_impl(
 
                     # BUG-OUTLINE-08 修复：每个阶段分配唯一步骤号，避免进度回跳
 
-                    # 与前端 OUTLINE_STEPS_V51 保持一致（8步，1-based）
+                    # 与前端 OUTLINE_STEPS_V51 保持一致（2026-10-19 起 13 步，1-based）
+
+                    # 13 步口径（《目录生成工作流程优化方案》第五节）：
+                    #   1  读取项目资料与目录库样本      6  并发生成三级目录
+                    #   2  AI 生成一级目录              7  L3 局部校验
+                    #   3  L1 校验                     8  AI 局部自检
+                    #   4  并发生成二级目录            9  规则引擎全局校验
+                    #   5  L2 校验                     10 程序自动修复与重排编号
+                    #                                   11 生成质量评分报告
+                    #                                   12 增量保存
+                    #                                   13 最终审核通过
 
                     # BUG-FIX-26 修复：原 step 0 导致前端 outline_step-1=-1 数组越界
 
@@ -949,34 +1011,48 @@ async def generate_outline_sse_impl(
                     step_map = {
 
                         # BUG-FIX 2026-09-18（P1）：原映射整体错位一格——后端把
-                        # 「准备」占 step1，一级生成从 step2 起；而前端
-                        # OUTLINE_STEPS_V51 八步是 1=生成L1、2=校验L1、3=生成L2、
-                        # 4=校验L2、5=生成L3、6=AI自检、7=最终审核、8=保存。
-                        # 后果：步骤条永远显示上一个阶段的名字（用户看到「校验」
-                        # 时 AI 其实在生成 L3），完成态判定也跟着错位。
-                        "V5.1准备": 1,  # 准备阶段（归入步骤1：即将生成一级目录）
 
-                        "V5.1一级生成": 1,  # 步骤1：AI生成一级目录
+                        # 「准备」占 step1，一级生成从 step2 起；而前端步骤是
 
-                        "V5.1一级校验": 2,  # 步骤2：一级目录校验
+                        # 1=读资料起始步。后果：步骤条永远显示上一个阶段的
 
-                        "V5.1二级生成": 3,  # 步骤3：生成二级目录
+                        # 名字，完成态判定也跟着错位。
 
-                        "V5.1二级校验": 4,  # 步骤4：二级目录校验
+                        "V5.1准备": 1,  # 准备阶段（归入步骤1：读取项目资料与样本）
 
-                        "V5.1三级生成": 5,  # 步骤5：生成三级目录
+                        "目录生成": 1,  # 直出模式检测（归入步骤1）
 
-                        "V5.1标题质量": 5,  # 标题质量后处理（与三级生成同阶段，仅更新消息）
+                        "V5.1一级生成": 2,  # 步骤2：AI 生成一级目录
 
-                        "V5.1技术增强": 5,  # 技术增强（与三级生成同阶段，仅更新消息）
+                        "V5.1一级校验": 3,  # 步骤3：L1 校验
 
-                        "V5.1自检": 6,  # 步骤6：AI自检
+                        "V5.1二级生成": 4,  # 步骤4：并发生成二级目录
 
-                        "V5.1最终审核通过": 7,  # 步骤7：最终审核通过
+                        "V5.1二级校验": 5,  # 步骤5：L2 校验
 
-                        "V5.1保存": 8,  # 步骤8：保存到数据库
+                        "V5.1三级生成": 6,  # 步骤6：并发生成三级目录
 
-                        "V5.1完成": 8,  # 生成完成
+                        "V5.1标题质量": 6,  # 标题质量后处理（与三级生成同阶段，仅更新消息）
+
+                        "V5.1技术增强": 6,  # 技术增强（与三级生成同阶段，仅更新消息）
+
+                        "V5.1本地校验": 7,  # 步骤7：L3 局部校验（自检第一段）
+
+                        "V5.1自检": 8,  # 步骤8：AI 局部自检
+
+                        "V5.1规则校验": 9,  # 步骤9：规则引擎全局校验
+
+                        "V5.1自动修复": 10,  # 步骤10：程序自动修复与重排编号
+
+                        "V5.1质量评分": 11,  # 步骤11：生成质量评分报告
+
+                        "V5.1审核回灌": 8,  # 审核回灌重生成（归属 AI 自检阶段）
+
+                        "V5.1最终审核通过": 13,  # 步骤13：最终审核通过
+
+                        "V5.1保存": 12,  # 步骤12：增量保存到数据库
+
+                        "V5.1完成": 13,  # 生成完成
 
                     }
 
@@ -1006,7 +1082,7 @@ async def generate_outline_sse_impl(
                         phase=phase,
                         message=message,
                         current_step=step or None,
-                        progress=round(step / 8.0 * 100, 1) if step else None,
+                        progress=round(step / 13.0 * 100, 1) if step else None,
                     )
 
 
@@ -1096,7 +1172,15 @@ async def generate_outline_sse_impl(
                     except Exception as _refill_e:
                         logger.warning("[目录生成] 知识库两轮补漏预览失败（忽略）: %s", _refill_e)
 
-                if not await _save_and_finalize_outline(project_id, outline, outline_queue, emit=_qput):
+                # ENHANCE 2026-10-19（优化 6）：门禁裁决（含质量评分）随完成
+                # 事件下发，前端完成卡片展示「目录生成质量报告」。直出路径不
+                # 经过 _self_check_v51，gate_report 为 None 时前端降级不展示。
+                _gate_report = (
+                    getattr(v51_state, "gate_report", None) if v51_state is not None else None
+                )
+                if not await _save_and_finalize_outline(
+                    project_id, outline, outline_queue, emit=_qput, gate_report=_gate_report
+                ):
 
                     return
 
@@ -1200,9 +1284,15 @@ async def generate_outline_sse_impl(
 
                             if outline:
 
+                                _gate_report = (
+                                    getattr(v51_state, "gate_report", None)
+                                    if v51_state is not None
+                                    else None
+                                )
                                 if not await _save_and_finalize_outline(
 
-                                    project_id, outline, outline_queue, is_fallback=True, emit=_qput
+                                    project_id, outline, outline_queue, is_fallback=True, emit=_qput,
+                                    gate_report=_gate_report,
 
                                 ):
 
@@ -1695,7 +1785,7 @@ async def generate_outline_sse_impl(
                         project_id,
                         "outline_v51",
                         task_id=task_info.task_id,
-                        total_steps=8,
+                        total_steps=13,
                         phase="准备",
                         message="目录生成已启动",
                         owner_id=lock_ctx["owner_id"],

@@ -26,8 +26,11 @@ from app.services.ai import workflows_sections as ws
 def _plan_stats(text):
     """返回 (block 块数, 有语言的 bad 块数)。"""
     plan = cc.plan_chart_fence_lines(text.split("\n"))
-    return (sum(1 for a, l, b, c in plan if a == "block"),
-            sum(1 for a, l, b, c in plan if a == "bad" and l))
+    # BUG-FIX 2026-10-17（第七轮）：规划器条目扩展为 5 元组
+    # (action, lang, lines, consumed, prose)——第 5 元素是载荷后被误吞的
+    # 正文段（见 plan_chart_fence_lines docstring）。本统计只看前 4 项。
+    return (sum(1 for a, l, b, c, _pr in plan if a == "block"),
+            sum(1 for a, l, b, c, _pr in plan if a == "bad" and l))
 
 
 # =====================================================================
@@ -116,7 +119,7 @@ class TestFindUnclosedChartFence:
         lines = text.split("\n")
         info = cc.find_unclosed_chart_fence(lines)
         start, first_bad = 0, None
-        for action, lang, payload, c in cc.plan_chart_fence_lines(lines):
+        for action, lang, payload, c, _pr in cc.plan_chart_fence_lines(lines):
             if action == "bad" and lang:
                 first_bad = (start, len(payload), c)
                 break
@@ -271,7 +274,7 @@ class TestPlanChartFenceLinesLimit:
         lines = (["头部正文", "```mermaid"]
                  + ["  line %d" % i for i in range(payload_n)]
                  + ["```", "尾部正文"])
-        assert sum(c for _a, _l, _p, c
+        assert sum(c for _a, _l, _p, c, _pr
                    in cc.plan_chart_fence_lines(lines)) == len(lines)
 
 

@@ -14,6 +14,7 @@ from fastapi.security import APIKeyHeader
 from starlette.responses import FileResponse, StreamingResponse
 from ..config import PROJECTS_DATA_DIR
 from ..db import get_db
+from ..logging_context import make_context_bound
 from ..models import ExportConfig
 from ..services import task_lock as _task_lock
 from ..services.export import build_docx, check_document, get_latest_export, list_exports, record_failed_export
@@ -141,14 +142,46 @@ def _drain_queue_to_journal(journal: _StreamJournal) -> None:
                 break
             journal.append(item)
 
-    t = threading.Thread(target=_loop, name=f"sse-journal-drain:{journal.stream_id}", daemon=True)
+    # ENHANCE 2026-10-18（P2-14 traceId 全覆盖）：子线程默认不继承主线程
+    # contextvars，后台 drain 线程内的日志（含断流/封存告警）此前 rid/pid 全为
+    # `-`，无法与发起的导出请求串联。此处在**发起侧**捕获上下文再交给线程执行。
+    t = threading.Thread(
+        target=make_context_bound(_loop),
+        name=f"sse-journal-drain:{journal.stream_id}",
+        daemon=True,
+    )
     t.start()
 
 
+def _sse_json_default(o) -> str:
+    """SSE 负载兜底序列化：对无法 JSON 序列化的对象（异常、datetime、sqlite Row、
+    未实现 __dict__ 的领域对象等）统一转可读字符串，避免 `json.dumps` 抛异常。
+
+    BUG-FIX 2026-10-18（D2·P1）：导出 SSE 主循环 `yield _sse_frame(...)` 若负载
+    含不可序列化对象，`json.dumps` 异常会被外层宽泛 `except` 捕获并以 `error`
+    事件终止整条流——文件已生成却向前端误报「失败」。加此兜底后单帧异常不再
+    杀流，前端始终收到终态（completed/error），符合可观测性要求。
+    """
+    try:
+        return repr(o)
+    except Exception:
+        return "<unserializable>"
+
+
 def _sse_frame(seq: int | None, event_type: str, payload: dict) -> str:
-    """拼 SSE 帧；seq 非空时携 id: 行（与前端 last_event_id 续传语义对齐）。"""
+    """拼 SSE 帧；seq 非空时携 id: 行（与前端 last_event_id 续传语义对齐）。
+
+    序列化失败（payload 含不可序列化对象）时降级为带标记的安全帧，绝不抛异常。
+    """
     id_line = f"id: {seq}\n" if seq is not None else ""
-    return f"{id_line}event: {event_type}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+    try:
+        data = json.dumps(payload, ensure_ascii=False, default=_sse_json_default)
+    except (TypeError, ValueError):
+        data = json.dumps(
+            {"event": event_type, "_serialization_error": True},
+            ensure_ascii=False,
+        )
+    return f"{id_line}event: {event_type}\ndata: {data}\n\n"
 
 
 async def _acquire_export_lock(project_id: int) -> tuple[str, str]:

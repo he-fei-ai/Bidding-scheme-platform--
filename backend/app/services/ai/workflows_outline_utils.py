@@ -21,6 +21,12 @@ from .prompts import (
 # 统一预算避免上下文负载被放大。旧注释写的「最多并行 10 次」实际是
 # `warnings[:10]` 条数截断的副产品，并非真实的并发上限。
 L3_REPAIR_CONTEXT_TOKEN_CAP = 6000
+
+# BUG-FIX 2026-10-17（L-1）：规则兜底滚动候选次数上限。
+# `_rule_based_fallback` 按 idx 偏移推进 `_semantic_fallback_title` 的维度池，
+# 优先取通过具体性校验的候选。12 次 ≈ 覆盖整个 `_L3_FALLBACK_DIMENSIONS`
+# 池一轮；仍不具体则退回首个非脏候选（保底可读，绝不退化为脏标题）。
+_RULE_FALLBACK_MAX_ATTEMPTS = 12
 from .providers.base import AIMessage
 
 # 2026-10-10：三级标题 AI 修复的条数上限改为可配置。
@@ -991,6 +997,7 @@ async def repair_l3_generic_titles(
     construction_method_json: str,
     project_scope: str = "",
     max_repair: int | None = None,
+    use_ai: bool | None = None,
 ) -> list[dict]:
     """修复含通用占位词的三级目录标题。
 
@@ -999,16 +1006,27 @@ async def repair_l3_generic_titles(
 
     Args:
         max_repair: 单次最多修复条数。None 时取配置 OUTLINE_L3_REPAIR_MAX。
+        use_ai: 是否允许 AI 调用。None（默认）= 按 provider 是否可用自动判别
+            （provider is None → False）；显式 True/False 可覆盖。
+            False 时走**纯规则兜底模式**：跳过项目上下文组装与 AI 调用，
+            全部任务按 `_rule_based_fallback`（`_semantic_fallback_title`
+            工程实体 × 专业维度组合）修复。用于离线/未配置密钥场景——
+            BUG-FIX 2026-10-17（L-1 · 离线泛化标题永久泄漏）：旧实现
+            `_l3_specificity_closeout` 在 provider is None 时**完全跳过修复**，
+            泛化标题原样进入审核与落库；且本函数若被直接以 None 调用，
+            每条任务都会先打一次必然 AttributeError 的 provider.chat 再回落
+            规则兜底——功能侥幸可用但每次空抛异常、噪声日志、且绕远了。
     """
     if max_repair is None:
         max_repair = OUTLINE_L3_REPAIR_MAX
+    _use_ai = (provider is not None) if use_ai is None else bool(use_ai)
 
     repaired = copy.deepcopy(outline)
     _, warnings = validate_l3_specificity(repaired)
     if not warnings:
         return repaired
 
-    logger.info("[L3修复] 检测到 %d 个通用三级标题，开始修复", len(warnings))
+    logger.info("[L3修复] 检测到 %d 个通用三级标题，开始修复（AI=%s）", len(warnings), _use_ai)
 
     # 构建项目上下文
     #
@@ -1023,23 +1041,28 @@ async def repair_l3_generic_titles(
     #      聚合上下文负载被放大 10 倍。
     # 修复：改用提示词模块统一的 assemble_prompt_context 组装（按优先级排序 +
     # 总预算内截断），并对每段做元标记中和。
-    project_context = assemble_prompt_context(
-        {
-            "SUMMARY": sanitize_prompt_value((summary or "")[:3000]),
-            "TENDER_CONTEXT": sanitize_prompt_value((tender_context or "")[:5000]),
-            "BOQ": sanitize_prompt_value((boq_json or "")[:2000]),
-            "CONSTRUCTION_METHOD": sanitize_prompt_value((construction_method_json or "")[:2000]),
-            "PROJECT_SCOPE": sanitize_prompt_value((project_scope or "")[:1000]),
-        },
-        max_tokens=L3_REPAIR_CONTEXT_TOKEN_CAP,
-        priorities={
-            "SUMMARY": 100,
-            "TENDER_CONTEXT": 95,
-            "PROJECT_SCOPE": 80,
-            "CONSTRUCTION_METHOD": 70,
-            "BOQ": 65,
-        },
-    )
+    #
+    # BUG-FIX 2026-10-17（L-1）：纯规则模式跳过组装——没有 AI 消费者，
+    # 白扔约 13k 字符的脱敏/截断开销（大目录 × 多轮时不可忽略）。
+    project_context = ""
+    if _use_ai:
+        project_context = assemble_prompt_context(
+            {
+                "SUMMARY": sanitize_prompt_value((summary or "")[:3000]),
+                "TENDER_CONTEXT": sanitize_prompt_value((tender_context or "")[:5000]),
+                "BOQ": sanitize_prompt_value((boq_json or "")[:2000]),
+                "CONSTRUCTION_METHOD": sanitize_prompt_value((construction_method_json or "")[:2000]),
+                "PROJECT_SCOPE": sanitize_prompt_value((project_scope or "")[:1000]),
+            },
+            max_tokens=L3_REPAIR_CONTEXT_TOKEN_CAP,
+            priorities={
+                "SUMMARY": 100,
+                "TENDER_CONTEXT": 95,
+                "PROJECT_SCOPE": 80,
+                "CONSTRUCTION_METHOD": 70,
+                "BOQ": 65,
+            },
+        )
 
     # BUG-FIX-PROMPT-B2 2026-10-04：取**未渲染的模板**（命中 DB 覆盖），变量注入
     # 交由统一渲染函数 render_prompt（下方 _repair_one 内逐任务完成）。旧实现用
@@ -1091,6 +1114,10 @@ async def repair_l3_generic_titles(
             if _quota is None:  # 历史口径：保持静默跳过（向后兼容）
                 continue
             rule_only_tasks.append((path, node, l1_title, parent_title, ""))
+        elif not _use_ai:
+            # BUG-FIX 2026-10-17（L-1 · 离线泛化标题永久泄漏）：纯规则模式下
+            # 非空泛化标题也直接走规则兜底，不再进 AI 任务队列。
+            rule_only_tasks.append((path, node, l1_title, parent_title, l3_title))
         else:
             repair_tasks.append((path, node, l1_title, parent_title, l3_title))
         if _quota is not None and (len(repair_tasks) + len(rule_only_tasks)) >= max_repair:
@@ -1131,7 +1158,18 @@ async def repair_l3_generic_titles(
     def _rule_based_fallback(
         node: dict, l1_title: str, l2_title: str, path: str
     ) -> str:
-        """按父级语义生成一个具体、非占位的兜底标题（不含裸编号后缀）。"""
+        """按父级语义生成一个具体、非占位的兜底标题（不含裸编号后缀）。
+
+        BUG-FIX 2026-10-17（L-1 · 兜底产物仍泛化）：旧实现只要求候选
+        「非脏」（`_is_dirty_l3_title_deep`），而 `_semantic_fallback_title`
+        的父级指代词 + 泛化维度词路径会产出「总体理解安全保障」这类
+        **仍含 `_L3_GENERIC_PATTERNS` 泛化词**的标题——下一轮
+        `validate_l3_specificity` 照旧检出，等于白修一轮（且在多轮循环里
+        表现为「无进展提前收尾」，用户看到残留告警）。现改为滚动候选
+        （idx 偏移推进维度池），优先取通过 `_is_l3_title_project_specific`
+        具体性校验的候选；全部候选都不具体时才退回首个非脏候选
+        （保底仍远比原标题可读，且不会退化为脏标题）。
+        """
         try:
             from .outline_common import _semantic_fallback_title
 
@@ -1146,13 +1184,21 @@ async def repair_l3_generic_titles(
             # 后续 `_uniquify_outline_titles` 消歧（追加维度词，标题质量下降）。
             # 改传活集合：`_semantic_fallback_title` 无 await、纯同步执行，
             # 并发任务间安全，且成功的候选本就会在 _fallback 里再登记一次。
-            _new = _semantic_fallback_title(
-                _parent,
-                _idx,
-                _global_used_titles,
-                context_title=l1_title or "",
-            )
-            return _new or ""
+            _first_clean = ""
+            for _offset in range(_RULE_FALLBACK_MAX_ATTEMPTS):
+                _new = _semantic_fallback_title(
+                    _parent,
+                    _idx + _offset,
+                    _global_used_titles,
+                    context_title=l1_title or "",
+                )
+                if not _new:
+                    break
+                if not _first_clean:
+                    _first_clean = _new
+                if _is_l3_title_project_specific(_new, l2_title):
+                    return _new
+            return _first_clean
         except Exception as _fe:  # noqa: BLE001
             logger.debug("[L3修复] 规则兜底标题生成失败: %s", _fe)
             return ""
@@ -1227,18 +1273,26 @@ async def repair_l3_generic_titles(
             logger.warning("[L3修复] AI调用失败 (%s): %s", l3_title[:20], e)
             _fallback("AI 调用异常")
 
-    # 空标题节点直接规则兜底（同步执行，无 AI 调用）
+    # 空标题节点 / 纯规则模式的泛化标题：直接规则兜底（同步执行，无 AI 调用）
     #
     # BUG-FIX 2026-10-15（D3 · 空标题永久泄漏）：见上方 rule_only_tasks 的注释。
+    # BUG-FIX 2026-10-17（L-1 · 离线泛化标题泄漏）：纯规则模式（use_ai=False）
+    # 下非空泛化标题也进本队列；日志文案按原标题是否为空分别表述，
+    # 不再一律写「空标题」（旧文案在规则模式下属于不准确日志）。
     for _path, _node, _l1, _l2, _l3 in rule_only_tasks:
         _new = _rule_based_fallback(_node, _l1, _l2, _path)
+        _kind = "空标题" if not _l3 else "泛化标题"
         if _new and _new != _l3 and not _is_dirty_l3_title_deep(_new):
             _node["title"] = _new
             _global_used_titles.add(_new)
-            logger.info("[L3修复] 空标题 → %s（规则兜底，父级=%s）", _new[:30], _l2[:20])
+            logger.info(
+                "[L3修复] %s「%s」→ %s（规则兜底，父级=%s）",
+                _kind, _l3[:30], _new[:30], _l2[:20],
+            )
         else:
             logger.warning(
-                "[L3修复] 空标题节点规则兜底失败，保留空标题（path=%s）", _path,
+                "[L3修复] %s节点规则兜底失败，保留原标题「%s」（path=%s）",
+                _kind, _l3[:30], _path,
             )
 
     if repair_tasks:

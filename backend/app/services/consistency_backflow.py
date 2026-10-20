@@ -40,10 +40,11 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any
 
 from ..db import get_db
+from . import consistency_rules as rules
 from . import text_patch
+from .consistency_auditor import ConsistencyAuditor
 from .consistency_repair import _load_all_project_content
 from .facts_service import (
     dedup_key,
@@ -87,7 +88,11 @@ def _open_conflicts(conn, project_id: int) -> list[dict]:
 def _existing_fact_markers(project_id: int) -> set:
     """既有事实的 label + 归一化 value 集合，用于候选去重。"""
     markers: set = set()
-    with get_db() as conn:
+    # PERF（2026-10-17）：纯读改 readonly 连接，不再在 to_thread 里抢全局写锁
+    # （与 `consistency_auditor._collect_fact_instances` 2026-10-08 的修复同源）。
+    # 本函数与 `propose_facts` 都在事实回流 Tab 的「重新扫描」热路径上，用写连接
+    # 做纯读会在正文生成高峰期与写库请求争锁，把前端轮询拖慢。
+    with get_db(readonly=True) as conn:
         row = conn.execute(
             "SELECT global_facts_json FROM analysis WHERE project_id = ?", (project_id,)
         ).fetchone()
@@ -115,7 +120,13 @@ def propose_facts(project_id: int, min_occurrences: int = 3) -> dict:
         每项候选：{conflict_id, fact_name, value, occurrences, category,
         suggested_key, occurrences_map}
     """
-    with get_db() as conn:
+    # PERF（2026-10-17）：`propose_facts` 全程只读（读正文 + 读冲突 + 读事实），
+    # 改 readonly 连接跳过全局写锁。此前两处 `get_db()`（本函数与
+    # `_existing_fact_markers`）都按写连接取锁 —— 与 `consistency_auditor`
+    # 2026-10-08 修过的「纯读却抢写锁」同类：生成高峰期事实回流 Tab 的每次
+    # 扫描都会与正文写库争锁。写路径（`accept_fact_proposals`）仍用写连接，
+    # 不受影响。
+    with get_db(readonly=True) as conn:
         content_by_id = _load_all_project_content(conn, project_id)
         conflicts = _open_conflicts(conn, project_id)
     existing = _existing_fact_markers(project_id)
@@ -199,30 +210,57 @@ def merge_fact_proposals(
       不同 value 只留一条（见下方 known limitation）；
     - 顺序稳定：先既有项、后新增项。
 
-    Known limitation（HARDEN 2026-10-11·R-14，有意不改语义）：候选的 key 恒为
-    ``audit_<conflict_id>``（或显式 ``suggested_key``），而 ``label`` 是
-    ``fact_name``，所以「同 label 不同 value」不会被上面的 dedup 拦下。触发链路
-    是**跨轮**的，一轮内不会重复产出同名候选——``propose_facts`` 每个 open 冲突
-    只取一个 winner，而 ``consistency_auditor._save_conflicts`` 先清掉全部未解决行、
-    再对同名已解决历史复用同一行，故任一时刻每个 fact_name 最多一行 open 冲突。
-    但上一轮确认的候选不拦下一轮：正文改了口径后，新一轮 winner 与已确认值不同时，
-    第二条同名候选同样会通过 dedup。后果比「冗余」更重：下游按
-    ``consistency_auditor.FACT_BASELINE_CATEGORIES`` 用 **category**（不是 label）
-    收基准，且把该事实名下**所有**值都收进 ``all_facts`` 互比（没有「首条胜出」），
-    于是用户自己确认的两条事实会互相判成冲突，且该冲突来自 global_facts 本身、
-    无法靠改正文消解。判定不改的原因：label 去重会静默丢弃用户明确确认的候选
-    （界面回报「0 条新增」却查不出原因），比留下一条冗余事实更糟；且 ``basic``
-    等非基准分类本就允许多条同 label 事实并存。
+    已知限制 → 已闭环（HARDEN 2026-10-11·R-14 → BUG-FIX 2026-10-13 第六轮）：
+    候选的 key 恒为 ``audit_<conflict_id>``（或显式 ``suggested_key``），而
+    ``label`` 是 ``fact_name``，所以「同 label 不同 value」不会被上面的 dedup 拦下。
+    触发链路是**跨轮**的：上一轮确认的候选不拦下一轮，正文改口径后新一轮 winner
+    与已确认值不同时，第二条同名候选同样会通过 dedup。后果比「冗余」更重：下游按
+    ``FACT_BASELINE_CATEGORIES`` 用 **category**（不是 label）收基准，且把该事实名
+    下**所有**值都收进 ``all_facts`` 互比（没有「首条胜出」），于是用户自己确认的
+    两条事实会互相判成冲突，且该冲突来自 global_facts 本身、无法靠改正文消解。
+
+    2026-10-11 判定「不改」的理由是：label 去重会**静默丢弃**用户明确确认的候选
+    （界面回报「0 条新增」却查不出原因），比留下一条冗余事实更糟。现在的方案同时
+    避开两头：**不静默丢弃，而是在基准类别内拦截并回传可读的拒绝原因**
+    （``plan_fact_merge`` 的第三个返回值），由 ``accept_fact_proposals`` 随响应体
+    回传、前端可显式提示「N 条未采纳：与既有事实冲突」。非基准类别（``basic`` 等）
+    不受影响——它们本就允许多条同 label 事实并存，且审计器不拿它们互比。
 
     Args:
         existing_items: 既有事实项（不会被就地修改，函数内做浅拷贝）
         proposals: 待采纳候选（``propose_facts`` 的条目）
 
     Returns:
-        ``(合并后的清单, 新增条数)``
+        ``(合并后的清单, 新增条数)`` —— 需要拒绝原因时用
+        :func:`plan_fact_merge`（返回值多一个 ``skipped`` 列表）。
+    """
+    items, added, _skipped = plan_fact_merge(existing_items, proposals)
+    return items, added
+
+
+def plan_fact_merge(
+    existing_items: list[dict], proposals: list[dict]
+) -> tuple[list[dict], int, list[dict]]:
+    """``merge_fact_proposals`` 的**带拒绝原因**版本（BUG-FIX 2026-10-13·R-14 闭环）。
+
+    合并规则与 ``merge_fact_proposals`` 完全一致，额外追加一条**基准类别互斥**：
+    若候选所属 category 属于 ``rules.FACT_BASELINE_CATEGORIES``，且清单里已存在
+    同 category 但取值不同的事实，则该候选**不入库**，并在 ``skipped`` 里给出原因
+    （否则两条事实会互判冲突且无法靠改正文消解，见 ``merge_fact_proposals`` 的
+    R-14 注释）。
+
+    取值比较复用审计器自身的等价判定 ``ConsistencyAuditor._distinct_values``
+    （唯一实现：金额按「元」换算、工期归一到数字），因此「450」与「450 日历天」
+    视为同值不拦，而「450」与「60」视为异值拦截。该函数是纯内存计算，不破坏
+    「临界区 I/O-free」约定。
+
+    Returns:
+        ``(合并后的清单, 新增条数, 被拒绝候选列表)``；被拒绝候选形如
+        ``{"fact_name": ..., "value": ..., "reason": "..."}``。
     """
     items = list(existing_items)
     added = 0
+    skipped: list[dict] = []
     for p in proposals:
         if not isinstance(p, dict):
             continue
@@ -244,9 +282,51 @@ def merge_fact_proposals(
         # 的幂等场景；suggested_key 恰好撞上既有 key 时也会在此被拦下。
         if any(dedup_key(new_item) == dedup_key(it) for it in items):
             continue
+        # R-14：基准类别互斥——同类别已有异值事实则拒绝（含本批次内互相冲突）
+        conflict_with = _find_baseline_conflict(items, new_item)
+        if conflict_with is not None:
+            skipped.append(
+                {
+                    "fact_name": fact_name,
+                    "value": value,
+                    "category": new_item["category"],
+                    "reason": (
+                        f"与既有事实「{conflict_with.get('label')}={conflict_with.get('value')}」"
+                        f"同属 {new_item['category']} 基准类别但取值不同：若一并入库，"
+                        "二者会互相判成冲突，且该冲突来自事实基准本身、改正文无法消解。"
+                        "请先确定唯一取值（或修改既有事实）后重新采纳。"
+                    ),
+                }
+            )
+            continue
         items.append(new_item)
         added += 1
-    return items, added
+    return items, added, skipped
+
+
+def _find_baseline_conflict(items: list[dict], candidate: dict) -> dict | None:
+    """找出清单中与候选**同基准类别且取值不同**的事实项（无则返回 None）。
+
+    非基准类别（如 ``basic``）直接放行：审计器不拿它们互比，多条同 label 并存合法。
+    """
+    categories = rules.FACT_BASELINE_CATEGORIES
+    category = str(candidate.get("category") or "")
+    baseline_fact_name = categories.get(category)
+    if not baseline_fact_name:
+        return None
+    candidate_value = str(candidate.get("value") or "")
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("category") or "") != category:
+            continue
+        existing_value = str(item.get("value") or "")
+        if not existing_value:
+            continue
+        # 复用审计器的取值等价判定（金额换算/工期归一都在里面，唯一实现）
+        if len(ConsistencyAuditor._distinct_values([existing_value, candidate_value], fact_name=baseline_fact_name)) > 1:
+            return item
+    return None
 
 
 def accept_fact_proposals(project_id: int, proposals: list[dict]) -> dict:
@@ -264,10 +344,15 @@ def accept_fact_proposals(project_id: int, proposals: list[dict]) -> dict:
         proposals: 要采纳的候选（来自 propose_facts 的条目）
 
     Returns:
-        {"added": n, "merged_total": m}
+        ``{"added": n, "merged_total": m, "skipped": [...]}``
+
+        ``skipped`` 为被基准类别互斥规则拒绝的候选（BUG-FIX 2026-10-13·R-14），
+        每项含可读的 ``reason``，供前端显式提示「为什么没采纳」，避免重蹈
+        「界面回报 0 条新增却查不出原因」的覆辙。该字段为**新增**，老调用方
+        只读 ``added`` / ``merged_total`` 不受影响。
     """
     if not proposals:
-        return {"added": 0, "merged_total": 0}
+        return {"added": 0, "merged_total": 0, "skipped": []}
 
     try:
         # HARDEN 2026-10-11（并发丢失更新）：旧实现把「读旧事实清单」和「写回」拆在
@@ -291,11 +376,13 @@ def accept_fact_proposals(project_id: int, proposals: list[dict]) -> dict:
             ).fetchone()
             items = parse_stored_items(old_row["global_facts_json"]) if old_row else []
 
-            # 合并走纯函数：临界区内不含任何 I/O（见 merge_fact_proposals docstring）
-            items, added = merge_fact_proposals(items, proposals)
+            # 合并走纯函数：临界区内不含任何 I/O（见 merge_fact_proposals docstring）。
+            # 用带拒绝原因的版本：R-14 拦截下来的候选也要回传给调用方，否则用户
+            # 看到「0 条新增」无从得知是被冲突规则挡了。
+            items, added, skipped = plan_fact_merge(items, proposals)
 
             if added == 0:
-                return {"added": 0, "merged_total": len(items)}
+                return {"added": 0, "merged_total": len(items), "skipped": skipped}
 
             facts_json = dump_items(items)
             conn.execute(
@@ -311,4 +398,4 @@ def accept_fact_proposals(project_id: int, proposals: list[dict]) -> dict:
     except Exception as e:
         logger.error("[事实回流] 写入失败 project=%s: %s", project_id, e, exc_info=True)
         raise
-    return {"added": added, "merged_total": len(items)}
+    return {"added": added, "merged_total": len(items), "skipped": skipped}

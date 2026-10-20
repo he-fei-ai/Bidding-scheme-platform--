@@ -33,6 +33,7 @@ logs/
 backend/_*.py
 backend/_*.txt
 backend/_*.log
+backend/_*.err
 backend/tg2.txt
 backend/tg_out.txt
 frontend/_*.txt
@@ -75,6 +76,10 @@ backend/temp_test_*.py
 frontend/vitest_out.txt
 frontend/vitest_err.txt
 frontend/run_tests.ps1
+
+# E2E 链路验证证据产物（勿提交；同目录根层 *.py 驱动脚本正常入库）
+_e2e_aligned_*/*
+!_e2e_aligned_*/*.py
 frontend/_check_refs.py
 frontend/_find_sse.py
 

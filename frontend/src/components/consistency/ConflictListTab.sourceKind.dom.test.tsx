@@ -17,6 +17,7 @@
  */
 import { describe, it, expect, vi, beforeAll, beforeEach, afterEach } from "vitest";
 import { render, screen, fireEvent, cleanup } from "@testing-library/react";
+import type { AuditSummary } from "../../api";
 
 const hasDom = typeof window !== "undefined" && typeof document !== "undefined";
 
@@ -54,20 +55,25 @@ const getConflictsMock = vi.fn(async () => ({
   conflicts: [AI_FINDING, RULE_CONFLICT],
 }));
 
-const getAuditSummaryMock = vi.fn(async () => ({
-  status: "ok",
-  summary: {
-    latest_audit: { audit_time: "2026-10-15 10:00:00" },
-    unresolved_conflicts: 2,
-    resolved_conflicts: 0,
-    conflicts_by_severity: { high: 1, medium: 1 },
-    conflicts_by_severity_rule: { high: 1 },
-    unresolved_rule_conflicts: 1,
-    unresolved_ai_findings: 1,
-    resolved_ai_findings: 0,
-    audit_source: "rule",
-  },
-}));
+// 显式标注返回类型：测试需要构造「无审计记录」（latest_audit=null）等
+// 形状不一的 summary，推断类型会把可选字段钉成必填而导致 mockResolvedValueOnce
+// 类型报错（2026-10-17）。
+const getAuditSummaryMock = vi.fn(
+  async (): Promise<{ status: string; summary: AuditSummary }> => ({
+    status: "ok",
+    summary: {
+      latest_audit: { audit_time: "2026-10-15 10:00:00" },
+      unresolved_conflicts: 2,
+      resolved_conflicts: 0,
+      conflicts_by_severity: { high: 1, medium: 1 },
+      conflicts_by_severity_rule: { high: 1 },
+      unresolved_rule_conflicts: 1,
+      unresolved_ai_findings: 1,
+      resolved_ai_findings: 0,
+      audit_source: "rule",
+    },
+  }),
+);
 
 const getFixSuggestionMock = vi.fn(async () => ({
   status: "ok",
@@ -176,11 +182,55 @@ describe.skipIf(!hasDom)("冲突来源（rule/ai）区分展示", () => {
     await screen.findByText("AI 发现", undefined, { timeout: 60_000 });
     // 两行各有「修复建议」按钮 —— 点第一个（列表序默认 AI 行在前）
     fireEvent.click((await screen.findAllByText("修复建议", undefined, { timeout: 60_000 }))[0]);
-    expect(await screen.findByText(/AI 语义发现，无结构化取值/, undefined, { timeout: 60_000 })).toBeTruthy();
+    // BUG-FIX 2026-10-17：弹窗「冲突数值」列新增了占位说明（与表格同口径），
+    // 与建议正文里的同款文案构成**两处**匹配 —— 原 findByText 单匹配断言在此
+    // 抛 "found multiple elements"。语义未变（AI 发现的建议可见），改为多重匹配。
+    expect(
+      (await screen.findAllByText(/AI 语义发现，无结构化取值/, undefined, { timeout: 60_000 })).length,
+    ).toBeGreaterThan(0);
     const adoptBtn = Array.from(document.querySelectorAll(".ant-modal button"))
       .find((b) => b.textContent?.includes("采纳建议并修复"));
     expect(adoptBtn).toBeTruthy();
     expect((adoptBtn as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("BUG-FIX 2026-10-17：建议弹窗不把 AI 发现标注为「事实项」，冲突数值有占位说明", async () => {
+    // 第六轮修了表格列（紫色标签 + 截断文本），漏了弹窗：这里曾把 AI 发现的
+    // issue 原文（最长 100 字自由文本）标注成「事实项：」，用户以为是系统把
+    // 这段话当成了事实名；「冲突数值」则渲染成空 Tag 组、没有任何解释。
+    render(<ConflictListTab projectId={1} />);
+    await screen.findByText("AI 发现", undefined, { timeout: 60_000 });
+    fireEvent.click((await screen.findAllByText("修复建议", undefined, { timeout: 60_000 }))[0]);
+    // 等弹窗打开（建议正文出现）。注意文案在「建议正文」与「冲突数值占位」两处
+    // 都出现，必须用 findAllByText —— 单匹配断言会抛 multiple elements。
+    expect(
+      (await screen.findAllByText(/AI 语义发现，无结构化取值/, undefined, { timeout: 60_000 }))
+        .length,
+    ).toBeGreaterThan(0);
+    const modal = document.querySelector(".ant-modal") as HTMLElement;
+    expect(modal).toBeTruthy();
+    // 弹窗内用「AI 语义发现：」而非「事实项：」标注
+    expect(modal.textContent).toContain("AI 语义发现：");
+    expect(modal.textContent).not.toContain("事实项：");
+  });
+
+  it("BUG-FIX 2026-10-17：无审计记录时摘要卡片不显示来源标签", async () => {
+    getAuditSummaryMock.mockResolvedValueOnce({
+      status: "ok",
+      summary: {
+        latest_audit: null,
+        unresolved_conflicts: 0,
+        resolved_conflicts: 0,
+        conflicts_by_severity: {},
+        audit_source: "rule",
+      },
+    });
+    render(<ConflictListTab projectId={1} />);
+    // 等摘要卡渲染出来（无审计 → 时间占位 —）
+    expect(await screen.findByText("最近审计时间", undefined, { timeout: 60_000 })).toBeTruthy();
+    // audit_source 默认回落 'rule'，但无审计记录时不得挂「规则审计」标签
+    expect(screen.queryByText("规则审计")).toBeNull();
+    expect(screen.queryByText("AI 审计")).toBeNull();
   });
 
   it("摘要卡片标注「其中 N 条为 AI 语义发现」", async () => {

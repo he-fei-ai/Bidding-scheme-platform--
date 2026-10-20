@@ -75,21 +75,33 @@ def _sync_get_analysis(project_id: int) -> dict | None:
         return dict(row) if row else None
 
 def _sync_update_scope(project_id: int, scope: str) -> None:
+    # BUG-FIX 2026-10-17（与 uploaded_files.updated_at 修复同型）：analysis 表 DDL 声明
+    # updated_at NOT NULL，但此前仅 _sync_clear_analysis 和 _sync_confirm_and_retrieve
+    # 两处维护它，其余 5 处写入全跳过。scope 更新是其中一处，补上。
     with get_db() as conn:
         existing = conn.execute('SELECT 1 FROM analysis WHERE project_id = ?', (project_id,)).fetchone()
         if existing:
-            conn.execute('UPDATE analysis SET scope = ? WHERE project_id = ?', (scope, project_id))
+            conn.execute(
+                "UPDATE analysis SET scope = ?, updated_at = datetime('now', 'localtime') "
+                "WHERE project_id = ?",
+                (scope, project_id),
+            )
         else:
-            conn.execute('INSERT INTO analysis (project_id, scope) VALUES (?, ?)', (project_id, scope))
+            conn.execute(
+                "INSERT INTO analysis (project_id, scope, updated_at) VALUES (?, ?, datetime('now', 'localtime'))",
+                (project_id, scope),
+            )
 
 def _sync_update_field(project_id: int, field: str, value: str) -> None:
     field = _validate_field_name(field)
     with get_db() as conn:
         # BUG-FIX 2026-09-14（中）：analysis 行不存在时纯 UPDATE 影响 0 行，
         # 写入被静默丢弃。改为 upsert（与 _sync_insert_or_update 保持一致）。
+        # BUG-FIX 2026-10-17：同步更新 updated_at（同型 uploaded_files 修复）。
         conn.execute(
-            f'INSERT INTO analysis (project_id, {field}) VALUES (?, ?) '
-            f'ON CONFLICT(project_id) DO UPDATE SET {field} = excluded.{field}',
+            f'INSERT INTO analysis (project_id, {field}, updated_at) VALUES (?, ?, datetime(\'now\', \'localtime\')) '
+            f'ON CONFLICT(project_id) DO UPDATE SET {field} = excluded.{field}, '
+            f"updated_at = datetime('now', 'localtime')",
             (project_id, value),
         )
 
@@ -113,7 +125,11 @@ def _sync_reset_facts_audit(project_id: int) -> None:
         if 'facts_audit_json' not in cols:
             return
         if conn.execute('SELECT 1 FROM analysis WHERE project_id = ?', (project_id,)).fetchone():
-            conn.execute("UPDATE analysis SET facts_audit_json = '', facts_audit_at = NULL WHERE project_id = ?", (project_id,))
+            conn.execute(
+                "UPDATE analysis SET facts_audit_json = '', facts_audit_at = NULL, "
+                "updated_at = datetime('now', 'localtime') WHERE project_id = ?",
+                (project_id,),
+            )
 
 def _sync_clear_analysis(project_id: int) -> None:
     with get_db() as conn:
@@ -153,11 +169,25 @@ def _sync_insert_or_update(project_id: int, summary: str, field: str) -> None:
     # 合法值会派生出不存在的 `confirmed_scope` 列，直接 500；且该派生值未经
     # 校验就拼进 SQL 标识符。没有对应「已确认」标记的字段不触碰任何 confirmed 列。
     confirmed_col = _derive_confirmed_field(field)
+    # BUG-FIX 2026-10-17：两条路径均同步 updated_at（同型 uploaded_files 修复）。
+    now = "datetime('now', 'localtime')"
     with get_db() as conn:
         if confirmed_col:
-            conn.execute(f'INSERT INTO analysis (project_id, {field}) VALUES (?, ?)\n                ON CONFLICT(project_id) DO UPDATE SET {field} = excluded.{field},\n                {confirmed_col} = 0', (project_id, summary))
+            conn.execute(
+                f'INSERT INTO analysis (project_id, {field}, updated_at) '
+                f'VALUES (?, ?, {now}) '
+                f'ON CONFLICT(project_id) DO UPDATE SET {field} = excluded.{field}, '
+                f'{confirmed_col} = 0, updated_at = {now}',
+                (project_id, summary),
+            )
         else:
-            conn.execute(f'INSERT INTO analysis (project_id, {field}) VALUES (?, ?)\n                ON CONFLICT(project_id) DO UPDATE SET {field} = excluded.{field}', (project_id, summary))
+            conn.execute(
+                f'INSERT INTO analysis (project_id, {field}, updated_at) '
+                f'VALUES (?, ?, {now}) '
+                f'ON CONFLICT(project_id) DO UPDATE SET {field} = excluded.{field}, '
+                f'updated_at = {now}',
+                (project_id, summary),
+            )
 
 def _sync_read_boq(project_id: int) -> str | None:
     with get_db() as conn:
@@ -178,8 +208,13 @@ def _sync_confirm_field(project_id: int, field: str) -> None:
     # BUG-FIX 2026-10-05：见 _ALLOWED_CONFIRMED_FIELDS 注释。此前无校验，
     # 属「未校验标识符直接进 SQL」的注入模板。
     _validate_confirmed_field(field)
+    # BUG-FIX 2026-10-17：同步更新 updated_at（同型 uploaded_files 修复）。
     with get_db() as conn:
-        conn.execute(f'UPDATE analysis SET {field} = 1 WHERE project_id = ?', (project_id,))
+        conn.execute(
+            f"UPDATE analysis SET {field} = 1, updated_at = datetime('now', 'localtime') "
+            f"WHERE project_id = ?",
+            (project_id,),
+        )
 
 def _sync_select_flags(project_id: int, *fields: str) -> tuple | None:
     validated_fields = [_validate_field_name(f) for f in fields]
@@ -556,7 +591,61 @@ async def confirm_construction_method(project_id: int, current_user: Annotated[o
 
 @router.delete('/analysis')
 async def clear_analysis(project_id: int, current_user: Annotated[object, Depends(get_current_user)]=None):
-    """清除已生成的摘要和评分点信息"""
+    """清除已生成的摘要和评分点信息
+
+    A-3 BUG-FIX 2026-10-17：此前仅清 analysis 表，outlines（v51_tasks）、sections 表
+    和图表表残留 → 用户感知「我清了分析为什么目录/正文/图表还在」。现级联清除下游
+    派生产物 + 缓存失效，与 feasibility 路由 save_analysis 的下游失效语义对齐。
+    """
     await enforce_project_access(project_id, current_user)
+
+    # 1) 清 analysis 表（原有）
     await asyncio.to_thread(_sync_clear_analysis, project_id)
+
+    # 2) 级联清除下游派生产物（目录/正文/图表/评分任务）
+    #    各清理动作独立 try/except，互不阻塞——某表不存在或已被清理都不算失败
+    def _cascade_clear() -> None:
+        import sqlite3 as _sqlite3
+        from ..services.redis_cache import CacheService
+
+        conn = None
+        try:
+            # 复用 get_db 拿正确的连接（含 readonly guard + WAL 配置）
+            from ..db import get_db as _get_db
+            with _get_db() as conn_w:
+                conn = conn_w
+                cols = {r[1] for r in conn.execute("PRAGMA table_info(v51_tasks)").fetchall()}
+                if "project_id" in cols:
+                    conn.execute("DELETE FROM v51_tasks WHERE project_id = ?", (project_id,))
+                # sections 表——口径同 services/sections.clear_project_sections
+                conn.execute("DELETE FROM sections WHERE project_id = ?", (project_id,))
+                # charts 表——若存在 project_id 列则清除（不同环境表结构不一，做列存在性守卫）
+                try:
+                    chart_cols = {r[1] for r in conn.execute("PRAGMA table_info(charts)").fetchall()}
+                    if "project_id" in chart_cols:
+                        conn.execute("DELETE FROM charts WHERE project_id = ?", (project_id,))
+                except _sqlite3.OperationalError:
+                    pass  # charts 表不存在（老库），跳过
+                # 注：file_parse_tasks 表语义是「上传文件解析任务」（docx/pdf 等），
+                # 与 analysis 清空无直接关联——不触碰，避免误删合法解析任务行
+        except Exception as _ce:
+            logger.warning("[级联清除] 下游产物清理失败（忽略，analysis 表已清）: %s", _ce)
+
+        # 3) 缓存失效（各方法独立 try/except）
+        try:
+            from ..services.sections import invalidate_content_caches
+            invalidate_content_caches(project_id)
+        except Exception as _ie:
+            logger.warning("[级联清除] 章节缓存失效失败（忽略）: %s", _ie)
+        try:
+            CacheService.invalidate_outline(project_id)
+        except Exception as _ie:
+            logger.warning("[级联清除] 目录缓存失效失败（忽略）: %s", _ie)
+        try:
+            CacheService.invalidate_project_detail(project_id)
+        except Exception as _ie:
+            logger.warning("[级联清除] 项目详情缓存失效失败（忽略）: %s", _ie)
+        logger.info("[级联清除] analysis 清理完成 project=%d", project_id)
+
+    await asyncio.to_thread(_cascade_clear)
     return {'status': 'ok'}

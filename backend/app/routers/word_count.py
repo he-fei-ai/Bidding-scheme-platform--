@@ -75,7 +75,64 @@ def _load_project_writing_length(project_id: int) -> str | None:
     return None
 
 
-def _tolerance_for_section(s) -> float:
+def _build_children_ids(sections) -> set[int]:
+    """构建「拥有下级章节」的父节点 id 集合（D1 修复 2026-10-20）。
+
+    生成侧 ``build_chapter_content_messages`` 显式传 ``is_l3_own``，含下级的 L3
+    走四档「子树总字数」；而校验侧此前仅凭 ``level==3/target_words/tier`` 判定，
+    把含下级的 L3 误判为「L3 自身正文」240~360，与生成/面板/SSE 口径分叉。
+    现按 ``parent_id`` 关系重建下级集合，供 ``_is_l3_own_section`` 与权威解析器
+    使用，让四处对同一 L3 的 ``is_l3_own`` 判定逐值一致。
+    """
+    ids: set[int] = set()
+    for s in sections:
+        pid = getattr(s, "parent_id", None)
+        if pid is not None:
+            ids.add(pid)
+    return ids
+
+
+def _section_actual_words(s) -> int:
+    """章节实际字数（易标 R1 可读口径，D2 修复 2026-10-20）。
+
+    与生成链 / R9R10 / R12 警告共用同一事实源 ``count_readable_words``，消除
+    「校验页用原始 count_words、强控链用可读字数」的膨胀（探针实测含表格/
+    图片/URL 的正文两口径差约 40%）。``Section`` 模型未透出 ``readable_word_count``
+    列（list_sections 用 SELECT * 但 pydantic 忽略未声明字段），故优先取该列（
+    若上游透出）、否则按正文现算。无正文时（生产环境 word_count 由 content 派生，
+    必为 0）兼容回落 ``word_count``，以兼容仅设 word_count 的旧单元测试桩。
+    """
+    rwc = getattr(s, "readable_word_count", None)
+    if rwc is not None:
+        return int(rwc)
+    content = getattr(s, "content", "") or ""
+    if content:
+        return count_readable_words(content)
+    return int(getattr(s, "word_count", 0) or 0)
+
+
+def _prepare_wc_context(project_id: int, sections) -> tuple[dict, dict]:
+    """线程池中预取校验上下文：``(可读字数表, 强控覆盖表)``（D2/D3 修复 2026-10-20）。
+
+    覆盖表复用装配层唯一入口 ``word_control_runtime.build_section_override``，保证
+    校验页展示的区间与生成链 R5 完全同源（含「配置失配回落 S」的 GUARD）；
+    非强控 / 无快照 / 异常 → 空 dict（校验页回落档位口径，与修复前行为一致）。
+    """
+    readable_map: dict = {}
+    for s in sections:
+        readable_map[getattr(s, "id", None)] = _section_actual_words(s)
+    override: dict = {}
+    try:
+        from ..services import word_control_runtime as wcr
+
+        state = wcr.load_project_word_control(project_id)
+        override = wcr.build_section_override(state, sections) or {}
+    except Exception as e:
+        logger.debug("[字数控制] 校验页读取强控覆盖失败（回落档位口径）: %s", e)
+    return readable_map, override
+
+
+def _tolerance_for_section(s, children_ids: set[int] | None = None) -> float:
     """解析章节的容差比例（BUG-FIX 2026-10-09：消除硬编码 ±0.10）。
 
     此前 `_target_bounds` 直接写死 0.10，而 `word_count_tiers.tolerance_ratio`
@@ -86,7 +143,7 @@ def _tolerance_for_section(s) -> float:
     现按与生成侧相同的优先级取容差：L3 自身正文 → L3_OWN_TOLERANCE_RATIO；
     其余 → 章节档位的 tolerance_ratio；无档位时回落 0.10（保持兼容）。
     """
-    if _is_l3_own_section(s):
+    if _is_l3_own_section(s, children_ids):
         return get_l3_own_tolerance()
     tier_key = getattr(s, 'word_count_tier', None)
     if tier_key:
@@ -122,19 +179,23 @@ async def overview(project_id: int, user=Depends(get_current_user)):
         logger.error('加载章节失败: %s', e, exc_info=True)
         raise HTTPException(status_code=500, detail=f'加载章节失败: {str(e)[:200]}') from e
 
+    children_ids = _build_children_ids(sections)
+    readable_map, override = await asyncio.to_thread(_prepare_wc_context, project_id, sections)
+    _kw = {"writing_length": writing_length, "children_ids": children_ids, "override": override}
+
     total_words = sum((s.word_count for s in sections))
-    total_target = sum((_resolve_target_for_section(s, writing_length) or 0 for s in sections))
+    total_target = sum((_resolve_target_for_section(s, writing_length, children_ids=children_ids, override=override) or 0 for s in sections))
     completed = [s for s in sections if s.word_count > 0]
-    on_target = [s for s in sections if _is_within_tolerance(s)]
-    below_target = [s for s in sections if _is_below_target(s)]
-    exceeded_target = [s for s in sections if _is_above_target(s)]
+    on_target = [s for s in sections if _is_within_tolerance(s, actual=readable_map.get(s.id), **_kw)]
+    below_target = [s for s in sections if _is_below_target(s, actual=readable_map.get(s.id), **_kw)]
+    exceeded_target = [s for s in sections if _is_above_target(s, actual=readable_map.get(s.id), **_kw)]
     empty = [s for s in sections if s.word_count == 0]
 
     level3_sections = [s for s in sections if (s.level or 3) == 3]
-    level3_on_target = [s for s in level3_sections if _is_within_tolerance(s)]
-    level3_below = [s for s in level3_sections if _is_below_target(s)]
-    level3_exceeded = [s for s in level3_sections if _is_above_target(s)]
-    per_tier_stats = _compute_tier_stats(sections)
+    level3_on_target = [s for s in level3_sections if _is_within_tolerance(s, actual=readable_map.get(s.id), **_kw)]
+    level3_below = [s for s in level3_sections if _is_below_target(s, actual=readable_map.get(s.id), **_kw)]
+    level3_exceeded = [s for s in level3_sections if _is_above_target(s, actual=readable_map.get(s.id), **_kw)]
+    per_tier_stats = _compute_tier_stats(sections, writing_length, children_ids, override, readable_map)
 
     return {'status': 'ok', 'project_id': project_id, 'total_sections': len(sections), 'total_words': total_words, 'total_target': total_target, 'target_coverage': round(total_words / total_target * 100, 1) if total_target else 0, 'completed_sections': len(completed), 'on_target_sections': len(on_target), 'below_target_sections': len(below_target), 'exceeded_target_sections': len(exceeded_target), 'empty_sections': len(empty), 'stats': {'per_level': _group_by_level(sections), 'per_status': _group_by_status(sections), 'level3_stats': {'count': len(level3_sections), 'on_target': len(level3_on_target), 'below_target': len(level3_below), 'exceeded_target': len(level3_exceeded), 'rate': round(len(level3_on_target) / len(level3_sections) * 100, 1) if level3_sections else 0}, 'per_tier_stats': per_tier_stats}}
 
@@ -151,25 +212,35 @@ async def section_stats(project_id: int, user=Depends(get_current_user)):
         logger.error('加载章节失败: %s', e, exc_info=True)
         raise HTTPException(status_code=500, detail=f'加载章节失败: {str(e)[:200]}') from e
 
+    children_ids = _build_children_ids(sections)
+    readable_map, override = await asyncio.to_thread(_prepare_wc_context, project_id, sections)
     items = []
     for s in sections:
-        effective_target = _resolve_target_for_section(s, writing_length)
+        effective_target = _resolve_target_for_section(s, writing_length, children_ids=children_ids, override=override)
         tier_key = getattr(s, 'word_count_tier', None)
         tier_cfg = get_tier_config(tier_key) if tier_key else get_default_tier_config()
         tier_label = tier_cfg.get('label') if tier_cfg else None
         tier_target = int(tier_cfg.get('target_words', 0)) if tier_cfg else 0
         if effective_target and s.word_count > 0:
-            on_target_val = _is_within_tolerance(s)
+            on_target_val = _is_within_tolerance(
+                s, actual=readable_map.get(s.id),
+                writing_length=writing_length, children_ids=children_ids, override=override,
+            )
         elif s.word_count == 0:
             on_target_val = 'unknown'
         else:
             on_target_val = False
 
+        # D2 修复 2026-10-20：面板展示字数/进度与 on_target 判定共用 R1 可读口径，
+        # 保证「面板/校验/SSE」对同一节的可读字数逐值相等（避免展示 raw、判定 readable 互矛）。
+        _a = readable_map.get(s.id)
+        if _a is None:
+            _a = _section_actual_words(s)
         items.append({
             'id': s.id, 'title': s.title, 'level': s.level, 'parent_id': s.parent_id,
-            'section_type': s.section_type, 'status': s.status, 'word_count': s.word_count,
-            'target_words': effective_target, 'word_count_text': _human_words(s.word_count),
-            'progress': _progress(s.word_count, effective_target),
+            'section_type': s.section_type, 'status': s.status, 'word_count': _a,
+            'target_words': effective_target, 'word_count_text': _human_words(_a),
+            'progress': _progress(_a, effective_target),
             'word_count_tier': tier_key, 'tier_label': tier_label, 'tier_target': tier_target,
             'on_target': on_target_val,
         })
@@ -178,94 +249,138 @@ async def section_stats(project_id: int, user=Depends(get_current_user)):
     return {'status': 'ok', 'project_id': project_id, 'total': len(items), 'items': items}
 
 
-def _target_bounds(s) -> tuple[int, int]:
+def _target_bounds(s, *, writing_length: str | None = None,
+                   children_ids: set[int] | None = None,
+                   override: dict | None = None) -> tuple[int, int]:
     """解析章节达标区间 [lo, hi]（CONVERGE 2026-10-12：转发唯一权威口径）。
 
-    - L3 自身正文（无档位覆盖）：300 ± 20%（默认 240~360），随
-      L3_OWN_TARGET_WORDS / L3_OWN_TOLERANCE_RATIO 配置变化。
-    - 其他（L3 非叶子四档子树总字数、L4+ 叶子）：target × [1-tol, 1+tol]，
-      其中 tol 取**目标来源**的 tolerance_ratio（BUG-FIX 2026-10-09：
-      此前硬编码 0.10，与管理员可编辑的 word_count_tiers.tolerance_ratio
-      以及生成侧口径分叉）。
+    - 体系合并 2026-10-20：强控项目不再在本函数内写独立分支，而是把
+      ``build_section_override`` 产物作为 ``strict_override`` 透传给统一解析器（
+      命中即短路返回 R5 区间 ``[ceil(0.8S), floor(1.2S)]``）；与生成链 / R9R10 /
+      SSE / R12 完全同源，彻底消除「双体系平行实现」；
+    - D1 修复 2026-10-20：``children_ids`` 让含下级的 L3 走四档子树总字数；
+    - 其余（L3 自身正文 300±20%、L4+ 叶子档位）：target × [1-tol, 1+tol]。
     """
-    resolved = _resolve_word_target_for_section(s)
+    resolved = _resolve_word_target_for_section(
+        s, writing_length, children_ids=children_ids, override=override,
+    )
     if not resolved:
         return (0, 0)
     return (int(resolved.lo), int(resolved.hi))
 
 
-def _is_below_target(s) -> bool:
-    """字数已生成且低于达标区间下界（无目标或空正文均不算）。"""
-    lo, hi = _target_bounds(s)
-    return bool(lo) and s.word_count > 0 and s.word_count < lo
+def _is_below_target(s, *, actual: int | None = None,
+                     writing_length: str | None = None,
+                     children_ids: set[int] | None = None,
+                     override: dict | None = None) -> bool:
+    """字数已生成且低于达标区间下界（无目标或空正文均不算）。
+
+    D2 修复 2026-10-20：实际字数按易标 R1 可读口径（``actual`` 或 ``_section_actual_words``），
+    与 ``_target_bounds`` / 强控链共用同一计量。
+    """
+    lo, hi = _target_bounds(s, writing_length=writing_length, children_ids=children_ids, override=override)
+    a = actual if actual is not None else _section_actual_words(s)
+    return bool(lo) and a > 0 and a < lo
 
 
-def _is_above_target(s) -> bool:
-    """字数已生成且高于达标区间上界（无目标或空正文均不算）。"""
-    lo, hi = _target_bounds(s)
-    return bool(hi) and s.word_count > 0 and s.word_count > hi
+def _is_above_target(s, *, actual: int | None = None,
+                     writing_length: str | None = None,
+                     children_ids: set[int] | None = None,
+                     override: dict | None = None) -> bool:
+    """字数已生成且高于达标区间上界（无目标或空正文均不算）。D2：R1 可读口径。"""
+    lo, hi = _target_bounds(s, writing_length=writing_length, children_ids=children_ids, override=override)
+    a = actual if actual is not None else _section_actual_words(s)
+    return bool(hi) and a > 0 and a > hi
 
 
-def _is_l3_own_section(s) -> bool:
-    """判断章节是否属于 L3 自身正文（无下级目录章节、无档位覆盖）。"""
+def _is_l3_own_section(s, children_ids: set[int] | None = None) -> bool:
+    """判断章节是否属于 L3 自身正文（无下级目录章节、无档位覆盖）。
+
+    D1 修复 2026-10-20：新增 ``children_ids``——含下级的 L3 不是「自身正文」，
+    应走四档「子树总字数」口径。``children_ids`` 为 None（调用方无子节点信息，
+    如单元测试直接构造单节）时保持既有多数派口径（视为 L3 自身正文）。
+    """
     if (s.level or 3) != 3:
         return False
     if (s.target_words or 0) > 0:
         return False
-    return getattr(s, 'word_count_tier', None) in (None, '')
+    if getattr(s, 'word_count_tier', None) not in (None, ''):
+        return False
+    if children_ids is not None and getattr(s, "id", None) in children_ids:
+        return False
+    return True
 
 
-def _resolve_target_for_section(s, writing_length: str | None = None):
+def _resolve_target_for_section(s, writing_length: str | None = None, *,
+                                children_ids: set[int] | None = None,
+                                override: dict | None = None):
     """解析章节有效目标字数（CONVERGE 2026-10-12：转发唯一权威口径）。
 
-    权威实现见 ``services/word_target_resolver.py``（本函数曾是 5 份同构实现
-    之一）。本函数保留原签名与返回语义（``int | None``，L1/L2 → None），
-    口径改为转发，避免「生成侧 / 校验侧 target 与 tolerance 各算一套」的分叉。
+    权威实现见 ``services/word_target_resolver.py``。本函数保留原签名与
+    返回语义（``int | None``，L1/L2 → None），口径改为转发。体系合并
+    2026-10-20：``override`` 透传至统一解析器（强控命中时 target=S）。
 
-    优先级：单节点 target_words > 单节点 word_count_tier
-      > L3 自身正文 300±20% > 全局 writing_length（本项目最近一次生成任务所用档位）
-      > 默认档位（standard）。
+    优先级：强控覆盖（体系 B）> 单节点 target_words > 单节点 word_count_tier
+      > L3 自身正文 300±20% > 全局 writing_length > 默认档位（standard）。
     """
-    from ..services.word_target_resolver import (
-        resolve_section_word_target_from_mapping,
+    resolved = _resolve_word_target_for_section(
+        s, writing_length, children_ids=children_ids, override=override,
     )
-
-    resolved = resolve_section_word_target_from_mapping(s, writing_length=writing_length)
     return resolved.target if resolved else None
 
 
-def _resolve_word_target_for_section(s, writing_length: str | None = None):
+def _resolve_word_target_for_section(s, writing_length: str | None = None, *,
+                                     children_ids: set[int] | None = None,
+                                     override: dict | None = None):
     """返回完整口径对象（target / lo / hi / tolerance / source）。
 
     CONVERGE 2026-10-12：``_target_bounds`` 与 ``_tolerance_for_section`` 原本
-    各自再解析一遍（且边界条件不同：前者对「target == L3 自身目标」用
-    ``get_l3_own_range()``，后者对「L3 无档位覆盖」用 L3 容差），存在同一事实
-    两个判定标准的隐患。现统一取权威对象的 lo/hi/tolerance。
+    各自再解析一遍（且边界条件不同），现统一取权威对象的 lo/hi/tolerance。
+
+    体系合并 2026-10-20：把强控覆盖表 ``override``（``build_section_override`` 产物）
+    按章节 id 取本节条目，作为 ``strict_override`` 透传给统一解析器（命中即短路）。
     """
     from ..services.word_target_resolver import (
         resolve_section_word_target_from_mapping,
     )
 
-    return resolve_section_word_target_from_mapping(s, writing_length=writing_length)
+    # D1 修复 2026-10-20：对 L3 显式传 is_l3_own（含下级的 L3 → False → 四档子树），
+    # 与生成侧 build_chapter_content_messages 对称；非 L3 传 None 交由解析器层级判定。
+    is_l3_own = _is_l3_own_section(s, children_ids) if (s.level or 3) == 3 else None
+    sid = getattr(s, "id", None)
+    ov = override.get(sid) if (override and sid is not None) else None
+    return resolve_section_word_target_from_mapping(
+        s, writing_length=writing_length, is_l3_own=is_l3_own, strict_override=ov,
+    )
 
 
-def _is_within_tolerance(s) -> bool:
+def _is_within_tolerance(s, *, actual: int | None = None,
+                         writing_length: str | None = None,
+                         children_ids: set[int] | None = None,
+                         override: dict | None = None) -> bool:
     """判断章节字数是否在达标区间内。
 
     L3 自身正文：300 ± 20%（默认 240~360，随 L3_OWN_* 配置变化）；
     L3 非叶子（四档子树总字数）与其他层级：±10%。
+
+    D2 修复 2026-10-20：实际字数按 R1 可读口径；D1/D3：区间随 children_ids/override。
     """
-    lo, hi = _target_bounds(s)
-    if not lo or not hi or s.word_count == 0:
+    lo, hi = _target_bounds(s, writing_length=writing_length, children_ids=children_ids, override=override)
+    a = actual if actual is not None else _section_actual_words(s)
+    if not lo or not hi or a == 0:
         return False
-    return lo <= s.word_count <= hi
+    return lo <= a <= hi
 
 
-def _compute_tier_stats(sections) -> dict:
+def _compute_tier_stats(sections, writing_length: str | None = None,
+                        children_ids: set[int] | None = None,
+                        override: dict | None = None,
+                        readable_map: dict | None = None) -> dict:
     """按档位分组统计达标率。
 
     L3 自身正文（300 ± 20%，240~360）：归入 l3_own；
     L3 非叶子（四档子树总字数）与其他层级：按各自档位 ±10%。
+    D1/D2/D3 修复 2026-10-20：区间随 children_ids/override，计量统一用 R1 可读字数。
     """
     stats = defaultdict(lambda: {'count': 0, 'on_target': 0, 'below': 0, 'exceeded': 0})
     default_cfg = get_default_tier_config()
@@ -274,17 +389,18 @@ def _compute_tier_stats(sections) -> dict:
         if (s.level or 3) < 3:
             continue
         tier_key = getattr(s, 'word_count_tier', None) or default_key
-        target = _resolve_target_for_section(s)
+        target = _resolve_target_for_section(s, writing_length, children_ids=children_ids, override=override)
         if not target:
             continue
         entry = stats[tier_key]
         entry['count'] += 1
-        if s.word_count == 0:
+        a = readable_map.get(s.id) if readable_map is not None else _section_actual_words(s)
+        if a == 0:
             continue
-        lo, hi = _target_bounds(s)
-        if s.word_count < lo:
+        lo, hi = _target_bounds(s, writing_length=writing_length, children_ids=children_ids, override=override)
+        if a < lo:
             entry['below'] += 1
-        elif s.word_count > hi:
+        elif a > hi:
             entry['exceeded'] += 1
         else:
             entry['on_target'] += 1

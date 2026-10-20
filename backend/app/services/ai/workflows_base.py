@@ -9,7 +9,14 @@ import threading
 import time
 from typing import Any
 
-from ...config import CONCUR_INITIAL, CONCUR_MAX, CONCUR_MIN, GLOBAL_AI_CONCURRENCY_MAX
+from ...config import (
+    AI_CALL_TIMEOUT,
+    AI_JSON_MODE_TIMEOUT,
+    CONCUR_INITIAL,
+    CONCUR_MAX,
+    CONCUR_MIN,
+    GLOBAL_AI_CONCURRENCY_MAX,
+)
 from ...utils.json_parser import extract_json_from_text
 from .heading_standard import HeadingNumberingGenerator, build_heading_spec_prompt
 from .prompts import get_prompt
@@ -92,6 +99,29 @@ async def with_timeout(coro, timeout: int = 30, error_msg: str = "AI调用超时
             timeout,
         )
         raise TimeoutError(f"{error_msg}（{timeout}秒）")
+
+
+def _content_call_timeout(max_tokens: int | None) -> int:
+    """内容调用（非 json_mode 探测）的超时上限：与 provider 自身口径对齐。
+
+    BUG-2026-10-19-02（P1）：原硬编码 30s，与 `openai_compatible.chat` 的
+    max_tokens 自适应超时（>=16000→180s、>=8000→120s）冲突——外层
+    with_timeout 提前熔断 provider 本就允许的长请求，慢模型生成大 JSON
+    （如 L1 目录 8192 tokens）被误杀，整个任务失败。
+
+    口径：不低于 `AI_CALL_TIMEOUT`（默认 60s），并按请求的 max_tokens
+    仿照 provider 规则抬高，保证外层上限 >= provider 自身预算。
+    """
+    timeout = AI_CALL_TIMEOUT
+    try:
+        mt = int(max_tokens or 0)
+    except (TypeError, ValueError):
+        mt = 0
+    if mt >= 16000:
+        timeout = max(timeout, 180)
+    elif mt >= 8000:
+        timeout = max(timeout, 120)
+    return timeout
 
 
 class EmptyAIResponseError(Exception):
@@ -931,6 +961,13 @@ async def collect_json_response(
             导致 AI 不可达时总延迟达到 6+ 分钟（3*2*60s）。
             现在总延迟 = 1次(2次 chat) * 2次 provider 重试 = 4次 AI 调用 * 60s = 240s = 4分钟。
             加上 JSON 自修复链路，最坏情况约 5 分钟，由 generate-sse 的 SSE_TOTAL_TIMEOUT 兜底。
+        max_tokens: 同时决定**外层超时上限**（BUG-2026-10-19-02）。
+            json_mode 探测调用固定 `AI_JSON_MODE_TIMEOUT`（默认 20s，快速失败即降级）；
+            内容调用取 `_content_call_timeout(max_tokens)`：不低于 `AI_CALL_TIMEOUT`
+            （默认 60s），max_tokens>=8000 时抬到 120s、>=16000 时 180s，
+            与 provider 自身自适应超时口径一致，避免外层提前熔断慢模型的长请求
+            （生产实证：spark-x2.5-4b 生成 L1 目录 8192 tokens 需 >30s，
+            旧硬编码 30s 把整个目录生成任务判死）。
     """
     # BUG-C-01 修复：全局 AI 并发上限控制（带超时保护）
     _acquired = await _ai_monitor.acquire(timeout=60.0)  # 60秒超时
@@ -964,6 +1001,12 @@ async def collect_json_response(
                         else:
                             _json_mode_timeout_cache.pop(provider_key, None)
                 try:
+                    # BUG-2026-10-19-02（P1）：超时改为配置化 + 自适应。
+                    # json_mode 保持快速探测（默认 20s，失败即降级）；
+                    # 内容调用按 max_tokens 自适应（>=8000 tokens → >=120s），
+                    # 与 provider 自身超时口径对齐，不再提前熔断慢模型的长请求。
+                    _json_mode_timeout = AI_JSON_MODE_TIMEOUT
+                    _content_timeout = _content_call_timeout(max_tokens)
                     if use_json_mode:
                         raw_content = await with_timeout(
                             provider.chat(
@@ -973,7 +1016,7 @@ async def collect_json_response(
                                 max_tokens=max_tokens,
                                 extra_body=extra_body,
                             ),
-                            timeout=20,
+                            timeout=_json_mode_timeout,
                             error_msg="目录生成AI调用超时(json_mode)",
                         )
                     else:
@@ -984,7 +1027,7 @@ async def collect_json_response(
                                 max_tokens=max_tokens,
                                 extra_body=extra_body,
                             ),
-                            timeout=30,
+                            timeout=_content_timeout,
                             error_msg="目录生成AI调用超时",
                         )
                 except TimeoutError as timeout_err:
@@ -1009,14 +1052,27 @@ async def collect_json_response(
                                     max_tokens=max_tokens,
                                     extra_body=extra_body,
                                 ),
-                                timeout=30,
+                                timeout=_content_timeout,
                                 error_msg="目录生成降级AI调用超时",
                             )
                         except TimeoutError:
-                            # 非 json_mode 也超时，彻底失败
-                            raise timeout_err
-                        except Exception:
-                            raise timeout_err
+                            # 非 json_mode 也超时，彻底失败。
+                            # BUG-2026-10-19-02：原实现直接 raise timeout_err
+                            # （json_mode 那次的错误），信息只提 json_mode 20s、
+                            # 掩盖降级调用也超时的事实，运维按「json_mode 超时」
+                            # 排查永远找不到根因。合并两次超时事实，保留「超时」
+                            # 字样使上层兜底提供商降级链照旧触发。
+                            raise TimeoutError(
+                                f"{timeout_err}；降级非 json_mode 重试仍超时"
+                                f"（{_content_timeout}秒）"
+                            ) from timeout_err
+                        except Exception as _degraded_err:
+                            # 降级调用自身失败（连接/限流/取消等）：同样合并事实，
+                            # 不让 json_mode 的超时错误顶替真实原因。
+                            raise TimeoutError(
+                                f"{timeout_err}；降级非 json_mode 重试失败: "
+                                f"{_degraded_err}"
+                            ) from _degraded_err
                     else:
                         raise
                 except Exception as _chat_err:
@@ -1051,7 +1107,7 @@ async def collect_json_response(
                                 max_tokens=max_tokens,
                                 extra_body=extra_body,
                             ),
-                            timeout=30,
+                            timeout=_content_call_timeout(max_tokens),
                             error_msg="目录生成降级AI调用超时",
                         )
                     else:
@@ -1111,7 +1167,7 @@ async def collect_json_response(
                                     max_tokens=max_tokens,
                                     extra_body=extra_body,
                                 ),
-                                timeout=60,
+                                timeout=_content_call_timeout(max_tokens),
                                 error_msg="目录生成降级AI调用超时(错误响应恢复)",
                             )
                             parsed = extract_json_from_text(raw_content)
@@ -1218,7 +1274,8 @@ async def collect_json_response(
                 ]
                 try:
                     repaired_content = await with_timeout(
-                        provider.chat(repair_messages, temperature=0.3), timeout=60
+                        provider.chat(repair_messages, temperature=0.3),
+                        timeout=AI_CALL_TIMEOUT,
                     )
                     parsed = extract_json_from_text(repaired_content)
                     # 同样的字符串/空值防护：修复结果也必须是 dict/list

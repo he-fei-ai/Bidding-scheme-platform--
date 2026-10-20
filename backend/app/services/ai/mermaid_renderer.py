@@ -31,10 +31,66 @@ import re
 import threading
 import time
 
+from ...logging_format import log_error as _log_error
 from .mermaid_service import MermaidRenderError, get_mermaid_service_client
 
 
 logger = logging.getLogger(__name__)
+
+
+# =========================================================================
+# 渲染失败告警节流（2026-10-18 第三轮）
+# =========================================================================
+# 背景：Mermaid HTTP 渲染服务未部署时，每个图表 2 次重试 × 每节多图会产生
+# 数百条同因 WARNING（基线 418 条），真实告警被淹没，日志分析成本陡增。
+#
+# 策略：以「原因类别」为键做时间窗节流 —— 窗口内首次输出完整 WARNING，
+# 后续仅累计计数；窗口到期时输出一条汇总 WARNING 说明被抑制了多少条。
+# 这样既**不丢失任何失败事实**（计数保留），又把日志量压到可观测水平。
+# =========================================================================
+
+#: 节流窗口（秒）
+_RENDER_WARN_WINDOW_SECONDS = 300.0
+
+#: 原因类别 → (上次输出时间, 窗口内已抑制条数)
+_render_warn_state: dict[str, list] = {}
+_render_warn_lock = threading.Lock()
+
+
+def _should_log_render_warning(reason_key: str, detail: str = "") -> bool:
+    """判断是否应输出该类别的渲染告警；返回 False 表示已被节流抑制。"""
+    key = f"{reason_key}|{detail[:80]}"
+    now = time.monotonic()
+    with _render_warn_lock:
+        state = _render_warn_state.get(key)
+        if state is None:
+            _render_warn_state[key] = [now, 0]
+            return True
+        last, suppressed = state[0], state[1]
+        if now - last >= _RENDER_WARN_WINDOW_SECONDS:
+            # 窗口到期：先汇总上一次被抑制的条数，再重置
+            if suppressed:
+                logger.warning(
+                    "[MermaidRenderer] 同类渲染失败在 %.0fs 内另有 %d 条已被节流抑制",
+                    _RENDER_WARN_WINDOW_SECONDS, suppressed,
+                )
+            state[0], state[1] = now, 0
+            return True
+        state[1] = suppressed + 1
+        return False
+
+
+def _log_render_warning(msg: str, *args, error_code: str, retryable: bool, **kwargs) -> None:
+    """渲染失败专用告警出口：统一携带 error_code/error_layer/retryable。"""
+    _log_error(
+        msg % args if args else msg,
+        None,
+        error_code=error_code,
+        layer="service",
+        retryable=retryable,
+        component="mermaid_renderer",
+        **kwargs,
+    )
 
 
 # =========================================================================
@@ -376,9 +432,20 @@ def render_mermaid_to_bytes(
                 )
                 _http_bytes = None
         except MermaidRenderError as e:
-            logger.warning("Mermaid HTTP Service 渲染失败（第%d次）: %s", _retry + 1, e)
+            # ENHANCE 2026-10-18（第三轮）：HTTP 渲染服务未部署时，每图 2 次重试会
+            # 产生海量重复 WARNING（基线 418+ 条），淹没真实告警。此处按“同一
+            # 原因 + 时间窗”节流：窗口内首次完整输出，其余累计后汇总一次。
+            if _should_log_render_warning("render", str(e)):
+                _log_render_warning(
+                    "Mermaid HTTP Service 渲染失败（第%d次）: %s", _retry + 1, e,
+                    error_code="MERMAID_HTTP_RENDER_FAILED", retryable=True,
+                )
         except Exception as e:
-            logger.warning("Mermaid HTTP Service 异常（第%d次）: %s", _retry + 1, e)
+            if _should_log_render_warning("exception", type(e).__name__):
+                _log_render_warning(
+                    "Mermaid HTTP Service 异常（第%d次）: %s", _retry + 1, e,
+                    error_code="MERMAID_HTTP_EXCEPTION", retryable=False,
+                )
         if _http_bytes is None and _retry < _max_retries - 1:
             # BUG-FIX 2026-09-18（P2）：去掉固定 sleep(1.0)——重试段已运行在
             # 共享渲染池（仅 4 线程）内，空睡期间 worker 完全白白占用，

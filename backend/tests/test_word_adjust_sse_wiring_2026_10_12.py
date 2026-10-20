@@ -69,8 +69,15 @@ class TestSignaturePlacement:
             "use_word_adjust 不在签名里 —— 补丁很可能被插到 `):` 之后，"
             "变成函数体里的普通语句（不报错但 FastAPI 不暴露该 query 参数）"
         )
-        assert params[-1] == "use_word_adjust", (
-            f"use_word_adjust 必须是签名最后一个参数，实际在第 {params.index('use_word_adjust')} 位；"
+        # ENHANCE 2026-10-18（契约同步）：`generation_mode` 已按「追加末尾」约定
+        # 加在 `use_word_adjust` 之后，故「最后一个参数」的期望更新为 generation_mode；
+        # 同时保留原意图 —— use_word_adjust 必须紧邻其前，不允许被插到中间，
+        # 否则 sections.py 的位置参数调用仍会整体错位。
+        assert params[-1] == "generation_mode", (
+            f"签名最后一个参数应为 generation_mode，实际为 {params[-1]}"
+        )
+        assert params[-2] == "use_word_adjust", (
+            f"use_word_adjust 必须紧邻末位参数之前，实际在第 {params.index('use_word_adjust')} 位；"
             "插在中间会让 routers/sections.py::generate_content 的位置参数调用整体错位"
         )
 

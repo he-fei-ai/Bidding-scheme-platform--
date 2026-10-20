@@ -31,6 +31,7 @@ from ...config import (
     OCR_MAX_CONCURRENT,
     OCR_MAX_FILE_SIZE_MB,
     OCR_TIMEOUT,
+    PDF_EXTRACT_TIMEOUT,
     PDF_TABLE_EXTRACT_ENABLED,
     PPT_COM_ENABLED,
     PPT_COM_TIMEOUT,
@@ -219,6 +220,46 @@ def _format_pdf_table_row(row: list) -> str:
 
 
 def _extract_pdf(file_path: str) -> str:
+    """提取 PDF 文本（带超时护栏的外层入口）。
+
+    BUG-FIX 2026-10-19（上传解析卡死）：pdfplumber/pypdf 对病态 PDF 或
+    环境放大（DEBUG 日志风暴下每条记录持锁写盘）可能挂几十分钟不返回。
+    解析跑在请求线程（asyncio.to_thread）里，前端超时判失败，而
+    file_parse_tasks 停在 processing、uploaded_files 无记录。与
+    PPT_COM_TIMEOUT 同教训，给整个提取加限时护栏：
+      - 超时抛 TimeoutError，由 save_upload 既有失败分支如实写
+        「文本提取失败」进任务行与文件行，不再无限挂住上传请求；
+      - 子线程为 daemon，超时后自行收尾（与 PPT COM daemon 线程同口径）；
+      - PDF_EXTRACT_TIMEOUT=0 关闭护栏（保持旧行为）。
+    被包装的原实现见 `_extract_pdf_impl`（逐字未动，保持既有测试对
+    `files._extract_pdf` 源码的 inspect 断言与 monkeypatch 接缝语义不变——
+    patch 本模块 `files._extract_pdf` 仍然命中此入口）。
+    """
+    timeout = PDF_EXTRACT_TIMEOUT
+    if timeout and timeout > 0:
+        box: dict[str, Any] = {}
+
+        def _run() -> None:
+            try:
+                box["result"] = _extract_pdf_impl(file_path)
+            except BaseException as e:  # 原样回传给调用方判型（含 TimeoutError 语义透传）
+                box["error"] = e
+
+        worker = threading.Thread(target=_run, daemon=True, name="pdf-extract-guard")
+        worker.start()
+        worker.join(timeout)
+        if worker.is_alive():
+            raise TimeoutError(
+                f"PDF 解析超时（>{timeout}s），文件可能过于复杂或损坏，"
+                "请拆分/修复后重新上传"
+            )
+        if "error" in box:
+            raise box["error"]
+        return box.get("result", "")
+    return _extract_pdf_impl(file_path)
+
+
+def _extract_pdf_impl(file_path: str) -> str:
     """提取 PDF 文本（增强 1.1: 支持扫描件 OCR 自动降级）
 
     使用 pypdf 提取文本，若文本不足 100 字符则自动尝试 MinerU OCR 解析。
@@ -1039,7 +1080,8 @@ def _extract_image_ocr(file_path: str) -> str:
         # 避免因为没有 OCR 引擎而中断整个文件上传流程。
         logger.warning(
             "图片文字识别不可用（OCR_ENGINE=%s，未安装可用引擎或引擎无输出）。"
-            "跳过 OCR，文件将以空文本入库。建议安装 OCR 引擎或将图片文字复制到文本文件后重新上传。",
+            "跳过 OCR，文件将以空文本入库。建议安装 OCR 引擎或将图片文字复制到文本文件后重新上传。"
+            " | error_code=OCR_UNAVAILABLE error_layer=service retryable=False",
             engine,
         )
     return text

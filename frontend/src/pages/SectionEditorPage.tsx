@@ -304,6 +304,14 @@ const [progressTotal, setProgressTotal] = useState(0);
   const [useWordSampling, setUseWordSampling] = useState(false);
   const [useFallbackExpand, setUseFallbackExpand] = useState(false);
   const [useConsistencyAudit, setUseConsistencyAudit] = useState(false);
+  // ENHANCE 2026-10-18（第二轮）：正文生成顺序模式。
+  //   batch（默认）—— 按目录树顺序分批，同父节点章节同批并行、批次间串行，
+  //     上下文承接自然、全局事实调用稳定、问题定位容易、缓存命中更高；
+  //   serial       —— 逐节串行（最强承接，最慢）；
+  //   parallel     —— 一次性全并发（旧行为，完成顺序不保证）。
+  // 落库/展示/导出顺序在任何模式下都与目录树顺序一致。
+  // 默认值与后端 config.CONTENT_GENERATION_MODE 统一为 batch（2026-10-18 第二轮）。
+  const [generationMode, setGenerationMode] = useState<"parallel" | "batch" | "serial">("batch");
   // 并发生成正文并发数（可选项：2/4/6/8，后端硬上限 MAX_CONTENT_CONCURRENCY=8）
   const [concurrency, setConcurrency] = useState<number>(4);
   // W-3 2026-10-12：易标 R9/R10/R11 字数双向多轮调整的「单次强制」开关。
@@ -383,6 +391,62 @@ const [progressTotal, setProgressTotal] = useState(0);
     });
   }
 
+  // BUG-FIX 2026-10-20（进度显示）：从 generation-status 权威快照回填进度面板。
+  // 重载恢复（loadTree）与无流轮询（recovery poll）共用：
+  //   · 计数器 / total 直接取后端聚合值（与 SSE 终态同源，避免前端硬算分叉）；
+  //   · items 按 section_id 去重浅合并，标题优先本轮树快照、其次已有 items，
+  //     保证逐章节列表与目录树展示一致，且不会因轮询丢失已渲染条目。
+  const seedProgressFromStatus = useCallback((
+    status: Awaited<ReturnType<typeof getGenerationStatus>>,
+    titleSourceTree?: SectionTreeNode[] | null,
+  ) => {
+    setProgressTotal(status.total_sections || 0);
+    setProgressSuccess(status.completed_count || 0);
+    setProgressFailed(status.failed_count || 0);
+    setProgressCancelled(status.cancelled_count || 0);
+
+    const rows = Array.isArray(status.sections) ? status.sections : [];
+    if (rows.length === 0) return;
+
+    const titleMap = new Map<number, string>();
+    if (titleSourceTree) {
+      const walk = (nodes: SectionTreeNode[]) => {
+        for (const n of nodes) {
+          titleMap.set(n.id, n.title || "");
+          if (n.children && n.children.length > 0) walk(n.children);
+        }
+      };
+      walk(titleSourceTree);
+    }
+
+    setProgressItems((prev) => {
+      const byId = new Map<number, ProgressItem>();
+      for (const it of prev) byId.set(it.section_id, it);
+      for (const r of rows) {
+        const sid = r.section_id;
+        if (typeof sid !== "number") continue;
+        const base = byId.get(sid);
+        const title = titleMap.get(sid) || base?.title || `章节 #${sid}`;
+        byId.set(sid, {
+          section_id: sid,
+          title,
+          status: r.status || base?.status || "generating",
+          progress: typeof r.progress === "number" ? r.progress : (base?.progress || 0),
+          message: base?.message || "",
+          word_count: base?.word_count,
+        });
+      }
+      // 保持已有顺序，未在前一轮出现过的章节追加在后
+      const ordered: ProgressItem[] = [];
+      for (const it of prev) {
+        const m = byId.get(it.section_id);
+        if (m) { ordered.push(m); byId.delete(it.section_id); }
+      }
+      for (const m of byId.values()) ordered.push(m);
+      return ordered;
+    });
+  }, []);
+
   const loadTree = useCallback(async () => {
     if (!isProjectIdValid) return;
     setLoading(true);
@@ -393,10 +457,14 @@ const [progressTotal, setProgressTotal] = useState(0);
       // 首先检查是否有正在进行的生成任务（数据库层面）
       let hasActiveTask = false;
       let activeTaskStatus = "";
+      let recoveredStatus: Awaited<ReturnType<typeof getGenerationStatus>> | null = null;
       try {
         const status = await getGenerationStatus(projectId);
         hasActiveTask = status.has_active_task || false;
         activeTaskStatus = status.task_status || "";
+        if (hasActiveTask && (activeTaskStatus === "running" || activeTaskStatus === "paused")) {
+          recoveredStatus = status;
+        }
 
         // 如果有活跃任务且状态为 running，恢复前端生成状态
         if (hasActiveTask && activeTaskStatus === "running" && !isGeneratingRef.current) {
@@ -423,6 +491,15 @@ const [progressTotal, setProgressTotal] = useState(0);
       } else {
         setTree(sanitizeTreeIfNotGenerating(t));
       }
+
+      // BUG-FIX 2026-10-20（进度显示）：重载/切页回到一个「正在后台生成」的项目时，
+      // 旧实现只 setIsGenerating(true) 点亮进度面板，却从不播种进度、也不建 SSE
+      // （/generate-content 是会触发新一轮生成的 GET，不能拿来做只读重连），
+      // 于是面板永远停在「0总 0存 / 0%」且不随后台推进——用户以为卡死。
+      // 现用后端权威的 generation-status 快照立即回填进度，后续由 recovery 轮询续更。
+      if (recoveredStatus) {
+        seedProgressFromStatus(recoveredStatus, t);
+      }
       
       await loadWordBudget();
     } catch (e: any) {
@@ -448,6 +525,50 @@ const [progressTotal, setProgressTotal] = useState(0);
       return [];
     }
   }, [projectId]);
+
+  // BUG-FIX 2026-10-20（进度/状态显示）：后台续跑任务的无流轮询。
+  // 重载/切页回到一个正在后台生成的项目时，前端没有（也不能）建立 /generate-content
+  // SSE，进度只来自一次性 generation-status 快照；旧实现快照之后再也不续更，
+  // 面板停在快照那一刻，任务真正跑完也不会自动收尾。
+  // 现在：仅当「生成中且本组件未持有活 SSE 流」时，每 5s 拉一次 generation-status 续更；
+  // 本组件持有活流时让位给事件驱动（避免双写竞态）；任务不再活跃则以权威数字收尾。
+  useEffect(() => {
+    if (!isGenerating || !isProjectIdValid) return;
+    const timer = setInterval(async () => {
+      if (!isMountedRef.current || eventSourceRef.current) return;
+      try {
+        const status = await getGenerationStatus(projectId);
+        if (!isMountedRef.current) return;
+        const active = status.has_active_task
+          && (status.task_status === "running" || status.task_status === "paused");
+        if (active) {
+          seedProgressFromStatus(status);
+          if (status.task_status === "paused") {
+            // 后台已被别处暂停：切到暂停态展示（停掉轮询，露出「恢复」按钮）
+            isGeneratingRef.current = false;
+            setIsGenerating(false);
+            setIsPaused(true);
+            isPausedRef.current = true;
+          }
+          return;
+        }
+        // 任务已结束（completed/failed/cancelled，或残留被后端自动修正）：以权威数字收尾
+        isGeneratingRef.current = false;
+        setIsGenerating(false);
+        setIsPaused(false);
+        isPausedRef.current = false;
+        globalCompletedReceivedRef.current = true;
+        setProgressTotal(status.total_sections || 0);
+        setProgressSuccess(status.completed_count || 0);
+        setProgressFailed(status.failed_count || 0);
+        setProgressCancelled(status.cancelled_count || 0);
+        await silentRefreshTree();
+      } catch {
+        // 轮询失败忽略，下个周期重试
+      }
+    }, 5000);
+    return () => clearInterval(timer);
+  }, [isGenerating, isProjectIdValid, projectId, seedProgressFromStatus, silentRefreshTree]);
 
   // 修复：批量应用树更新——避免频繁 setTree 导致渲染卡顿
   const flushTreeUpdates = useCallback(() => {
@@ -748,7 +869,7 @@ const handleSelectSection = (node: SectionTreeNode) => {
       tableRatio: orchTableRatio,
       preferMermaid: orchPreferMermaid,
       sectionPerSegment: orchSectionPerSegment,
-    } : undefined, useWordAdjust);
+    } : undefined, useWordAdjust, generationMode);
 eventSourceRef.current = eventSource;
     let finishedNormally = false;
     let hasConnected = false;
@@ -2178,6 +2299,33 @@ globalCompletedReceivedRef.current = true;
               disabled={isGenerating || isExpanding}
             />
           </Tooltip>
+
+          {/* ENHANCE 2026-10-18（第二轮）：正文生成顺序模式（目录树顺序） */}
+          <Tooltip title="生成顺序：顺序分批=按目录树顺序分批发（同父章节同批并行，默认）；逐节串行=一节一节生成（承接最强）；并行=一次性全并发（旧行为）">
+            <Select
+              size="small"
+              value={generationMode}
+              onChange={(v) => setGenerationMode(v)}
+              style={{ width: 104 }}
+              disabled={isGenerating || isExpanding}
+              options={[
+                { value: "batch", label: "顺序分批" },
+                { value: "serial", label: "逐节串行" },
+                { value: "parallel", label: "并行(旧)" },
+              ]}
+            />
+          </Tooltip>
+
+          {/* 遗留加固（2026-10-19）：parallel 模式完成顺序不保证的显式提示。
+              落库/展示/导出顺序始终与目录树一致，仅**完成事件流的到达顺序**
+              不保证 —— 用户选 parallel 时应在 UI 上被告知，避免误判为乱序。 */}
+          {generationMode === "parallel" && (
+            <Tooltip title="并行模式仅追求完成速度，各章节**完成事件的到达顺序**不保证；正文落库与导出顺序始终与目录树顺序一致，不影响最终成稿。">
+              <Tag color="orange" icon={<WarningFilled />} style={{ marginInlineEnd: 0, cursor: "help" }}>
+                完成顺序不保证
+              </Tag>
+            </Tooltip>
+          )}
 
           {/* ENHANCE 2026-10-05（P-11）：正文编排参数（对齐易标规格六.4/六.5） */}
           <Tooltip title="启用 AI 内容编排：预判每章配图类型与表格密度（表格/图片/mermaid 偏好）">

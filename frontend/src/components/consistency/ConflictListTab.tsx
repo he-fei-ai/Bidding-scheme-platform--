@@ -594,16 +594,30 @@ setAudit(result);
         {suggestionModal.conflict && (
           <Space direction="vertical" style={{ width: "100%" }}>
             <div>
-              <Text strong>事实项：</Text>
+              {/* BUG-FIX 2026-10-17（P3·AI 发现被标注为「事实项」）：第六轮修了
+                  表格列（AI 发现挂紫色标签 + 截断文本），漏了两个弹窗 —— 这里把
+                  AI 发现的 issue 原文（最长 100 字自由文本）标注成「事实项」，
+                  用户以为是系统把这段话当成了事实名。与表格同口径区分展示。 */}
+              <Text strong>
+                {suggestionModal.conflict.source_kind === "ai" ? "AI 语义发现：" : "事实项："}
+              </Text>
               <Text>{suggestionModal.conflict.fact_name}</Text>
             </div>
             <div>
               <Text strong>冲突数值：</Text>
-              <Space size={[4, 4]} wrap>
-                {(suggestionModal.conflict.values || []).map((v, i) => (
-                  <Tag key={i} color="red">{v}</Tag>
-                ))}
-              </Space>
+              {suggestionModal.conflict.source_kind === "ai" ? (
+                // 表格列有占位说明（第六轮），弹窗此前渲染成空 Tag 组，用户
+                // 不知道这一行为什么没有数值。
+                <Text type="secondary" style={{ fontSize: 12 }}>
+                  —（AI 语义发现，无结构化取值）
+                </Text>
+              ) : (
+                <Space size={[4, 4]} wrap>
+                  {(suggestionModal.conflict.values || []).map((v, i) => (
+                    <Tag key={i} color="red">{v}</Tag>
+                  ))}
+                </Space>
+              )}
             </div>
             <div>
               <Text strong>涉及章节：</Text>
@@ -664,16 +678,27 @@ setAudit(result);
         {fixModal.conflict && (
           <Space direction="vertical" style={{ width: "100%" }}>
             <div>
-              <Text strong>事实项：</Text>
+              {/* 与建议弹窗同口径区分 AI 发现（防御性：当前 UI 路径下 AI 发现
+                  到不了本弹窗 —— 表格按钮禁用 + 采纳按钮禁用；但弹窗状态是组件
+                  级的，不依赖入口假设）。 */}
+              <Text strong>
+                {fixModal.conflict.source_kind === "ai" ? "AI 语义发现：" : "事实项："}
+              </Text>
               <Text>{fixModal.conflict.fact_name}</Text>
             </div>
             <div>
               <Text strong>冲突数值：</Text>
-              <Space size={[4, 4]} wrap>
-                {(fixModal.conflict.values || []).map((v, i) => (
-                  <Tag key={i} color="red">{v}</Tag>
-                ))}
-              </Space>
+              {fixModal.conflict.source_kind === "ai" ? (
+                <Text type="secondary" style={{ fontSize: 12 }}>
+                  —（AI 语义发现，无结构化取值）
+                </Text>
+              ) : (
+                <Space size={[4, 4]} wrap>
+                  {(fixModal.conflict.values || []).map((v, i) => (
+                    <Tag key={i} color="red">{v}</Tag>
+                  ))}
+                </Space>
+              )}
             </div>
             <div>
               <Text strong>统一后的数值：</Text>

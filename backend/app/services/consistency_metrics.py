@@ -25,6 +25,15 @@ KNOWN_KEYS: tuple[str, ...] = (
     "ai_findings_repaired",  # AI 语义审计中已被就地修复的发现条数
     "ai_patch_rejected",     # AI 语义补丁被唯一性校验拒绝的累计条数
     "guard_interceptions",   # 生成中守卫拦截（409）次数（事实回流采纳路径）
+    # ENHANCE 2026-10-17（第八轮·T7-3 监控埋点）：新增「运维可观测性」维度，
+    # 弥补此前只有「成功/失败计数」、缺「耗时与改写量」的盲区。纯累计值、纯内存，
+    # 随 `GET /consistency/metrics` 下发，进程重启归零（仅实时观测，不作为结论来源）。
+    "audit_duration_ms_total",   # 审计接口累计耗时（毫秒），用于观测审计性能退化
+    "conflicts_detected_total",  # 累计检测到的确定性规则冲突条数
+    "autofix_applied_total",     # 自动修复真正落文成功（status=ok）的次数
+    "autofix_no_change_total",   # 自动修复未改动正文（no_change/partial）的次数
+    "autofix_failed_total",      # 自动修复抛异常（HTTP 500）的次数
+    "autofix_edits_total",       # 自动修复累计改写的文本处数（= 各次 total_replacements 之和）
 )
 
 
@@ -64,9 +73,61 @@ class _MetricsRegistry:
 consistency_metrics = _MetricsRegistry()
 
 
+def _record_audit(duration_ms: int, n_conflicts: int) -> None:
+    """记录一次审计的耗时与检出的冲突数（累计）。
+
+    Args:
+        duration_ms: 本次审计接口耗时（毫秒，含排队等待）。
+        n_conflicts: 本次审计检出的确定性规则冲突条数。
+    """
+    consistency_metrics.inc("audit_duration_ms_total", max(0, int(duration_ms)))
+    consistency_metrics.inc("conflicts_detected_total", max(0, int(n_conflicts)))
+
+
+def _record_autofix(
+    *,
+    applied: bool = False,
+    no_change: bool = False,
+    failed: bool = False,
+    edits: int = 0,
+) -> None:
+    """记录一次自动修复的结局与改写量（累计）。
+
+    Args:
+        applied: 真正落文成功（接口 status=ok）。
+        no_change: 未改动正文（no_change / partial）。
+        failed: 抛异常（HTTP 500）。
+        edits: 本次实际改写的文本处数（total_replacements）。
+    """
+    if applied:
+        consistency_metrics.inc("autofix_applied_total")
+    if no_change:
+        consistency_metrics.inc("autofix_no_change_total")
+    if failed:
+        consistency_metrics.inc("autofix_failed_total")
+    if edits:
+        consistency_metrics.inc("autofix_edits_total", max(0, int(edits)))
+
+
 # 模块级便捷函数（委托给全局实例，便于单行调用）
 def inc(name: str, n: int = 1) -> None:
     consistency_metrics.inc(name, n)
+
+
+def record_audit(duration_ms: int, n_conflicts: int) -> None:
+    _record_audit(duration_ms, n_conflicts)
+
+
+def record_autofix(
+    *,
+    applied: bool = False,
+    no_change: bool = False,
+    failed: bool = False,
+    edits: int = 0,
+) -> None:
+    _record_autofix(
+        applied=applied, no_change=no_change, failed=failed, edits=edits
+    )
 
 
 def snapshot() -> dict[str, int]:

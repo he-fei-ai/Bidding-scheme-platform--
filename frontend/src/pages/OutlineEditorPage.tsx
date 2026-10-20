@@ -22,6 +22,7 @@ import {
 import type { SectionTreeNode } from "../types";
 import { extractApiError, annotateOutlineWithNumbers, getLevelColor, getLevelLabel, findNodeInTree, updateNodeInTree, OUTLINE_STEPS_V51, reduceOutlineGeneratingEvent, outlineDictToTreeNodes, nextFreeSortOrder, allocTempNodeId, normalizeNodeTitle } from "../utils";
 import RecoveryBanner from "../components/RecoveryBanner";
+import OutlineQualityReport, { type OutlineQuality } from "../components/OutlineQualityReport";
 
 const { Text, Title } = Typography;
 
@@ -99,6 +100,16 @@ export default React.memo(function OutlineEditorPage() {
   const [outlineProgress, setOutlineProgress] = useState<{ level1: number; completed: number; total: number } | null>(null);
   const [outlineGenerationDone, setOutlineGenerationDone] = useState(false);
   const [generationEndState, setGenerationEndState] = useState<'completed' | 'error' | 'stopped' | 'cancelled' | null>(null);
+  // 2026-10-19 优化 6：目录生成质量报告（completed 事件 quality 字段，后端
+  // outline_quality 五维评分）。直出路径/评分关闭时为 null，卡片整体不展示。
+  const [outlineQuality, setOutlineQuality] = useState<OutlineQuality | null>(null);
+  const [gateIssueCount, setGateIssueCount] = useState<number>(0);
+  const [gateSummary, setGateSummary] = useState<string>("");
+  const [gateAutoFixed, setGateAutoFixed] = useState<string[]>([]);
+  // 预计剩余秒数（按已耗时与当前百分比线性外推；0 表示不展示）
+  const [etaSeconds, setEtaSeconds] = useState<number>(0);
+  // 本次生成的起始时刻（ETA 计算的基准；ref 避免 SSE 闭包读到旧值）
+  const generationStartedAtRef = useRef<number>(0);
 
   // V5.1 人工审核状态
   const [pendingReviewTree, setPendingReviewTree] = useState<SectionTreeNode[] | null>(null);
@@ -274,6 +285,13 @@ export default React.memo(function OutlineEditorPage() {
     setOutlineGenerationDone(false);
     setGenerationEndState(null);
     setReviewConfirmed(false);
+    // 2026-10-19：重置质量报告与 ETA（上一轮的数据不得残留到新一轮）
+    setOutlineQuality(null);
+    setGateIssueCount(0);
+    setGateSummary("");
+    setGateAutoFixed([]);
+    setEtaSeconds(0);
+    generationStartedAtRef.current = Date.now();
     // 每次生成都是一次全新的事件流：重置 SSE 幂等守卫，
     // 否则上一轮残留的 terminalApplied/seq 会让本轮的终态被当作重放丢弃。
     appliedSeqRef.current = null;
@@ -336,6 +354,18 @@ export default React.memo(function OutlineEditorPage() {
             progressPercentRef.current = patch.progressPercent;
           }
           setProgressMessage(patch.progressMessage);
+          // 2026-10-19：预计剩余时间（已耗时 ÷ 当前百分比线性外推；<10% 时
+          // 分母太小噪声大不展示，≥100% 清零）。仅生成中有效。
+          const _etaPct = patch.progressPercent ?? progressPercentRef.current;
+          const _startedAt = generationStartedAtRef.current;
+          if (_startedAt > 0 && _etaPct >= 10 && _etaPct < 100) {
+            const _elapsedSec = (Date.now() - _startedAt) / 1000;
+            setEtaSeconds(
+              Math.max(1, Math.round((_elapsedSec * (100 - _etaPct)) / _etaPct))
+            );
+          } else if (_etaPct >= 100) {
+            setEtaSeconds(0);
+          }
           // BUG-FIX 2026-10-12（跨模块进度断链）：后端 SSE 在 L2 并发生成期逐章
           // 推送 `progress: { level1, completed, total }`（sse_outline.py:846），
           // 但本页此前**从不读取**该字段，`outlineProgress` 只有初始的 setXxx(null)，
@@ -366,9 +396,22 @@ export default React.memo(function OutlineEditorPage() {
           setOutlineGenerationDone(true);
           setGenerationEndState('completed');
           setProgressPercent(100);
-          // V51 策略固定 8 步
-          setOutlineStep(8);
+          // 2026-10-19：终态步骤号按 SSE 协议取（13=最终审核通过），
+          // 不再硬编码 8；服务端未下发时退回步骤总数兜底
+          setOutlineStep(
+            typeof data.outline_step === "number" ? data.outline_step : OUTLINE_STEPS_V51.length
+          );
           setProgressMessage(data.message || "目录生成完成");
+          // 2026-10-19 优化 6：质量评分报告随完成事件下发（直出路径/评分关闭时为 null）
+          setOutlineQuality((data.quality as OutlineQuality) ?? null);
+          setGateIssueCount(
+            typeof data.gate_issue_count === "number" ? data.gate_issue_count : 0
+          );
+          setGateSummary(typeof data.gate_summary === "string" ? data.gate_summary : "");
+          setGateAutoFixed(
+            Array.isArray(data.gate_auto_fixed) ? data.gate_auto_fixed.map(String) : []
+          );
+          setEtaSeconds(0);
           if (data.outline) {
             // BUG-OUTLINE-01 修复：使用 outlineDictToTreeNodes 转换数据，
             // 确保节点包含 sort_order/status/has_content 等前端必需字段，
@@ -1176,23 +1219,45 @@ const applyTitles = (nodes: SectionTreeNode[]): SectionTreeNode[] =>
                   执行中
                 </Tag>
               )}
+              {/* 2026-10-19：完成态标题展示质量评分徽章 */}
+              {!isGenerating && generationEndState === 'completed' && outlineQuality && (
+                <Tag
+                  color={
+                    outlineQuality.grade?.startsWith("A")
+                      ? "success"
+                      : outlineQuality.grade?.startsWith("B")
+                      ? "processing"
+                      : outlineQuality.grade?.startsWith("C")
+                      ? "warning"
+                      : "error"
+                  }
+                >
+                  质量 {outlineQuality.total_score} 分（{outlineQuality.grade}）
+                </Tag>
+              )}
             </Space>
           }
           style={{ marginBottom: 16 }}
         >
-          {/* 当前阶段名称 */}
-          <div style={{ marginBottom: 12, padding: "8px 12px", backgroundColor: "#f6f8fa", borderRadius: 6, border: "1px solid #e8e8e8" }}>
+          {/* 当前阶段名称 + 预计剩余 */}
+          <div style={{ marginBottom: 12, padding: "8px 12px", backgroundColor: "#f6f8fa", borderRadius: 6, border: "1px solid #e8e8e8", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
             <Space>
               <span style={{ color: "#8c8c8c", fontSize: 12 }}>当前阶段：</span>
               <Text strong style={{ fontSize: 13 }}>{progressMessage || OUTLINE_STEPS_V51[outlineStep - 1] || "准备中..."}</Text>
             </Space>
+            {/* 2026-10-19：预计剩余时间（ETA）。仅生成中且百分比 ≥10% 时展示 */}
+            {isGenerating && etaSeconds > 0 && (
+              <Text type="secondary" style={{ fontSize: 11 }}>
+                预计剩余约 {etaSeconds >= 60 ? `${Math.round(etaSeconds / 60)} 分 ${etaSeconds % 60} 秒` : `${etaSeconds} 秒`}
+              </Text>
+            )}
           </div>
 
           {/* 进度条 */}
           <div style={{ marginBottom: 8 }}>
             <Progress
               percent={progressPercent}
-              status={generationEndState === 'error' ? 'exception' : generationEndState === 'stopped' || generationEndState === 'cancelled' ? 'normal' : 'active'}
+              status={generationEndState === 'error' ? 'exception' : generationEndState === 'stopped' || generationEndState === 'cancelled' ? 'normal' : generationEndState === 'completed' ? 'success' : 'active'}
               showInfo
               size="small"
             />
@@ -1252,6 +1317,17 @@ const applyTitles = (nodes: SectionTreeNode[]): SectionTreeNode[] =>
               })}
             </div>
           </div>
+
+          {/* 2026-10-19 优化 6：完成态展示「目录生成质量报告」卡片
+              （五维评分 + 门禁问题摘要 + 自动修复项；quality 为 null 时组件返回 null） */}
+          {!isGenerating && generationEndState === 'completed' && (
+            <OutlineQualityReport
+              quality={outlineQuality}
+              gateIssueCount={gateIssueCount}
+              gateSummary={gateSummary}
+              gateAutoFixed={gateAutoFixed}
+            />
+          )}
 
           {/* 停止按钮 */}
           <div style={{ marginTop: 12, textAlign: "right" }}>

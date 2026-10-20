@@ -277,6 +277,71 @@ def get_hazard_by_code(code: str) -> Optional[HazardProject]:
     return _HAZARD_INDEX.get(code)
 
 
+def match_hazards_for_chapter(
+    title: str,
+    ancestors: list[str] | None = None,
+    detected: list[HazardProject] | None = None,
+) -> list[HazardProject]:
+    """判断某章节是否与已识别的危大工程相关（正文阶段上下文注入用）。
+
+    匹配口径（任一命中即相关）：
+      1. 章节标题/祖先标题包含该危大工程关键词；
+      2. 章节标题包含该危大工程的必含章节名（required_sections）；
+      3. 章节标题包含危大工程名称本身（如「深基坑工程专项施工方案」）。
+
+    Args:
+        title: 当前章节标题。
+        ancestors: 祖先章节标题列表（上级章节上下文）。
+        detected: scan_hazard_projects 识别到的危大工程列表；
+            None 时按全部六类匹配。
+
+    Returns:
+        匹配到的危大工程列表（按 HAZARD_PROJECTS 定义顺序）。
+    """
+    pool = detected if detected is not None else HAZARD_PROJECTS
+    hay = " ".join([title or "", *list(ancestors or [])]).lower()
+    if not hay.strip():
+        return []
+    matched: list[HazardProject] = []
+    for hp in pool:
+        hit = any(kw.lower() in hay for kw in hp.keywords)
+        if not hit and hp.name and hp.name.lower() in hay:
+            hit = True
+        if not hit:
+            hit = any(sec and sec.lower() in hay for sec in hp.required_sections)
+        if hit:
+            matched.append(hp)
+    return matched
+
+
+def format_hazard_context(matched: list[HazardProject]) -> str:
+    """把匹配到的危大工程格式化为提示词注入文本（危大工程判定参数）。
+
+    内容：必含章节、必含表格、必含图表、安全阈值、适用规范。
+    """
+    if not matched:
+        return ""
+    blocks: list[str] = []
+    for hp in matched:
+        lines = [f"◆ {hp.name}（危大工程，须编制专项施工方案）"]
+        if hp.required_sections:
+            lines.append("  必含章节: " + "、".join(hp.required_sections))
+        if hp.required_tables:
+            lines.append("  必含表格: " + "、".join(hp.required_tables))
+        if hp.required_charts:
+            lines.append("  必含图表: " + "、".join(hp.required_charts))
+        if hp.safety_threshold:
+            thr = "、".join(f"{k}={v}" for k, v in hp.safety_threshold.items())
+            lines.append(f"  安全阈值: {thr}")
+        if hp.reference_standards:
+            lines.append("  适用规范: " + "；".join(hp.reference_standards))
+        blocks.append("\n".join(lines))
+    return (
+        "危大工程判定参数（本项目已识别以下危大工程，相关章节必须覆盖其必含要素，"
+        "并符合适用规范与安全阈值）:\n" + "\n\n".join(blocks)
+    )
+
+
 def list_hazard_projects() -> List[Dict[str, Any]]:
     """返回所有危大工程的元数据（用于 API 和前端展示）。"""
     return [

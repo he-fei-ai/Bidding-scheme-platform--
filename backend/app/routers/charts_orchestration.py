@@ -19,6 +19,7 @@ from ..services.ai.chart_orchestrator import (
     generate_all_chart_payloads,
     generate_chart_payload,
 )
+from ..services.chart_auto_orchestration import auto_orchestrate_section
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/charts", tags=["charts-orchestration"])
@@ -169,3 +170,49 @@ async def generate_single_payload(
         raise HTTPException(status_code=400, detail=f"无法生成 {chart_type} 类型图表载荷")
 
     return {"payload": payload}
+
+
+# ============================================================
+# 自动编排闭环（需求 1/3/4：全部自动生成，无人工配图入口）
+# ============================================================
+
+
+class AutoOrchestrateSectionRequest(BaseModel):
+    """单章节自动编排请求"""
+    project_id: int = Field(..., description="项目 ID")
+    section_id: int = Field(..., description="章节 ID")
+    insert_into_content: bool = Field(
+        True,
+        description="是否把图表围栏写入正文最佳位置（默认 True；正文为空时自动降级持久化 chart 字段）",
+    )
+    use_ai: bool = Field(False, description="是否启用 AI 增强（默认本地推断/模板生成）")
+
+
+@router.post("/auto-orchestrate-section")
+async def auto_orchestrate_section_api(request: AutoOrchestrateSectionRequest):
+    """单章节图表自动编排闭环（2026-10-17，需求 1/3/4 端到端接线）。
+
+    流程：分析是否需要配图 → 生成 Mermaid/JSON 载荷 → 统一闸门校验修复
+    （repair_mermaid 内聚）→ 按建议段落位置把 ```mermaid / ```chart-json
+    围栏写入正文 → 落库。正文已有图表围栏时去重跳过；校验失败时容错跳过
+    （不占图号）；正文为空时降级持久化章节 chart 字段。
+    """
+    ai_client = None
+    if request.use_ai:
+        try:
+            from ..services.ai.provider_factory import get_ai_config
+            ai_client = get_ai_config()
+        except Exception as e:
+            logger.warning("AI 客户端不可用，回退本地编排: %s", e)
+
+    result = auto_orchestrate_section(
+        project_id=request.project_id,
+        section_id=request.section_id,
+        insert_into_content=request.insert_into_content,
+        ai_client=ai_client,
+    )
+
+    if result.get("skipped_reason") == "section_not_found":
+        raise HTTPException(status_code=404, detail=f"章节 {request.section_id} 不存在")
+
+    return result

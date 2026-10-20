@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import sqlite3
 import time
 from typing import Any
 from fastapi import HTTPException, Query
@@ -303,9 +304,83 @@ def _rollback_dirty_sections(leaf_ids: list[int]):
 
         logger.warning("[正文生成] 回滚脏状态失败: %s", e)
 
+
+def check_analysis_stale_sync(conn, project_id: int) -> tuple[bool, str | None]:
+    """A-2 2026-10-17：检测 analysis 是否因文件变更而过时（硬拦截用）。
+
+    对比 analysis.updated_at 与该项目 MAX(uploaded_files.updated_at)。
+    若 files 比 analysis 新，则 analysis 已过时，目录/正文生成应被拒绝。
+
+    Args:
+        conn: sqlite3 连接（调用方负责 get_db() 上下文）
+        project_id: 项目 ID
+
+    Returns:
+        (is_stale, reason) — is_stale=True 表示 analysis 过时；reason 是给前端的
+        可读错误信息（None 表示未过时或无法判断）
+    """
+    # 取 analysis.updated_at
+    try:
+        row = conn.execute(
+            "SELECT updated_at FROM analysis WHERE project_id = ?",
+            (project_id,),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        # 老库 updated_at 列不存在时降级：默认不过时（行为兼容）
+        return False, None
+
+    if not row:
+        return False, None  # 无 analysis → 由上层处理（不是 stale 而是无数据）
+
+    analysis_updated = row["updated_at"] if row else None
+
+    # 取最新文件时间
+    try:
+        files_row = conn.execute(
+            "SELECT MAX(updated_at) AS latest_file FROM uploaded_files WHERE project_id = ?",
+            (project_id,),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return False, None
+
+    latest_file = files_row["latest_file"] if files_row else None
+
+    # 任一 None → 无法判断 → 放行
+    if analysis_updated is None or latest_file is None:
+        return False, None
+
+    if latest_file > analysis_updated:
+        return True, (
+            "项目文件已更新，请重新运行「AI 分析」后再生成目录。"
+            f"（文件更新于 {latest_file}，分析结果更新于 {analysis_updated}）"
+        )
+    return False, None
+
+
+async def check_analysis_stale_async(project_id: int) -> tuple[bool, str | None]:
+    """check_analysis_stale_sync 的 async 包装——在 asyncio.to_thread 内
+    运行 get_db + 同步检查，避免 SSE 主循环阻塞（async 函数里直接跑
+    同步 SQLite 会被 test_backlog_is_confined 棘轮捕获）。
+    """
+    def _run():
+        with get_db() as conn:
+            return check_analysis_stale_sync(conn, project_id)
+
+    return await asyncio.to_thread(_run)
+
+
 async def _extract_project_context(project_id: int) -> dict:
 
-    """提取项目上下文数据：摘要、评分点、行业信息、招标上下文等"""
+    """提取项目上下文数据：摘要、评分点、行业信息、招标上下文等
+
+    A-5 BUG-FIX 2026-10-17（硬闸门缺失）：此前仅检查 analysis 行是否存在 +
+    summary/scoring 是否非空，**不检查 confirmed_summary/confirmed_scoring**。
+    绕过前端直接调用 SSE 目录生成可基于用户从未确认过的 AI 输出生成目录，
+    用户可能事后才发现目录依据的是「待审核」状态下的数据。
+    现 SELECT 补齐 confirmed_* 列，软闸门：已确认但非空正常；未确认且非空
+    给可观测 warning 日志 + 返回值带 is_confirmed 标志（SSE 主循环可据此
+    在第一事件里推送一条提示给前端）。
+    """
 
 
 
@@ -317,7 +392,12 @@ async def _extract_project_context(project_id: int) -> dict:
 
                 # BUG-FIX 2026-09-18（P1）：补 boq_json——清单工程量此前在
                 # 目录生成链路是 write-only 死字段，现随上下文一并取出供 L2 注入。
-                "SELECT summary_json, scoring_points_json, scope, global_facts_json, boq_json FROM analysis WHERE project_id = ?",
+                # A-5 2026-10-17：补 confirmed_summary/confirmed_scoring 软闸门
+                # A-2 2026-10-17：补 updated_at 硬拦截（files.updated_at > analysis.updated_at
+                # 时目录生成返回 SSE error 事件）
+                "SELECT summary_json, scoring_points_json, scope, global_facts_json, boq_json, "
+                "confirmed_summary, confirmed_scoring, updated_at "
+                "FROM analysis WHERE project_id = ?",
 
                 (project_id,),
 
@@ -373,6 +453,26 @@ async def _extract_project_context(project_id: int) -> dict:
 
 
     scoring_points_list = scoring_points if isinstance(scoring_points, list) else []
+
+
+    # A-5 BUG-FIX 2026-10-17（软闸门）：已确认标志位读取
+    _confirmed_summary = bool(row.get("confirmed_summary"))
+    _confirmed_scoring = bool(row.get("confirmed_scoring"))
+    _has_summary = bool(summary) and summary not in ("{}", "", "待AI解析")
+    _has_scoring = bool(scoring_points_list)
+    # 软闸门：数据非空但未确认 —— 给可观测 warning + 返回值带 is_confirmed 标志
+    # 不硬拦截（行为兼容：用户可能故意用未确认数据生成），但让主循环/前端能感知
+    _is_confirmed = _confirmed_summary and _confirmed_scoring
+    if _has_summary and not _confirmed_summary:
+        logger.warning(
+            "目录上下文装配: summary 非空但未确认 (confirmed_summary=0)，"
+            "目录将基于未确认摘要生成 project=%d", project_id,
+        )
+    if _has_scoring and not _confirmed_scoring:
+        logger.warning(
+            "目录上下文装配: scoring_points 非空但未确认 (confirmed_scoring=0)，"
+            "目录将基于未确认评分点生成 project=%d", project_id,
+        )
 
 
 
@@ -451,6 +551,15 @@ async def _extract_project_context(project_id: int) -> dict:
         "global_facts_items": _parse_global_facts_items(row.get("global_facts_json")),
 
         "boq_json": row.get("boq_json") or "",
+
+        # A-5 2026-10-17 软闸门标志：目录生成上下文是否基于已确认数据
+        # 调用方（SSE 主循环）可据此在首事件推送提示给前端
+        "is_confirmed": _is_confirmed,
+        "confirmed_summary": _confirmed_summary,
+        "confirmed_scoring": _confirmed_scoring,
+
+        # A-2 2026-10-17 硬拦截时间戳：供 SSE 主循环对比文件更新时间
+        "analysis_updated_at": row.get("updated_at"),
 
     }
 
@@ -627,9 +736,10 @@ def _clear_and_save_outline(project_id: int, outline: list) -> list:
     # 消歧/护栏改写产物若仍泛化会直接落库。人工编辑章节与审核回灌路径
     # 完全绕开 V5.1 生成链，这里是它们唯一的防线。
     try:
-        from ...config import OUTLINE_L3_MAX_PARENT_REUSE
+        from ...config import OUTLINE_L3_INTRA_MAX_PARENTS, OUTLINE_L3_MAX_PARENT_REUSE
         from ...services.ai.outline_common import (
             _cap_cross_chapter_repetition,
+            _cap_intra_chapter_repetition,
             _cleanup_placeholder_titles as _cleanup_after_cap,
         )
 
@@ -640,6 +750,15 @@ def _clear_and_save_outline(project_id: int, outline: list) -> list:
             logger.info(
                 "_clear_and_save_outline: 跨章成套复用护栏改写 %d 个三级标题 project=%d",
                 _capped, project_id,
+            )
+        # 2026-10-19 新增（岳阳路事故）：同章内成套照抄护栏，与生成侧同一上限。
+        outline, _intra_capped = _cap_intra_chapter_repetition(
+            outline, OUTLINE_L3_INTRA_MAX_PARENTS
+        )
+        if _intra_capped:
+            logger.info(
+                "_clear_and_save_outline: 同章成套照抄护栏改写 %d 个三级标题 project=%d",
+                _intra_capped, project_id,
             )
         _ph_fixed_after_uniquify += _cleanup_after_cap(outline)
     except Exception as _cap_exc:
@@ -795,6 +914,15 @@ def _clear_and_save_outline(project_id: int, outline: list) -> list:
                 section_type = node.get("section_type", "")
 
                 scoring_point_id = node.get("scoring_point_id")
+
+                # 2026-10-20 易标机制引入 P0-2：Aligned 模式程序构造的 L1 携带
+                # source_requirement_id（R{n} 口径，与评分点解析器同命名空间，见
+                # workflows_analysis.py 关于 sections.scoring_point_id 的注释）。
+                # 无显式 scoring_point_id 时回落取 source_requirement_id 写入现有列，
+                # 零迁移复用既有审计链（scoring_compliance / export 预检）；旧数据
+                # 两字段皆无时仍为 NULL，行为与历史一致。
+                if scoring_point_id is None:
+                    scoring_point_id = node.get("source_requirement_id")
 
                 # BUG-FIX 2026-10-09（编号命名空间统一 · 跨模块数据传递丢失）：
                 # 落库后的目录树此前从不携带 number 字段，后果是三层各算一遍：
@@ -974,6 +1102,26 @@ def _clear_and_save_outline(project_id: int, outline: list) -> list:
 
                     saved_node["scoring_point_id"] = None
 
+                # 2026-10-20 易标机制引入 P0-2：易标 OutlineItem 扩展字段随节点
+                # 透出到目录 JSON（前端/导出/正文消费方可见）；仅在有值时写入，
+                # 旧数据不新增字段，完全向后兼容。DB 表结构不变（避免 SQLite
+                # ADD COLUMN 迁移面扩大），重进目录时由生成链路重新回填。
+                if node.get("source_requirement_id"):
+                    saved_node["source_requirement_id"] = node["source_requirement_id"]
+                if node.get("content_mode"):
+                    saved_node["content_mode"] = node["content_mode"]
+                if node.get("locked"):
+                    saved_node["locked"] = True
+                # BUG-FIX 2026-10-20（P0·aligned 溢出合并留痕）：评分项超过一级
+                # 章节硬上限时，溢出项被合并进最后一章（见 workflows_outline_v51
+                # ._merge_overflow_scoring_into_last_l1）。合并清单必须随目录
+                # JSON 透出，否则「本章覆盖了哪些评分项」只存在于生成进程的内存
+                # 里，重进目录/导出/正文链路都无法追溯，覆盖率审计也会漏判。
+                if node.get("merged_requirement_ids"):
+                    saved_node["merged_requirement_ids"] = [
+                        str(mid) for mid in node["merged_requirement_ids"] if str(mid or "").strip()
+                    ]
+
                 # BUG-OUTLINE-02 修复：包含 target_words 字段供前端字数预算参考
 
                 target_words = node.get("target_words")
@@ -1087,6 +1235,8 @@ async def _save_and_finalize_outline(
 
     emit=None,
 
+    gate_report: dict | None = None,
+
 ) -> bool:
 
     """保存目录并推送完成事件（公共函数，消除主流程和降级流程的重复代码）
@@ -1108,6 +1258,10 @@ async def _save_and_finalize_outline(
             task_registry.broadcast_event/update_progress —— 重连客户端（SSE
             断线后靠广播重建的会话）收不到 saving/完成事件，步骤条永久卡死。
             调用方传入 _qput 后事件走完整广播链；未传时退回直入队列兼容旧调用。
+        gate_report: 可选的目录门禁裁决（v51_state.gate_report）。ENHANCE
+            2026-10-19（优化 6）：其中 quality_score（五维质量评分）随
+            completed 事件下发，供前端「目录生成质量报告」卡片展示；
+            不传/直出路径时 completed 事件不含 quality 字段，前端降级不展示。
 
 
 
@@ -1189,11 +1343,12 @@ async def _save_and_finalize_outline(
 
     # 此处只发送保存阶段的步骤，避免重复。
 
-    # BUG 修复：V51 前端 OUTLINE_STEPS_V51 仅 8 步，旧代码固定发送 8/9 导致 step 9 越界。
+    # BUG 修复：前端 OUTLINE_STEPS_V51 共 13 步（2026-10-19 起），旧代码固定
+    # 发送 7/8/9 且 9 越界。13 步口径下：保存前置审核=步骤 12（增量保存）。
 
-    audit_step = 7
+    audit_step = 12
 
-    save_step = audit_step + 1
+    save_step = 12
 
     await _emit_evt(
 
@@ -1241,6 +1396,10 @@ async def _save_and_finalize_outline(
 
         "outline": outline,
 
+        # ENHANCE 2026-10-19：终态带步骤号（13=最终审核通过），前端 completed
+        # 分支不再硬编码步数，步骤条与百分比按协议推进到 100%。
+        "outline_step": 13,
+
         "progress": {
 
             "level1": total_level1,
@@ -1252,6 +1411,32 @@ async def _save_and_finalize_outline(
         },
 
     }
+
+    # ENHANCE 2026-10-19（优化 6）：质量评分报告随完成事件下发（见函数签名
+    # gate_report 说明）。字段缺失/类型异常时静默跳过，不影响完成事件本体。
+    if isinstance(gate_report, dict):
+
+        _quality = gate_report.get("quality_score")
+
+        if isinstance(_quality, dict):
+
+            done_event["quality"] = _quality
+
+        try:
+
+            done_event["gate_issue_count"] = int(gate_report.get("issue_count") or 0)
+
+        except (TypeError, ValueError):
+
+            done_event["gate_issue_count"] = 0
+
+        done_event["gate_summary"] = str(gate_report.get("summary") or "")
+
+        _auto_fixed = gate_report.get("auto_fixed")
+
+        if isinstance(_auto_fixed, list):
+
+            done_event["gate_auto_fixed"] = [str(a) for a in _auto_fixed]
 
     await _emit_evt(done_event)
 

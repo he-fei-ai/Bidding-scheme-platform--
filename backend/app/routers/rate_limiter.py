@@ -6,6 +6,7 @@
 """
 
 import logging
+import os
 
 from fastapi import Depends, HTTPException, Request
 
@@ -19,6 +20,30 @@ from ..services.rate_limiting import get_rate_limiter
 # 配置：每个端点可覆盖的默认配额
 DEFAULT_LIMIT = 100  # 每窗口最大请求数
 DEFAULT_WINDOW = 60  # 秒
+
+
+def _rate_limit_bypassed_in_tests() -> bool:
+    """测试环境下是否跳过 HTTP 限流（2026-10-20 修复全量套件 429 污染）。
+
+    根因（有实录）：``TestClient`` 的所有请求共享同一个标识符
+    ``ip_testclient`` —— 无认证注入（``request.state.current_user`` 为空）、
+    无 API Key、``client.host`` 对 TestClient 固定为 ``testclient``。
+    全量套件单进程跑出数千个 HTTP 请求，远超 100 次/60s 的滑动窗口后，
+    后运行的测试文件全部拿到 429：``test_outline_hardening_2026_10_08.py``
+    的 8 个用例即因此失败（``_mk_section`` 断言 201 实得 429）。
+    单文件运行或 ``-k`` 选择运行时请求量小、不触发，表现为"间歇性失败"，
+    早期被误判为"跨文件 DB 污染"。
+
+    为什么在**依赖层**跳过而不是限速器内部：限速器算法本身由
+    ``tests/test_sections_integration.py::TestRateLimiting`` 等服务级
+    单测直接覆盖（它们调用 ``get_rate_limiter().allow(...``），在依赖层
+    跳过不影响这些用例，也不削弱算法正确性验证。
+
+    生产环境无 ``PYTEST_RUNNING`` 标记（conftest 在任何 app 导入前设置），
+    行为零变化。需要验证 HTTP 429 行为的测试可 monkeypatch 本函数返回
+    False 后按原路径断言。
+    """
+    return os.environ.get("PYTEST_RUNNING") == "1"
 
 
 def get_identifier_from_request(request: Request) -> str:
@@ -76,6 +101,12 @@ async def rate_limit_dependency(
     Raises:
         HTTPException: 状态码 429，当请求超过限额时
     """
+    # BUG-FIX 2026-10-20（全量套件 429 污染根因修复）：测试环境跳过限流。
+    # 详见 _rate_limit_bypassed_in_tests 的根因注释。放行而非抛错，
+    # 保证 TestClient 集成测试在完整跑套件时不被共享标识符的配额耗光。
+    if _rate_limit_bypassed_in_tests():
+        return
+
     limiter = get_rate_limiter()
     identifier = get_identifier_from_request(request)
     local_limit = limit if limit is not None else DEFAULT_LIMIT

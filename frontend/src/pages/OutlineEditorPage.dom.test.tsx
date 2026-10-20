@@ -295,7 +295,7 @@ describe.skipIf(!hasDom)("OutlineEditorPage 组件级交互（2026-10-12 加固�
     });
     const _lc = lastCall((taskStore.updateTask as ReturnType<typeof vi.fn>).mock.calls) as [string, { progress?: number }];
     const lastCallData = _lc[1];
-    expect(lastCallData.progress).toBe(50); // step5/8 → (5-1)/8 = 50%
+    expect(lastCallData.progress).toBe(31); // step5/13 → (5-1)/13 ≈ 31%
   });
 
   it("重连重放的旧进度事件不得让进度倒退", async () => {
@@ -310,16 +310,16 @@ describe.skipIf(!hasDom)("OutlineEditorPage 组件级交互（2026-10-12 加固�
     emit({ status: "connected" });
     emit({ status: "generating", phase: "outline_phase", outline_step: 6, seq: 10 });
     await rtl.waitFor(() => {
-      expect(document.body.textContent).toContain("50");
+      expect(document.body.textContent).toContain("38");
     });
     // 重放一条更早的进度事件（服务端 last_event）
     emit({ status: "generating", phase: "outline_phase", outline_step: 3, seq: 4 });
-    // 不应回退到 25%
+    // 不应回退到 15%
     await new Promise((r) => setTimeout(r, 50));
     const { taskStore } = await import("@/services/taskStore");
     const calls = (taskStore.updateTask as ReturnType<typeof vi.fn>).mock.calls;
     const last = (lastCall(calls) as [string, { progress?: number }])[1];
-    expect(last.progress).toBe(63); // step6/8 → 5/8 = 63%，未倒退
+    expect(last.progress).toBe(38); // step6/13 → 5/13 ≈ 38%，未倒退
   });
 
   it("seq 相同的重放事件被直接丢弃", async () => {

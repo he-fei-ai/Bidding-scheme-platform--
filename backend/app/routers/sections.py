@@ -27,6 +27,7 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from starlette.responses import StreamingResponse
 from ..config import (
+    CONTENT_GENERATION_MODE,
     CONTENT_USE_CONSISTENCY_AUDIT_DEFAULT,
     CONTENT_USE_ORCHESTRATION_DEFAULT,
     CONTENT_USE_WORD_SAMPLING_DEFAULT,
@@ -219,7 +220,7 @@ async def generate_outline_sse(project_id: int, strategy: str | None=Query(None)
     return await generate_outline_sse_impl(project_id, outline_mode=outline_mode)
 
 @router.get('/generate-content', dependencies=[limit_per_endpoint])
-async def generate_content(request: Request, project_id: int, writing_length: str=Query('standard'), regenerate_ids: str=Query(''), root_section_id: int | None=Query(None), regenerate_missing: bool=Query(False), use_orchestration: bool=Query(CONTENT_USE_ORCHESTRATION_DEFAULT), level2_default: int=Query(3500, ge=1000, le=10000), use_word_sampling: bool=Query(CONTENT_USE_WORD_SAMPLING_DEFAULT), use_fallback_expand: bool=Query(False), use_consistency_audit: bool=Query(CONTENT_USE_CONSISTENCY_AUDIT_DEFAULT), concurrency: int=Query(4, ge=1, le=8), orch_max_ai_images: int=Query(6, ge=0, le=50), orch_table_ratio: str=Query('moderate'), orch_prefer_mermaid: bool=Query(True), orch_section_per_segment: int=Query(10, ge=3, le=40), use_word_adjust: bool | None=Query(None), current_user: Annotated[Any, Depends(get_current_user)]=None):
+async def generate_content(request: Request, project_id: int, writing_length: str=Query('standard'), regenerate_ids: str=Query(''), root_section_id: int | None=Query(None), regenerate_missing: bool=Query(False), use_orchestration: bool=Query(CONTENT_USE_ORCHESTRATION_DEFAULT), level2_default: int=Query(3500, ge=1000, le=10000), use_word_sampling: bool=Query(CONTENT_USE_WORD_SAMPLING_DEFAULT), use_fallback_expand: bool=Query(False), use_consistency_audit: bool=Query(CONTENT_USE_CONSISTENCY_AUDIT_DEFAULT), concurrency: int=Query(4, ge=1, le=8), orch_max_ai_images: int=Query(6, ge=0, le=50), orch_table_ratio: str=Query('moderate'), orch_prefer_mermaid: bool=Query(True), orch_section_per_segment: int=Query(10, ge=3, le=40), use_word_adjust: bool | None=Query(None), generation_mode: str=Query(CONTENT_GENERATION_MODE, pattern='(?i)^(parallel|batch|serial)$'), current_user: Annotated[Any, Depends(get_current_user)]=None):
     """SSE 并发生成正文（EventSource 只支持 GET）
 
     2026-08-21 修复：权限验证和参数验证异常包装在 SSE 流中，确保始终返回 text/event-stream
@@ -237,6 +238,12 @@ async def generate_content(request: Request, project_id: int, writing_length: st
     永远退回服务端默认。追加在 current_user 之前、且保持与 impl 同序，是
     「位置参数调用不整体错位」的硬约束（见 generate_content_impl 内注释）。
     不传时行为与改动前逐字一致，向后兼容。
+
+    ENHANCE 2026-10-18（第二轮）：generation_mode 顺序生成开关
+    （batch 默认 / serial 逐节串行 / parallel 一次性并发）。同样遵循
+    「追加在末尾、与 impl 同序」约束；不传 = config.CONTENT_GENERATION_MODE
+    （2026-10-18 第二轮起为 batch，与前端默认一致；需要严格旧行为可显式传
+    parallel 或置 env CONTENT_GENERATION_MODE=parallel）。
     """
     try:
         if current_user:
@@ -256,7 +263,7 @@ async def generate_content(request: Request, project_id: int, writing_length: st
         async def error_generator():
             yield f"data: {json.dumps({'status': 'error', 'message': _error_msg}, ensure_ascii=False)}\n\n"
         return StreamingResponse(error_generator(), media_type='text/event-stream; charset=utf-8', headers={'Cache-Control': 'no-cache, no-transform', 'Connection': 'keep-alive', 'X-Accel-Buffering': 'no', 'Content-Encoding': 'none'})
-    return await generate_content_impl(project_id, writing_length, regenerate_ids, root_section_id, regenerate_missing, use_orchestration, level2_default, use_word_sampling, use_fallback_expand, use_consistency_audit, concurrency, orch_max_ai_images, orch_table_ratio, orch_prefer_mermaid, orch_section_per_segment, use_word_adjust)
+    return await generate_content_impl(project_id, writing_length, regenerate_ids, root_section_id, regenerate_missing, use_orchestration, level2_default, use_word_sampling, use_fallback_expand, use_consistency_audit, concurrency, orch_max_ai_images, orch_table_ratio, orch_prefer_mermaid, orch_section_per_segment, use_word_adjust, generation_mode)
 
 @router.get('/v51-pending-task')
 async def v51_pending_task_route(project_id: int, current_user: Annotated[Any, Depends(get_current_user)]=None):
@@ -515,9 +522,18 @@ async def review_outline_with_autofix_route(project_id: int, current_user: Annot
     后续对节点的改名/删除/移动请求全部打在 id=undefined 上链路断裂，且刷新
     后修复结果丢失。现在修复成功后走与目录生成同一落库链 _clear_and_save_outline
     （含旧正文按 (level,title) 快照回填），并额外返回带数据库 ID 的完整目录树。
+
+    BUG-FIX 2026-10-19（BUG-OUTLINE-07a · 并发写冲突）：本路由最终会调用
+    ``_clear_and_save_outline``（``DELETE FROM sections`` + 批量 INSERT 长写
+    事务），与目录生成主链路（同函数、同表、同事务形态）**同性质**——但此前
+    未走 ``task_guard.reject_if_generation_running``，目录生成进行中执行本接口
+    会导致两份 ``DELETE+INSERT`` 互相覆盖（后写者胜），用户看到的目录可能是
+    其中任一版本，且正文回填按 ```(level, title)`` 快照匹配也会错位。此处
+    接入与其他章节写端点同一口径的守卫（目录生成中一律 409）。
     """
     if current_user:
         await require_project_permission(project_id, current_user)
+    _reject_if_generation_running(project_id)
     from ..services.ai.workflows import review_outline_with_autofix as _review_outline_with_autofix
     provider, scoring_points, outline = await _prepare_review(project_id)
     result = await _review_outline_with_autofix(provider, scoring_points, outline)
@@ -647,10 +663,16 @@ async def v51_confirm_route(project_id: int, data: dict, current_user: Annotated
                 detail='edited_outline 必须是列表（[{...}, ...]），而非其他类型',
             )
         raise HTTPException(status_code=409, detail='V5.1 确认冲突：其他标签页或操作已提交了修改，请刷新页面后重试')
+    # BUG-FIX 2026-10-19（BUG-OUTLINE-07c）：level3 阶段确认后应进入 final
+    # 阶段（`_wait_for_v51_review` 会在 L3 生成完成后把 `current_phase` 置为
+    # "level3" 等用户审核，见 workflows_outline_v51.py:4771）。此前遗漏该分支，
+    # 直接落 else 返回 `next_phase='unknown'`，前端无法据此推进 UI 状态。
     if state.current_phase == 'level1':
         next_phase = 'level2'
     elif state.current_phase == 'level2':
         next_phase = 'level3'
+    elif state.current_phase == 'level3':
+        next_phase = 'final'
     elif state.current_phase == 'final':
         next_phase = 'done'
     else:
@@ -682,9 +704,20 @@ async def pause_generation_route(project_id: int, current_user: Annotated[Any, D
 
 @router.post('/expand-content', dependencies=[limit_per_endpoint])
 async def expand_content(request: Request, project_id: int, writing_length: str=Query('standard'), level2_default: int=Query(3500, ge=1000, le=10000), concurrency: int | None = Query(None, ge=1, le=8), current_user: Annotated[Any, Depends(get_current_user)]=None):
-    """兜底扩写：对字数不足的章节并发扩写，确保内容充实（SSE 流）"""
+    """兜底扩写：对字数不足的章节并发扩写，确保内容充实（SSE 流）
+
+    BUG-FIX 2026-10-19（BUG-OUTLINE-07d · 前置拦截）：兜底扩写虽然已在
+    ``sse_content.expand_content_impl`` 里通过 ``content-generation`` 任务组锁
+    与「目录生成」「正文生成」互斥（同 ``technical-plan`` 组），但抢锁是走 SSE
+    流内部的 ``TaskLockConflict`` 分支，前端只收到 status='error' 的 SSE 事件
+    才知晓被拦截。若目录生成正在进行，用户触发扩写会得到空 stream → 立刻收到
+    error 事件 → UI 显示「兜底扩写启动失败」，体验不佳且错误不清晰。此处前置
+    调用 ``_reject_if_generation_running``，让目录生成进行中直接 409 + 明确
+    文案，用户体验一致（与其他章节写端点同一口径）。
+    """
     if current_user:
         await require_project_permission(project_id, current_user)
+    _reject_if_generation_running(project_id)
     valid_lengths = ('short', 'standard', 'detailed', 'extra_long')
     if writing_length not in valid_lengths:
         raise HTTPException(status_code=422, detail=f'writing_length 必须是 {valid_lengths} 之一')

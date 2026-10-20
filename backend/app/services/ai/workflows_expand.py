@@ -36,6 +36,12 @@ logger = logging.getLogger(__name__)
 from .workflows_base import with_timeout
 from .workflows_sections import generate_section_content
 
+# ENHANCE 2026-10-18（审计遗留 D2 批次 2 收编）：本文件此前完全没有 get_prompt
+# 调用（grep 命中 0），目录扩展 / 正文扩写 / 一致性审计 / 审计修复 四组提示词的
+# system + user 两侧均为内联字面量 —— 管理页不可见、不可覆盖、无版本、漂移检测
+# 失效。现统一接入注册表，并保留原硬编码作为「DB/注册表不可用」时的最小 fallback。
+from .prompts import get_prompt
+
 
 EARLY_CONTENT_PROBE_COUNT = 3
 
@@ -201,7 +207,17 @@ async def expand_outline_for_content(
     """
     outline_json = json.dumps(current_outline, ensure_ascii=False, indent=2)
 
-    expand_prompt = (
+    # ENHANCE 2026-10-18（审计遗留 D2 批次 2 收编）：本文件原先 **完全没有
+    # get_prompt 调用**（grep 命中 0），目录扩展的 system+user 两侧均为内联
+    # 字面量 —— 管理页看不到、无法覆盖/版本化，漂移检测也失效。现两侧收编。
+    # summary / scoring_points 来自解析链路（外部内容），注入前做元标记中和。
+    expand_prompt = get_prompt(
+        "OUTLINE_EXPAND_USER",
+        outline_json=outline_json,
+        summary=summary,
+        scoring_points=scoring_points,
+        sanitize=True,
+    ) or (
         f"你是一个标书目录扩展专家。当前目录字数不足，需要补充更多二三级目录来增加内容量。\n\n"
         f"【补充原则】\n"
         f"1. 只补充二级和三级子目录，不修改一级目录结构\n"
@@ -219,7 +235,7 @@ async def expand_outline_for_content(
         messages = [
             AIMessage(
                 role="system",
-                content="你是一个标书目录扩展专家，擅长补充完善目录结构。请直接输出 JSON 数组。",
+                content=get_prompt("OUTLINE_EXPAND_SYSTEM"),
             ),
             AIMessage(role="user", content=expand_prompt),
         ]
@@ -238,14 +254,18 @@ def section_expand_threshold(
     flat_minimum: int,
     level2_default: int = 3500,
     writing_length: str | None = None,
+    strict_override: dict | None = None,
 ) -> int:
     """单章节的扩写阈值（CONVERGE 2026-10-12：目标解析转发唯一权威口径）。
 
     达标线 = 有效目标字数 × 80%，不超过 ``flat_minimum``，保底 200 字。
 
     口径（唯一公式，见 ``services/word_target_resolver.py``）：
+      - **体系合并 2026-10-20**：传入 ``strict_override``（``build_section_override``
+        的本节产物）时，统一解析器短路返回体系 B 目标 S，达标线=S×80%（恰为
+        R5 区间下限）；未命中回落体系 A 档位链。
       - **L1/L2**：父节点，不生成正文，不参与扩写，返回 0；
-      - **优先级**：单节点 ``target_words`` > 单节点 ``word_count_tier``
+      - **优先级**：强控覆盖 > 单节点 ``target_words`` > 单节点 ``word_count_tier``
         > **L3 自身正文 300±20%** > 全局 ``writing_length`` 档位 > 默认档位。
 
     CONVERGE 行为修正（唯一一处）：此前本函数对「L3 无档位覆盖但有全局
@@ -258,13 +278,16 @@ def section_expand_threshold(
         flat_minimum: 平铺阈值（所有档位共享的扩写上限）
         level2_default: [已废弃] 不再使用
         writing_length: 全局档位 key（brief/standard/detailed/long）
+        strict_override: 体系 B 强控覆盖（本节条目，可选）
 
     Returns:
         int: 扩写达标线（字数不足此值则触发扩写）；L1/L2 返回 0
     """
     from ..word_target_resolver import resolve_section_word_target_from_mapping
 
-    resolved = resolve_section_word_target_from_mapping(section, writing_length=writing_length)
+    resolved = resolve_section_word_target_from_mapping(
+        section, writing_length=writing_length, strict_override=strict_override,
+    )
     if not resolved:
         return 0
     target = int(resolved.target)
@@ -383,7 +406,15 @@ async def expand_content_fallback(
                 expansion_target = max(words * 2, words + MIN_SECTION_EXPANSION_INCREMENT)
                 expansion_target = min(expansion_target, threshold * 2)
 
-                expansion_prompt = (
+                # ENHANCE 2026-10-18（审计遗留 D2 批次 2 收编）：system+user 两侧收编
+                expansion_prompt = get_prompt(
+                    "SECTION_EXPAND_USER",
+                    words=words,
+                    expansion_target=expansion_target,
+                    section_title=title,
+                    content=content,
+                    sanitize=True,
+                ) or (
                     f"你是一个标书正文扩写专家。请扩写以下章节正文内容，使其更充实、专业。\n\n"
                     f"【扩写原则】\n"
                     f"1. 在原有内容基础上扩充，不删除原有内容\n"
@@ -400,7 +431,7 @@ async def expand_content_fallback(
                     messages = [
                         AIMessage(
                             role="system",
-                            content="你是一个标书正文扩写专家，擅长在保留原有内容的基础上扩充正文。",
+                            content=get_prompt("SECTION_EXPAND_SYSTEM"),
                         ),
                         AIMessage(role="user", content=expansion_prompt),
                     ]
@@ -792,7 +823,22 @@ async def _audit_one_group(
         )
         _evidence_rule = ""
 
-    audit_prompt = (
+    # ENHANCE 2026-10-18（审计遗留 D2 批次 2 收编）：user 侧收编为
+    # CONSISTENCY_AUDIT_USER；system 侧沿用既有硬编码（注册表已由
+    # CONSISTENCY_AGENT_SYSTEM 承载 Agent 多轮路径，两者角色设定不同，
+    # 不强行合并以免改变语义）。
+    audit_prompt = get_prompt(
+        "CONSISTENCY_AUDIT_USER",
+        facts_block=facts_block,
+        completeness_block=completeness_block,
+        summary=summary[:5000],
+        group_index=group_idx + 1,
+        total_groups=total_groups,
+        group_content=group_content,
+        evidence_rule=_evidence_rule,
+        conflict_fields=_conflict_fields,
+        sanitize=True,
+    ) or (
         f"你是一个标书一致性审计专家。请检查以下正文内容是否与项目事实变量存在冲突或不一致。\n\n"
         f"{facts_block}{completeness_block}"
         f"【项目事实】\n{summary[:5000]}\n\n"
@@ -817,7 +863,8 @@ async def _audit_one_group(
     messages = [
         AIMessage(
             role="system",
-            content="你是一个标书一致性审计专家，擅长发现正文中的矛盾和不一致。",
+            content=get_prompt("CONSISTENCY_AUDIT_SYSTEM")
+            or "你是一个标书一致性审计专家，擅长发现正文中的矛盾和不一致。",
         ),
         AIMessage(role="user", content=audit_prompt),
     ]
@@ -914,7 +961,14 @@ async def _audit_one_group(
         current_content = target.get("content", "")
         if not current_content:
             continue
-        repair_prompt = (
+        # ENHANCE 2026-10-18（审计遗留 D2 批次 2 收编）：修复请求 system+user 两侧收编
+        repair_prompt = get_prompt(
+            "CONSISTENCY_REPAIR_USER",
+            issue=conflict.get("issue", ""),
+            suggestion=suggestion,
+            current_content=current_content[:5000],
+            sanitize=True,
+        ) or (
             f"请修复以下正文中的一致性问题。\n\n"
             f"【问题描述】\n{conflict.get('issue', '')}\n\n"
             f"【修复建议】\n{suggestion}\n\n"
@@ -925,7 +979,7 @@ async def _audit_one_group(
             repair_messages = [
                 AIMessage(
                     role="system",
-                    content="你是一个标书正文修复专家，请根据审计意见精确修复正文。",
+                    content=get_prompt("CONSISTENCY_REPAIR_SYSTEM"),
                 ),
                 AIMessage(role="user", content=repair_prompt),
             ]

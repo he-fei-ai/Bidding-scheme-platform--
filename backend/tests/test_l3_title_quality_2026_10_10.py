@@ -909,12 +909,26 @@ class TestL3QualityNoProviderWiring:
         assert "OUTLINE_L3_QUALITY_ENHANCE_ENABLED" in block, "收口块未受开关控制"
 
     def test_no_provider_branch_is_not_silent(self):
-        """provider 缺失时必须落 warning 日志并向前端提示，不得静默跳过。"""
+        """provider 缺失时必须落 warning 日志并向前端提示，不得静默跳过。
+
+        BUG-FIX 2026-10-17（L-1 · 离线泛化标题永久泄漏）：旧实现在
+        `provider is None` 时用 `elif not _passed:` 分支**完全跳过修复**，
+        泛化标题原样进入审核与落库；该分支只告警不修复。
+        现改为统一 `if not _passed:` 分支：有无 provider 都跑修复循环，
+        仅以 `use_ai=_use_ai` 区分模式（None → 纯规则兜底）。
+        本测试守护新的行为契约：
+          1) 修复调用不得被 provider 门禁挡掉（`use_ai=` 传模式位）；
+          2) 修复后仍有残留时，warning 日志 + phase_callback 照旧触发。
+        """
         block = self._block()
-        assert "elif not _passed:" in block, "缺少无 provider 分支（静默跳过）"
-        seg = block[block.index("elif not _passed:"):]
-        assert "logger.warning" in seg, "无 provider 时未落 warning 日志"
-        assert "await phase_callback(" in seg, "无 provider 时未向前端提示"
+        # 1) 修复调用与模式位（取代旧的「provider is not None」前置门禁）
+        assert "repair_l3_generic_titles(" in block, "repair 未被调用"
+        assert "use_ai=_use_ai" in block, "修复调用未传模式位（provider 缺失时将不修复）"
+        assert "_use_ai = provider is not None" in block, "未按 provider 判别模式"
+        # 2) 残留告警 + 前端提示（不得静默）
+        seg = block[block.index("if not _passed2:"):]
+        assert "logger.warning" in seg, "修复后残留未落 warning 日志"
+        assert "await phase_callback(" in seg, "修复后残留未向前端提示"
 
     def test_exception_never_blocks_generation(self):
         """质量收口是增强环节，任何异常都不得阻断目录生成。"""
@@ -1004,7 +1018,10 @@ class TestDirectPathQualityCloseout:
         assert callable(v51._apply_l3_quality_closeout), "共用收口函数缺失"
         # 直出分支在 return 之前调用收口（确保产物经过清洗/去重/校验）
         src = Path(v51.__file__).read_text(encoding="utf-8")
-        start = src.index("if should_use_direct_outline(scoring_points, outline_mode):")
+        # 2026-10-20 易标机制引入：直出分支条件追加了 aligned 模式排除（
+        # `and OUTLINE_ALIGNED_MODE != "aligned"`），锁点改用前缀匹配以免
+        # 尾部条件演进再次误报。
+        start = src.index("if should_use_direct_outline(scoring_points, outline_mode)")
         end = src.index('logger.warning("[V5.1] 直出路径未产出结果，回退分步路径")')
         direct_seg = src[start:end]
         assert "_apply_l3_quality_closeout(" in direct_seg, "直出路径未接入共用质量收口"

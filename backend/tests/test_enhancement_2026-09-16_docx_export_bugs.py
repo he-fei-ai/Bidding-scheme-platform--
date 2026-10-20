@@ -75,7 +75,13 @@ def _reset_cache_globals(monkeypatch, cache_dir):
 
 
 def test_set_cached_export_path_persists_valid_index(tmp_path, monkeypatch):
-    """_set_cached_export_path 必须把映射原子持久化，可被 _get_cached_export_path 读回"""
+    """_set_cached_export_path 必须把映射原子持久化，可被 _get_cached_export_path 读回
+
+    L-4（2026-10-17）契约更新：_get_cached_export_path 现在对「索引有键但文件
+    不存在 / 不是有效 ZIP」按 miss 处理（build_docx 只在文件落盘后才登记缓存，
+    生产路径不受影响）。故本测试先落盘真实文件再断言读回；并补一条
+    「文件缺失按 miss」的对照断言钉住新契约。
+    """
     index_path = _reset_cache_globals(monkeypatch, tmp_path)
     key = "a" * 32
     out_path = str(tmp_path / "out.docx")
@@ -86,7 +92,13 @@ def test_set_cached_export_path_persists_valid_index(tmp_path, monkeypatch):
     assert index_path.exists()
     data = json.loads(index_path.read_text(encoding="utf-8"))
     assert data.get(key) == out_path
-    # 读回一致
+    # 新契约对照：文件尚未落盘 → 按 miss 返回 None（不再虚报命中）
+    assert _get_cached_export_path(key) is None
+    # 落盘后读回一致（L-4 完整性校验要求是合法 ZIP，写入真实最小 ZIP）
+    import zipfile as _zf
+
+    with _zf.ZipFile(out_path, "w") as _zip:
+        _zip.writestr("word/document.xml", "<xml/>")
     assert _get_cached_export_path(key) == out_path
 
 

@@ -703,29 +703,44 @@ class GenerationManager:
 
             if generation_id:
                 pending = conn.execute(
-                    """SELECT s.id, s.title, s.level, s.section_type, s.scoring_point_id,
+                    """SELECT s.id, s.parent_id, s.sort_order, s.title, s.level,
+                              s.section_type, s.scoring_point_id,
                               s.content, s.target_words, s.status,
                               p.progress, p.retry_count, p.last_error
-                       FROM sections s
-                       LEFT JOIN section_generation_progress p
-                               ON s.id = p.section_id AND p.generation_id = ?
-                       WHERE s.project_id = ?
-                         AND (p.status IS NULL OR p.status IN ('pending', 'failed', 'cancelled'))
-                       ORDER BY s.sort_order""",
+                        FROM sections s
+                        LEFT JOIN section_generation_progress p
+                                ON s.id = p.section_id AND p.generation_id = ?
+                        WHERE s.project_id = ?
+                          AND (p.status IS NULL OR p.status IN ('pending', 'failed', 'cancelled'))
+                        ORDER BY s.id""",
                     (generation_id, project_id),
                 ).fetchall()
             else:
                 pending = conn.execute(
-                    """SELECT s.id, s.title, s.level, s.section_type, s.scoring_point_id,
+                    """SELECT s.id, s.parent_id, s.sort_order, s.title, s.level,
+                              s.section_type, s.scoring_point_id,
                               s.content, s.target_words, s.status,
                               NULL AS progress, NULL AS retry_count, NULL AS last_error
-                       FROM sections s
-                       WHERE s.project_id = ? AND s.status != 'completed'
-                       ORDER BY s.sort_order""",
+                        FROM sections s
+                        WHERE s.project_id = ? AND s.status != 'completed'
+                        ORDER BY s.id""",
                     (project_id,),
                 ).fetchall()
 
-            return [dict(row) for row in pending]
+            pending = [dict(row) for row in pending]
+
+            # 遗留加固（2026-10-19）：待恢复章节按目录树深度优先前序返回。
+            # 旧口径 `ORDER BY s.sort_order` 是**跨父扁平**排序，两个 L1 子树的
+            # 兄弟会被交错（1.1, 2.1, 1.2, 2.2），且同父 sort_order 重复时次序
+            # 不确定 —— 而本结果被 /pending-sections **分页**下发给前端，
+            # 排序不稳定会让翻页重复/漏项。统一收敛到唯一权威口径。
+            try:
+                from .ai.ordered_generation import order_tree_dfs
+                pending = order_tree_dfs(pending)
+            except ImportError:  # pragma: no cover - 防御性兜底（等价旧口径）
+                pending.sort(key=lambda r: (r.get("sort_order") or 0, r.get("id") or 0))
+
+            return pending
 
     def _persist_task(self, task: GenerationTask):
         """持久化任务到数据库"""

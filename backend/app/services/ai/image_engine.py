@@ -298,6 +298,137 @@ def _render_arrange_sys(
     return rendered or get_prompt(key)
 
 
+def _render_arrange_user(
+    chart_label: str,
+    *,
+    section_title: str = "",
+    section_content: str = "",
+    project_overview: str = "",
+    scoring_standard: str = "",
+    industry_profile: str = "",
+) -> str:
+    """渲染「配图编排」**用户**提示词（原 7 处逐字重复的硬编码 f-string）。
+
+    ENHANCE 2026-10-18（审计遗留 D2 批次 2 收编）：
+      - 模板收编为注册表 key ``CHART_ARRANGE_USER``，末句图表名词抽成
+        ``{CHART_LABEL}``，管理页从此可见/可覆盖/可版本化；
+      - **同时修复安全口径不一致**：原先 7 处均为裸 f-string 插值
+        （无 sanitize_prompt_value、无 sanitize=True），而同文件组 B 的
+        3 处却做了元标记中和。现统一 ``sanitize=True``，与组 B 及
+        workflows_analysis 的既有口径对齐。
+
+    空值兜底文案（「未提供项目概述」等）由本函数上移处理，渲染结果与原实现
+    逐字节一致（见 tests/test_prompts_adoption_2026_10_18.py 的等价断言）。
+    """
+    try:
+        rendered = get_prompt(
+            "CHART_ARRANGE_USER",
+            CHART_LABEL=chart_label,
+            section_title=section_title,
+            section_content=section_content,
+            project_overview=project_overview or "未提供项目概述",
+            scoring_standard=scoring_standard or "未提供评分标准",
+            industry_profile=industry_profile or "未提供行业背景",
+            sanitize=True,
+        )
+    except Exception as e:  # 渲染异常不能影响配图主流程
+        logger.warning("[配图编排] 用户提示词渲染失败: %s", e)
+        rendered = ""
+    if rendered:
+        return rendered
+    # 兜底：DB/注册表均不可用时的最小 fallback（保留原硬编码形态）
+    return (
+        f"章节标题：{section_title}\n\n章节内容：\n{section_content}\n\n项目概述：\n"
+        f"{project_overview or '未提供项目概述'}\n\n评分标准：\n"
+        f"{scoring_standard or '未提供评分标准'}\n\n行业背景：\n"
+        f"{industry_profile or '未提供行业背景'}\n\n"
+        f"请根据以上信息判断该章节是否需要生成{chart_label}，并返回JSON格式的判断结果。"
+    )
+
+
+def _render_mermaid_gen_user(
+    chart_kind: str,
+    *,
+    section_title: str = "",
+    section_content: str = "",
+    project_overview: str = "",
+    arrange_result: dict | None = None,
+) -> str:
+    """渲染 Mermaid 图生成的**用户**提示词（原 3 处重复的硬编码 f-string）。
+
+    ENHANCE 2026-10-18（审计遗留 D2 批次 2 收编）：模板收编为注册表 key
+    ``CHART_MERMAID_GEN_USER``。元标记中和沿用原实现（调用点已先做
+    ``sanitize_prompt_value``，本函数对编排 JSON 也加 neutralize 之外的
+    默认开关关闭——编排 JSON 是结构化载荷，需保持可解析，故不再中和其花括号）。
+    """
+    arrange_json = json.dumps(arrange_result, ensure_ascii=False, indent=2)
+    try:
+        rendered = get_prompt(
+            "CHART_MERMAID_GEN_USER",
+            CHART_KIND=chart_kind,
+            safe_title=sanitize_prompt_value(section_title),
+            safe_content=sanitize_prompt_value(section_content),
+            safe_overview=sanitize_prompt_value(project_overview or "未提供项目概述"),
+            arrange_result=arrange_json,
+        )
+    except Exception as e:
+        logger.warning("[图表生成] 用户提示词渲染失败: %s", e)
+        rendered = ""
+    return rendered or (
+        f"章节标题：{sanitize_prompt_value(section_title)}\n\n章节内容：\n"
+        f"{sanitize_prompt_value(section_content)}\n\n项目概述：\n"
+        f"{sanitize_prompt_value(project_overview or '未提供项目概述')}\n\n编排结果：\n"
+        f"{arrange_json}\n\n请根据以上信息生成Mermaid{chart_kind}代码。"
+    )
+
+
+def _render_struct_data_gen_user(
+    schema: str,
+    chart_desc: str,
+    *,
+    section_title: str = "",
+    section_content: str = "",
+    project_overview: str = "",
+    arrange_result: dict | None = None,
+    writing_length: str = "standard",
+    industry_profile: str = "",
+) -> str:
+    """渲染结构化图表数据生成的**用户**提示词（原 2 处重复的硬编码 f-string）。
+
+    ENHANCE 2026-10-18（审计遗留 D2 批次 2 收编）：模板收编为注册表 key
+    ``CHART_STRUCT_DATA_GEN_USER``。**同时修复安全口径不一致**：原实现对
+    ``industry_profile``（行业画像，来自解析链路）裸插值未做元标记中和，
+    现统一 ``sanitize=True``（对 JSON 编排载荷无副作用，单遍替换不二次扫描）。
+    """
+    arrange_json = json.dumps(arrange_result, ensure_ascii=False, indent=2)
+    try:
+        rendered = get_prompt(
+            "CHART_STRUCT_DATA_GEN_USER",
+            SCHEMA=schema,
+            CHART_DESC=chart_desc,
+            safe_title=sanitize_prompt_value(section_title),
+            safe_content=sanitize_prompt_value(section_content),
+            safe_overview=sanitize_prompt_value(project_overview or "未提供项目概述"),
+            arrange_result=arrange_json,
+            writing_length=writing_length or "standard",
+            industry_profile=industry_profile or "未提供行业背景",
+            sanitize=True,
+        )
+    except Exception as e:
+        logger.warning("[图表数据生成] 用户提示词渲染失败: %s", e)
+        rendered = ""
+    if rendered:
+        return rendered
+    return (
+        f"章节标题：{sanitize_prompt_value(section_title)}\n\n章节内容：\n"
+        f"{sanitize_prompt_value(section_content)}\n\n项目概述：\n"
+        f"{sanitize_prompt_value(project_overview or '未提供项目概述')}\n\n编排结果：\n"
+        f"{arrange_json}\n\n写作长度：{writing_length}\n\n行业背景：\n"
+        f"{industry_profile or '未提供行业背景'}\n\n"
+        f"请根据以上信息生成{schema}格式的{chart_desc}。"
+    )
+
+
 def repair_mermaid(code: str, return_diff: bool = False) -> str | tuple[str, dict]:
     """修复常见 Mermaid 语法问题
 
@@ -495,21 +626,14 @@ async def generate_flowchart_arrange(
         writing_length=writing_length,
     )
 
-    user_prompt = f"""章节标题：{section_title}
-
-章节内容：
-{section_content}
-
-项目概述：
-{project_overview or "未提供项目概述"}
-
-评分标准：
-{scoring_standard or "未提供评分标准"}
-
-行业背景：
-{industry_profile or "未提供行业背景"}
-
-请根据以上信息判断该章节是否需要生成流程图，并返回JSON格式的判断结果。"""
+    user_prompt = _render_arrange_user(
+        "流程图",
+        section_title=section_title,
+        section_content=section_content,
+        project_overview=project_overview,
+        scoring_standard=scoring_standard,
+        industry_profile=industry_profile,
+    )
 
     messages = [
         AIMessage(role="system", content=arr_sys),
@@ -565,16 +689,32 @@ async def chart_data_fix(
             elif "tasks" in _parsed:
                 _parsed_summary = f"\n  Mermaid 解析预览: tasks={len(_parsed.get('tasks', []))}"
         _counts_str = ", ".join(f"{k}×{v}" for k, v in _counts.items()) if _counts else "无"
-        _repair_prompt = f"""
-[机械化修复上下文 v{_version}]
-  repair_mermaid 触发: {'是' if _changed else '否'}
-  已执行修复步骤: {', '.join(_steps) if _steps else '无'}
-  步骤触发次数: {_counts_str}
-  结构化校验错误: {'; '.join(_struct_errs) if _struct_errs else '无'}
-  修复前代码片段: {str(_rm.get('before', ''))[:300]}
-  修复后代码片段: {str(_rm.get('after', ''))[:300]}{_parsed_summary}
-
-"""
+        # ENHANCE 2026-10-18（审计遗留 D2 批次 2 收编）：修复上下文块收编为注册表
+        # key CHART_REPAIR_CONTEXT_BLOCK —— 该块此前是纯内联 f-string，运维无法在
+        # 管理页调整诊断粒度/字段顺序。渲染失败时回落原硬编码形态。
+        try:
+            _repair_prompt = get_prompt(
+                "CHART_REPAIR_CONTEXT_BLOCK",
+                repair_version=_version,
+                repair_triggered="是" if _changed else "否",
+                repair_steps=", ".join(_steps) if _steps else "无",
+                step_counts=_counts_str,
+                struct_errors="; ".join(_struct_errs) if _struct_errs else "无",
+                before_snippet=str(_rm.get("before", ""))[:300],
+                after_snippet=str(_rm.get("after", ""))[:300],
+                parsed_summary=_parsed_summary,
+            )
+        except Exception as e:
+            logger.warning("[图表修复] 修复上下文块渲染失败: %s", e)
+            _repair_prompt = (
+                f"\n[机械化修复上下文 v{_version}\n"
+                f"  repair_mermaid 触发: {'是' if _changed else '否'}\n"
+                f"  已执行修复步骤: {', '.join(_steps) if _steps else '无'}\n"
+                f"  步骤触发次数: {_counts_str}\n"
+                f"  结构化校验错误: {'; '.join(_struct_errs) if _struct_errs else '无'}\n"
+                f"  修复前代码片段: {str(_rm.get('before', ''))[:300]}\n"
+                f"  修复后代码片段: {str(_rm.get('after', ''))[:300]}{_parsed_summary}\n\n"
+            )
 
     # ENHANCE 2026-10-11: 高频 type mismatch 动态注入
     # 如果当前 chart_type 在 _REPAIR_TYPE_MISMATCHES 里有高频错位记录（≥3 次），
@@ -585,23 +725,45 @@ async def chart_data_fix(
         _relevant = [m for m in _high_freq if m["outer_type"] == chart_type]
         if _relevant:
             _types_to_avoid = ", ".join(m["original_type"] for m in _relevant)
-            _mismatch_warning = f"\n⚠️ 历史上 {chart_type} 类型曾多次（≥{_REPAIR_MISMATCH_THRESHOLD}次）被误输出为 {_types_to_avoid} 格式，请务必输出正确的 {chart_type} 格式，不要混淆！\n"
+            # ENHANCE 2026-10-18：告警模板收编为 CHART_TYPE_MISMATCH_WARNING
+            try:
+                _mismatch_warning = get_prompt(
+                    "CHART_TYPE_MISMATCH_WARNING",
+                    chart_type=chart_type,
+                    threshold=_REPAIR_MISMATCH_THRESHOLD,
+                    types_to_avoid=_types_to_avoid,
+                )
+            except Exception:
+                _mismatch_warning = (
+                    f"\n⚠️ 历史上 {chart_type} 类型曾多次（≥{_REPAIR_MISMATCH_THRESHOLD}次）"
+                    f"被误输出为 {_types_to_avoid} 格式，请务必输出正确的 {chart_type} 格式，不要混淆！\n"
+                )
     except Exception:
         pass  # 统计模块不可用时静默跳过
 
-    user_prompt = f"""图表类型：{chart_type}
-{_mismatch_warning}
-章节标题：{section_title}
-
-章节内容：
-{section_content}
-
-错误信息：
-{error_message or "未提供错误信息"}
-{_repair_prompt}原始数据：
-{original_data or "未提供原始数据"}
-
-请根据以上信息生成降级可用的图表数据。"""
+    # ENHANCE 2026-10-18：user 侧整体收编为 CHART_DATA_FIX_USER
+    try:
+        user_prompt = get_prompt(
+            "CHART_DATA_FIX_USER",
+            chart_type=chart_type,
+            mismatch_warning=_mismatch_warning,
+            section_title=section_title,
+            section_content=section_content,
+            error_message=error_message or "未提供错误信息",
+            repair_context=_repair_prompt,
+            original_data=original_data or "未提供原始数据",
+            sanitize=True,
+        )
+    except Exception as e:
+        logger.warning("[图表修复] 用户提示词渲染失败: %s", e)
+        user_prompt = ""
+    if not user_prompt:
+        user_prompt = (
+            f"图表类型：{chart_type}\n{_mismatch_warning}\n章节标题：{section_title}\n\n"
+            f"章节内容：\n{section_content}\n\n错误信息：\n{error_message or '未提供错误信息'}\n"
+            f"{_repair_prompt}原始数据：\n{original_data or '未提供原始数据'}\n\n"
+            f"请根据以上信息生成降级可用的图表数据。"
+        )
 
     messages = [
         AIMessage(role="system", content=fix_sys),
@@ -630,21 +792,14 @@ async def generate_layout_arrange(
         summary=project_overview,
     )
 
-    user_prompt = f"""章节标题：{section_title}
-
-章节内容：
-{section_content}
-
-项目概述：
-{project_overview or "未提供项目概述"}
-
-评分标准：
-{scoring_standard or "未提供评分标准"}
-
-行业背景：
-{industry_profile or "未提供行业背景"}
-
-请根据以上信息判断该章节是否需要生成布局图，并返回JSON格式的判断结果。"""
+    user_prompt = _render_arrange_user(
+        "布局图",
+        section_title=section_title,
+        section_content=section_content,
+        project_overview=project_overview,
+        scoring_standard=scoring_standard,
+        industry_profile=industry_profile,
+    )
 
     messages = [
         AIMessage(role="system", content=arr_sys),
@@ -669,22 +824,14 @@ async def generate_layout_mermaid(
 
     gen_sys = get_prompt("LAYOUT_GENERATE_SYSTEM")
 
-    # SECURITY-FIX 2026-10-06：section_content / project_overview 为用户内容，做元标记中和。
-    safe_title = sanitize_prompt_value(section_title)
-    safe_content = sanitize_prompt_value(section_content)
-    safe_overview = sanitize_prompt_value(project_overview or "未提供项目概述")
-    user_prompt = f"""章节标题：{safe_title}
-
-章节内容：
-{safe_content}
-
-项目概述：
-{safe_overview}
-
-编排结果：
-{json.dumps(arrange_result, ensure_ascii=False, indent=2)}
-
-请根据以上信息生成Mermaid布局图代码。"""
+    # 元标记中和已下沉到 _render_mermaid_gen_user 内部统一处理。
+    user_prompt = _render_mermaid_gen_user(
+        "布局图",
+        section_title=section_title,
+        section_content=section_content,
+        project_overview=project_overview,
+        arrange_result=arrange_result,
+    )
 
     messages = [
         AIMessage(role="system", content=gen_sys),
@@ -718,21 +865,14 @@ async def generate_timeline_arrange(
         summary=project_overview,
     )
 
-    user_prompt = f"""章节标题：{section_title}
-
-章节内容：
-{section_content}
-
-项目概述：
-{project_overview or "未提供项目概述"}
-
-评分标准：
-{scoring_standard or "未提供评分标准"}
-
-行业背景：
-{industry_profile or "未提供行业背景"}
-
-请根据以上信息判断该章节是否需要生成里程碑时间线图，并返回JSON格式的判断结果。"""
+    user_prompt = _render_arrange_user(
+        "里程碑时间线图",
+        section_title=section_title,
+        section_content=section_content,
+        project_overview=project_overview,
+        scoring_standard=scoring_standard,
+        industry_profile=industry_profile,
+    )
 
     messages = [
         AIMessage(role="system", content=arr_sys),
@@ -757,22 +897,14 @@ async def generate_timeline_mermaid(
 
     gen_sys = get_prompt("TIMELINE_GENERATE_SYSTEM")
 
-    # SECURITY-FIX 2026-10-06：section_content / project_overview 为用户内容，做元标记中和。
-    safe_title = sanitize_prompt_value(section_title)
-    safe_content = sanitize_prompt_value(section_content)
-    safe_overview = sanitize_prompt_value(project_overview or "未提供项目概述")
-    user_prompt = f"""章节标题：{safe_title}
-
-章节内容：
-{safe_content}
-
-项目概述：
-{safe_overview}
-
-编排结果：
-{json.dumps(arrange_result, ensure_ascii=False, indent=2)}
-
-请根据以上信息生成Mermaid时间线代码。"""
+    # 元标记中和已下沉到 _render_mermaid_gen_user 内部统一处理。
+    user_prompt = _render_mermaid_gen_user(
+        "时间线",
+        section_title=section_title,
+        section_content=section_content,
+        project_overview=project_overview,
+        arrange_result=arrange_result,
+    )
 
     messages = [
         AIMessage(role="system", content=gen_sys),
@@ -806,21 +938,14 @@ async def generate_comparison_arrange(
         summary=project_overview,
     )
 
-    user_prompt = f"""章节标题：{section_title}
-
-章节内容：
-{section_content}
-
-项目概述：
-{project_overview or "未提供项目概述"}
-
-评分标准：
-{scoring_standard or "未提供评分标准"}
-
-行业背景：
-{industry_profile or "未提供行业背景"}
-
-请根据以上信息判断该章节是否需要生成对比图，并返回JSON格式的判断结果。"""
+    user_prompt = _render_arrange_user(
+        "对比图",
+        section_title=section_title,
+        section_content=section_content,
+        project_overview=project_overview,
+        scoring_standard=scoring_standard,
+        industry_profile=industry_profile,
+    )
 
     messages = [
         AIMessage(role="system", content=arr_sys),
@@ -845,22 +970,14 @@ async def generate_comparison_mermaid(
 
     gen_sys = get_prompt("COMPARISON_GENERATE_SYSTEM")
 
-    # SECURITY-FIX 2026-10-06：section_content / project_overview 为用户内容，做元标记中和。
-    safe_title = sanitize_prompt_value(section_title)
-    safe_content = sanitize_prompt_value(section_content)
-    safe_overview = sanitize_prompt_value(project_overview or "未提供项目概述")
-    user_prompt = f"""章节标题：{safe_title}
-
-章节内容：
-{safe_content}
-
-项目概述：
-{safe_overview}
-
-编排结果：
-{json.dumps(arrange_result, ensure_ascii=False, indent=2)}
-
-请根据以上信息生成Mermaid对比图代码。"""
+    # 元标记中和已下沉到 _render_mermaid_gen_user 内部统一处理。
+    user_prompt = _render_mermaid_gen_user(
+        "对比图",
+        section_title=section_title,
+        section_content=section_content,
+        project_overview=project_overview,
+        arrange_result=arrange_result,
+    )
 
     messages = [
         AIMessage(role="system", content=gen_sys),
@@ -931,11 +1048,18 @@ async def generate_mermaid_flowchart(
     valid, msg = validate_mermaid(raw_content)
     if not valid:
         mermaid_repair = get_prompt("MERMAID_REPAIR_PROMPT")
+        # ENHANCE 2026-10-18（审计遗留 D2 批次 2 收编）：修复请求的 user 侧收编为
+        # MERMAID_REPAIR_USER（原为两处重复的 f-string 拼接）。
+        # 不加 sanitize：raw_content 是待修复的 Mermaid 源码，中和会破坏
+        # 节点/连线语法（与 BUG-FIX-PROMPT-S1 同理）。
+        repair_user = get_prompt(
+            "MERMAID_REPAIR_USER",
+            raw_content=raw_content,
+            error_message=msg,
+        ) or f"原始 Mermaid 代码：\n{raw_content}\n\n校验问题：{msg}"
         repair_messages = [
             AIMessage(role="system", content=mermaid_repair),
-            AIMessage(
-                role="user", content=f"原始 Mermaid 代码：\n{raw_content}\n\n校验问题：{msg}"
-            ),
+            AIMessage(role="user", content=repair_user),
         ]
         try:
             repaired = await with_timeout(
@@ -1055,14 +1179,19 @@ async def generate_illustration_prompt(
     logger.info("[配图方案] 开始: title=%s, path=%s", section_title, section_path)
     ill_sys = get_prompt("ILLUSTRATION_PLAN_SYSTEM")
     logger.info("[配图方案] 提示词加载: SYSTEM=%d字", len(ill_sys))
-    ill_user = (
-        f"请为以下章节规划一张配图方案：\n\n"
-        f"## 章节路径\n{section_path}\n\n"
-        f"## 章节标题\n{section_title}\n\n"
-        f"## 章节正文（摘要）\n{section_content[:2000] if section_content else '（暂无正文）'}\n\n"
-        f"## 行业背景\n{industry_profile or '通用工程'}\n\n"
-        f"请严格按照系统提示词中的 JSON 格式输出。"
+    # ENHANCE 2026-10-18（审计遗留 D2 批次 2 收编）：原为隐式 f-string 拼接，
+    # 收编为 ILLUSTRATION_PLAN_USER，并对注入内容开启元标记中和。
+    ill_user = get_prompt(
+        "ILLUSTRATION_PLAN_USER",
+        section_path=section_path,
+        section_title=section_title,
+        section_content=section_content[:2000] if section_content else "（暂无正文）",
+        industry_profile=industry_profile or "通用工程",
+        sanitize=True,
     )
+    if not ill_user:
+        logger.warning("[配图方案] 用户提示词未注册")
+        return {}
 
     messages = [
         AIMessage(role="system", content=ill_sys),
@@ -1090,21 +1219,15 @@ async def generate_illustration_arrange(
     arr_sys = get_prompt("ILLUSTRATION_ARRANGE_SYSTEM")
     logger.info("[配图编排] 插图 提示词加载: %d字", len(arr_sys))
 
-    user_prompt = f"""章节标题：{section_title}
-
-章节内容：
-{section_content}
-
-项目概述：
-{project_overview or "未提供项目概述"}
-
-评分标准：
-{scoring_standard or "未提供评分标准"}
-
-行业背景：
-{industry_profile or "未提供行业背景"}
-
-请根据以上信息判断该章节是否需要配图插图，如果需要，建议使用的图像风格（engineering_diagram/realistic_photo/technical_drawing/custom），并说明理由。返回JSON格式的判断结果。"""
+    user_prompt = get_prompt(
+        "ILLUSTRATION_ARRANGE_USER",
+        section_title=section_title,
+        section_content=section_content,
+        project_overview=project_overview or "未提供项目概述",
+        scoring_standard=scoring_standard or "未提供评分标准",
+        industry_profile=industry_profile or "未提供行业背景",
+        sanitize=True,
+    )
 
     messages = [
         AIMessage(role="system", content=arr_sys),
@@ -1376,21 +1499,14 @@ async def generate_labor_arrange(
     )
     logger.info("[配图编排] 劳动力图 提示词加载: %d字", len(arr_sys))
 
-    user_prompt = f"""章节标题：{section_title}
-
-章节内容：
-{section_content}
-
-项目概述：
-{project_overview or "未提供项目概述"}
-
-评分标准：
-{scoring_standard or "未提供评分标准"}
-
-行业背景：
-{industry_profile or "未提供行业背景"}
-
-请根据以上信息判断该章节是否需要生成劳动力图表，并返回JSON格式的判断结果。"""
+    user_prompt = _render_arrange_user(
+        "劳动力图表",
+        section_title=section_title,
+        section_content=section_content,
+        project_overview=project_overview,
+        scoring_standard=scoring_standard,
+        industry_profile=industry_profile,
+    )
 
     messages = [
         AIMessage(role="system", content=arr_sys),
@@ -1427,23 +1543,16 @@ async def generate_labor_data(
     safe_title = sanitize_prompt_value(section_title)
     safe_content = sanitize_prompt_value(section_content)
     safe_overview = sanitize_prompt_value(project_overview or "未提供项目概述")
-    user_prompt = f"""章节标题：{safe_title}
-
-章节内容：
-{safe_content}
-
-项目概述：
-{safe_overview}
-
-编排结果：
-{json.dumps(arrange_result, ensure_ascii=False, indent=2)}
-
-写作长度：{writing_length}
-
-行业背景：
-{industry_profile or "未提供行业背景"}
-
-请根据以上信息生成LaborPlan格式的劳动力图表JSON数据。"""
+    user_prompt = _render_struct_data_gen_user(
+        "LaborPlan",
+        "劳动力图表JSON数据",
+        section_title=section_title,
+        section_content=section_content,
+        project_overview=project_overview,
+        arrange_result=arrange_result,
+        writing_length=writing_length,
+        industry_profile=industry_profile,
+    )
 
     messages = [
         AIMessage(role="system", content=gen_sys),
@@ -1472,21 +1581,14 @@ async def generate_architecture_arrange(
         summary=project_overview,
     )
 
-    user_prompt = f"""章节标题：{section_title}
-
-章节内容：
-{section_content}
-
-项目概述：
-{project_overview or "未提供项目概述"}
-
-评分标准：
-{scoring_standard or "未提供评分标准"}
-
-行业背景：
-{industry_profile or "未提供行业背景"}
-
-请根据以上信息判断该章节是否需要生成架构图，并返回JSON格式的判断结果。"""
+    user_prompt = _render_arrange_user(
+        "架构图",
+        section_title=section_title,
+        section_content=section_content,
+        project_overview=project_overview,
+        scoring_standard=scoring_standard,
+        industry_profile=industry_profile,
+    )
 
     messages = [
         AIMessage(role="system", content=arr_sys),
@@ -1517,23 +1619,16 @@ async def generate_architecture_tree(
     safe_title = sanitize_prompt_value(section_title)
     safe_content = sanitize_prompt_value(section_content)
     safe_overview = sanitize_prompt_value(project_overview or "未提供项目概述")
-    user_prompt = f"""章节标题：{safe_title}
-
-章节内容：
-{safe_content}
-
-项目概述：
-{safe_overview}
-
-编排结果：
-{json.dumps(arrange_result, ensure_ascii=False, indent=2)}
-
-写作长度：{writing_length}
-
-行业背景：
-{industry_profile or "未提供行业背景"}
-
-请根据以上信息生成ArchNode格式的架构图JSON树。"""
+    user_prompt = _render_struct_data_gen_user(
+        "ArchNode",
+        "架构图JSON树",
+        section_title=section_title,
+        section_content=section_content,
+        project_overview=project_overview,
+        arrange_result=arrange_result,
+        writing_length=writing_length,
+        industry_profile=industry_profile,
+    )
 
     messages = [
         AIMessage(role="system", content=gen_sys),
@@ -2128,21 +2223,22 @@ class InlineChartDetector:
                 "reason": "关键词检测未命中",
             }
 
-        detect_sys = """你是标书编制专家，擅长判断哪些章节内容适合生成数据图表。
-
-判断标准：
-1. 包含多组对比数据（如不同方案的成本对比）→ 适合柱状图/对比图
-2. 包含趋势分析（如工期-资源投入曲线）→ 适合折线图
-3. 包含比例分布（如资金分配比例）→ 适合饼图
-4. 包含结构化数据（如设备清单）→ 适合表格
-
-返回 JSON：{"needed": true/false, "chart_type": "bar/pie/line/table", "data_source": "数据来源说明", "reason": "判断理由"}"""
-
-        user_prompt = f"""章节标题：{chapter_info.get('title', '')}
-章节描述：{chapter_info.get('description', '')}
-项目事实：{json.dumps(facts, ensure_ascii=False, indent=2)[:2000]}
-
-请判断该章节是否适合生成内联数据图表，返回JSON格式的判断结果。"""
+        # ENHANCE 2026-10-18（审计遗留 D2 批次 2 收编）：此前 system 与 user
+        # **两侧都是内联字面量**，是本批唯一「system 也未注册表化」的点 ——
+        # 管理页完全看不到这段判定规则，运维无法调整「什么样的章节该配图」。
+        # 现两侧均收编为 INLINE_CHART_DETECT_SYSTEM / INLINE_CHART_DETECT_USER，
+        # 并对注入内容开启元标记中和（facts 来自解析链路，属外部内容）。
+        detect_sys = get_prompt("INLINE_CHART_DETECT_SYSTEM")
+        user_prompt = get_prompt(
+            "INLINE_CHART_DETECT_USER",
+            section_title=chapter_info.get("title", ""),
+            section_desc=chapter_info.get("description", ""),
+            facts_json=json.dumps(facts, ensure_ascii=False, indent=2)[:2000],
+            sanitize=True,
+        )
+        if not detect_sys or not user_prompt:
+            logger.warning("InlineChartDetector: 提示词未注册，跳过 AI 判定并回退启发式")
+            return quick
 
         messages = [
             AIMessage(role="system", content=detect_sys),

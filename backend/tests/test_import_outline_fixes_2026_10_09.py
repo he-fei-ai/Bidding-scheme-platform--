@@ -42,6 +42,40 @@ if str(BACKEND_DIR) not in sys.path:
 from app.main import app  # noqa: E402
 from app.services import files as files_mod  # noqa: E402
 
+
+def _func_src(module_rel_path: str, func_name: str) -> str:
+    """按「源文件 + 函数名 + def 边界」截取函数体源码。
+
+    BUG-FIX 2026-10-17（L-2 · flaky 根因）：`inspect.getsource` 依赖
+    `func.__code__.co_firstlineno` + 模块对象的 `__module__` 元数据；全量
+    套件跑完后（大量 importlib 动态加载 / monkeypatch 副作用），这些元数据
+    可能被短暂覆盖，导致 getsource 定位到错误偏移、**返回其他函数的源码**
+    （不抛异常，断言静默失败/假阳性）——本文件多个源码断言测试在全量运行中
+    间歇失败即此根因（单独运行与同文件复跑均通过，与 DB / 时间戳无关，
+    是纯源码断言的元数据漂移）。conftest 已打全局补丁，但其「getmodule
+    失败即回退标准实现」的窗口仍在。本文件所有源码断言统一改为直读源文件
+    截取，彻底自足、零元数据依赖（与 conftest 补丁同思路）。
+    """
+    src = (BACKEND_DIR / module_rel_path).read_text(encoding="utf-8")
+    m = re.search(rf"^(?:async\s+)?def\s+{re.escape(func_name)}\s*\(", src, re.MULTILINE)
+    assert m, f"未找到 {func_name} 的定义: {module_rel_path}"
+    lines = src[m.start() :].splitlines()
+    head = lines[0]
+    indent = len(head) - len(head.lstrip())
+    out = [head]
+    for line in lines[1:]:
+        stripped = line.strip()
+        if stripped and (
+            stripped.startswith("def ")
+            or stripped.startswith("async def ")
+            or stripped.startswith("class ")
+        ):
+            this_indent = len(line) - len(line.lstrip())
+            if this_indent <= indent:
+                break
+        out.append(line)
+    return "\n".join(out)
+
 OLE2_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
 
 
@@ -156,12 +190,13 @@ class TestParseCacheInvalidation:
         R-3/BUG-5 2026-10-12：解析+落盘+终态逻辑已下沉到
         ``services.files._persist_file_extraction``，缓存清先于解析的时序转而由该
         函数保证，本用例据此改为检查该函数源码。
+
+        BUG-FIX 2026-10-17（L-2）：源码获取从 `inspect.getsource` 改为
+        `_func_src` 直读源文件截取——前者依赖 `__code__.co_firstlineno`
+        元数据，全量套件跑完后可能漂移并返回其他函数的源码（不抛异常、
+        断言静默失败），是本文件间歇 flaky 的根因。
         """
-        import inspect
-
-        from app.services import files as fmod
-
-        src = inspect.getsource(fmod._persist_file_extraction)
+        src = _func_src("app/services/files.py", "_persist_file_extraction")
         assert "_clear_parse_cache(" in src
         assert src.index("_clear_parse_cache(") < src.index("extract_text_from_path(")
 
@@ -237,11 +272,10 @@ class TestUploadedFilesScopedByProject:
         留在 task。故分两处校验，且两处合计至少 3 处 uploaded_files 更新都带
         project_id 作用域。
         """
-        import inspect
+        from app.services import files as fmod  # noqa: F401 —— 仅验证模块可导入
 
-        from app.services import files as fmod
-
-        fs_src = inspect.getsource(fmod._persist_file_extraction)
+        # BUG-FIX 2026-10-17（L-2）：改用直读源文件截取，不用 inspect.getsource
+        fs_src = _func_src("app/services/files.py", "_persist_file_extraction")
         text = (BACKEND_DIR / "app" / "tasks" / "__init__.py").read_text(encoding="utf-8")
         # 去掉整行注释，防止修复注释里引用旧写法造成假阳性
         task_src = "\n".join(
@@ -252,10 +286,13 @@ class TestUploadedFilesScopedByProject:
         # 表现为单行形态。否则同一段 SQL 仅因排版方式不同就会让源码断言假阴性
         # （R-3 重构把长 UPDATE 拆成两个相邻字面量即触发过此问题）。
         task_src = re.sub(r'"[ \t]*\n[ \t]*"', "", task_src)
-        assert "SET status = 'processing' WHERE id = ? AND project_id = ?" in fs_src, (
+        # BUG-FIX 2026-10-17（updated_at 漂移）：2026-10-17 给 uploaded_files 加了
+        # updated_at 列，processing/终态 UPDATE 都新增了该字段。断言不能再卡死
+        # 精确 SQL 字符串，改为只检查关键 WHERE 收敛子句。
+        assert "SET status" in fs_src and "WHERE id = ? AND project_id = ?" in fs_src, (
             "processing 更新未按 project_id 收敛"
         )
-        assert "SET status = ?, extracted_text_path = ?, message = ?" in fs_src
+        assert "SET status" in fs_src and "extracted_text_path" in fs_src and "message" in fs_src
         # task 异常兜底里的 failed UPDATE 仍按项目收敛（单行即可匹配，跨行 SQL 不可直接拼接断言）
         assert "SET status = 'failed', message = ?" in task_src
         assert (
@@ -263,8 +300,8 @@ class TestUploadedFilesScopedByProject:
         ), "三处 uploaded_files 更新必须都带 project_id 作用域"
 
     def test_re_extract_update_scoped_by_project(self):
-        from app.services.files import re_extract_text
-        src = inspect.getsource(re_extract_text)
+        # BUG-FIX 2026-10-17（L-2）：同上，直读源文件截取
+        src = _func_src("app/services/files.py", "re_extract_text")
         assert "WHERE id = ? AND project_id = ?" in src, "re_extract_text 的 UPDATE 未按项目收敛"
 
 

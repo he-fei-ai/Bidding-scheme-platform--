@@ -30,6 +30,9 @@ from __future__ import annotations
 from . import (
     _context,
     _integrate,  # ENHANCE 2026-10-12：整合调用方散落的存量硬编码提示词
+    # ENHANCE 2026-10-18（审计遗留 D2 批次 2）：收编 image_engine / workflows_*
+    # 的 user 侧硬编码提示词（system 侧此前已注册表化）
+    _integrate_batch2,
     _security,
     _shared,
     analysis,
@@ -71,26 +74,33 @@ from ._cache import (
 )
 from ._context import (
     DEFAULT_PRIORITIES,
+    PART_ALIASES,
     assemble_prompt_context,
     build_chapter_context,
     estimate_tokens,
+    normalize_part_name,
     truncate_to_tokens,
     split_into_token_capped_chunks,
 )
 from ._registry import (
     _ALL_PROMPTS,
     _reg,
+    audit_shared_usage,
     clean_prompt_text,
     extract_variables,
     get_prompt_variables,
     has_residual_placeholders,
     render_prompt,
     render_prompt_safe,
+    resolve_shared_refs,
+    validate_prompt_content,
     validate_prompt_variables,
 )
 from ._security import (
     desensitize_sensitive_info,
+    detect_injection_risk,
     neutralize_meta_markers,
+    sanitize_for_injection,
     sanitize_prompt_value,
 )
 from ._notifications import (
@@ -182,4 +192,12 @@ __all__ = [
     "validate_prompt_variables",
     "clean_prompt_text",
     "extract_variables",
+    # ENHANCE 2026-10-17
+    "resolve_shared_refs",
+    "audit_shared_usage",
+    "validate_prompt_content",
+    "detect_injection_risk",
+    "sanitize_for_injection",
+    "normalize_part_name",
+    "PART_ALIASES",
 ]

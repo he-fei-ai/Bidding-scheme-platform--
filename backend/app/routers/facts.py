@@ -521,6 +521,43 @@ async def save_facts(project_id: int, body: GlobalFactList, current_user: Annota
                 "facts_audit_json = '', facts_audit_at = NULL",
                 (project_id, facts_json, _ef_json),
             )
+            # ENHANCE 2026-10-19（岳阳路事故·页眉修复）：项目名占位回填。
+            # 前端快速建项目时默认命名为「招投标项目 <时间戳>」，分析提取出
+            # projectName 事实后从不回写 → DOCX 页眉/封面长期显示占位名。
+            # 现在保存事实时检测：项目名仍是占位模式且事实里有真实 projectName
+            # 则自动回写 projects.name（用户改过名则尊重用户命名，不覆盖）。
+            try:
+                _pname = ""
+                for _it in items:
+                    if isinstance(_it, dict) and str(_it.get("key") or "") in (
+                        "projectName",
+                        "project_name",
+                        "项目名称",
+                    ):
+                        _pname = str(_it.get("value") or "").strip()
+                        break
+                if _pname:
+                    _DEFAULT_NAME_RE = re.compile(
+                        r"^(招投标项目|未命名项目|新建项目)\s*\d{4}[-/年]"
+                    )
+                    _row_name = conn.execute(
+                        "SELECT name FROM projects WHERE id = ?", (project_id,)
+                    ).fetchone()
+                    _cur_name = str((_row_name["name"] if _row_name else "") or "").strip()
+                    if _cur_name != _pname and (
+                        not _cur_name or _DEFAULT_NAME_RE.match(_cur_name)
+                    ):
+                        conn.execute(
+                            "UPDATE projects SET name = ?, updated_at = datetime('now','localtime') "
+                            "WHERE id = ?",
+                            (_pname, project_id),
+                        )
+                        logger.info(
+                            "[事实保存] 项目名占位回填: %r → %r (project=%d)",
+                            _cur_name, _pname, project_id,
+                        )
+            except Exception as _pn_e:
+                logger.warning("[事实保存] 项目名回填失败（不影响保存本身）: %s", _pn_e)
             # ENHANCE 2026-10-06（设计文档 8.1「保存后清空旧正文生成缓存」）：
             # 事实基准已全量覆写，若旧正文缓存不失效，用户改完事实重生成时仍命中
             # 旧章节内容，造成「改了事实但正文前后仍不一致」的隐性回归。失效三层

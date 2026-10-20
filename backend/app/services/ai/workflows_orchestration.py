@@ -19,6 +19,9 @@ import time
 from typing import Any
 from .providers.base import AIMessage
 from .prompts import get_prompt, render_prompt
+# 2026-10-20 易标机制引入（规格二.5）：参考条目截断长度配置化，
+# 默认值 = 历史硬编码值（60/120），不改变现有行为。
+from app.config import KNOWLEDGE_CATALOG_SUMMARY_MAX, KNOWLEDGE_CATALOG_TITLE_MAX
 
 logger = logging.getLogger(__name__)
 
@@ -204,8 +207,9 @@ def _build_knowledge_catalog_text(catalog: list | None) -> str:
             iid = int(it.get("id"))
         except (TypeError, ValueError):
             continue
-        title = str(it.get("title") or "").strip()[:60]
-        summary = str(it.get("summary") or "").strip()[:120]
+        # 2026-10-20 截断长度配置化（原硬编码 [:60]/[:120]，默认值不变）
+        title = str(it.get("title") or "").strip()[:KNOWLEDGE_CATALOG_TITLE_MAX]
+        summary = str(it.get("summary") or "").strip()[:KNOWLEDGE_CATALOG_SUMMARY_MAX]
         items.append((iid, title, summary))
     if not items:
         return ""
@@ -594,18 +598,43 @@ def _adjudicate_illustrations(plans: list[dict],
         _p["illustration_type"] = None
 
     # === 第一阶段：收集所有候选 ===
+    # 2026-10-20 易标机制引入（规格三.2）：同类图按归一化 reason 去重。
+    # 对齐易标 resolveIllustrationPlan 的「标题归一化去重」：同一类型的多个
+    # 候选若配图意图相同（reason 前 16 字归一化后相等），只保留 priority 高的
+    # 一个，避免同一张「施工流程图」类意图在不同小节重复裁定落图。
     mermaid_candidates = []  # [(idx, priority)]
     image_candidates = []    # [(idx, priority)]
+    _mm_seen: dict[str, tuple[int, int]] = {}  # key -> (priority, idx)
+    _im_seen: dict[str, tuple[int, int]] = {}
+
+    def _dedup_key(obj: dict) -> str:
+        raw = str(obj.get("reason") or obj.get("purpose") or "").strip()
+        if not raw:
+            return ""  # 无意图描述 → 不参与去重（各算各的）
+        return re.sub(r"[\s，。、；：;:,.!！?？\-—_/（）()【】\[\]「””]+", "", raw)[:16]
+
+    def _collect(cands: list, seen: dict, idx: int, pr: int, key: str) -> None:
+        if key:
+            if key in seen:
+                old_pr, old_idx = seen[key]
+                if pr > old_pr:  # 新候选优先：旧候选出局，换人登记
+                    cands[:] = [(i, p) for i, p in cands if i != old_idx]
+                    cands.append((idx, pr))
+                    seen[key] = (pr, idx)
+                return  # priority 不高于已登记者 → 丢弃
+            seen[key] = (pr, idx)
+        cands.append((idx, pr))
+
     for idx, p in enumerate(plans):
         plan = p.get("plan", {})
         mm = plan.get("mermaid") or {}
         im = plan.get("image") or {}
         if mm.get("needed"):
             pr = normalize_priority(mm.get("priority"), needed=True)
-            mermaid_candidates.append((idx, pr))
+            _collect(mermaid_candidates, _mm_seen, idx, pr, _dedup_key(mm))
         if im.get("needed"):
             pr = normalize_priority(im.get("priority"), needed=True)
-            image_candidates.append((idx, pr))
+            _collect(image_candidates, _im_seen, idx, pr, _dedup_key(im))
 
     # === 第二阶段：分段择优（避免图片集中在前面）===
     segments = max(1, n // section_per_segment + (1 if n % section_per_segment else 0))
@@ -809,7 +838,15 @@ async def generate_full_skeleton(provider: Any, outline: list,
     listing = "\n".join(
         f"{sid}\t{title}" for sid, title in sorted(nodes.items())
     )
-    user_prompt = (
+    # ENHANCE 2026-10-18（审计遗留 D2 批次 2 收编）：user 侧收编为
+    # CONTENT_SKELETON_USER（system 侧早已于 BUG-FIX-PROMPT-E3 收编）。
+    # 项目概述来自解析链路（外部内容），注入前做元标记中和。
+    user_prompt = get_prompt(
+        "CONTENT_SKELETON_USER",
+        project_overview=(project_overview or "")[:800],
+        node_listing=listing,
+        sanitize=True,
+    ) or (
         f"### 项目概述\n{(project_overview or '')[:800]}\n\n"
         f"### 需要写骨架的章节（section_id<TAB>标题）\n{listing}\n\n"
         "请为以上每个 section_id 输出一篇 1~2 句的篇章骨架，返回严格 JSON。"

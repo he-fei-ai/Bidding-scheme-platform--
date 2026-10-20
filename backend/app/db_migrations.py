@@ -73,11 +73,16 @@ def unify_api_key_encryption(conn, columns: tuple[tuple[str, str], ...] | None =
 #    二级条目），又把正文章节整段删掉。生成侧已改为同级去重，这里把存量数据里
 #    已经写死进库的后缀清掉。只剥离后缀字符串本身，不改动任何真实内容。
 #
-# 2) 占位/泛化标题清理（2026-10-12 追加）：加固前（2026-10-10 之前）生成的目录
-#    会出现「专项6」「总体实施策划（2）」这类占位/泛化脏标题（见 outline_common
-#    里的 _is_dirty_l3_title / _semantic_fallback_title）。这里复用生成侧的同
-#    一套清洗逻辑，把存量 JSON 树里的 L3+ 脏标题改写为语义化标题。
-#    只作用于 JSON 树（sections.title 单行存储只存 L1/L2，不含 L3 占位）。
+# 2) 占位/泛化标题清理（2026-10-12 追加，2026-10-17 扩至 sections 全层级）：
+#    加固前（2026-10-10 之前）生成的目录会出现「专项6」「总体实施策划（2）」这类
+#    占位/泛化脏标题（判定与改写复用生成侧 outline_common 的
+#    `_is_dirty_l3_title` / `_cleanup_placeholder_titles`，两侧口径永不漂移）。
+#    覆盖两类存储形态：
+#      · JSON 目录树（v51_tasks / project_templates，阶段 2）；
+#      · sections 表单行标题（阶段 3 按项目重建树清洗 —— `_save_nodes` 递归落库
+#        **全部层级**，sections.title 里 L3+ 占位与 JSON 树一样多；
+#        此处旧注释「只存 L1/L2」写于更早 schema，已修正）。
+#    只改写 L3+ 脏标题，L1/L2 用户正式章节名绝不触碰。
 
 #: JSON 目录树形态的表与列：(表名, 需要清洗的列)
 _LEGACY_TITLE_JSON_COLUMNS: tuple[tuple[str, tuple[str, ...]], ...] = (
@@ -123,17 +128,91 @@ def _strip_suffix_tree(obj, strip_fn) -> bool:
     return changed
 
 
+def _clean_sections_placeholder_titles(conn: sqlite3.Connection) -> int:
+    """按项目重建 sections 目录树，清洗 L3+ 占位/泛化脏标题，返回改写行数。
+
+    BUG-FIX 2026-10-17（L-5 · 存量脏数据净化）：
+    `_save_nodes`（routers/sse/sse_db_ops.py）递归落库**全部层级**
+    （level = base_level + 1），sections.title 里的 L3+ 占位标题与 JSON 树一样
+    多；而本迁移的阶段 2 此前只覆盖 JSON 列——函数 docstring 里
+    「sections.title 单行存储只存 L1/L2，不含 L3 占位」的注释写于更早的
+    schema，与现行实现不符。于是生成链路自 2026-10-09 起已逐轮收口的脏标题
+    （「专项6」「总体实施策划（2）」及 2026-10-17 第六轮的编号前缀家族），
+    在**已落库**的 sections 行里原样存活：用户在目录编辑器 / API / 导出 /
+    正文上下文里照看不误，且不会随「下次生成」自愈（目录不重新生成时）。
+
+    实现：按 project_id 分组 → 按 parent_id + sort_order 重建森林 →
+    `_cleanup_placeholder_titles`（与生成链路**同一函数、同一口径**，
+    只动 level>=3，L1/L2 用户正式章节名绝不碰）→ 只写回真实变化的行。
+    幂等：清洗器本身幂等，无变化即零写入，重复执行安全。
+    """
+    columns = _db_table_columns(conn, "sections")
+    if not {"id", "parent_id", "title", "project_id"} <= columns:
+        return 0
+    try:
+        rows = conn.execute(
+            "SELECT id, parent_id, title, project_id FROM sections "
+            "ORDER BY project_id, sort_order, id"
+        ).fetchall()
+    except sqlite3.Error as exc:
+        logger.warning("[silent-except] 读取 sections 失败，跳过占位标题清洗: %s", exc)
+        return 0
+
+    by_project: dict = {}
+    for r in rows:
+        by_project.setdefault(r["project_id"], []).append(r)
+
+    # 函数内导入：`_cleanup_placeholder_titles` 在调用方
+    # `clean_legacy_outline_title_suffixes` 里是局部名，模块级不存在；
+    # 且 ai 服务链在 db_migrations 导入期尚未就绪，必须惰性导入。
+    try:
+        from .services.ai.outline_common import _cleanup_placeholder_titles
+    except Exception as exc:  # 清理失败不能阻塞启动
+        logger.debug("[silent-except] 无法加载标题清洗函数，跳过 sections 清洗: %s", exc)
+        return 0
+
+    changed = 0
+    for _project_id, prows in by_project.items():
+        nodes: dict = {}
+        for r in prows:
+            nodes[r["id"]] = {"id": r["id"], "title": r["title"] or "", "children": []}
+        roots = []
+        for r in prows:
+            pid = r["parent_id"]
+            # 环/孤儿防御：父不存在、父是自身、或父不在本项目 → 按根处理
+            if pid is not None and pid != r["id"] and pid in nodes:
+                nodes[pid]["children"].append(nodes[r["id"]])
+            else:
+                roots.append(nodes[r["id"]])
+        if not roots:
+            continue
+        before = {rid: n["title"] for rid, n in nodes.items()}
+        try:
+            _cleanup_placeholder_titles(roots)
+        except Exception as exc:  # 单项目清洗失败不影响其他项目
+            logger.debug("[silent-except] sections 占位标题清洗跳过（project=%s）: %s", _project_id, exc)
+            continue
+        for rid, n in nodes.items():
+            if n["title"] != before[rid]:
+                conn.execute(
+                    "UPDATE sections SET title = ? WHERE id = ?", (n["title"], rid)
+                )
+                changed += 1
+    return changed
+
+
 def clean_legacy_outline_title_suffixes(conn: sqlite3.Connection, *, commit: bool = True) -> dict[str, int]:
     """清理存量目录标题上的冗余后缀与占位标题（幂等，可重复执行）。
 
-    两个清理阶段（先后缀后占位，确保顺序正确）：
+    三个清理阶段（先后缀后占位再树清洗，确保顺序正确）：
       阶段 1：剥离「（其2）」「（其 2）」式冗余序数后缀（所有标题层级）
-      阶段 2：改写 L3+ 的「专项N」「总体实施策划」等占位/泛化脏标题
+      阶段 2：改写 JSON 目录树里 L3+ 的「专项N」「总体实施策划」等占位/泛化脏标题
+      阶段 3：按项目重建 sections 树，改写其中 L3+ 占位/泛化脏标题
 
     覆盖：
-      - sections.title / feasibility_outline_nodes.title（单行字符串，仅阶段 1 生效）
-      - v51_tasks 的 level1/level2/final/edited outline JSON（两阶段都生效）
-      - project_templates.outline_json（两阶段都生效）
+      - sections.title / feasibility_outline_nodes.title（单行字符串，阶段 1 + 3 生效）
+      - v51_tasks 的 level1/level2/final/edited outline JSON（阶段 1 + 2 生效）
+      - project_templates.outline_json（阶段 1 + 2 生效）
 
     全部按「表/列是否存在」守卫，坏 JSON 静默跳过 —— 清理失败绝不阻塞启动。
     返回 {目标: 受影响的行数}，供启动日志与测试观测。
@@ -231,6 +310,17 @@ def clean_legacy_outline_title_suffixes(conn: sqlite3.Connection, *, commit: boo
                 )
                 changed += 1
         stats[table] = changed
+
+    # 阶段 3（BUG-FIX 2026-10-17 · L-5）：sections 表按项目重建树清洗 L3+ 占位标题。
+    # `_save_nodes` 递归落库全部层级，sections.title 里的 L3+ 脏标题与 JSON 树一样
+    # 多；阶段 2 只覆盖 JSON 列，此前的注释「sections.title 只存 L1/L2」与现行
+    # schema 不符（该注释写于更早版本）。与生成链路（落库层归一化链）同函数同口径。
+    try:
+        _sec_fixed = _clean_sections_placeholder_titles(conn)
+        if _sec_fixed:
+            stats["sections.placeholder"] = _sec_fixed
+    except Exception as _sec_exc:  # 清理失败不能阻塞启动
+        logger.debug("[silent-except] sections 占位标题清洗跳过: %s", _sec_exc)
 
     if commit:
         conn.commit()

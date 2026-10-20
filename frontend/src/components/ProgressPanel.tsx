@@ -113,6 +113,18 @@ export default React.memo(function ProgressPanel({ items, total, success, failed
     ? Math.min(100, percent + generatingProgress)
     : percent;
 
+  // BUG-FIX 2026-10-20（状态显示）：非运行态下，旧实现只要 failed===0 就把进度条
+  // 渲染成绿色 success（对勾）。可「暂停」与「中途停止」同样是 isRunning=false 且
+  // failed 可能为 0，于是跑到 30% 被暂停的生成被显示成「已完成」，误导用户。
+  // 现在：只有真正全部完成（done>=total）才 success；有失败仍 exception；
+  // 其余（暂停 / 中途停止 / 未跑满）一律 normal（灰色），如实反映「未完成的静止态」。
+  const allDone = total > 0 && done >= total;
+  const progressStatus: "active" | "exception" | "success" | "normal"
+    = isRunning ? "active"
+      : failed > 0 ? "exception"
+        : allDone ? "success"
+          : "normal";
+
   const statusIcon = (status: string) => {
     return PHASE_CONFIG[status]?.icon || null;
   };
@@ -138,7 +150,7 @@ export default React.memo(function ProgressPanel({ items, total, success, failed
         percent={effectivePercent}
         size="small"
         strokeWidth={6}
-        status={isRunning ? "active" : (failed > 0 ? "exception" : "success")}
+        status={progressStatus}
       />
       {items.length > 0 && (
       <div style={{ maxHeight: 100, overflow: "auto", marginTop: 4 }}>

@@ -19,6 +19,9 @@ export default defineConfig({
     environment: "node",
     include: ["src/**/*.test.ts", "src/**/*.test.tsx"],
     setupFiles: ["./src/setupTests.ts"],
+    // L-1（2026-10-17）修复不在本文件：Windows 盘符大小写导致 vitest 双实例、
+    // runner 状态分裂（详见 scripts/run-vitest.mjs 头注）。npm test 脚本已改走
+    // 该规范化启动器，从任意盘符大小写的 cwd 启动均能拿到一致身份。
     // BUG-FIX 2026-10-13（消除 DOM 测试 flaky）：此前未设 `testTimeout`，走 vitest
     // 默认的 **5000ms**。而组件级交互测试要真渲染 antd（Table/Modal/Tabs 在 jsdom
     // 下单次渲染就要数百毫秒），再叠加 `waitFor` 的异步重试与 26 个测试文件并发
@@ -52,11 +55,10 @@ export default defineConfig({
     // 阶段被并行争抢拖到超时，导致 8 tests 全部 skip + 文件级 ❯ 标记失败。
     // 单独运行 8/8 通过，确认非代码缺陷。现在降到 2 worker（物理核数/2）从根因
     // 消除争抢；retry 升到 2 给偶发一次额外重试。纯函数用例不受影响（毫秒级）。
-    poolOptions: {
-      threads: {
-        maxThreads: 2,
-      },
-    },
+    // ENHANCE 2026-10-17（Vitest 5 迁移）：`test.poolOptions.threads.maxThreads`
+    // 已被 Vitest 4+ 移除（运行时告警 DEPRECATED），迁移为等价的顶层 `maxWorkers`。
+    // 语义不变：限制并发 worker 到 2，消除 antd+jsdom 全量并发下的 CPU/内存争抢。
+    maxWorkers: 2,
     // 三保险：retry=2（最多重试 2 次），确定性回归重试后仍失败、照常红灯。
     retry: 2,
   },

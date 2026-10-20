@@ -211,7 +211,12 @@ class TestPdfTableExtract:
         import inspect
         import re
 
-        src = inspect.getsource(file_service._extract_pdf)
+        # BUG-FIX 2026-10-19：_extract_pdf 外层新增超时护栏 wrapper 后，
+        # 开关守卫与 plumber 调用位于原实现 _extract_pdf_impl（逐字未动）。
+        # 本测试钉的是「守卫先于调用」语义，故直接 inspect 原实现。
+        from app.services import extractors as _extractors_mod
+
+        src = inspect.getsource(_extractors_mod._extract_pdf_impl)
         # 开关守卫必须在 plumber 提取之前（关闭时不得触碰 pdfplumber 分支）。
         # R-1 2026-10-12：提取器搬迁后，开关与被调用方都经 _late() 晚解析
         # （保住 monkeypatch 接缝），源码形态随之变化 —— 这里用正则容忍
