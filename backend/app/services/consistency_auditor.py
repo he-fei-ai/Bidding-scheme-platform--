@@ -747,8 +747,15 @@ class ConsistencyAuditor:
     def _load_suggestion_payload(
         self, conflict_id: str, project_id: int
     ) -> tuple[str | None, str | None]:
-        """读冲突记录并推导出 (target_value, suggestion_text)；无记录/异常返回 (None, None)。"""
-        with get_db() as conn:
+        """读冲突记录并推导出 (target_value, suggestion_text)；无记录/异常返回 (None, None)。
+
+        PERF 2026-10-27（并发·纯读跳过全局写锁）：本函数只做一次 SELECT，是
+        「采纳建议 / 修复建议」前端按钮的每次点击热路径。此前用无参
+        ``get_db()`` 抢全局写锁 —— 任何项目的审计落库 / 导出 / 生成高峰期，
+        该读都会在 ``_db_write_lock``（8s 超时）上排队，纯属自伤。WAL 模式下
+        readonly 连接走并发读通道，与写事务互不阻塞。
+        """
+        with get_db(readonly=True) as conn:
             row = conn.execute(
                 "SELECT * FROM consistency_conflicts WHERE conflict_id = ? AND project_id = ?",
                 (conflict_id, project_id),

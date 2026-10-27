@@ -470,6 +470,10 @@ export function outlineDictToTreeNodes(
       sort_order: sortOrder,
       section_type: typeof n.section_type === "string" ? n.section_type : "text",
       scoring_point_id: n.scoring_point_id ?? null,
+      // 2026-10-20 遗留 3/5：Aligned 锁定/正文模式随 SSE 目录字典透传到
+      // 审核弹窗（此前构造器只挑选固定字段，locked 在此被静默丢弃）。
+      locked: n.locked === true,
+      content_mode: typeof n.content_mode === "string" ? n.content_mode : null,
       // BUG-FIX 2026-10-09（跨模块数据链 / 章节状态机）：
       // 原实现硬编码 `status: "active"` —— 这是一个全仓库无人写入、
       // 也不被任何消费者识别的幽灵状态。它让目录审核弹窗里的每个节点
@@ -1247,6 +1251,96 @@ export function countExtractedFiles(files: { status: string }[]): number {
 }
 
 // ============================================================
+// 上传解析模块 —— 在途状态判定（BUG-FIX 2026-10-26）
+// ============================================================
+
+/**
+ * 「解析仍在执行中」的文件状态（**唯一口径**）。
+ *
+ * BUG-FIX 2026-10-26（幽灵任务）：此前 FileUploadPage 把 `pending` 也算作在途
+ * （inFlight = processing || queued || pending），据此向 taskStore 注册 running
+ * 任务。但后端 `uploaded_files.status` 里的 `pending` 只有一个写入方 ——
+ * `clear_project_texts`（清空提取文本时把行重置为「待提取」），而它**不会**
+ * 派发任何解析任务。于是「清空提取」会让顶栏凭空多出 N 条「文件解析 0%」，
+ * 且永远不会进终态（用户只能靠离开页面触发 stopTracking 清理）。
+ *
+ * 后端语义对照：
+ *   - `processing` —— 已派发后台解析，worker 尚未落终态；
+ *   - `queued`     —— file_parse_tasks 的 DDL 默认值（历史脏行），无在途含义，
+ *                     但保留在集合内以维持既有轮询语义，不新增行为；
+ *   - `pending`    —— 「已入库、从未解析」的静态态，**不是**在途。
+ */
+export const IN_FLIGHT_FILE_STATUSES: readonly string[] = Object.freeze([
+  "processing",
+  "queued",
+]);
+
+/** 该文件是否仍有解析任务在跑（用于 taskStore 注册 / 轮询判定） */
+export function isInFlightFileStatus(status: string | null | undefined): boolean {
+  if (!status) return false;
+  return IN_FLIGHT_FILE_STATUSES.indexOf(status) !== -1;
+}
+
+// ============================================================
+// 上传解析模块 —— 路由参数解析（BUG-FIX 2026-10-26）
+// ============================================================
+
+/**
+ * 路由参数 → 合法项目 ID（正整数）。
+ *
+ * BUG-FIX 2026-10-26：原实现 `id ? Number(id) : null` 对 `Number("1.5")` 返回
+ * 1.5（truthy）、`Number("1abc")` 返回 NaN（被 falsy 兜住但理由不对），
+ * 非整数会带着小数去请求 `/projects/1.5/files`。SummaryReviewPage 已有等价的
+ * `!isNaN && > 0` 守卫，上传页缺同样的防线，现抽成纯函数共用口径。
+ */
+export function parseProjectId(raw: string | null | undefined): number | null {
+  if (raw === null || raw === undefined || raw === "") return null;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || !Number.isInteger(n) || n <= 0) return null;
+  return n;
+}
+
+// ============================================================
+// 上传解析模块 —— 「进入要点提取」流程门禁（2026-10-26）
+// ============================================================
+
+/**
+ * 是否允许从上传页进入「要点提取」（纯函数，组件级可测）。
+ *
+ * BUG-FIX 2026-10-26（流程入口零门禁）：此前判定只看 `files.length > 0`。
+ * 用户只上传 1 张 OCR 失败的扫描件（status='failed'）也能一路点进提取页，
+ * 直到点「生成摘要」才被后端 400「请先上传文件」拦住，且提取页没有返回上传页
+ * 的引导 —— 空转一次 AI 提交流程才发现走错了门。
+ * 现把「没有可用文本」这一事实提前到入口说清，并区分「还在解析」与「已失败」。
+ */
+export function checkReadyForExtraction(
+  files: { status: string }[],
+): { ready: true } | { ready: false; reason: string } {
+  const extracted = files.filter(
+    (f) => f.status === "success" || f.status === "extracted",
+  ).length;
+  if (extracted > 0) return { ready: true };
+  const inFlight = files.filter((f) => isInFlightFileStatus(f.status)).length;
+  if (inFlight > 0) {
+    return { ready: false, reason: "有文件正在解析中，请等解析完成后再进入要点提取" };
+  }
+  return {
+    ready: false,
+    reason: "没有已提取到文本的文件，请先点「重新提取」或重新上传可解析的文件",
+  };
+}
+
+/**
+ * 「主文件已换源、旧摘要/评分基于旧文本」的统一提示文案。
+ *
+ * BUG-FIX 2026-10-26：此前同一段文案在 FileUploadPage 里出现两次
+ * （handleToggleRole 手动切角色路径 / handleUpload 上传挤主文件路径），
+ * 历史上就是靠这种副本漂移出真实故障。集中到一处常量，两条路径共用。
+ */
+export const NEEDS_REANALYSIS_MESSAGE =
+  "主文件已变更，请到「提取项目」重新生成摘要与评分点";
+
+// ============================================================
 // 上传解析模块 —— 批量上传交互状态机（组件级可测化 2026-10-05）
 // 从 FileUploadPage.tsx 的 handleUpload / finish 内联逻辑抽取为纯函数，
 // 使「批量上传状态错乱」类缺陷可以在无 DOM 环境下单测。
@@ -1411,13 +1505,20 @@ export function formatReExtractResultText(
 export function formatClearTextsResult(r: {
   files_reset?: number | null;
   tasks_cleared?: number | null;
+  files_kept_processing?: number | null;
   warning?: string | null;
 }): { level: "success" | "warning"; text: string } {
   const warning = (r?.warning || "").trim();
   if (warning) return { level: "warning", text: warning };
+  const base = `已重置 ${r?.files_reset ?? 0} 个文件状态为待提取，清理 ${r?.tasks_cleared ?? 0} 条旧解析记录`;
+  // BUG-FIX 2026-10-26：后端不再把在途 processing 行重置为 pending，需明确告知
+  // 用户这批文件未受本次清空影响（它们的解析仍会完成并重新落盘），否则会误以为
+  // 「清空」把所有文件都置空了。老后端无该字段 → kept=0，文案与旧版逐字一致。
+  const kept = r?.files_kept_processing ?? 0;
   return {
     level: "success",
-    text: `已重置 ${r?.files_reset ?? 0} 个文件状态为待提取，清理 ${r?.tasks_cleared ?? 0} 条旧解析记录`,
+    text:
+      kept > 0 ? `${base}；${kept} 个正在解析中的文件未受影响` : base,
   };
 }
 
@@ -1474,12 +1575,20 @@ export function formatParsingStatusText(
   }
   const { recent_completed: done, recent_failed: bad } = s;
   if (done === 0 && bad === 0) return null;
-  const warning =
-    s.latest && s.latest.status === "completed" ? (s.latest.error_message || "").trim() : "";
+  const latest = s.latest || null;
+  const latestNote = latest ? (latest.error_message || "").trim() : "";
   if (bad === 0) {
-    return warning ? `最近解析完成 ${done} 个（${warning}）` : `最近解析完成 ${done} 个文件`;
+    return latestNote && latest?.status === "completed"
+      ? `最近解析完成 ${done} 个（${latestNote}）`
+      : `最近解析完成 ${done} 个文件`;
   }
-  return `最近解析完成 ${done} 个，失败 ${bad} 个`;
+  // BUG-FIX 2026-10-26（失败原因失明）：此前失败分支只播报计数，latest.error_message
+  // 仅在「最近一条是 completed」时被消费 —— 批量上传全部失败时用户只看到
+  // 「失败 N 个」而看不到原因（磁盘满 / 格式不支持 / OCR 不可用），只能逐个点
+  // 预览排查。现失败分支同样透出最近一条失败原因。
+  return latestNote && latest?.status === "failed"
+    ? `最近解析完成 ${done} 个，失败 ${bad} 个（${latestNote}）`
+    : `最近解析完成 ${done} 个，失败 ${bad} 个`;
 }
 
 // ============================================================
@@ -1530,6 +1639,47 @@ export function resolveAccept(
     .map((s) => (s.startsWith(".") ? s : `.${s}`));
   const uniq = Array.from(new Set(parts));
   return uniq.length ? uniq.join(",") : fallback;
+}
+
+/**
+ * 从后端下发的格式清单解析出**精确**的单文件大小上限（MB，纯函数）。
+ *
+ * BUG-FIX 2026-10-26（前后端上限漂移）：后端 supported-formats 的
+ * `max_file_size_mb` 是 `MAX_FILE_SIZE // (1024*1024)` 整数除法，运维把上限调成
+ * 51MB / 25.5MB 这类非整 MB 值时前端拿到的是向下截断值，于是「前端放行、
+ * 后端 400」的区间重新出现。优先级：精确浮点值 → 整 MB 值 → 字节值换算 → 本地兜底。
+ * 老后端不下发 `max_file_size_exact_mb` 时行为与旧版完全一致。
+ */
+export function resolveUploadLimitMb(
+  remote: {
+    max_file_size_exact_mb?: number | null;
+    max_file_size_mb?: number | null;
+    max_file_size?: number | null;
+  } | null | undefined,
+  fallbackMb: number = 50,
+): number {
+  const exact = remote?.max_file_size_exact_mb;
+  if (typeof exact === "number" && exact > 0) return exact;
+  const mb = remote?.max_file_size_mb;
+  if (typeof mb === "number" && mb > 0) return mb;
+  const bytes = remote?.max_file_size;
+  if (typeof bytes === "number" && bytes > 0) return bytes / (1024 * 1024);
+  return fallbackMb;
+}
+
+/**
+ * OCR 是否已明确关闭（纯函数）。
+ *
+ * BUG-FIX 2026-10-26（ocr_enabled 零消费）：后端 supported-formats 早在下发
+ * `ocr_enabled`，前端却只消费了 `max_file_size_mb` —— OCR 关闭时前端仍把
+ * png/jpg 放进 accept 并鼓励上传，用户必然得到「解析成功但文本为空」。
+ * 只有后端**明确返回 false** 时才判定为关闭（缺字段/查询失败一律按可用处理，
+ * 避免网络抖动把图片入口误封）。
+ */
+export function isOcrDisabled(
+  remote: { ocr_enabled?: boolean | null } | null | undefined,
+): boolean {
+  return remote?.ocr_enabled === false;
 }
 
 // ============================================================
@@ -2013,14 +2163,18 @@ export function findProviderMeta(providerName: string | null | undefined): Provi
  *
  * - cancelled：用户主动取消（不降级、不弹错）
  * - conflict：组锁 409 冲突（不降级，单独提示）
+ * - background：SSE 已收到 stream_id（构建已在后端启动）后流中断——
+ *   不降级同步导出（后端仍持组锁，重跑必然 409 或重复构建一份 DOCX），
+ *   改提示「任务仍在后台执行，稍后在导出历史查看」（BUG-FIX 2026-10-27）
  * - fallback：其他 SSE 传输/构建失败（降级同步接口）
  */
 export function classifyExportFailure(
   err: any,
   cancelRequested: boolean,
-): "cancelled" | "conflict" | "fallback" {
+): "cancelled" | "conflict" | "background" | "fallback" {
   if (cancelRequested || err?.__cancelled) return "cancelled";
   if (err?.status === 409 || err?.response?.status === 409 || err?.__conflict) return "conflict";
+  if (err?.__stream_started) return "background";
   return "fallback";
 }
 

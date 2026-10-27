@@ -247,7 +247,8 @@ describe("formatParsingStatusText（解析任务状态展示）", () => {
         latest: { ...warn, error_message: "   " },
       }),
     ).toBe("最近解析完成 3 个文件");
-    // 失败行的原因不重复播报（已有独立失败计数）
+    // BUG-FIX 2026-10-26：失败分支同样透出最近一条失败原因（此前只报计数，
+    // 批量全失败时用户只看到「失败 N 个」而看不到原因，只能逐个点预览排查）
     expect(
       formatParsingStatusText({
         status: "completed",
@@ -256,6 +257,17 @@ describe("formatParsingStatusText（解析任务状态展示）", () => {
         recent_failed: 1,
         total_tasks: 3,
         latest: { ...warn, status: "failed", error_message: "文本提取失败: boom" },
+      }),
+    ).toBe("最近解析完成 2 个，失败 1 个（文本提取失败: boom）");
+    // 最近一条不是失败（如最新一条是成功的其它文件）时不追加无关原因
+    expect(
+      formatParsingStatusText({
+        status: "completed",
+        processing: 0,
+        recent_completed: 2,
+        recent_failed: 1,
+        total_tasks: 3,
+        latest: { ...warn, status: "completed", error_message: "" },
       }),
     ).toBe("最近解析完成 2 个，失败 1 个");
   });

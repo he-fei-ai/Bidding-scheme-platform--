@@ -3,7 +3,6 @@ import hashlib
 import logging
 import os
 import re
-import sqlite3
 from pathlib import Path
 import shutil
 import threading
@@ -110,6 +109,9 @@ from .extractors._notices import (
     _EXTRACT_ERROR_PREFIXES_TUPLED,
     is_extraction_notice,
 )
+# 标书智能体（一）引入：解析质量校验，非空文件却解析出空/乱码时显式告警，
+# 填补此前"解析失败静默返回空"的缺口。
+from .extractors.parse_quality import assess_extraction as _assess_extraction
 from .extractors import (
     _LEGACY_OLE_EXTS,
     _OLE2_MAGIC,
@@ -292,6 +294,21 @@ def prune_parse_tasks(project_id: int | None = None, max_rows: int | None = None
     return deleted
 
 
+def _table_has_column(conn, table: str, column: str) -> bool:
+    """探测表是否具备指定列（用于老库 schema 兼容分支）。
+
+    比 ``try: SELECT col ... except sqlite3.OperationalError`` 更精确：不会把
+    其他类型的 OperationalError（锁超时、磁盘 I/O）误判成「缺列」而走降级路径。
+    探测失败一律按「无该列」处理（调用方走保守分支，不做可能误判的回收）。
+    """
+    try:
+        rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    except Exception as _e:  # pragma: no cover - 防御性
+        logger.debug("探测 %s 列结构失败（按无该列处理）: %s", table, _e)
+        return False
+    return any(str(r[1]) == column for r in rows)
+
+
 def reclaim_stale_parse_state(*, stale_minutes: int | None = None) -> dict[str, int]:
     """回收长时间停留在 processing 的解析状态（beat 每小时调用一次）。
 
@@ -315,10 +332,10 @@ def reclaim_stale_parse_state(*, stale_minutes: int | None = None) -> dict[str, 
     删除重传。本函数把超时的 processing 收敛为 failed 并写明原因，把「永久等待」
     变成「可自助重试」。
 
-    时钟说明：``uploaded_files`` 只有 created_at（无 updated_at），而**唯一**写
-    processing 的位置是 ``_persist_file_extraction``（本文件内），
-    ``re_extract_text`` 不会把行改回 processing —— 因此用 created_at 判陈旧
-    不会对「老文件重新提取」产生假阳性。
+    时钟说明（F-H FIX 2026-10-26）：判陈旧一律用 ``updated_at``（最近一次状态
+    变更时间），不再降级用 ``created_at``。老库缺该列时**跳过** uploaded_files
+    回收 —— 因为「created_at 很老 + 刚被 async-reparse 改回 processing」正是
+    误判场景本身；宁可少回收一轮，也不误杀合法在途任务。
 
     幂等与可自愈：重复调用只影响仍在 processing 且超时的行；迟到的 worker 完成后
     照常把终态覆盖为 success（``_persist_file_extraction`` 的终态 UPDATE 不带
@@ -349,9 +366,14 @@ def reclaim_stale_parse_state(*, stale_minutes: int | None = None) -> dict[str, 
             # 「过期」并标记 failed，worker 正常完成后才覆盖回来。现改用 updated_at：
             #   - 有 updated_at 列（新 schema）→ 用 updated_at 判 stale（正确语义：
             #     最近一次状态变更时间，async-reparse 刚改回 processing 时 updated_at=现在）
-            #   - 无 updated_at 列（老 DB）→ 降级用 created_at，避免 SQLite
-            #     "no such column" 错误，同时触发 logger.warning 提示升级 schema。
-            try:
+            #
+            # F-H FIX 2026-10-26（老库降级仍有误判风险）：此前缺列时**降级用
+            # created_at 继续回收**，而这正是误判场景本身——老库上 async-reparse
+            # 改回 processing 时 created_at 仍是上传时刻，一条合法在途任务会在
+            # 下一轮 beat 被直接判死。现在缺列时**跳过 uploaded_files 回收**
+            # （宁可不回收也不要误杀），只保留 file_parse_tasks 回收（该表 DDL
+            # 自带 updated_at，不受老库影响），并给出可执行的迁移指引。
+            if _table_has_column(conn, "uploaded_files", "updated_at"):
                 cur = conn.execute(
                     """UPDATE uploaded_files
                        SET status = 'failed', message = ?
@@ -359,20 +381,13 @@ def reclaim_stale_parse_state(*, stale_minutes: int | None = None) -> dict[str, 
                          AND datetime(updated_at, ?) < datetime('now', 'localtime')""",
                     (stale_msg, f"{int(minutes)} minutes"),
                 )
-            except sqlite3.OperationalError:
-                # 老 DB 缺 updated_at 列：降级用 created_at + 告警引导迁移
+                result["uploaded_files_failed"] = int(cur.rowcount or 0)
+            else:
                 logger.warning(
-                    "uploaded_files 缺 updated_at 列，reclaim_stale_parse_state 降级用 created_at "
-                    "（async-reparse 路径可能被误判为 stale）—— 请执行 DB 迁移。"
+                    "uploaded_files 缺 updated_at 列，本轮跳过孤儿 processing 回收"
+                    "（避免用 created_at 误杀 async-reparse 的在途任务）—— "
+                    "请执行 DB 迁移（init_db 会补列并回填 updated_at=created_at）。"
                 )
-                cur = conn.execute(
-                    """UPDATE uploaded_files
-                       SET status = 'failed', message = ?
-                       WHERE status = 'processing'
-                         AND datetime(created_at, ?) < datetime('now', 'localtime')""",
-                    (stale_msg, f"{int(minutes)} minutes"),
-                )
-            result["uploaded_files_failed"] = int(cur.rowcount or 0)
 
             cur = conn.execute(
                 """UPDATE file_parse_tasks
@@ -688,6 +703,10 @@ def save_upload(project_id: int, filename: str, content: bytes, file_role: str =
             # 现在如实写入提示信息（status 保持 success，不改变主文件选择/缓存语义）。
             if not extracted_text.strip():
                 message = EMPTY_TEXT_MESSAGE
+            else:
+                # GAP-FIX 2026-10-26（R9）：解析质量 error（如几乎全为控制字符/
+                # 大文件只出几十字符）不再静默成功，回填 warning 文案给前端展示。
+                message = _parse_quality_error_message(str(file_path), extracted_text)
             # M-1 2026-10-15：把警告一并写进任务行（此前只写文件行）
             _update_parse_task(
                 project_id, "completed", 100, error_message=message, filename=filename
@@ -892,7 +911,14 @@ def _persist_file_extraction(
     elif is_extraction_notice(extracted_text):
         _status, _msg = "failed", extracted_text.strip()
     else:
-        _status, _msg = "success", ("" if extracted_text.strip() else EMPTY_TEXT_MESSAGE)
+        # GAP-FIX 2026-10-26（R9）：空文本沿用既有提示；非空但存在 error 级解析
+        # 质量问题（控制字符/替换符过多、大文件近乎空）同样回填提示，不再静默成功。
+        _msg = (
+            EMPTY_TEXT_MESSAGE
+            if not extracted_text.strip()
+            else _parse_quality_error_message(file_path, extracted_text)
+        )
+        _status = "success"
     if _write_error is not None:
         # 任务行可能已被写为 completed（create_task_row=False 的派发路径），
         # 必须强制覆盖，否则会 UPDATE 0 行、状态端点继续谎报成功。
@@ -1263,6 +1289,7 @@ def extract_text_from_path(file_path: str) -> str:
         ext = sniffed
 
     file_hash = _get_file_hash(file_path)
+    used_cache = False
 
     # 检查缓存（仅缓存支持的格式）
     # BUG-FIX-74/74c: 补全缓存格式列表并统一引用模块级常量
@@ -1275,6 +1302,7 @@ def extract_text_from_path(file_path: str) -> str:
             cache_time = cached[1]
             if time.time() - cache_time < _PARSE_CACHE_TTL:
                 logger.info("[文件解析] 命中缓存: %s", Path(file_path).name)
+                used_cache = True
                 return cached[2]
         # 清理过期缓存
         _clear_parse_cache(file_path)
@@ -1295,6 +1323,12 @@ def extract_text_from_path(file_path: str) -> str:
         result = _do_extract_text(file_path, ext, declared_ext)
     elapsed = time.monotonic() - _t0
 
+    # 标书智能体（一）引入：解析质量校验。
+    # 仅对"非缓存命中"的真实解析结果做校验，非空文件却解析出空/乱码时显式告警，
+    # 填补此前"解析失败静默返回空、下游误以为文件无内容"的缺口（不抛错以免中断上传流程）。
+    if not used_cache:
+        _report_parse_quality(file_path, result)
+
     # 存储缓存（仅缓存支持的格式）
     if ext in _PARSE_CACHEABLE_EXTS and file_hash:
         with _parse_cache_lock:
@@ -1307,6 +1341,39 @@ def extract_text_from_path(file_path: str) -> str:
 
     logger.info("[文件解析] %s 解析完成，提取 %d 字符, 耗时 %.2fs", ext, len(result), elapsed)
     return result
+
+
+def _parse_quality_error_message(file_path: str, text: str) -> str:
+    """把 error 级解析质量问题转成用户可读提示（无问题返回空串）。
+
+    GAP-FIX 2026-10-26（R9，解析质量异常仍显示「成功」）：``_report_parse_quality``
+    此前只写 ERROR 日志，文件行仍以 ``status='success'`` + ``message=''`` 落库，
+    前端显示「解析成功」，用户完全看不到「文本几乎全是控制字符 / 大文件只解析出
+    几十字符」这类异常。现在把 error 级结论回填到 ``uploaded_files.message``：
+    - status 保持 success（不改变主文件选择与缓存语义，向后兼容）；
+    - message 走前端既有的「成功但需注意」黄色提示位（FileUploadPage.tsx:715）。
+    """
+    try:
+        issues = _assess_extraction(file_path, text)
+    except Exception as _qe:  # pragma: no cover - 校验工具不应影响主流程
+        logger.debug("[文件解析] 质量校验异常（已忽略）: %s", _qe)
+        return ""
+    errors = [i for i in issues if i.severity == "error"]
+    if not errors:
+        return ""
+    return "解析质量异常：" + "；".join(i.message for i in errors)
+
+
+def _report_parse_quality(file_path: str, text: str) -> None:
+    """解析质量告警（标书智能体（一）引入）。
+
+    对解析结果做质量校验，若存在 error 级问题则记录 ERROR 日志（不抛错，避免中断
+    上传流程），使此前"静默返回空"的解析失败变为可观测。异常被吞掉以免校验本身
+    影响主流程。
+    """
+    message = _parse_quality_error_message(file_path, text)
+    if message:
+        logger.error("[文件解析] %s -> %s", Path(file_path).name, message)
 
 
 def _do_extract_text(file_path: str, ext: str, declared_ext: str = "") -> str:
@@ -2011,12 +2078,31 @@ def clear_project_texts(project_id: int) -> dict:
         files_reset = 0
         tasks_cleared = 0
         reset_warning = ""
+        files_kept_processing = 0
         try:
             with get_db() as conn:
+                # BUG-FIX 2026-10-26（清空与在途解析竞态 · 幽灵任务）：此前 WHERE
+                # 无 status 过滤，把**正在后台解析**（status='processing'）的行也一并
+                # 重置为 'pending'。后果有两层：
+                #   1) 'pending' 在语义上是「已入库、从未解析过」，而该文件此刻正有
+                #      Celery 任务在跑 —— 行状态与真实世界不一致；
+                #   2) 前端 FileUploadPage 把 pending 当「在途」注册进 taskStore
+                #      （inFlight = processing || queued || pending），于是给一个
+                #      **永远不会再执行的解析**注册了 running 任务，顶栏永久显示
+                #      「文件解析 0%」，只有离开页面才消失。
+                # 现只对非在途行做重置；在途行的 texts/ 已被删除，但对应 worker 完成
+                # 时会经 _persist_file_extraction 重新落盘并写终态，语义自洽。
+                # files_reset 计数口径不变（仍只统计本次被重置的行）。
+                kept = conn.execute(
+                    "SELECT COUNT(*) AS c FROM uploaded_files "
+                    "WHERE project_id = ? AND status = 'processing'",
+                    (project_id,),
+                ).fetchone()
+                files_kept_processing = int(kept["c"]) if kept else 0
                 cur = conn.execute(
                     "UPDATE uploaded_files SET status = 'pending', message = '', "
                     "extracted_text_path = '', updated_at = datetime('now', 'localtime') "
-                    "WHERE project_id = ?",
+                    "WHERE project_id = ? AND status != 'processing'",
                     (project_id,),
                 )
                 files_reset = cur.rowcount or 0
@@ -2046,13 +2132,18 @@ def clear_project_texts(project_id: int) -> dict:
     _text_cache_clear(project_id)
 
     logger.info(
-        "clear_project_texts project=%d: 重置 %d 个文件状态为 pending，清理 %d 条解析任务终态行",
-        project_id, files_reset, tasks_cleared,
+        "clear_project_texts project=%d: 重置 %d 个文件状态为 pending，清理 %d 条解析任务终态行，"
+        "保留 %d 个在途 processing 行",
+        project_id, files_reset, tasks_cleared, files_kept_processing,
     )
     return {
         "status": "cleared",
         "files_reset": files_reset,
         "tasks_cleared": tasks_cleared,
+        # BUG-FIX 2026-10-26：新增（可选字段，老前端忽略）—— 在途解析行未被重置的数量，
+        # 前端据此提示「有 N 个文件正在解析中，未受本次清空影响」，避免用户误以为
+        # 这批文件也被清空了（它们的 worker 稍后会重新落盘并写终态）。
+        "files_kept_processing": files_kept_processing,
         # M-5 2026-10-15：仅在「文本已删但 DB 重置失败」时非空，前端据此告警
         "warning": reset_warning,
     }
@@ -2118,6 +2209,10 @@ def re_extract_text(project_id: int, file_id: int) -> dict:
             # 用户误以为已修复（解析结果丢失无感知）。
             if not extracted_text.strip():
                 message = EMPTY_TEXT_MESSAGE
+            else:
+                # GAP-FIX 2026-10-26（R9）：重提取同样是「非空但质量为 error」的场景，
+                # 与 save_upload 同口径回填提示。
+                message = _parse_quality_error_message(str(file_path), extracted_text)
             _update_parse_task(
                 project_id, "completed", 100, error_message=message, filename=filename
             )
@@ -2152,17 +2247,54 @@ def re_extract_text(project_id: int, file_id: int) -> dict:
     # 现与 save_upload 对齐：仅在文本非空时落盘；未落盘时把 DB 字段置空串。
     text_written = False
     if extracted_text.strip():
+        # F-G FIX 2026-10-26：先写临时文件再原子替换（同目录 os.replace）。
+        # 原来直接 write_text 目标文件，'w' 模式会**先截断再写入**：一旦磁盘满/
+        # 权限拒绝，旧文本已经被截断，所谓「保留旧结果」并不成立。改为临时文件
+        # 后，失败时目标文件仍是上一次的完整内容，「保留旧结果」才可如实承诺。
+        tmp_text_path = text_path.with_name(text_path.name + ".tmp")
         try:
-            text_path.write_text(extracted_text, encoding="utf-8")
+            tmp_text_path.write_text(extracted_text, encoding="utf-8")
+            os.replace(tmp_text_path, text_path)
             text_written = True
         except Exception as e:
+            try:
+                if tmp_text_path.exists():
+                    tmp_text_path.unlink()
+            except Exception:  # pragma: no cover - 清理失败不影响主流程
+                pass
             logger.error("重新提取：写入提取文本失败 file_id=%s: %s", file_id, e)
             _update_parse_task(project_id, "failed", 0, f"写入提取文本失败: {e}", filename)
+            # F-G FIX 2026-10-26（写盘失败口径不明确）：此前该分支直接 return，
+            # DB 里 status/extracted_text_path 保持旧值——旧文本确实保住了，但
+            # 前端只看到一次「失败」toast，刷新后又显示旧的「解析成功」，
+            # 用户无法判断「现在用的到底是哪一版文本」。现明确两件事：
+            #   1) 返回值新增 ``text_preserved``，如实说明旧结果是否仍然可用；
+            #   2) 把提示回填 uploaded_files.message（**不改 status**，旧文本仍是
+            #      唯一可用文本），刷新后前端黄色提示位能持续可见。
+            preserved = bool(old_text_path and Path(old_text_path).exists())
+            keep_msg = (
+                f"写入提取文本失败，已保留上一次解析结果（未更新）: {e}"
+                if preserved
+                else f"写入提取文本失败，且无可用的历史解析结果: {e}"
+            )[:500]
+            try:
+                with get_db() as conn:
+                    conn.execute(
+                        "UPDATE uploaded_files SET message = ?, "
+                        "updated_at = datetime('now', 'localtime') "
+                        "WHERE id = ? AND project_id = ?",
+                        (keep_msg, file_id, project_id),
+                    )
+            except Exception as _db_e:
+                # 回写提示失败只降级为日志：失败响应本身已能告知调用方
+                logger.warning(
+                    "重新提取：写盘失败后回写提示失败 file_id=%s: %s", file_id, _db_e
+                )
             return {
                 "file_id": file_id,
                 "filename": filename,
                 "status": "failed",
-                "message": f"写入提取文本失败: {e}",
+                "message": keep_msg,
                 # BUG-FIX 2026-10-16（接口字段不实）：此前写盘失败分支硬编码
                 # text_length=0，而 extracted_text 此时**可能已提取到内容**
                 # （磁盘满/权限拒绝只发生在落盘环节）。字段含义是「本次提取
@@ -2170,6 +2302,7 @@ def re_extract_text(project_id: int, file_id: int) -> dict:
                 # 「什么都没提取到」，把一次写入故障误导成内容问题。
                 # 空文本/提取失败路径的 extracted_text 本就是空串，取值不变。
                 "text_length": len(extracted_text),
+                "text_preserved": preserved,
             }
     else:
         logger.info("重提取未产出文本，不落盘: %s (status=%s)", filename, status)

@@ -7,7 +7,10 @@ import time
 from fastapi import HTTPException
 from starlette.responses import StreamingResponse
 from ...config import OUTLINE_AUTO_CONFIRM
+from ...db import get_db
 from ...services.ai.workflows import generate_outline as _run_outline_workflow
+from ...services.ai.workflows_outline_v51 import recommend_outline_reference
+from ...services.ai.workflows_scheme_extraction import parse_scheme_extraction_raw
 from ...services import task_lock as _task_lock
 from ...services import task_snapshot
 from ...services.task_registry import TaskStatus, task_registry
@@ -35,6 +38,29 @@ from .sse_db_ops import (
 )
 from .sse_shared import SSE_TERMINAL_STATUSES, SSE_TOTAL_TIMEOUT_DEFAULT, _NotifyQueue, logger
 from .sse_utils import _try_get_provider, _try_get_provider_with_retry
+
+
+def _read_scheme_extraction_for_outline(project_id: int) -> "tuple[str, list]":
+    """从 analysis.scheme_extraction_json 读取方案类型与危大工程判定参数（标书智能体（一）引入）。
+
+    供目录生成按方案类型自动选用模板，并按危大参数深化「计算书与图纸」「应急处置」章节
+    （《引入方案》第六节2）。读取失败/缺列/未识别均安全降级为 ``("", [])``，绝不中断生成。
+    解析口径统一走 :func:`parse_scheme_extraction_raw`（与 ``GET /ai/scheme-outline-template``
+    预览侧共用同一真相，避免「预览模板」与「实际生成模板」漂移）。
+    """
+    try:
+        with get_db() as conn:
+            row = conn.execute(
+                "SELECT scheme_extraction_json FROM analysis WHERE project_id = ?",
+                (project_id,),
+            ).fetchone()
+    except Exception as _e:  # 读取失败不影响目录生成
+        logger.debug("[目录生成] 读取方案提取失败（忽略）: %s", _e)
+        return "", []
+    if not row:
+        return "", []
+    return parse_scheme_extraction_raw(row[0] or "{}")
+
 
 # ---------------------------------------------------------------------------
 # ENHANCE 2026-09-15（Task 9）：目录生成的任务组锁 / 任务快照接线
@@ -202,21 +228,29 @@ async def _outline_main_loop(
             if elapsed_total >= SSE_TOTAL_TIMEOUT:
 
                 logger.warning(
-                    "SSE 总超时 %ds, project=%d",
+                    "SSE 总超时 %ds, project=%d —— 后台目录生成任务仍在运行，"
+                    "仅关闭 SSE 显示连接并提示前端自动重连（不致命终止）",
                     SSE_TOTAL_TIMEOUT,
                     project_id,
                 )
 
                 try:
 
-                    yield f"data: {json.dumps({'status': 'error', 'message': f'生成超过{SSE_TOTAL_TIMEOUT // 60}分钟，已自动终止'}, ensure_ascii=False)}\n\n"
+                    # BUG-FIX（超时误报终止）：后台 _run_outline_task 与 SSE 显示解耦，
+                    # 超时只是「SSE 显示连接达上限」，任务本身仍在跑。原先发送
+                    # status=error 并声称"已自动终止"会误导用户（实际任务从未被取消，
+                    # 仍占用任务组锁并继续生成，用户既看不到进度也拿不到结果）。
+                    # 改为发送非终态 `sse_timeout`，前端据此自动重连并复用运行中
+                    # 的后台任务（task_registry 重连机制），直至任务真正完成。
+                    yield f"data: {json.dumps({'status': 'sse_timeout', 'message': f'后台目录生成仍在进行（已超过{SSE_TOTAL_TIMEOUT // 60}分钟 SSE 显示上限），正在自动重连以继续获取进度...'}, ensure_ascii=False)}\n\n"
 
                 except Exception as _e:
 
                     logger.debug("[SSE] 静默捕获异常: %s", _e)
 
-                outline_finished_ref[0] = True
-
+                # 注意：不置 outline_finished_ref[0]=True（那只会结束 SSE 循环、
+                # 不影响后台任务），也不取消后台任务。直接 break 关闭本连接，
+                # 前端收到 sse_timeout 后会自动重连复用后台任务。
                 break
 
 
@@ -831,6 +865,19 @@ async def generate_outline_sse_impl(
                     project_info = context["project_info"]
 
                     global_facts_items = context.get("global_facts_items") or []
+
+                    # 标书智能体（一）引入：用户未显式提供参考目录时，按已识别的专项方案类型
+                    # 自动选用对应目录模板（仅追加类型特有重点章节，不影响通用骨架；
+                    # 未识别/读取失败则保持原行为 —— 回退 REFERENCE_TEMPLATE_V51）。
+                    if not (reference_outline or "").strip():
+                        _st, _dp = _read_scheme_extraction_for_outline(project_id)
+                        if _st or _dp:
+                            try:
+                                _ref = recommend_outline_reference(_st, _dp)
+                                reference_outline = json.dumps(_ref, ensure_ascii=False)
+                                logger.info("[目录生成] 按方案类型「%s」+危大参数(%d项)自动选用目录模板（%d 章）", _st, len(_dp or []), len(_ref))
+                            except Exception as _re:  # 推荐失败不影响生成，回退通用模板
+                                logger.debug("[目录生成] 方案类型模板推荐失败（忽略）: %s", _re)
 
                     # BUG-FIX 2026-09-18（P1）：清单工程量接线到目录生成
 
@@ -1715,28 +1762,10 @@ async def generate_outline_sse_impl(
         # 两次 _clear_and_save_outline 的 DELETE+INSERT 竞态）。
         lock_ctx["owner_id"] = _make_lock_owner(project_id, task_info.task_id)
 
-        # 若上次目录生成留下未确认的中断快照，先如实告知用户（**不阻断**）。
-        # 参考实现 recoverInterruptedOutlineGenerationTask 是直接拒绝启动、
-        # 让用户手动重来；本软件没有可续跑的检查点（中断就是丢了），
-        # 再拦一道只会让用户多点一次，所以选择「告知 + 继续」。
-        try:
-            _interrupted = await asyncio.to_thread(
-                task_snapshot.list_interruptions, project_id, task_type="outline_v51"
-            )
-        except Exception as _int_e:
-            _interrupted = []
-            logger.warning("[目录生成] 查询中断快照失败（忽略）project=%d: %s", project_id, _int_e)
-        if _interrupted:
-            _int_msg = task_snapshot.interruption_summary(_interrupted[0])
-            logger.warning("[目录生成] %s project=%d，本次将重新开始生成", _int_msg, project_id)
-            await _qput(
-                {
-                    "status": "generating",
-                    "phase": "recovery",
-                    "outline_step": 1,
-                    "message": f"{_int_msg}（本次已重新开始生成）",
-                }
-            )
+        # REMOVED 2026-10-26（需求：未完成的任务不再保留、直接重新开始）：
+        # 原先会在此查询并推送「上次未正常结束的任务」提示（interruption_summary）
+        # 给前端。现已移除该提示——目录生成不再提示历史中断，直接重新开始。
+        # 下方登记新快照前会主动清掉本项目旧的 outline_v51 快照行。
 
         # 抢锁在独立线程执行；客户端若在抢锁瞬间断开 SSE，await 会被取消，
         # 而锁已在 worker 线程里落地（锁行已写 sqlite）。此时 lock_ctx 尚未来得及登记
@@ -1778,6 +1807,15 @@ async def generate_outline_sse_impl(
             raise
 
         try:
+            # ENHANCE 2026-10-26：开始新一轮目录生成前，主动清除本项目旧的
+            # outline_v51 快照行（含上次未正常结束 / 中断的行），落实「未完成
+            # 不再保留、直接重新开始」。快照只是可观测性，清除失败不影响生成。
+            try:
+                await asyncio.to_thread(
+                    task_snapshot.delete_for_project, project_id, "outline_v51"
+                )
+            except Exception as _del_e:
+                logger.warning("[目录生成] 清除旧快照失败（忽略）project=%d: %s", project_id, _del_e)
             try:
                 _snap = await asyncio.to_thread(
                     functools.partial(

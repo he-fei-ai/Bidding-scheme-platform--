@@ -10,6 +10,9 @@ from typing import Any
 from ...db import get_db
 
 from ...utils import count_words as _count_words
+# ENHANCE 2026-10-21（正文 #3）：扩写/修复达标判定改用 R1 可读字数口径，与
+# 压缩/R12/校验页一致（此前用 raw `_count_words` 与 readable 目标阈值分叉）。
+from ...utils import count_readable_words as _crw
 
 
 def _words_excluding_chart_payload(content: str) -> int:
@@ -23,9 +26,9 @@ def _words_excluding_chart_payload(content: str) -> int:
         for _lang, body, _mt in iter_chart_fences(content):
             if body:
                 text = text.replace(body, "")
-        return _count_words(text)
+        return _crw(text)
     except Exception:
-        return _count_words(content)
+        return _crw(content)
 from ...utils.json_parser import extract_json_from_text
 from .providers.base import AIMessage
 
@@ -441,8 +444,8 @@ async def expand_content_fallback(
                         timeout=120,
                     )
                     expanded_stripped = (expanded or "").strip()
-                    expanded_words = _count_words(expanded_stripped)
-                    # 质量闸：必须变长且至少达到原字数的 80%（字数口径统一用 _count_words）
+                    expanded_words = _crw(expanded_stripped)
+                    # 质量闸：必须变长且至少达到原字数的 80%（字数口径统一用可读字数 _crw，与 R1/压缩/R12 一致）
                     if (
                         expanded_stripped
                         and len(expanded_stripped) > len(content)
@@ -479,7 +482,24 @@ async def expand_content_fallback(
                     except Exception:
                         logger.debug("兜底扩写 on_section_done 回调失败（忽略）", exc_info=True)
 
-    await asyncio.gather(*(_expand_one(entry) for entry in deficient), return_exceptions=True)
+    # BUG-FIX（本轮深度探索·gather 吞异常防护，同 R9/R10 2026-10-17 口径）：
+    # 裸 return_exceptions=True 会把 _expand_one 未覆盖路径的异常作为返回值
+    # 吞掉——日志只剩「兜底扩写完成：0/N 达标」的假成功，生产排障无线索。
+    # 这里显式检查异常实例并记日志，与 run_section/total_word_adjustments 同构。
+    _expand_results = await asyncio.gather(
+        *(_expand_one(entry) for entry in deficient), return_exceptions=True
+    )
+    for _ei, _eres in enumerate(_expand_results):
+        if isinstance(_eres, BaseException):
+            _etitle = ""
+            try:
+                _etitle = str(deficient[_ei].get("title") or deficient[_ei].get("id") or "?")
+            except Exception:
+                _etitle = "?"
+            logger.error(
+                "兜底扩写：小节 %s 协程异常（被 gather 吞掉，现已显式记录）: %s",
+                _etitle, _eres, exc_info=_eres,
+            )
     logger.info("兜底扩写完成：%d/%d 个章节达标（共 %d 个不足）", reached, len(deficient), len(deficient))
     return results
 
@@ -999,8 +1019,8 @@ async def _audit_one_group(
             if (
                 repaired
                 and len(repaired) > 100
-                and _count_words(repaired)
-                >= _count_words(current_content) * 0.8
+                and _crw(repaired)
+                >= _crw(current_content) * 0.8
             ):
                 target["content"] = repaired
                 repaired_count += 1
@@ -1009,8 +1029,8 @@ async def _audit_one_group(
             elif repaired:
                 logger.warning(
                     "一致性审计修复结果过短（%d/%d 字），疑似截断，拒绝应用: 章节 %s",
-                    _count_words(repaired),
-                    _count_words(current_content),
+                    _crw(repaired),
+                    _crw(current_content),
                     section_id,
                 )
         except Exception as repair_e:

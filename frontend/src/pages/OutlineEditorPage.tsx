@@ -8,7 +8,7 @@ import {
   ArrowLeftOutlined, ArrowRightOutlined, ThunderboltOutlined, EditOutlined, DeleteOutlined,
   PlusOutlined, ReloadOutlined, CloseCircleOutlined, CheckCircleOutlined, LoadingOutlined, MenuOutlined, UpOutlined,
   DownOutlined, DragOutlined, AuditOutlined, RobotOutlined, FolderOutlined,
-  RightOutlined, QuestionCircleOutlined,
+  RightOutlined, QuestionCircleOutlined, LockOutlined,
 } from "@ant-design/icons";
 import { taskStore } from "@/services/taskStore";
 import {
@@ -472,6 +472,24 @@ export default React.memo(function OutlineEditorPage() {
           eventSource.markTerminalEvent();  // BUG-F-04 修复：标记终端事件，避免 close() 时 abort
           eventSource.close();
           eventSourceRef.current = null;
+        } else if (data.status === "sse_timeout") {
+          // 后台目录生成仍在运行，仅 SSE 显示连接达到上限（后端超时保护触发）。
+          // 保持 generating 状态，不标记终态、不关闭连接；延迟自动重连以复用
+          // 运行中的后台任务（createOutlineEventSource 重连会命中 task_registry
+          // 中仍在运行的同名任务，不会重复发起生成也不会撞任务组锁）。
+          setProgressMessage(data.message || "后台仍在生成，正在自动重连以获取进度...");
+          if (!userStoppedRef.current && !terminalAppliedRef.current && isGeneratingRef.current) {
+            window.setTimeout(() => {
+              if (
+                isMountedRef.current &&
+                !userStoppedRef.current &&
+                isGeneratingRef.current &&
+                !terminalAppliedRef.current
+              ) {
+                startOutlineGeneration(true);
+              }
+            }, 1500);
+          }
         } else if (data.status === "error") {
           finishedNormally = true;
           setIsGenerating(false);
@@ -603,6 +621,12 @@ export default React.memo(function OutlineEditorPage() {
   };
 
   const handleEditTitle = async (node: SectionTreeNode) => {
+    // 2026-10-20 遗留 3：Aligned 程序构造的一级目录由系统锁定，
+    // 前端先行拦截（后端 update_section 同口径拒绝，双重防线）。
+    if (node.locked) {
+      message.warning("该章节由系统锁定（Aligned 程序构造的一级目录），不可编辑标题");
+      return;
+    }
     const { confirm } = Modal;
     // BUG-FIX 2026-09-29：原实现只在 onPressEnter 里保存，点「保存」按钮直接关窗
     // 不落库（按钮无效），用户误以为已改。抽出 doSave 同时挂到 onOk 与回车。
@@ -661,6 +685,10 @@ export default React.memo(function OutlineEditorPage() {
   };
 
   const handleDeleteNode = async (node: SectionTreeNode) => {
+    if (node.locked) {
+      message.warning("该章节由系统锁定（Aligned 程序构造的一级目录），不可删除");
+      return;
+    }
     try {
       await deleteSection(projectId, node.id);
       setTree((prev) => removeNodeFromTree(prev, node.id));
@@ -673,6 +701,10 @@ export default React.memo(function OutlineEditorPage() {
   };
 
   const handleMoveNode = async (node: SectionTreeNode, direction: "up" | "down") => {
+    if (node.locked) {
+      message.warning("该章节由系统锁定（Aligned 程序构造的一级目录），不可移动");
+      return;
+    }
     try {
       const newTree = await moveSection(projectId, node.id, direction);
       setTree(newTree);
@@ -802,13 +834,16 @@ export default React.memo(function OutlineEditorPage() {
     const isCollapsed = collapsedIds.has(node.id);
     const isFirstSibling = siblingIndex === 0;
     const isLastSibling = siblingIndex === siblingCount - 1;
+    // 2026-10-20 遗留 3：Aligned 程序构造的一级目录（locked）
+    // 只允许编辑子目录，自身标题/顺序/删除均禁用。
+    const isLocked = Boolean(node.locked);
     const menuItems: any[] = [
-      { key: "edit", icon: <EditOutlined />, label: "编辑标题", onClick: (e: any) => { e.domEvent.stopPropagation(); handleEditTitle(node); } },
+      { key: "edit", icon: <EditOutlined />, label: "编辑标题", disabled: isLocked, onClick: (e: any) => { e.domEvent.stopPropagation(); handleEditTitle(node); } },
       { key: "add", icon: <PlusOutlined />, label: "添加子目录", onClick: (e: any) => { e.domEvent.stopPropagation(); handleAddChild(node.id); } },
-      { key: "up", icon: <UpOutlined />, label: "上移", disabled: isFirstSibling, onClick: (e: any) => { e.domEvent.stopPropagation(); handleMoveNode(node, "up"); } },
-      { key: "down", icon: <DownOutlined />, label: "下移", disabled: isLastSibling, onClick: (e: any) => { e.domEvent.stopPropagation(); handleMoveNode(node, "down"); } },
+      { key: "up", icon: <UpOutlined />, label: "上移", disabled: isFirstSibling || isLocked, onClick: (e: any) => { e.domEvent.stopPropagation(); handleMoveNode(node, "up"); } },
+      { key: "down", icon: <DownOutlined />, label: "下移", disabled: isLastSibling || isLocked, onClick: (e: any) => { e.domEvent.stopPropagation(); handleMoveNode(node, "down"); } },
       { type: "divider" as const },
-      { key: "delete", icon: <DeleteOutlined />, label: "删除", danger: true, onClick: (e: any) => { e.domEvent.stopPropagation(); handleDeleteNode(node); } },
+      { key: "delete", icon: <DeleteOutlined />, label: "删除", danger: true, disabled: isLocked, onClick: (e: any) => { e.domEvent.stopPropagation(); handleDeleteNode(node); } },
     ];
 
     return (
@@ -857,7 +892,13 @@ export default React.memo(function OutlineEditorPage() {
           ) : (
             <span style={{ width: 20, height: 20, display: "inline-block" }} />
           )}
-          <DragOutlined style={{ color: "#bbb", cursor: "grab", fontSize: 14, flexShrink: 0 }} />
+          {isLocked ? (
+            <Tooltip title="系统锁定：一级目录由程序构造，标题/顺序不可编辑">
+              <LockOutlined style={{ color: "#8c8c8c", fontSize: 14, flexShrink: 0 }} />
+            </Tooltip>
+          ) : (
+            <DragOutlined style={{ color: "#bbb", cursor: "grab", fontSize: 14, flexShrink: 0 }} />
+          )}
           <span style={{ color: getLevelColor(node.level), fontSize: 11, fontWeight: 600, minWidth: 48, flexShrink: 0 }}>
             {getLevelLabel(node.level)}
           </span>
@@ -930,20 +971,33 @@ export default React.memo(function OutlineEditorPage() {
 
   // ===== V5.1 人工审核处理函数 =====
   const handleReviewEditTitle = (nodeId: number, value: string) => {
+    // 锁定章节的标题不可改（审核弹窗输入框已 disabled，此处双保险，
+    // 防止子目录/其他入口复用本函数绕过）。
+    if (pendingReviewTree && findNodeInTree(pendingReviewTree, nodeId)?.locked) return;
     setReviewEditTitles((prev) => ({ ...prev, [nodeId]: value }));
   };
 
   const handleReviewMoveNode = (index: number, direction: "up" | "down") => {
     if (!pendingReviewTree) return;
-    const newTree = [...pendingReviewTree];
     const targetIdx = direction === "up" ? index - 1 : index + 1;
-    if (targetIdx < 0 || targetIdx >= newTree.length) return;
+    if (targetIdx < 0 || targetIdx >= pendingReviewTree.length) return;
+    // 2026-10-20 遗留 3：锁定章节自身不可移动；也不允许其他章节与其交换位置
+    // （交换同样会改变锁定章节的顺序）。
+    if (pendingReviewTree[index]?.locked || pendingReviewTree[targetIdx]?.locked) {
+      message.warning("系统锁定的一级章节顺序不可调整");
+      return;
+    }
+    const newTree = [...pendingReviewTree];
     [newTree[index], newTree[targetIdx]] = [newTree[targetIdx], newTree[index]];
     setPendingReviewTree(newTree);
   };
 
   const handleReviewDeleteNode = (index: number) => {
     if (!pendingReviewTree) return;
+    if (pendingReviewTree[index]?.locked) {
+      message.warning("该章节由系统锁定（Aligned 程序构造的一级目录），不可删除");
+      return;
+    }
     const newTree = pendingReviewTree.filter((_, i) => i !== index);
     setPendingReviewTree(newTree);
   };
@@ -1489,7 +1543,9 @@ const applyTitles = (nodes: SectionTreeNode[]): SectionTreeNode[] =>
           <Alert
             message={
               reviewStage === 'level1'
-                ? '请审核 AI 生成的一级目录，可编辑标题、调整顺序、删除或新增章节。确认后将继续生成二级目录。'
+                ? (annotatedReviewTree?.some((n) => n.locked)
+                    ? '本目录包含系统锁定的一级章节（Aligned 程序构造，锁标）：其标题/顺序/删除已禁用，其余章节可编辑或新增。确认后将继续生成二级目录。'
+                    : '请审核 AI 生成的一级目录，可编辑标题、调整顺序、删除或新增章节。确认后将继续生成二级目录。')
                 : reviewStage === 'level2'
                 ? '请审核二级目录结构，确认后将继续生成三级目录。'
                 : '请确认最终目录结构（完整三级树），审核通过后方可保存目录并继续生成正文内容。'
@@ -1535,6 +1591,7 @@ const applyTitles = (nodes: SectionTreeNode[]): SectionTreeNode[] =>
                 <Input
                   size="small"
                   defaultValue={node.title}
+                  disabled={Boolean(node.locked)}
                   onChange={(e) => handleReviewEditTitle(node.id, e.target.value)}
                   style={{ flex: 1, fontSize: 13, fontWeight: 600 }}
                   variant="borderless"
@@ -1547,27 +1604,33 @@ const applyTitles = (nodes: SectionTreeNode[]): SectionTreeNode[] =>
                     e.currentTarget.style.border = "none";
                   }}
                 />
+                {node.locked && (
+                  <Tag color="blue" icon={<LockOutlined />} style={{ marginInlineEnd: 0, fontSize: 10 }}>
+                    系统锁定
+                  </Tag>
+                )}
                 {reviewStage !== 'final' && (
                   <>
                     <Button
                       type="text" size="small" icon={<UpOutlined />}
-                      disabled={index === 0}
+                      disabled={index === 0 || Boolean(node.locked)}
                       onClick={() => handleReviewMoveNode(index, "up")}
-                      style={{ padding: "0 4px" }} title="上移"
+                      style={{ padding: "0 4px" }} title={node.locked ? "系统锁定章节不可移动" : "上移"}
                     />
                     <Button
                       type="text" size="small" icon={<DownOutlined />}
-                      disabled={index === (annotatedReviewTree?.length ?? 0) - 1}
+                      disabled={index === (annotatedReviewTree?.length ?? 0) - 1 || Boolean(node.locked)}
                       onClick={() => handleReviewMoveNode(index, "down")}
-                      style={{ padding: "0 4px" }} title="下移"
+                      style={{ padding: "0 4px" }} title={node.locked ? "系统锁定章节不可移动" : "下移"}
                     />
                     <Popconfirm
                       title={`删除「${node.title}」？`}
                       onConfirm={() => handleReviewDeleteNode(index)}
                       okText="删除" cancelText="取消"
                       okButtonProps={{ danger: true }}
+                      disabled={Boolean(node.locked)}
                     >
-                      <Button type="text" size="small" danger icon={<DeleteOutlined />} style={{ padding: "0 4px" }} title="删除" />
+                      <Button type="text" size="small" danger icon={<DeleteOutlined />} disabled={Boolean(node.locked)} style={{ padding: "0 4px" }} title={node.locked ? "系统锁定章节不可删除" : "删除"} />
                     </Popconfirm>
                   </>
                 )}

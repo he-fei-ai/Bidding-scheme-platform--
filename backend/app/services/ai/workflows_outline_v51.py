@@ -69,6 +69,7 @@ from .outline_common import (
     FIXED_28_CHAPTERS,
     _build_professional_isolation_block,
     _cap_cross_chapter_repetition,
+    _cap_cross_chapter_l2_repetition,
     _cap_intra_chapter_repetition,
     _cleanup_placeholder_titles,
     _cn_ordinal,
@@ -76,6 +77,7 @@ from .outline_common import (
     _disambiguate_title,
     _ensure_min_children,
     _is_dirty_l3_title_deep,
+    _is_placeholder_numbered_title,
     _parse_scope_items,
     _sanitize_cross_domain_titles,
     _title_core,
@@ -85,9 +87,14 @@ from .outline_common import (
     generate_one_outline_json_by_level1,
 )
 # 2026-10-10：接入此前长期无生产调用方的 L3 具体性校验 / AI 修复（死代码激活）
+# 2026-10-23《标书智能体（5）》：新增 make_full_outline_validator（统一封装的
+# 业务校验回调工厂，直出路径的模型原始输出在 collect_json_response 内过业务校验）
 from .workflows_outline_utils import (  # noqa: E402
+    _strip_title_number_prefix,
+    make_full_outline_validator,
     repair_l3_generic_titles,
     validate_l3_specificity,
+    validate_outline_business,
 )
 from .prompts import get_prompt, render_prompt, sanitize_prompt_value
 from .providers.base import AIMessage
@@ -102,8 +109,11 @@ from app.config import (
     OUTLINE_AI_LOCAL_REVIEW_ENABLED,
     OUTLINE_AI_LOCAL_REVIEW_MAX_NODES,
     OUTLINE_ALIGNED_MODE,
+    OUTLINE_DEGRADED_ALERT_RATIO,
     OUTLINE_L1_MAX_CHAPTERS,
     OUTLINE_L2_CONCURRENCY,
+    OUTLINE_L2_RETRY_CONCURRENCY,
+    OUTLINE_L2_RETRY_FAILED_ROUNDS,
     OUTLINE_L3_INTRA_MAX_PARENTS,
     OUTLINE_L3_MAX_PARENT_REUSE,
     OUTLINE_L3_QUALITY_ENHANCE_ENABLED,
@@ -138,18 +148,41 @@ from ...config import (  # noqa: E402
     OUTLINE_DIRECT_MAX_LEVEL1,
     OUTLINE_DIRECT_MAX_SCORING_CHARS,
     OUTLINE_DIRECT_MAX_SCORING_ITEMS,
+    OUTLINE_DIRECT_MIN_OUTPUT_TOKENS,
+    OUTLINE_DIRECT_MODEL_MAX_OUTPUT_TOKENS,
 )
+
+
+def _provider_max_output_tokens(provider: Any) -> int | None:
+    """最佳努力获取运行模型的「最大输出 token」预算（文档方案一选择依据之一）。
+
+    优先读取 provider 暴露的 max_output_tokens 属性（若未来 provider 实现该能力）；
+    否则回退到运维显式声明的 OUTLINE_DIRECT_MODEL_MAX_OUTPUT_TOKENS；
+    均未提供返回 None（即不参与直出/分步判定，沿用旧的评分点规模代理口径）。
+    """
+    if provider is not None:
+        attr = getattr(provider, "max_output_tokens", None)
+        if isinstance(attr, int) and attr > 0:
+            return attr
+    declared = OUTLINE_DIRECT_MODEL_MAX_OUTPUT_TOKENS
+    if isinstance(declared, int) and declared > 0:
+        return declared
+    return None
 
 
 def should_use_direct_outline(
     scoring_points: str,
     mode: str = "auto",
+    model_max_output_tokens: int | None = None,
 ) -> bool:
     """判断是否走「短标书 + 强模型」直出路径。
 
     Args:
         scoring_points: 评分点 JSON 文本
         mode: "auto" 自动判别 / "direct" 强制直出 / "stepwise" 强制分步
+        model_max_output_tokens: 运行模型的最大输出 token 预算（可选）。
+            由调用方经 _provider_max_output_tokens 探测后传入，用于在评分点
+            规模判定为短标书时再按「模型输出预算」二次把关（文档方案一选择依据）。
 
     Returns:
         bool: True = 走直出路径。
@@ -157,15 +190,28 @@ def should_use_direct_outline(
     自动判别口径（对齐易标规格二.2「超出 AI 输出长度」的分界）：
       - 评分点文本长度 <= OUTLINE_DIRECT_MAX_SCORING_CHARS
       - 评分条目数 <= OUTLINE_DIRECT_MAX_SCORING_ITEMS
-    两条都满足才判定为短标书。长标书走分步是规格明确的要求——
-    「几十万字标书提纲很长，普通模型输出仅 1500 字左右」，硬压进一次
-    调用必然被截断，产出残缺 JSON。
+      - 模型最大输出 token >= OUTLINE_DIRECT_MIN_OUTPUT_TOKENS（弱模型强制分步）
+    前两条都满足才判定为短标书；第三条作为额外护栏，避免弱模型一次性输出
+    长 JSON 被截断（「普通模型输出仅 1500 字左右」硬压进一次调用必残缺）。
     """
     if mode == "stepwise":
         return False
     if mode == "direct":
         return True
     if not OUTLINE_DIRECT_ENABLED:
+        return False
+
+    # 文档方案一选择依据：模型最大输出 token 预算。预算过低（弱模型）即便评分点
+    # 规模判定为短标书，一次性输出长 JSON 也极易被截断，强制走分步路径更稳妥。
+    if (
+        model_max_output_tokens is not None
+        and model_max_output_tokens > 0
+        and model_max_output_tokens < OUTLINE_DIRECT_MIN_OUTPUT_TOKENS
+    ):
+        logger.info(
+            "[V5.1] 模型最大输出 token=%d < 直出阈值 %d，强制分步路径",
+            model_max_output_tokens, OUTLINE_DIRECT_MIN_OUTPUT_TOKENS,
+        )
         return False
 
     text = (scoring_points or "").strip()
@@ -256,12 +302,29 @@ async def generate_outline_direct(
         AIMessage(role="user", content=user_prompt),
     ]
 
+    # 《标书智能体（5）》§三/§四：统一封装内业务校验 + 定向修复。
+    # validator 在 collect_json_response 内对模型原始输出执行业务校验
+    # （深度三级 / 二级 3~5 / 三级 ≥5 / 标题非空），失败即带着具体问题
+    # 进入 AI 修复链（含行列号/路径级错误描述），而不是让半成品目录流到
+    # 上层才回退。标题编号前缀由工厂预剥离（确定性修复优先于 AI 修复，
+    # 见 make_full_outline_validator），不为此消耗修复调用。
+    _direct_validator = make_full_outline_validator("完整目录（三级结构）")
     raw = await collect_json_response(
         provider,
         messages,
         max_retries=2,
         max_tokens=OUTLINE_MAX_TOKENS_DIRECT,
+        validator=_direct_validator,
     )
+    # 标书智能体（4）缓存可观测性：直出路径按任务类型记账（fail-soft）。
+    # 直出路径的 user 消息整体随项目稳定（重复生成时逐字节一致），天然
+    # 适配前缀缓存，无需再拆分层。
+    try:
+        from .cache_metrics import record_provider_cache_usage
+
+        record_provider_cache_usage(provider, task_type="outline_direct")
+    except Exception:  # pragma: no cover - 防御性
+        pass
     if not raw:
         logger.warning("[目录直出] AI 未返回有效内容，回退分步路径")
         return []
@@ -272,12 +335,12 @@ async def generate_outline_direct(
         logger.warning("[目录直出] JSON 解析失败或为空，回退分步路径")
         return []
 
-    # BUG-FIX 2026-10-09（超长内容崩溃 · 浪费 AI 调用）：规模护栏必须前移到
-    # _normalize_direct_outline **之前** —— 后者在给每个一级标题补「第X章」前缀时
-    # 调用 _int_to_chinese_num，旧实现在 n >= 100 时抛 IndexError，异常被
-    # generate_outline_v51 的 try/except 吞掉后静默回退分步路径，一次完整 AI 调用
-    # 被白白浪费，日志里只剩一行 generic warning 无法定位。这里先按原始条目数做
-    # O(1) 判定；下方 normalize 之后再留一道（覆盖 normalize 过滤条目后的计数）。
+    # BUG-FIX 2026-10-09（超长内容崩溃 · 浪费 AI 调用）：规模护栏前移到
+    # _normalize_direct_outline **之前**（历史背景：normalize 曾给每个一级标题
+    # 补「第X章」前缀时调用 _int_to_chinese_num，n >= 100 抛 IndexError 静默回退；
+    # 2026-10-23 起该前缀回填已整体移除——见 _normalize_direct_outline 内注释，
+    # 但规模护栏保留为防御纵深）。这里先按原始条目数做 O(1) 判定；
+    # 下方 normalize 之后再留一道（覆盖 normalize 过滤条目后的计数）。
     if len(payload) > OUTLINE_DIRECT_MAX_LEVEL1:
         logger.warning(
             "[目录直出] 一级章数 %d 超过上限 %d，回退分步路径",
@@ -296,10 +359,32 @@ async def generate_outline_direct(
         )
         return []
 
-    # 复用分步路径的后处理链，保证两条路径的输出质量口径一致
-    outline = _ensure_min_children(outline, min_level2=3, min_level3=3)
+    # 复用分步路径的后处理链，保证两条路径的输出质量口径一致。
+    # 注：L3（叶子）最小数量必须与分步路径保持同一标尺（5，见 generate_nodes_distribution
+    # 默认 min_level3=5 与下方兜底补全 _ensure_min_children(min_level3=5)）。此前此处误用
+    # min_level3=3，会让直出产物比分步路径偏浅，违背「口径一致」与文档方案一对「层级完整」
+    # 的要求（对齐 yibiao-simple 文档：一次性直出后仍需 Schema 校验 + 层级校验）。
+    outline = _ensure_min_children(outline, min_level2=3, min_level3=5)
     outline, _fixes = _post_process_title_quality(outline)
     outline, _tech = _tech_enhance_titles(outline)
+
+    # 《标书智能体（5）》§八·一一对应（2026-10-23 补口）：直出路径此前对
+    # 「一级目录 ↔ 评分项」覆盖关系零校验（分步路径在 L1 有 ±1 覆盖门，
+    # 直出完全没有），模型合并/漏映射评分项的产物会直接交付。此处补同一把
+    # 尺（±1 容差，与 _check_scoring_coverage 口径一致）：差异过大返回空列表，
+    # 由调用方回退分步路径（分步 L1 校验携带评分项上下文，可走 correction
+    # 重试与评分项兜底，比直出重复修复更有效）。无评分项场景跳过。
+    _sp_items_direct = _extract_scoring_items_list(
+        _parse_scoring_points_json(scoring_points)[0]
+    )
+    _expected_l1 = len(_sp_items_direct)
+    if _expected_l1 > 0 and abs(len(outline) - _expected_l1) > 1:
+        logger.warning(
+            "[目录直出] 一级章数 %d 与评分项数 %d 差异过大（允许 ±1），"
+            "回退分步路径补齐覆盖",
+            len(outline), _expected_l1,
+        )
+        return []
 
     total = sum(
         1 + sum(1 + len(l3) for l3 in l2.get("children", []))
@@ -354,10 +439,20 @@ def _normalize_direct_outline(data: list) -> list[dict]:
         return []
 
     outline: list[dict] = []
-    for idx, node in enumerate(payload):
+    for node in payload:
         if not isinstance(node, dict):
             continue
-        title = str(node.get("title") or node.get("name") or "").strip()
+        # 《标书智能体（5）》原则七「编号交给程序保证」（2026-10-23 修复 P0）：
+        # 旧实现在此给一级标题回填「第X章」前缀（调 _int_to_chinese_num），
+        # 与平台的纯文本标题存储契约冲突——编号由导出端按树位置现算
+        # （export.py: display_text = numbering + strip(text)），sections.py
+        # 入口亦统一剥前缀；且回填后的标题会被 validate_outline_business 的
+        # 前缀残留检测判负，导致直出产物自 2026-10-09 起恒被打回分步路径，
+        # 每次白烧一次完整 AI 调用。现改为确定性剥离各级标题的编号前缀
+        # （兼容弱模型常见「第一章 / 1.1」残留），剥离后为空按无效节点丢弃。
+        title = _strip_title_number_prefix(
+            str(node.get("title") or node.get("name") or "").strip()
+        )
         if not title:
             continue
         item = {
@@ -367,14 +462,13 @@ def _normalize_direct_outline(data: list) -> list[dict]:
             "suggested_chart": str(node.get("suggested_chart") or node.get("chart") or ""),
             "children": [],
         }
-        # 一级标题缺编号时补上（对齐审核口径「一级标题含第X章编号」）
-        if not re.match(r"第[一二三四五六七八九十0-9]+章", item["title"]):
-            item["title"] = f"第{_int_to_chinese_num(idx + 1)}章 {item['title']}"
 
         for sub in node.get("children") or []:
             if not isinstance(sub, dict):
                 continue
-            sub_title = str(sub.get("title") or sub.get("name") or "").strip()
+            sub_title = _strip_title_number_prefix(
+                str(sub.get("title") or sub.get("name") or "").strip()
+            )
             if not sub_title:
                 continue
             l2 = {
@@ -385,7 +479,9 @@ def _normalize_direct_outline(data: list) -> list[dict]:
             for l3 in sub.get("children") or []:
                 if not isinstance(l3, dict):
                     continue
-                l3_title = str(l3.get("title") or l3.get("name") or "").strip()
+                l3_title = _strip_title_number_prefix(
+                    str(l3.get("title") or l3.get("name") or "").strip()
+                )
                 if not l3_title:
                     continue
                 l2["children"].append({
@@ -504,16 +600,243 @@ def _resolve_reference_json(reference_outline: Any) -> str:
         candidate = reference_outline
 
     if isinstance(candidate, list) and candidate:
-        # 只保留 id/title：调用方可能带上 zone 等额外字段，白占提示词预算
-        slim = [
-            {"id": str(ch.get("id", "")), "title": str(ch.get("title", "")).strip()}
-            for ch in candidate
-            if isinstance(ch, dict) and str(ch.get("title", "")).strip()
-        ]
+        # 保留 id/title；`source` 字段（方案类型/危大参数溯源标注）一并透传供提示词与
+        # 后续「来源透传到生成节点」使用。其余额外字段（zone 等）丢弃，避免白占提示词预算。
+        slim = []
+        for ch in candidate:
+            if not isinstance(ch, dict):
+                continue
+            title = str(ch.get("title", "")).strip()
+            if not title:
+                continue
+            item = {"id": str(ch.get("id", "")), "title": title}
+            src = ch.get("source")
+            if src:
+                item["source"] = str(src)
+            slim.append(item)
         if slim:
             return json.dumps(slim, ensure_ascii=False)
 
     return json.dumps(REFERENCE_TEMPLATE_V51, ensure_ascii=False)
+
+
+def _norm_title(title: str) -> str:
+    """归一化标题用于来源匹配：去空白、转小写，弱化中英文标点/括号/空格差异。"""
+    t = (title or "").strip().lower()
+    for sep in ("（", "）", "(", ")", "：", ":", "、", "，", ",", " "):
+        t = t.replace(sep, "")
+    return t
+
+
+def _build_reference_source_map(reference_outline: Any) -> "dict[str, str]":
+    """从参考目录构建「归一化标题 → 来源」映射，用于把来源标注透传到生成后的目录节点。
+
+    仅收录带 ``source`` 字段的参考章节（即方案类型特有关卡 / 危大参数深化章节，见
+    ``recommend_outline_reference``），通用 23 章基座章节无 ``source`` 不收录。
+    """
+    candidate: Any = None
+    if isinstance(reference_outline, str) and reference_outline.strip():
+        try:
+            candidate = json.loads(reference_outline)
+        except (ValueError, TypeError):
+            candidate = None
+    elif isinstance(reference_outline, list):
+        candidate = reference_outline
+    if not isinstance(candidate, list):
+        return {}
+    source_map: dict[str, str] = {}
+    for ch in candidate:
+        if not isinstance(ch, dict):
+            continue
+        title = (ch.get("title") or "").strip()
+        src = ch.get("source")
+        if title and src:
+            source_map[_norm_title(title)] = str(src)
+    return source_map
+
+
+def _apply_reference_source(level1: list, reference_outline: Any) -> None:
+    """把参考目录的来源标注透传到生成后的一级目录节点（标书智能体（一）第六节2 溯源）。
+
+    设计：L1 由 AI 依据评分项与参考目录生成，标题可能被改写。这里以「归一化标题双向包含」
+    做确定性最佳匹配——参考标题是生成标题的种子，二者通常存在包含关系（如生成标题
+    「基坑监测方案及报警制度」包含参考标题「基坑监测方案」）。仅对成功匹配的一级节点写入
+    ``source``，未匹配节点保持不变，**绝不**影响既有章节结构、数量与 AI 产出内容。
+    """
+    if not isinstance(level1, list) or not level1:
+        return
+    source_map = _build_reference_source_map(reference_outline)
+    if not source_map:
+        return
+    for node in level1:
+        if not isinstance(node, dict):
+            continue
+        if "source" in node:
+            continue  # 已有来源（如 aligned 回填扩展字段），不覆盖
+        title = (node.get("title") or "").strip()
+        if not title:
+            continue
+        n_title = _norm_title(title)
+        matched = ""
+        for ref_norm, src in source_map.items():
+            if not ref_norm or not n_title:
+                continue
+            # 双向包含：参考是种子（短）被生成标题（长）包含，或生成标题被参考（长）包含
+            if ref_norm in n_title or n_title in ref_norm:
+                matched = src
+                break
+        if matched:
+            node["source"] = matched
+
+
+# ===========================================================================
+# 标书智能体（一）引入：专项方案类型 → 目录模板选型
+# ===========================================================================
+# 依据「专项方案类型识别」产出（scheme_extraction.scheme_type，六大类危大工程）为目录生成
+# 选择参考目录骨架：在通用 23 章兜底模板基础上，按方案类型追加该类型特有的重点章节，
+# 使 L1 章节切分更贴合专项方案的真实内容结构（对应《引入方案》第六节"与各模块衔接"）。
+# 仅作「参考/种子」，最终章节仍由 L1 依据评分项与事实事实推导，互不影响。
+# 未知/空方案类型一律回退通用模板，保证既有行为零变化。
+_SCHEME_TYPE_EXTRA_CHAPTERS: dict[str, list[str]] = {
+    "基坑工程": [
+        "基坑监测方案",
+        "降水与排水施工",
+        "周边建（构）筑物及管线保护",
+    ],
+    "模板工程及支撑体系": [
+        "模板支撑体系设计与计算",
+        "模板安装与拆除",
+        "高支模验收",
+    ],
+    "脚手架工程": [
+        "脚手架搭设与拆除",
+        "脚手架检查与验收",
+        "卸料平台",
+    ],
+    "起重吊装及安装拆卸工程": [
+        "起重机械选型与布置",
+        "吊装作业安全技术",
+        "设备安装工程",
+    ],
+    "拆除工程": [
+        "拆除顺序与方法",
+        "拆除安全防护措施",
+        "废弃物清运",
+    ],
+    # "其他"：无特有章节，回退通用模板
+}
+
+# 危大工程判定参数 → 目录「计算书与图纸 / 应急处置」章节深化映射（标书智能体（一）第六节2）。
+# 当提取到对应危大参数时，为该专项方案的「计算书与图纸」「应急处置」增补配套章节，
+# 实现「危大工程判定结果影响这两类章节的深度」。仅在参数已识别（value 非「未提及」）时增补。
+_DANGEROUS_PARAM_CHAPTERS: dict[str, list[str]] = {
+    "开挖深度": [
+        "基坑工程计算书（支护稳定性与降水验算）",
+        "基坑坍塌及涌水涌砂应急预案",
+    ],
+    "支撑高度": [
+        "模板支撑体系计算书（立杆稳定与承载力验算）",
+        "模板支撑坍塌应急预案",
+    ],
+    "跨度": [
+        "模板及钢结构承载力计算书",
+        "高支模及钢结构坍塌应急预案",
+    ],
+    "施工总荷载": [
+        "模板支撑荷载验算计算书",
+        "模板坍塌应急预案",
+    ],
+    "集中线荷载": [
+        "模板支撑线荷载验算计算书",
+        "模板坍塌应急预案",
+    ],
+    "起吊重量": [
+        "起重吊装受力计算书",
+        "起重伤害及物体打击应急预案",
+    ],
+    "脚手架搭设高度": [
+        "脚手架稳定性计算书",
+        "脚手架坍塌及高处坠落应急预案",
+    ],
+    "幕墙施工高度": [
+        "幕墙安装计算书",
+        "高处坠落应急预案",
+    ],
+    "钢结构跨度": [
+        "钢结构安装计算书",
+        "钢结构坍塌应急预案",
+    ],
+    "人工挖孔桩深度": [
+        "人工挖孔桩计算书",
+        "中毒窒息及坍塌应急预案",
+    ],
+}
+
+
+def _deepen_by_dangerous_params(dangerous_params: "list | None") -> "list[dict]":
+    """根据危大工程判定参数，返回需补增的「计算书与图纸」「应急处置」深化章节。
+
+    对应《引入方案》第六节2「危大工程判定结果影响目录中计算书与图纸、应急处置章节的深度」。
+    每项形如 ``{"title": ..., "param": ...}``，``param`` 记录触发该章节的危大判定参数名，
+    供推荐结果标注来源。仅当某参数已被识别（value 存在且非「未提及」）才增补；同标题按
+    param 去重，避免重复章节。
+    """
+    if not dangerous_params or not isinstance(dangerous_params, list):
+        return []
+    out: list[dict] = []
+    seen: set[str] = set()
+    for item in dangerous_params:
+        if not isinstance(item, dict):
+            continue
+        param = (item.get("param") or item.get("name") or "").strip()
+        value = (item.get("value") or "").strip()
+        # 仅当参数已识别（非「未提及」、非空）才深化。
+        if not value or value == "未提及":
+            continue
+        for title in _DANGEROUS_PARAM_CHAPTERS.get(param, []):
+            if title in seen:
+                continue
+            seen.add(title)
+            out.append({"title": title, "param": param})
+    return out
+
+
+def recommend_outline_reference(
+    scheme_type: str, dangerous_params: "list | None" = None
+) -> list[dict]:
+    """按专项方案类型 + 危大工程判定参数推荐目录参考骨架（标书智能体（一）引入）。
+
+    Args:
+        scheme_type: 方案类型，取值见 ``_SCHEME_TYPE_EXTRA_CHAPTERS``（六大危大工程
+            分类）。非已知类型或空串一律回退通用 23 章模板。
+        dangerous_params: 危大工程判定参数列表（``analysis.scheme_extraction_json`` 中的
+            ``dangerous_work_params``，每项 ``{"param":..., "value":...}``）。当某参数已识别
+            （value 非「未提及」）时，为该专项方案的「计算书与图纸」「应急处置」增补配套章节，
+            实现「危大工程判定结果影响这两类章节的深度」。缺省/空则不做此深化。
+
+    Returns:
+        ``[{"id": ..., "title": ..., "source": ...}, ...]``，通用模板 + 方案类型特有章节 +
+        危大参数深化章节。追加章节带 ``source`` 字段标注来源（"方案类型：xxx" 或
+        "危大参数：xxx"），通用 23 章无该字段。返回的是新列表（副本），调用方可安全修改。
+    """
+    extras = _SCHEME_TYPE_EXTRA_CHAPTERS.get((scheme_type or "").strip())
+    base = [dict(ch) for ch in REFERENCE_TEMPLATE_V51]
+    # 1) 方案类型特有章节（第六节2：专项方案类型决定目录一级章节匹配的模板）
+    if extras:
+        for i, title in enumerate(extras, start=1):
+            base.append({
+                "id": f"ref_ext_{i}",
+                "title": title,
+                "source": f"方案类型：{scheme_type}",
+            })
+    # 2) 危大工程判定参数 → 深化「计算书与图纸」「应急处置」（第六节2），标注来源参数
+    for i, item in enumerate(_deepen_by_dangerous_params(dangerous_params), start=1):
+        base.append({
+            "id": f"ref_dp_{i}",
+            "title": item["title"],
+            "source": f"危大参数：{item['param']}",
+        })
+    return base
 
 
 # ========== AI 调用统一入口 ==========
@@ -540,39 +863,77 @@ def _resolve_outline_temperature() -> float:
 async def _call_ai_v51(
     provider: Any,
     system_prompt: str,
-    user_prompt: str,
+    user_prompt: "str | list[str]",
     max_tokens: int = 2000,
     max_retries: int = 1,
     project_info: dict | None = None,
     temperature: float | None = None,
+    cache_task: str = "outline",
+    section_id: str = "",
 ) -> Any:
     """V5.1 统一 AI 调用入口。
 
     重试逻辑由 collect_json_response 内部处理（含 JSON 自修复链路），
     这里不再包一层循环，避免嵌套重试。
 
+    标书智能体（4）——提示词顺序优化（2026-10-23，冲突时以外部引用标准为准）：
+    ``user_prompt`` 传 ``list[str]`` 时按「稳定上下文前置、任务差异后置」
+    装配为多条 user 消息（项目信息/行业画像/既有目录/事实等稳定块各成一条，
+    任务说明放最后）——同一项目重复生成目录、同章多次填充时，稳定前缀可
+    命中服务商 Prompt Cache；传 ``str`` 时保持旧的单条 user 行为。
+    分层总开关 OUTLINE_PROMPT_LAYERS_ENABLED（默认 true），false 时合并为
+    单条 user 消息（内容一致，仅消息条数不同）。
+
     Args:
         temperature: 显式覆盖温度；None 时取 `_resolve_outline_temperature()`。
+        cache_task: 缓存计量任务类型（outline_l1 / outline_l2 / outline_direct /
+            outline_selfcheck ...）。
+        section_id: 章节标识（可选，缓存计量日志定位用）。
     """
-    messages = [
-        AIMessage(role="system", content=system_prompt),
-        AIMessage(role="user", content=user_prompt),
-    ]
+    if isinstance(user_prompt, str):
+        user_blocks = [user_prompt]
+    else:
+        user_blocks = list(user_prompt or [])
+    try:
+        from ...config import OUTLINE_PROMPT_LAYERS_ENABLED as _LAYERS_ON
+    except Exception:  # pragma: no cover - 配置读取兜底
+        _LAYERS_ON = True
+    if _LAYERS_ON:
+        from .prompt_order import build_cache_friendly_messages
+
+        messages = build_cache_friendly_messages(system_prompt, user_blocks, "")
+    else:
+        from .prompt_order import merge_single_user
+
+        messages = [
+            AIMessage(role="system", content=system_prompt),
+            AIMessage(role="user", content=merge_single_user(user_blocks)),
+        ]
     extra_body = None
     if project_info:
         extra_body = {
             "projectName": project_info.get("name", ""),
             "projectType": project_info.get("industry", ""),
         }
-    result = await collect_json_response(
-        provider,
-        messages,
-        temperature=_resolve_outline_temperature() if temperature is None else temperature,
-        max_retries=max_retries,
-        max_tokens=max_tokens,
-        extra_body=extra_body,
-    )
-    return result
+    try:
+        result = await collect_json_response(
+            provider,
+            messages,
+            temperature=_resolve_outline_temperature() if temperature is None else temperature,
+            max_retries=max_retries,
+            max_tokens=max_tokens,
+            extra_body=extra_body,
+        )
+        return result
+    finally:
+        # 标书智能体（4）缓存可观测性：按任务类型累计 prompt cache 用量
+        # （collect_json_response 内部可能多次调用 provider，last_usage 取
+        # 最后一次；fail-soft，绝不影响主链路）。
+        from .cache_metrics import record_provider_cache_usage
+
+        record_provider_cache_usage(
+            provider, task_type=cache_task, section_id=section_id
+        )
 
 
 # ========== L1 一级目录生成 ==========
@@ -824,10 +1185,17 @@ async def _generate_level1_v51(
             f"（在 description 中说明覆盖了哪些评分项），一级章节总数不得超过 "
             f"{OUTLINE_L1_MAX_CHAPTERS}，同时确保每条评分项的要点都能在某个章节中落地。\n"
         )
-        base_user_prompt = (
-            f"<overview>\n{safe_summary}\n</overview>\n"
-            f"<requirements>\n{safe_requirements}\n</requirements>\n"
-            f"<reference>\n{safe_reference}\n</reference>\n\n"
+    # 标书智能体（4）——提示词顺序优化（缓存命中）：稳定上下文（项目概述 /
+    # 评分要求 / 目录库参考）拆成独立的 user 消息并前置，任务说明（章节数
+    # 要求、归并提示、重试修正）单独放最后一条 user 消息。同一项目多次
+    # 「重新生成目录」时，前几条消息逐字节一致 → 命中服务商 Prompt Cache。
+    _l1_ctx_blocks = [
+        f"<overview>\n{safe_summary}\n</overview>",
+        f"<requirements>\n{safe_requirements}\n</requirements>",
+        f"<reference>\n{safe_reference}\n</reference>",
+    ]
+    if OUTLINE_L1_MAX_CHAPTERS > 0 and _score_item_count > OUTLINE_L1_MAX_CHAPTERS:
+        _l1_task_block = (
             f"请严格按评分要求生成一级目录。\n"
             f"评分项总数: {_score_item_count}\n"
             f"要求:\n"
@@ -841,10 +1209,7 @@ async def _generate_level1_v51(
             f"{_l1_cap_hint}"
         )
     else:
-        base_user_prompt = (
-            f"<overview>\n{safe_summary}\n</overview>\n"
-            f"<requirements>\n{safe_requirements}\n</requirements>\n"
-            f"<reference>\n{safe_reference}\n</reference>\n\n"
+        _l1_task_block = (
             f"请严格按评分要求生成一级目录。\n"
             f"评分项总数: {_score_item_count}\n"
             f"要求:\n"
@@ -859,22 +1224,23 @@ async def _generate_level1_v51(
     # BUG-FIX 2026-10-19（岳阳路事故·专业隔离）：项目类型锁定 + 域外术语禁入。
     # 装修项目此前生成出「勘察技术路线与地质难点应对方案」这类地勘标题，
     # 正文被标题误导强行往地质上扯。在 L1 阶段即注入专业隔离约束。
+    # 属于项目级稳定上下文 → 进稳定消息块（不破坏缓存前缀）。
     try:
         _project_type = _detect_project_type(summary, global_facts)
     except Exception as _pt_e:
         logger.debug("项目类型检测失败（跳过专业隔离注入）: %s", _pt_e)
         _project_type = ""
     if _project_type:
-        base_user_prompt += _build_professional_isolation_block(_project_type)
+        _l1_ctx_blocks.append(_build_professional_isolation_block(_project_type))
 
     # BUG-FIX 2026-09-18（高）：注入招标文件上下文与行业背景（此前为死参数）。
     # 放在 <reference> 之后、全局事实之前，便于模型把「招标强制要求」与
-    # 「章节体系参考」区分开。
+    # 「章节体系参考」区分开。项目级稳定上下文 → 稳定消息块。
     _tender_block = _format_tender_context_block(tender_context, industry_profile)
     if _tender_block:
-        base_user_prompt += "\n" + _tender_block
+        _l1_ctx_blocks.append(_tender_block)
 
-    # 注入全局事实变量
+    # 注入全局事实变量（项目级稳定上下文 → 稳定消息块）
     facts_text = _format_facts_list(global_facts) if isinstance(global_facts, list) else ""
     if facts_text:
         # BUG-FIX 2026-09-14（中）：截断时无标记，模型会把半截数值当成完整事实
@@ -882,17 +1248,18 @@ async def _generate_level1_v51(
         if len(facts_text) > 2000:
             facts_text = facts_text[:2000] + "\n…（事实变量已截断，以事实变量页为准）"
         facts_block = (
-            "\n\n【全局事实变量】（目录章节涉及相关内容时须与之保持一致）：\n"
+            "【全局事实变量】（目录章节涉及相关内容时须与之保持一致）：\n"
             f"{facts_text}\n"
         )
-        base_user_prompt += facts_block
+        _l1_ctx_blocks.append(facts_block)
 
     # 最多 3 次重试（首次 + 2 次重试）
     # BUG-FIX 2026-09-18（P2）：快照基础 prompt。旧实现每次失败都往
     # base_user_prompt 上追加 correction，多次重试后旧错误信息/旧输出预览
     # 会累积污染提示（误导模型朝已失效的修正方向走）。改为每次重试以
-    # 「基础 + 最新修正段」重组。
-    _l1_prompt_base = base_user_prompt
+    # 「基础 + 最新修正段」重组。标书智能体（4）：correction 只追加到
+    # **任务差异消息**（最后一条），稳定上下文块跨重试保持逐字节一致。
+    _l1_task_base = _l1_task_block
     last_error = None
     last_raw = None
 
@@ -944,14 +1311,25 @@ async def _generate_level1_v51(
             raw_result = await _call_ai_v51(
                 provider,
                 sys_prompt,
-                base_user_prompt,
+                _l1_ctx_blocks + [_l1_task_block],
                 max_tokens=OUTLINE_MAX_TOKENS_L1,
                 max_retries=1,
                 project_info=project_info,
+                cache_task="outline_l1",
             )
             last_raw = raw_result
             # 规范化为 list[dict]
             level1 = _normalize_to_list(raw_result, "一级目录")
+            # 《标书智能体（5）》原则七「编号交给程序保证」（2026-10-23）：
+            # 弱模型常无视提示词在一级标题带回「第一章 / 1.1」等编号前缀。
+            # 与直出路径 _normalize_direct_outline、章节入口 sections.py 同一
+            # 契约：确定性剥离，不走 correction 重试（剥前缀不值得烧一次 AI
+            # 调用）；剥离后为空（纯编号标题）留给 _validate_level1 判「标题为空」。
+            for _n in level1:
+                if isinstance(_n, dict) and isinstance(_n.get("title"), str):
+                    _t = _strip_title_number_prefix(_n["title"])
+                    if _t:
+                        _n["title"] = _t
             # 修正 ID（按数组位置分配）
             level1 = _assign_ids(level1)
             # 校验
@@ -1004,7 +1382,7 @@ async def _generate_level1_v51(
                     f'示例：[{{"id":"1","title":"项目概述","description":"项目基本信息、规模、工期等"}},...]\n'
                     f'禁止返回 {{"result": ...}} 等包装格式！\n'
                 )
-                base_user_prompt = _l1_prompt_base + correction
+                _l1_task_block = _l1_task_base + correction
                 logger.warning(
                     "V5.1 L1 校验失败，第 %d/3 次: %s | raw=%s", attempt + 1, e, raw_preview
                 )
@@ -1252,12 +1630,56 @@ def _assign_ids(nodes: list[dict]) -> list[dict]:
     return _walk(nodes, "")
 
 
+def _merge_dropped_into_last_l1(kept: list[dict], dropped: list[dict]) -> int:
+    """把因硬上限被截掉的章节所承载的评分要点，归并进保留的最后一章。
+
+    FIX 2026-10-23（P1）：此前非 aligned 分支直接 `level1[:cap]` 丢弃溢出
+    章节，被丢章节承载的评分项**完全失联**——既没有任何章节提及它们，
+    `_check_scoring_coverage` 还把期望值降到 `min(评分项数, 上限)` 使校验
+    照常通过，于是「评分点覆盖不全」被静默吞掉（生产实证：2026-10-22
+    21:48:06 project=1871130，22 章截断到 15，7 条评分项无落点且无任何
+    告警）。aligned 分支早在 2026-10-20 就有 `_merge_overflow_scoring_into_last_l1`
+    做同类归并，本函数把该口径补齐到 AI 生成分支，消除两条路径的不一致。
+
+    只写 `description`（并把标题记入 `merged_from_dropped`），**不改变章节
+    数量**，硬上限的结构可控目标不受影响。
+    """
+    if not kept or not dropped:
+        return 0
+    parts: list[str] = []
+    for d in dropped:
+        if not isinstance(d, dict):
+            continue
+        _t = str(d.get("title", "") or "").strip()
+        _desc = str(d.get("description", "") or "").strip()
+        parts.append(f"{_t}（{_desc}）" if _desc and _t else (_t or _desc))
+    tail = "；".join(p for p in parts if p)
+    if not tail:
+        return 0
+
+    last = kept[-1]
+    if not isinstance(last, dict):
+        return 0
+    _marker = "【硬上限归并】"
+    if _marker in str(last.get("description", "") or ""):
+        return 0  # 幂等：重复截断不叠加
+    _prev = str(last.get("description", "") or "").strip()
+    last["description"] = (
+        (_prev + " " if _prev else "") + _marker + "本章需同时覆盖以下评分要点：" + tail
+    )
+    last["merged_from_dropped"] = [
+        str(d.get("title", "") or "") for d in dropped if isinstance(d, dict)
+    ]
+    return len(dropped)
+
+
 def _apply_l1_chapter_cap(level1: list[dict]) -> tuple[list[dict], bool]:
     """一级章节数硬上限截断（2026-10-19，OUTLINE_L1_MAX_CHAPTERS）。
 
     评分项被解析出 22 条时，旧逻辑会生成 22 个一级章节（生产事故实录），
-    超出投标文件的合理结构规模。超过上限时直接截断并告警——评分覆盖允许
-    牺牲，目录结构可控优先。
+    超出投标文件的合理结构规模。超过上限时截断并告警——章节数受控优先，
+    但被截章节承载的评分要点必须并回保留章节（FIX 2026-10-23），
+    不允许静默丢失。
 
     Returns:
         (截断后的目录, 是否发生截断)
@@ -1265,12 +1687,18 @@ def _apply_l1_chapter_cap(level1: list[dict]) -> tuple[list[dict], bool]:
     cap = OUTLINE_L1_MAX_CHAPTERS
     if cap <= 0 or not isinstance(level1, list) or len(level1) <= cap:
         return level1, False
+    dropped = level1[cap:]
+    kept = level1[:cap]
     logger.warning(
-        "V5.1 L1 章节数 %d 超过硬上限 %d（OUTLINE_L1_MAX_CHAPTERS），已强制截断",
+        "V5.1 L1 章节数 %d 超过硬上限 %d（OUTLINE_L1_MAX_CHAPTERS），已截断；"
+        "被截章节承载的评分要点将并入末章以保证可追溯: %s | "
+        "error_code=OUTLINE_L1_CAPPED error_layer=service retryable=False",
         len(level1),
         cap,
+        [str(d.get("title", "")) for d in dropped if isinstance(d, dict)],
     )
-    return level1[:cap], True
+    _merge_dropped_into_last_l1(kept, dropped)
+    return kept, True
 
 
 def _check_scoring_coverage(level1: list[dict], expected_count: int) -> None:
@@ -1627,7 +2055,17 @@ def _post_process_title_quality(level1: list[dict]) -> tuple[list[dict], int]:
             l2_title = l2_node.get("title", "").strip()
 
             # 检查 L2 标题质量
-            if not l2_title or _is_generic_title(l2_title):
+            #
+            # BUG-FIX 2026-10-26（二级占位标题漏网）：L2 此前只过 `_is_generic_title`
+            # 的 8 条锚定正则（不认「专项方案2」「内容3」「第6项」
+            # 「总体实施策划（2）」这类裸编号形态），于是 AI 在二级层产出的
+            # 编号式占位名会原样进入「二级目录审核」界面与落库 JSON。
+            # 现补一层层级无关的编号占位判定（只认编号，不碰「概述/其他」等合法词）。
+            if (
+                not l2_title
+                or _is_generic_title(l2_title)
+                or _is_placeholder_numbered_title(l2_title)
+            ):
                 new_l2 = _generate_quality_l2_title(l1_title, l2_idx, l2_count, used_l2_titles)
                 logger.info(
                     "标题质量修正: L2[%d.%d] '%s' -> '%s'", l1_idx + 1, l2_idx + 1, l2_title, new_l2
@@ -2189,15 +2627,22 @@ async def _fill_level2_with_ai(
     safe_other = sanitize_prompt_value(other_outline)
     safe_title = sanitize_prompt_value(level1_title)
     safe_skeleton = sanitize_prompt_value(skeleton_json)
-    user_prompt = (
-        f"<overview>\n{safe_summary}\n</overview>\n"
-        f"<requirements>\n{safe_sp}\n</requirements>\n"
-        f"{facts_block}"
-        f"{tender_block}"
-        f"{boq_block}"
-        f"<other_outline>\n{safe_other}\n</other_outline>\n"
-        f"{scope_block}"
-        f"{suggestions_block}"
+    # 标书智能体（4）——提示词顺序优化（缓存命中）：稳定上下文（项目概述 /
+    # 评分要求 / 事实 / 招标原文 / 清单 / 其他章节 / 承包范围 / 审核建议）拆成
+    # 独立 user 消息前置；**随章节变化**的 chapter_title + json_outline 骨架与
+    # 任务说明放最后一条。L2 是同章多次调用 + 多章并发的热点路径，稳定前缀
+    # 一致可直接命中服务商缓存（旧实现全部拼成单条 user，前缀逐章漂移）。
+    _l2_ctx_blocks = [
+        f"<overview>\n{safe_summary}\n</overview>",
+        f"<requirements>\n{safe_sp}\n</requirements>",
+        facts_block,
+        tender_block,
+        boq_block,
+        f"<other_outline>\n{safe_other}\n</other_outline>",
+        scope_block,
+        suggestions_block,
+    ]
+    _l2_task_block = (
         f"<chapter_title>\n{safe_title}\n</chapter_title>\n"
         f"<json_outline>\n{safe_skeleton}\n</json_outline>\n\n"
         f"请在原 JSON 骨架上补全 title 和 description。直接返回填充后的 JSON，不要额外说明。\n"
@@ -2205,8 +2650,9 @@ async def _fill_level2_with_ai(
 
     # 最多 3 次重试
     # BUG-FIX 2026-09-18（P2）：同 L1，快照基础 prompt，重试时以「基础 + 最新
-    # 修正段」重组，避免 correction 逐次累加污染提示。
-    _l2_prompt_base = user_prompt
+    # 修正段」重组，避免 correction 逐次累加污染提示。标书智能体（4）：
+    # correction 只追加到任务差异消息，稳定上下文块跨重试逐字节一致。
+    _l2_task_base = _l2_task_block
     last_error = None
     last_tb = None  # BUG-FIX: 存 traceback
     for attempt in range(3):
@@ -2221,10 +2667,12 @@ async def _fill_level2_with_ai(
             result = await _call_ai_v51(
                 provider,
                 sys_prompt,
-                user_prompt,
+                _l2_ctx_blocks + [_l2_task_block],
                 max_tokens=OUTLINE_MAX_TOKENS_L2,
                 max_retries=1,
                 project_info=project_info,
+                cache_task="outline_l2",
+                section_id=str(level1_index),
             )
             # 解析 AI 返回
             if isinstance(result, str):
@@ -2259,18 +2707,10 @@ async def _fill_level2_with_ai(
                     f"AI 返回格式无法识别: {type(result).__name__}, keys={list(result.keys()) if isinstance(result, dict) else 'N/A'}"
                 )
 
-            # 预校验：验证 AI 返回的 children 结构与骨架兼容
+            # E1（2026-10-21）：原「预校验」块已删除——它用单个骨架节点作模板比对 AI
+            # 整列 children，在现行健壮 check_json（结构模板模式）下永不产出有效信号，
+            # 且与下方 merge 后的权威结构校验（expected_schema）功能重叠，仅制造误导日志。
             skeleton_children = skeleton.get("children", [])
-            if merged_children and skeleton_children:
-                # 用骨架的第一个子节点作为结构模板
-                template_child = skeleton_children[0]
-                valid, err = check_json(
-                    json.dumps(merged_children, ensure_ascii=False),
-                    [template_child],  # 列表模板
-                )
-                if not valid:
-                    logger.warning("AI 返回 children 结构与骨架不兼容: %s", err)
-                    # 不直接失败，让合并逻辑处理不兼容情况
 
             # 将填充的 children 合并到骨架中
             # BUG-FIX 2026-09-14（高）：原实现在 merge **之后**才取 skeleton 当 schema，
@@ -2312,7 +2752,7 @@ async def _fill_level2_with_ai(
                     f"错误：{e!s}\n"
                     f"请在原 JSON 骨架上补全 title 和 description，禁止修改结构。\n"
                 )
-                user_prompt = _l2_prompt_base + correction
+                _l2_task_block = _l2_task_base + correction
                 logger.warning("L2 填充失败 %s，第 %d/3 次: %s", level1_title, attempt + 1, e)
                 continue
             raise
@@ -2459,8 +2899,15 @@ async def _generate_level2_v51(
     tender_context: str = "",
     boq_text: str = "",
     review_suggestions: list | None = None,
+    stats: dict | None = None,
 ) -> list[dict]:
     """L2：并发生成二级目录（预构建骨架 + AI 填充模式）。
+
+    `stats`（可选，出参）：调用方可传入一个 dict，本函数会写入降级诊断信息
+    ——`l2_total` / `l2_failed_titles` / `l2_recovered_titles` /
+    `l2_fallback_titles`（最终仍用默认目录的章节）/ `l2_degraded`(bool) /
+    `l2_retry_rounds`。用于让上层把「目录质量退化」如实告知用户，
+    而不是像 2026-10-23 之前那样只在后台留一行 WARNING（FIX P0）。
 
     设计文档流程：
     1. 用 generate_nodes_distribution 预构建每个一级章节的 JSON 骨架
@@ -2513,23 +2960,25 @@ async def _generate_level2_v51(
     results: list[dict | None] = [None] * total
     _l2_completed = {"n": 0}  # 共享计数器（dict 是可变对象，闭包能修改）
 
-    async def _fill_one(idx: int) -> dict:
+    async def _fill_one(idx: int, _sem=None) -> dict:
         l1_node = level1[idx]
         l1_title = l1_node.get("title", f"第{idx + 1}章")
         skeleton = skeletons[idx]
         other_outline = _build_other_outline(level1, idx)
+        # 补偿轮传入更窄的信号量；默认沿用首轮信号量（向后兼容）。
+        _gate = _sem if _sem is not None else sem
 
         # BUG-OUTLINE-PROGRESS-03 修复：子任务开始时立即推一条 "正在生成" 事件，
         # 让前端在 AI 60s 调用期间也能看到实时进展，而不是等 AI 全跑完才看到
         if progress_callback is not None:
             try:
                 await progress_callback(
-                    _l2_completed["n"], total, f"正在生成：{l1_title}..."
+                    min(_l2_completed["n"], total), total, f"正在生成：{l1_title}..."
                 )
             except Exception as _e:
                 logger.debug("[silent-except] workflows_outline_v51.py: line 1522 - %s", _e)
 
-        async with sem:
+        async with _gate:
             try:
                 _t0 = time.monotonic()
                 filled = await _fill_level2_with_ai(
@@ -2555,23 +3004,29 @@ async def _generate_level2_v51(
                 _l2_completed["n"] += 1
                 logger.info(
                     "L2[%d/%d] 完成: %s (耗时 %.1fs)",
-                    _l2_completed["n"], total, l1_title, time.monotonic() - _t0,
+                    min(_l2_completed["n"], total), total,
+                    l1_title, time.monotonic() - _t0,
                 )
                 if progress_callback is not None:
                     try:
-                        await progress_callback(_l2_completed["n"], total, l1_title)
+                        await progress_callback(
+                            min(_l2_completed["n"], total), total, l1_title
+                        )
                     except Exception as _cb_err:
                         logger.debug("L2 progress_callback(ok) 异常: %s", _cb_err)
                 return filled
             except Exception as e:
                 logger.error(
                     "L2[%d/%d] 失败 idx=%d %s: %s (耗时 %.1fs)",
-                    _l2_completed["n"] + 1, total, idx, l1_title, e, time.monotonic() - _t0,
+                    min(_l2_completed["n"] + 1, total), total, idx,
+                    l1_title, e, time.monotonic() - _t0,
                 )
                 _l2_completed["n"] += 1
                 if progress_callback is not None:
                     try:
-                        await progress_callback(_l2_completed["n"], total, f"{l1_title}(失败)")
+                        await progress_callback(
+                            min(_l2_completed["n"], total), total, f"{l1_title}(失败)"
+                        )
                     except Exception as _cb_err:
                         logger.debug("L2 progress_callback(err) 异常: %s", _cb_err)
                 raise
@@ -2582,11 +3037,13 @@ async def _generate_level2_v51(
 
     # 处理结果（gather_results 里是返回值 dict 或 Exception）
     l2_failed: list[str] = []
+    failed_idx: list[int] = []
     for idx, result in enumerate(gather_results):
         if isinstance(result, Exception):
             l1_title = level1[idx].get("title", f"第{idx + 1}章")
             l2_failed.append(l1_title)
-            logger.warning("V5.1 L2 章节失败 %s，使用默认目录", l1_title)
+            failed_idx.append(idx)
+            logger.warning("V5.1 L2 章节失败 %s，暂用默认目录占位", l1_title)
             # 默认填充（携带父一级章节标题前缀，避免默认标题跨章节重名）
             level1[idx]["children"] = _default_l2_children_for_skeleton(skeletons[idx], l1_title)
             if l2_done_queue is not None:
@@ -2595,12 +3052,88 @@ async def _generate_level2_v51(
             if results[idx] is not None:
                 level1[idx] = results[idx]
 
+    # ──────────────────────────────────────────────────────────────────────
+    # FIX 2026-10-23（P0）：失败章节低并发补偿重跑
+    #
+    # 生产实证 logs/backend.log 2026-10-22 21:47~21:56（project=1871130）：
+    # 首轮 15 章一次性并发打出 → provider 侧 HTTP 429 → rate_gate 把并发从
+    # 4 砍到 1，但**已发出的请求收不回来**，全部撞上 20s(json_mode)/
+    # 60s(非 json_mode) 超时预算 → 首轮 8/15、次轮 13/15 章节直接进入
+    # "默认目录"，用户最终拿到的是与本项目无关的模板目录。
+    #
+    # 补偿策略：首轮结束后，用**独立的窄信号量 + 全新超时预算**重跑失败章节。
+    # 此刻首轮的 N 路并发已全部收敛，闸门并发也已降下来，重跑不需要再抢额度，
+    # 成功率显著高于把首轮并发度调小的做法（后者会拖慢成功章节）。
+    # 由 OUTLINE_L2_RETRY_FAILED_ROUNDS 控制，0 = 保持 2026-10-23 前的行为。
+    # ──────────────────────────────────────────────────────────────────────
+    recovered: list[str] = []
+    retry_rounds_done = 0
+    if failed_idx and OUTLINE_L2_RETRY_FAILED_ROUNDS > 0:
+        retry_sem = DynamicSemaphore(max(1, OUTLINE_L2_RETRY_CONCURRENCY))
+        pending = list(failed_idx)
+        for _round in range(1, OUTLINE_L2_RETRY_FAILED_ROUNDS + 1):
+            if not pending:
+                break
+            retry_rounds_done = _round
+            logger.warning(
+                "V5.1 L2 补偿重跑第 %d/%d 轮：%d 个失败章节（并发上限 %d）",
+                _round, OUTLINE_L2_RETRY_FAILED_ROUNDS, len(pending),
+                max(1, OUTLINE_L2_RETRY_CONCURRENCY),
+            )
+            if phase_callback:
+                try:
+                    await phase_callback(
+                        "V5.1二级补偿",
+                        f"补偿重跑 {len(pending)} 个失败章节（第 {_round} 轮）",
+                    )
+                except Exception as _pcb_err:
+                    logger.debug("L2 补偿 phase_callback 异常: %s", _pcb_err)
+
+            _retry_tasks = [
+                asyncio.create_task(_fill_one(i, retry_sem)) for i in pending
+            ]
+            _retry_results = await asyncio.gather(*_retry_tasks, return_exceptions=True)
+
+            still_failed: list[int] = []
+            for pos, idx in enumerate(pending):
+                res = _retry_results[pos]
+                _title = level1[idx].get("title", f"第{idx + 1}章")
+                if isinstance(res, Exception) or results[idx] is None:
+                    still_failed.append(idx)
+                    logger.warning("V5.1 L2 补偿重跑仍失败: %s", _title)
+                    continue
+                level1[idx] = results[idx]
+                recovered.append(_title)
+                if l2_done_queue is not None:
+                    await l2_done_queue.put((idx, level1[idx]))
+            pending = still_failed
+
+    if recovered:
+        logger.info(
+            "V5.1 L2 补偿重跑救回 %d/%d 个章节: %s",
+            len(recovered), len(l2_failed), recovered,
+        )
+    # 最终仍未救回的章节：才是真正落默认目录的
+    l2_fallback = [t for t in l2_failed if t not in recovered]
+    l2_failed = l2_fallback
+
     # 发送哨兵通知 L3 消费者
     if l2_done_queue is not None:
         await l2_done_queue.put(None)
 
     if l2_failed:
         logger.warning("V5.1 L2 %d/%d 章节失败，已用默认目录: %s", len(l2_failed), total, l2_failed)
+        # 降级可观测：兜底占比超阈值时额外打一条带 error_code 的 ERROR，
+        # 便于监控系统按错误码聚合「目录质量退化」事件（默认 0.3）。
+        if total > 0 and (len(l2_failed) / total) > OUTLINE_DEGRADED_ALERT_RATIO:
+            logger.error(
+                "[目录质量退化] L2 兜底章节占比 %.0f%%（%d/%d）超过阈值 %.0f%%，"
+                "目录内容与本项目相关性严重下降，建议重试或降低并发后重生成 | "
+                "error_code=OUTLINE_L2_DEGRADED error_layer=service retryable=True "
+                "fallback_chapters=%s",
+                (len(l2_failed) / total) * 100, len(l2_failed), total,
+                OUTLINE_DEGRADED_ALERT_RATIO * 100, l2_failed,
+            )
 
     # 汇总日志
     total_l2_count = sum(len(l1.get("children", [])) for l1 in level1)
@@ -2614,6 +3147,18 @@ async def _generate_level2_v51(
         total_l3_count,
         len(l2_failed),
     )
+
+    # 出参：把降级诊断回写调用方（FIX 2026-10-23 P0）。
+    # 此前失败信息只存在于这一行 WARNING 里，上层（SSE/前端）完全拿不到，
+    # 用户看到的是一份"生成成功"但内容全是模板默认目录的目录树。
+    if stats is not None:
+        stats["l2_total"] = total
+        stats["l2_failed_titles"] = list(l2_failed)
+        stats["l2_recovered_titles"] = list(recovered)
+        stats["l2_fallback_titles"] = list(l2_fallback)
+        stats["l2_retry_rounds"] = retry_rounds_done
+        stats["l2_degraded"] = bool(l2_fallback)
+        stats["l2_degraded_ratio"] = (len(l2_fallback) / total) if total else 0.0
 
     # 修正所有 ID
     level1 = _fix_all_ids(level1)
@@ -3270,6 +3815,58 @@ def _generate_differentiated_l3_title(
     return _disambiguate_title(l2_title, used_titles, l1_title or "")
 
 
+def _audit_l3_fact_numbers(level1: list[dict], global_facts: list | None) -> int:
+    """E2（2026-10-21）：三级目录标题「未 grounding 数字」可观测审计（仅告警，零改动）。
+
+    L1/L2 提示词已注入全局事实约束，但 L3 由规则兜底生成、无事实注入入口
+    （见 _generate_level3_v51 docstring）。本函数扫描三级标题中的数字，报告
+    那些**未在全局事实数值集合中出现**的数字，供一致性校核/人工复核参考。
+
+    设计约束（零功能回归）：
+      - 只写日志，**不修改 level1**；任何异常都被吞掉，绝不影响目录生成收尾；
+      - 仅统计长度 >=2 的数字串，跳过单数字（多为序号/版本号），降低误报；
+      - 默认开启，可用 ``OUTLINE_L3_FACT_AUDIT_ENABLED=false`` 关闭。
+
+    Returns:
+        int: 命中「疑似未 grounding 数字」的三级标题数（仅用于日志/观测）。
+    """
+    try:
+        raw = str(os.getenv("OUTLINE_L3_FACT_AUDIT_ENABLED", "true") or "true").strip().lower()
+        if raw in ("0", "false", "no", "off"):
+            return 0
+        if not isinstance(global_facts, list) or not global_facts:
+            return 0
+
+        fact_numbers = set(re.findall(r"\d{2,}", _format_facts_list(global_facts) or ""))
+
+        flagged: list[str] = []
+        for l1 in level1:
+            if not isinstance(l1, dict):
+                continue
+            for l2 in l1.get("children", []) or []:
+                if not isinstance(l2, dict):
+                    continue
+                for l3 in l2.get("children", []) or []:
+                    if not isinstance(l3, dict):
+                        continue
+                    title = str(l3.get("title") or "").strip()
+                    if not title:
+                        continue
+                    ungrounded = set(re.findall(r"\d{2,}", title)) - fact_numbers
+                    if ungrounded:
+                        flagged.append(f"{title}（数字 {sorted(ungrounded)}）")
+        if flagged:
+            logger.warning(
+                "V5.1 L3 事实审计: %d 个三级标题含未在全局事实中出现的数字（仅告警，未改动）：%s",
+                len(flagged),
+                "；".join(flagged[:5]),
+            )
+        return len(flagged)
+    except Exception as _e:  # pragma: no cover - 可观测性兜底
+        logger.debug("V5.1 L3 事实审计异常（忽略）: %s", _e)
+        return 0
+
+
 async def _generate_level3_v51(
     provider: Any,
     level1: list[dict],
@@ -3278,6 +3875,7 @@ async def _generate_level3_v51(
     phase_callback: Callable | None = None,
     l2_done_queue: asyncio.Queue | None = None,
     project_info: dict | None = None,
+    global_facts: list | None = None,
 ) -> list[dict]:
     """L3：补全三级目录（全量串行后处理，**不是**流水线）。
 
@@ -3399,6 +3997,9 @@ async def _generate_level3_v51(
             "V5.1三级生成",
             f"三级目录生成完成 {l3_filled}/{l3_total}（差异化修正 {diff_fixed}，占位清洗和去重由后续统一处理）"
         )
+
+    # E2（2026-10-21）：L3 事实 grounding 审计（仅告警，不改动目录树）
+    _audit_l3_fact_numbers(level1, global_facts)
 
     return level1
 
@@ -4297,6 +4898,7 @@ async def _ai_deep_check(
             max_tokens=OUTLINE_MAX_TOKENS_SELFCHECK,
             max_retries=1,
             project_info=project_info,
+            cache_task="outline_selfcheck",
         )
     except Exception as e:
         logger.warning("V5.1 AI 深度检查失败: %s", e)
@@ -4596,11 +5198,17 @@ def _post_selfcheck_title_safety_net(outline: list[dict]) -> list[dict]:
         if _capped:
             outline = _uniquify_outline_titles(outline)
             _fixed2 += _cleanup_placeholder_titles(outline)
-        if _fixed or _fixed2 or _capped:
+        # 2026-10-27 第三轮新增：跨 L1 L2 复用护栏
+        outline, _l2_capped = _cap_cross_chapter_l2_repetition(outline)
+        if _l2_capped:
+            outline = _uniquify_outline_titles(outline)
+            _fixed2 += _cleanup_placeholder_titles(outline)
+        if _fixed or _fixed2 or _capped or _l2_capped:
             logger.info(
-                "V5.1 自检后标题兜底: 清洗 %d 个占位/泛化三级标题，跨章成套复用改写 %d 个",
+                "V5.1 自检后标题兜底: 清洗 %d 个占位/泛化三级标题，跨章成套复用改写 %d 个，跨章 L2 改写 %d 个",
                 _fixed + _fixed2,
                 _capped,
+                _l2_capped,
             )
         return outline
     except Exception as _e:
@@ -4780,6 +5388,11 @@ async def _apply_l3_quality_closeout(
         if _intra_capped:
             outline = _uniquify_outline_titles(outline)
             _cleaned += _cleanup_placeholder_titles(outline)
+        # 2026-10-27 第三轮新增：跨 L1 L2 复用护栏（修复 16 例跨 L1 L2 重复）。
+        outline, _l2_capped = _cap_cross_chapter_l2_repetition(outline)
+        if _l2_capped:
+            outline = _uniquify_outline_titles(outline)
+            _cleaned += _cleanup_placeholder_titles(outline)
         try:
             _ptype_direct = _detect_project_type(summary or "")
         except Exception:
@@ -4869,7 +5482,10 @@ async def generate_outline_v51(
     # ===== ENHANCE 2026-10-05（P-4）：短标书直出路径分支 =====
     # 2026-10-20 易标机制引入：aligned 模式下 L1 必须由程序构造，直出路径
     # （AI 一次性出全树）与「程序锁 L1」语义冲突，不走直出。
-    if should_use_direct_outline(scoring_points, outline_mode) and OUTLINE_ALIGNED_MODE != "aligned":
+    if should_use_direct_outline(
+        scoring_points, outline_mode,
+        model_max_output_tokens=_provider_max_output_tokens(provider),
+    ) and OUTLINE_ALIGNED_MODE != "aligned":
         if phase_callback:
             await phase_callback("目录生成", "检测到短标书，启用一次性直出模式...")
         logger.info(
@@ -4911,6 +5527,17 @@ async def generate_outline_v51(
                 project_scope,
                 phase_callback=phase_callback,
             )
+            # 直出路径轻量、默认不经过全量 outline_gate 业务门禁；此处补一道确定性
+            # 业务校验护栏，与分步路径共享同一质量标尺（最小节点数 / 标题非空 /
+            # 编号前缀残留 / 同级重复）。校验未通过说明直出产物存在结构性问题，
+            # 置空触发下方「回退分步路径」，而非把劣质目录直接交付。
+            _biz_ok, _biz_err = validate_outline_business(direct)
+            if not _biz_ok:
+                logger.warning(
+                    "[V5.1] 直出目录业务校验未通过（%s），回退分步路径", _biz_err
+                )
+                direct = []
+
             # 直出路径不做人工审核点（无 L1/L2 中间态可审），但保留最终审核入口
             if v51_state and outline_queue is not None:
                 if getattr(v51_state, "cancelled", False):
@@ -4944,6 +5571,8 @@ async def generate_outline_v51(
             # （下一行回退日志是不可达死代码）。生产表现：短标书直出遇 AI 超时/
             # JSON 失败时目录生成为空，而不是按设计回退到分步生成。修复后仅
             # 直出成功才返回，空结果落到下方分步路径。
+            # 来源透传：把参考目录的 source 标注落到生成后的一级节点（溯源）。
+            _apply_reference_source(direct, reference_outline)
             return direct
         logger.warning("[V5.1] 直出路径未产出结果，回退分步路径")
 
@@ -5029,6 +5658,9 @@ async def generate_outline_v51(
     )
     task_sem = DynamicSemaphore(max_concurrent)
 
+    # FIX 2026-10-23（P0）：承接 L2 降级诊断，供上层（SSE 完成事件/前端）
+    # 如实告知用户「本目录有多少章节是模板默认目录」。
+    _l2_stats: dict = {}
     level1 = await _generate_level2_v51(
         provider,
         level1,
@@ -5043,7 +5675,18 @@ async def generate_outline_v51(
         global_facts=global_facts,
         tender_context=tender_context,
         boq_text=boq_text,
+        stats=_l2_stats,
     )
+    if _l2_stats.get("l2_degraded"):
+        logger.warning(
+            "V5.1 L2 降级汇总：兜底章节 %d/%d（占比 %.0f%%），补偿重跑 %d 轮救回 %d 章 | "
+            "error_code=OUTLINE_L2_DEGRADED error_layer=service retryable=True",
+            len(_l2_stats.get("l2_fallback_titles", [])),
+            _l2_stats.get("l2_total", 0),
+            _l2_stats.get("l2_degraded_ratio", 0.0) * 100,
+            _l2_stats.get("l2_retry_rounds", 0),
+            len(_l2_stats.get("l2_recovered_titles", [])),
+        )
     _n_l2 = sum(
         1 + sum(1 + sum(1 for _ in l2.get("children", [])) for l2 in l1.get("children", []))
         for l1 in level1
@@ -5097,6 +5740,7 @@ async def generate_outline_v51(
         phase_callback=phase_callback,
         l2_done_queue=l2_done_queue,
         project_info=project_info,
+        global_facts=global_facts,
     )
     logger.info(
         "[V5.1-PHASE] L3 三级目录阶段耗时: %.1fs", time.monotonic() - _t_phase
@@ -5150,6 +5794,11 @@ async def generate_outline_v51(
             level1, OUTLINE_L3_INTRA_MAX_PARENTS
         )
         if _intra_capped_l3:
+            level1 = _uniquify_outline_titles(level1)
+            _cleaned_l3 += _cleanup_placeholder_titles(level1)
+        # 2026-10-27 第三轮新增：跨 L1 L2 复用护栏（修复 16 例跨 L1 L2 重复）。
+        level1, _l2_capped_l3 = _cap_cross_chapter_l2_repetition(level1)
+        if _l2_capped_l3:
             level1 = _uniquify_outline_titles(level1)
             _cleaned_l3 += _cleanup_placeholder_titles(level1)
         # 2026-10-19 新增（岳阳路事故·专业隔离）：装修项目目录出现
@@ -5270,6 +5919,7 @@ async def generate_outline_v51(
                     phase_callback=phase_callback,
                     l2_done_queue=_retry_queue,
                     project_info=project_info,
+                    global_facts=global_facts,
                 )
                 _retry_tree = _ensure_min_children(_retry_tree, min_level2=3, min_level3=5)
                 _retry_tree, _ = _tech_enhance_titles(_retry_tree)
@@ -5380,5 +6030,8 @@ async def generate_outline_v51(
         time.monotonic() - _t_start,
         _total_nodes,
     )
+    # 来源透传（标书智能体（一）第六节2 溯源）：把参考目录的 source 标注落到生成后的
+    # 一级目录节点，供前端/审核追溯「该章节由哪个方案类型/危大参数触发」。未匹配节点不变。
+    _apply_reference_source(level1, reference_outline)
     return level1
 

@@ -71,6 +71,8 @@ conn.executescript('''
         gantt_json TEXT DEFAULT NULL,
         illustration_type TEXT DEFAULT NULL,
         illustration_data TEXT DEFAULT NULL,
+        locked INTEGER NOT NULL DEFAULT 0,
+        content_mode TEXT DEFAULT NULL,
         content TEXT NOT NULL DEFAULT '',
         target_words INTEGER DEFAULT NULL,
         status TEXT NOT NULL DEFAULT 'pending',

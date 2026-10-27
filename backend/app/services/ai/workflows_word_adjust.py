@@ -696,7 +696,12 @@ async def run_total_word_adjustments(
                     no_progress, total,
                 )
                 break
-        if mode == wc.MODE_SHRINK and total >= (maximum_words or total):
+        # BUG-FIX（本轮深度探索）：收敛判定曾写反（`total >= maximum_words` 即
+        # break）——那等于「仍未达标就退出」，多轮缩写实际只能跑 1 轮，
+        # rounds_cap 形同虚设。现改为「已降到上限以下（收敛）」才退出；
+        # 未收敛则继续下一轮，由上方 round_idx > rounds_cap 兜住轮数上限。
+        # `maximum_words or total` 保留无上限时的短路退出语义。
+        if mode == wc.MODE_SHRINK and total <= (maximum_words or total):
             break
 
     summary["total_after"] = total

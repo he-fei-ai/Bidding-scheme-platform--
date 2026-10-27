@@ -24,6 +24,23 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/charts", tags=["charts"])
 
 
+@router.get("/health")
+async def mermaid_service_health() -> dict:
+    """Mermaid 渲染服务健康快照（运维监控用）。
+
+    ENHANCE 2026-10-27：只读客户端缓存的健康状态（各后端可用性/探测延迟/
+    连续失败/熔断状态），**不主动发起探测**，开销为零；数据由渲染路径的
+    TTL 探测（60s）与熔断器（连续 2 次失败冷却 300s）持续刷新。
+    """
+    from ..services.ai.mermaid_service import get_mermaid_service_client
+
+    try:
+        return get_mermaid_service_client().get_health_snapshot()
+    except Exception as e:  # pragma: no cover - 防御性：监控端点自身不抛错
+        logger.warning("[charts/health] 健康快照获取失败: %s", e)
+        return {"backends": {}, "error": str(e)}
+
+
 # ---------------------------------------------------------------------------
 # Defaults (mirrors the renderer's DEFAULT_* constants but exposed here so
 # Pydantic Field defaults don't depend on import order).

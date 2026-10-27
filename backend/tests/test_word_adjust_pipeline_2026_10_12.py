@@ -345,6 +345,53 @@ class TestR10TotalAdjustments:
         assert summary["adjusted_count"] == 0
         assert summary["fail_count"] >= wc.MAX_EXPANSION_NO_PROGRESS_ROUNDS
 
+    async def test_shrink_runs_multiple_rounds_when_not_converged(self):
+        """BUG-FIX 回归（本轮深度探索）：R10 缩写的收敛判定曾写反
+        （``total >= maximum_words`` 即 break），等价于「仍未达标就退出」，
+        多轮缩写实际只能跑 1 轮，rounds_cap 形同虚设。
+
+        本用例构造「慢速缩写」：3 节各 600 字（总 1800，上限 1000），
+        每轮每节仅净减 10 字。修复后应持续跑到轮数上限（3 轮 × 3 节
+        = 9 次单节调整，总量 1800 → 1710）；修复前 rounds 恒为 3
+        （只跑 1 轮）。
+        """
+        opts = wc.WordControlOptions(maximum_words=1000, section_words=300)
+        results = [
+            {"id": i, "status": "completed", "content": _zh(600), "title": f"S{i}"}
+            for i in range(1, 4)
+        ]
+        sections = {i: {"id": i, "level": 3, "title": f"S{i}"} for i in range(1, 4)}
+        # 脚本化回复：第 1 轮 590 ×3、第 2 轮 580 ×3、第 3 轮 570 ×3
+        p = _Provider([_zh(590)] * 3 + [_zh(580)] * 3 + [_zh(570)] * 3)
+        summary = await run_total_word_adjustments(
+            p, results, sections, options=opts, max_rounds=3,
+        )
+        assert summary["direction"] == "shrink"
+        # 3 个循环轮 × 每轮 3 节 = 9 次单节调整（修复前恒为 3）
+        assert summary["rounds"] == 9
+        assert summary["adjusted_count"] == 9
+        assert summary["fail_count"] == 0
+        # 1800 − 3 轮 × 3 节 × 10 字 = 1710（仍未达上限，靠轮数上限退出）
+        assert summary["total_after"] == 1710
+
+    async def test_shrink_exits_early_once_converged(self):
+        """配套语义：一轮内已降到上限以下时应立即退出（不空跑后续轮）。"""
+        opts = wc.WordControlOptions(maximum_words=1000, section_words=300)
+        results = [
+            {"id": i, "status": "completed", "content": _zh(600), "title": f"S{i}"}
+            for i in range(1, 3)
+        ]
+        sections = {i: {"id": i, "level": 3, "title": f"S{i}"} for i in range(1, 3)}
+        # 2 节各缩 100 字（恰好在批次额度内）→ 总量 1200 → 1000 收敛
+        p = _Provider([_zh(500), _zh(500)])
+        summary = await run_total_word_adjustments(
+            p, results, sections, options=opts, max_rounds=3,
+        )
+        assert summary["direction"] == "shrink"
+        assert summary["rounds"] == 2
+        assert summary["adjusted_count"] == 2
+        assert summary["total_after"] == 1000
+
 
 # ---------------------------------------------------------------------------
 # 流水线编排

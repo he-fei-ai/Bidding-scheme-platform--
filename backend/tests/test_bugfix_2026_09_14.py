@@ -604,11 +604,19 @@ def test_orchestration_end_to_end_with_stub_provider():
         stub, leaves, scoring_standards="评分标准A",
         project_overview="某三甲医院迁建工程", concurrency=1,
     ))
-    sys_msg, usr_msg = stub.calls[0][0].content, stub.calls[0][1].content
+    # 标书智能体（4）：编排消息栈现为「system + 稳定上下文（项目概述/评分
+    # 标准/素材清单/判断规则）+ 任务差异（当前叶子）」多条 user 消息。
+    # 守卫意图不变：全部消息不得残留占位符，评分标准/章节标题必须送达。
+    sys_msg = stub.calls[0][0].content
+    usr_texts = [m.content for m in stub.calls[0][1:]]
+    joined = "\n".join(usr_texts)
     assert re.findall(r"__[A-Z_]+__", sys_msg) == []
-    assert re.findall(r"__[A-Z_]+__", usr_msg) == []
-    assert "评分标准A" in usr_msg
-    assert "施工进度计划" in usr_msg
+    for _u in usr_texts:
+        assert re.findall(r"__[A-Z_]+__", _u) == []
+    assert "评分标准A" in joined
+    assert "施工进度计划" in joined
+    # 缓存核心：任务差异（当前叶子）在最后一条消息
+    assert "施工进度计划" in usr_texts[-1]
     assert res and res[0].get("recommended_type") == "gantt"
 
 

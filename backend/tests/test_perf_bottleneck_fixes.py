@@ -817,15 +817,23 @@ class TestSSEExportLockComplete:
     """
 
     def test_lock_acquired_before_build_starts(self):
-        """抢锁必须早于构建启动 —— 这正是原实现漏掉的一环。"""
+        """抢锁必须早于构建启动 —— 这正是原实现漏掉的一环。
+
+        BUG-FIX 2026-10-27 更新：构建提交改为 `run_in_executor(None, _run_build)`
+        直接提交线程池，不依赖事件循环调度（`create_task(to_thread(...))` 的任务
+        若在首次调度前被取消，构建永不运行，keepalive 会把组锁焊死）。
+        「锁先于构建」不变量本身不变。
+        """
         import inspect
         from app.routers.export import export_docx_stream
 
         source = inspect.getsource(export_docx_stream)
         lock_at = source.index("_acquire_export_lock(project_id)")
-        build_at = source.index("asyncio.create_task(asyncio.to_thread(_run_build))")
+        build_at = source.index(
+            "asyncio.get_running_loop().run_in_executor(None, _run_build)"
+        )
         assert lock_at < build_at, "抢锁必须早于构建启动"
-        assert source.count("asyncio.create_task(asyncio.to_thread(_run_build))") == 1, (
+        assert source.count("run_in_executor(None, _run_build)") == 1, (
             "构建只能启动一次"
         )
 

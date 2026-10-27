@@ -72,8 +72,16 @@ def record_call(
     success: bool = True,
     error_message: str = "",
     profile_name: str = "default",
+    cached_tokens: int = 0,
 ) -> str:
-    """记录一次 AI 调用，返回 call_id"""
+    """记录一次 AI 调用，返回 call_id
+
+    cached_tokens（标书智能体（4）2026-10-23）：本次输入中命中 Prompt Cache
+    的 token 数（OpenAI 兼容链路 prompt_tokens_details.cached_tokens /
+    Anthropic 链路 cache_read_input_tokens）。落库后可跨进程/重启观测
+    「哪类任务吃到了缓存、成本降了多少」；旧库无该列时静默降级（不记该列），
+    见 db_migrations 的兼容迁移。
+    """
     if total_tokens is None:
         total_tokens = prompt_tokens + completion_tokens
 
@@ -84,8 +92,9 @@ def record_call(
                 """INSERT INTO ai_usage_stats
                    (call_id, provider, model, base_url, task_type,
                     prompt_tokens, completion_tokens, total_tokens,
-                    cost_usd, response_time_ms, status, error_message, profile_name)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    cost_usd, response_time_ms, status, error_message, profile_name,
+                    cached_tokens)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     call_id,
@@ -101,11 +110,40 @@ def record_call(
                     "success" if success else "error",
                     error_message[:500] if error_message else "",
                     profile_name,
+                    max(0, int(cached_tokens or 0)),
                 ),
             )
             conn.commit()
     except Exception as e:
-        logger.debug("记录 AI 调用统计失败: %s", e)
+        # 兼容旧库（无 cached_tokens 列）：去掉该列重试一次，仍失败则放弃统计
+        try:
+            with get_db() as conn:
+                conn.execute(
+                    """INSERT INTO ai_usage_stats
+                       (call_id, provider, model, base_url, task_type,
+                        prompt_tokens, completion_tokens, total_tokens,
+                        cost_usd, response_time_ms, status, error_message, profile_name)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        call_id,
+                        provider,
+                        model,
+                        base_url,
+                        task_type,
+                        prompt_tokens,
+                        completion_tokens,
+                        total_tokens,
+                        cost_usd,
+                        response_time_ms,
+                        "success" if success else "error",
+                        error_message[:500] if error_message else "",
+                        profile_name,
+                    ),
+                )
+                conn.commit()
+        except Exception:
+            logger.debug("记录 AI 调用统计失败: %s", e)
 
     return call_id
 
@@ -127,6 +165,15 @@ def record_from_response(
     prompt_tokens = usage.get("prompt_tokens", 0)
     completion_tokens = usage.get("completion_tokens", 0)
     total_tokens = usage.get("total_tokens", prompt_tokens + completion_tokens)
+    # 标书智能体（4）（2026-10-23）：提取缓存命中 token 数（OpenAI 兼容链路
+    # prompt_tokens_details.cached_tokens / Anthropic 链路
+    # cache_read_input_tokens），供成本优化效果量化。
+    cached_tokens = 0
+    details = usage.get("prompt_tokens_details")
+    if isinstance(details, dict):
+        cached_tokens = int(details.get("cached_tokens", 0) or 0)
+    if not cached_tokens:
+        cached_tokens = int(usage.get("cache_read_input_tokens", 0) or 0)
 
     # 自动估算成本
     if not usage.get("cost_usd"):
@@ -148,6 +195,7 @@ def record_from_response(
         success=success,
         error_message=error_message,
         profile_name=profile_name,
+        cached_tokens=cached_tokens,
     )
 
 
@@ -169,41 +217,70 @@ def get_usage_summary(
 
     try:
         with get_db(readonly=True) as conn:
-            row = conn.execute(
-                f"""SELECT
-                    COUNT(*) as total_calls,
-                    SUM(prompt_tokens) as total_prompt_tokens,
-                    SUM(completion_tokens) as total_completion_tokens,
-                    SUM(total_tokens) as total_tokens,
-                    SUM(cost_usd) as total_cost_usd,
-                    AVG(response_time_ms) as avg_response_time_ms,
-                    MIN(response_time_ms) as min_response_time_ms,
-                    MAX(response_time_ms) as max_response_time_ms,
-                    SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) as success_count,
-                    SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) as error_count
-                FROM ai_usage_stats {where}
-            """,
-                params,
-            ).fetchone()
-            if not row:
+            # 标书智能体（4）：汇总缓存命中 token（旧库无该列时降级为基础查询）
+            _row = None
+            try:
+                _row = conn.execute(
+                    f"""SELECT
+                        COUNT(*) as total_calls,
+                        SUM(prompt_tokens) as total_prompt_tokens,
+                        SUM(completion_tokens) as total_completion_tokens,
+                        SUM(total_tokens) as total_tokens,
+                        SUM(cost_usd) as total_cost_usd,
+                        SUM(cached_tokens) as total_cached_tokens,
+                        AVG(response_time_ms) as avg_response_time_ms,
+                        MIN(response_time_ms) as min_response_time_ms,
+                        MAX(response_time_ms) as max_response_time_ms,
+                        SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) as success_count,
+                        SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) as error_count
+                    FROM ai_usage_stats {where}
+                    """,
+                    params,
+                ).fetchone()
+            except Exception:
+                _row = None
+            if _row is None:
+                _row = conn.execute(
+                    f"""SELECT
+                        COUNT(*) as total_calls,
+                        SUM(prompt_tokens) as total_prompt_tokens,
+                        SUM(completion_tokens) as total_completion_tokens,
+                        SUM(total_tokens) as total_tokens,
+                        SUM(cost_usd) as total_cost_usd,
+                        AVG(response_time_ms) as avg_response_time_ms,
+                        MIN(response_time_ms) as min_response_time_ms,
+                        MAX(response_time_ms) as max_response_time_ms,
+                        SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) as success_count,
+                        SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) as error_count
+                    FROM ai_usage_stats {where}
+                    """,
+                    params,
+                ).fetchone()
+            if not _row:
                 return _empty_summary(days, task_type, profile_name)
 
-            total = row["total_calls"] or 1
+            total = _row["total_calls"] or 1
+            _row_keys = _row.keys() if hasattr(_row, "keys") else []
+            _cached = _row["total_cached_tokens"] if "total_cached_tokens" in _row_keys else 0
+            _prompt = _row["total_prompt_tokens"] or 0
             return {
                 "days": days,
-                "total_calls": row["total_calls"],
-                "total_prompt_tokens": row["total_prompt_tokens"] or 0,
-                "total_completion_tokens": row["total_completion_tokens"] or 0,
-                "total_tokens": row["total_tokens"] or 0,
-                "total_cost_usd": round(row["total_cost_usd"] or 0.0, 4),
-                "total_cost_cny": round((row["total_cost_usd"] or 0.0) * 7.2, 2),
-                "avg_response_time_ms": round(row["avg_response_time_ms"] or 0, 0),
-                "min_response_time_ms": row["min_response_time_ms"] or 0,
-                "max_response_time_ms": row["max_response_time_ms"] or 0,
-                "success_count": row["success_count"] or 0,
-                "error_count": row["error_count"] or 0,
-                "success_rate": round((row["success_count"] or 0) / total * 100, 1),
-                "avg_tokens_per_call": round((row["total_tokens"] or 0) / total),
+                "total_calls": _row["total_calls"],
+                "total_prompt_tokens": _prompt,
+                "total_completion_tokens": _row["total_completion_tokens"] or 0,
+                "total_tokens": _row["total_tokens"] or 0,
+                "total_cost_usd": round(_row["total_cost_usd"] or 0.0, 4),
+                "total_cost_cny": round((_row["total_cost_usd"] or 0.0) * 7.2, 2),
+                # 标书智能体（4）：缓存命中量与命中率（cached/prompt）
+                "total_cached_tokens": _cached or 0,
+                "cache_hit_rate": round((_cached or 0) / _prompt * 100, 1) if _prompt else 0.0,
+                "avg_response_time_ms": round(_row["avg_response_time_ms"] or 0, 0),
+                "min_response_time_ms": _row["min_response_time_ms"] or 0,
+                "max_response_time_ms": _row["max_response_time_ms"] or 0,
+                "success_count": _row["success_count"] or 0,
+                "error_count": _row["error_count"] or 0,
+                "success_rate": round((_row["success_count"] or 0) / total * 100, 1),
+                "avg_tokens_per_call": round((_row["total_tokens"] or 0) / total),
                 "period": f"近{days}天",
             }
     except Exception as e:

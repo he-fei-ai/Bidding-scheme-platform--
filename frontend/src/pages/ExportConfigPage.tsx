@@ -100,6 +100,10 @@ export default function ExportConfigPage() {
   // BUG-FIX 2026-09-18（P2）：严格模式此前硬编码 false 且无 UI 开关，
   // 后端 strict_mode 才判定的空章节/评分点覆盖缺口永远不触发。
   const [strictMode, setStrictMode] = useState(false);
+  // ENHANCE（本轮跨模块深度探索·审核×导出打通）：一致性校核×导出闸门。
+  // 开启后存在未解决 high 冲突时导出被阻断（后端 ExportConfig.
+  // block_on_high_conflicts，默认 false 保持历史行为）。
+  const [blockOnHighConflicts, setBlockOnHighConflicts] = useState(false);
   // D5 加固（2026-10-07）：图表标题兜底补图开关。开启后章节无图表数据时按标题本地模板自动补图。
   const [autoFallbackCharts, setAutoFallbackCharts] = useState(false);
   // L-6（2026-10-17）：图题编号分隔符（图3-1 标题 / 图3-1：标题），默认空格=历史口径，
@@ -220,6 +224,8 @@ export default function ExportConfigPage() {
     image_dpi: 300,
     gantt_max_columns: 18,
     strict_mode: strictMode,
+    // ENHANCE（本轮跨模块深度探索·审核×导出打通）：一致性闸门透传后端
+    block_on_high_conflicts: blockOnHighConflicts,
     // D5 加固（2026-10-07）：图表标题兜底补图（仅命中强关键词的图表相关章节，不伪造数据）
     auto_fallback_charts: autoFallbackCharts,
     // L-6（2026-10-17）：图题编号分隔符透传后端（" " / "："）
@@ -320,10 +326,33 @@ export default function ExportConfigPage() {
             { __conflict: true },
           );
         }
+        // BUG-FIX 2026-10-27（P2·误降级同步导出）：已收到 stream_id 说明构建
+        // 已在后端启动并持有导出组锁。此时降级同步 exportDocx 要么撞锁 409
+        // （「导出冲突」误报），要么在后端构建结束后重复构建一份 DOCX。
+        // 现转「后台继续」分支：不降级、不报错，提示用户稍后在导出历史下载。
+        if (failureKind === "background") {
+          const bgMsg = "导出流连接中断，任务仍在后台执行，完成后可在导出历史中下载";
+          message.info(bgMsg);
+          loadData();
+          taskStore.completeTask(exportTaskId, "completed", bgMsg);
+          return;
+        }
         // SSE 传输/构建失败（非冲突）时降级为同步接口
+        // BUG-FIX 2026-10-27（P2·降级窗口取消被忽略）：进入同步降级前先检查
+        // 用户是否已请求取消——原实现此窗口内点「取消」只 abort 已结算的
+        // controller，同步 exportDocx 照样完整跑完并报「导出成功」。
+        if (cancelRequestedRef.current) {
+          throw Object.assign(new Error("导出已取消"), { __cancelled: true });
+        }
         setExportProgress(20);
         setExportPhase("正在读取章节数据...");
         const result = await exportDocx(projectId, config);
+        // 同步降级可能持续数分钟，完成后若用户已取消：结果保留在历史中，
+        // 但 UI 不再按「导出成功」庆祝，任务条目直接停止追踪。
+        if (cancelRequestedRef.current) {
+          taskStore.stopTracking(exportTaskId);
+          return;
+        }
         setExportProgress(100);
         setExportResult(result);
         setCheckResult(result.check);
@@ -675,6 +704,14 @@ export default function ExportConfigPage() {
                   <Switch checked={strictMode} onChange={setStrictMode} />
                   <Text type="secondary" style={{ fontSize: 12 }}>
                     开启后检查将把空章节/评分点覆盖缺口计入错误
+                  </Text>
+                </Space>
+              </Descriptions.Item>
+              <Descriptions.Item label="一致性冲突阻断导出">
+                <Space direction="vertical" size={0}>
+                  <Switch checked={blockOnHighConflicts} onChange={setBlockOnHighConflicts} />
+                  <Text type="secondary" style={{ fontSize: 12 }}>
+                    开启后：存在未解决的高严重度一致性冲突时禁止导出，需先在「一致性校核」页处理
                   </Text>
                 </Space>
               </Descriptions.Item>

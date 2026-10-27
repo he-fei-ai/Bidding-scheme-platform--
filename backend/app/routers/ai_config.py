@@ -1026,6 +1026,26 @@ async def get_cache_metrics():
     return snapshot()
 
 
+@router.get('/scheme-extraction-metrics')
+async def get_scheme_extraction_metrics():
+    """专项方案解析的执行指标（ENHANCE 2026-10-26）。
+
+    五类专项任务并发执行且单任务失败被隔离，运维需要能回答：
+
+      - 每类任务（project_overview / scheme_type / dangerous_work_params /
+        basis_list / construction_condition）各跑了多少次、成功/失败多少次；
+      - 每类任务的最近一次耗时、最大耗时、平均耗时（定位长期拖慢的任务）；
+      - 一批五个任务的整体耗时与失败数（``batch`` 段）。
+
+    计数为进程内统计，重启归零；与 ``cache_metrics`` 同口径（零 IO、fail-soft）。
+    """
+    from ..services.ai.workflows_scheme_extraction import (
+        scheme_extraction_metrics_snapshot,
+    )
+
+    return scheme_extraction_metrics_snapshot()
+
+
 @router.get('/image-model')
 async def get_image_model_config(user_id: int=Depends(lambda: 1)):
     """获取用户的图像模型配置"""

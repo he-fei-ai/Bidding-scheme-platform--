@@ -62,6 +62,22 @@ def _safe_tender_context(tender_context: str) -> str:
     return truncate_to_tokens(tender_context, ANALYSIS_CONTEXT_TOKEN_CAP)
 
 
+def _record_analysis_cache(provider: Any, task_type: str) -> None:
+    """标书智能体（4）缓存可观测性：解析链路按任务类型累计 prompt cache 用量。
+
+    解析链路（摘要/评分点/清单/工界/工法/全局事实）已按「稳定全文前缀 +
+    任务差异后置」组织（见 _build_analysis_messages），同一文件多次分析时
+    前缀可命中缓存；此处按任务类型埋点，使命中率可量化（fail-soft，绝不
+    影响解析主链路）。
+    """
+    try:
+        from .cache_metrics import record_provider_cache_usage
+
+        record_provider_cache_usage(provider, task_type=task_type)
+    except Exception:  # pragma: no cover - 防御性
+        pass
+
+
 # 缓存优化（标书智能体设计文档（四）——提示词顺序优化）：
 # 所有「解析招标文件」类任务共用同一份稳定 system 前缀（ANALYSIS_SYSTEM），
 # 把占 token 最大、且跨任务不变的招标原文拆成独立的 user 消息并前置，
@@ -162,6 +178,7 @@ async def generate_tender_summary(provider: Any, tender_context: str) -> str:
         timeout=_stage_timeout(provider, 60), max_tokens=4096,
         require_nonempty=True, retries=1, context="[AI摘要]",
     )
+    _record_analysis_cache(provider, "analysis_summary")
     logger.info("[AI摘要] 生成完成，响应长度: %d 字符", len(raw_response or ""))
     return raw_response
 
@@ -272,6 +289,7 @@ async def extract_scoring_points(provider: Any, tender_context: str, summary: st
             require_nonempty=False,
             context="[评分点]第一阶段",
         )
+        _record_analysis_cache(provider, "analysis_scoring_stage1")
         first_points = _extract_array_from_response(extract_json_from_text(first_raw))
     except Exception as e:
         logger.warning("[评分点] 第一阶段失败（重试耗尽，返回空列表降级）: %s", e)
@@ -306,6 +324,7 @@ async def extract_scoring_points(provider: Any, tender_context: str, summary: st
             require_nonempty=False,
             context="[评分点]第二阶段",
         )
+        _record_analysis_cache(provider, "analysis_scoring_stage2")
         review_points = _extract_array_from_response(extract_json_from_text(review_content))
         logger.info(
             "[评分点] 第二阶段完成：补充 %d 个评分点，总计 %d 个",
@@ -438,6 +457,7 @@ async def extract_global_facts(
                         temperature=0.3,
                         max_retries=1,
                     )
+                    _record_analysis_cache(provider, "facts_extract_segment")
                     if isinstance(_seg_result, dict):
                         _seg_items = _dict_to_fact_items(_seg_result)
                     else:
@@ -482,6 +502,7 @@ async def extract_global_facts(
                 temperature=0.3,
                 max_retries=1,
             )
+            _record_analysis_cache(provider, "facts_extract")
             if isinstance(result, dict):
                 items = _dict_to_fact_items(result)
             else:
@@ -691,6 +712,7 @@ async def analyze_boq(provider: Any, tender_context: str) -> list[dict]:
     result = None
     try:
         result = await collect_json_response(provider, messages, max_retries=1)
+        _record_analysis_cache(provider, "analysis_boq")
     except Exception as e:
         logger.warning("[AI清单] collect_json_response 抛异常: %s，使用默认清单项目", e)
     if isinstance(result, list) and result:
@@ -734,6 +756,7 @@ async def analyze_work_interface(provider: Any, tender_context: str) -> list[dic
     result = None
     try:
         result = await collect_json_response(provider, messages, max_retries=1)
+        _record_analysis_cache(provider, "analysis_work_interface")
     except Exception as e:
         logger.warning("[AI工界] collect_json_response 抛异常: %s，使用默认工作界面", e)
     if isinstance(result, list) and result:
@@ -783,6 +806,7 @@ async def analyze_construction_method(provider: Any, tender_context: str) -> lis
     result = None
     try:
         result = await collect_json_response(provider, messages, max_retries=2)
+        _record_analysis_cache(provider, "analysis_construction_method")
     except Exception as e:
         logger.warning("[AI工法] collect_json_response 抛异常: %s，使用默认工程作法", e)
     if isinstance(result, list) and result:

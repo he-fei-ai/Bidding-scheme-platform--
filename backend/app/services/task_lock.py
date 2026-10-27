@@ -44,8 +44,10 @@ ENHANCE 2026-09-15：移植自易标 `taskService.cjs` 的 `lockPolicy: 'group-e
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+import atexit
 import logging
 import os
+import re
 import sqlite3
 import threading
 from typing import Any, Callable
@@ -338,6 +340,119 @@ def reclaim_stale(*, now: datetime | None = None) -> int:
     return count
 
 
+#: owner_id 中的进程标识段（形如 `12345:ab12cd`，即 `<pid>:<实例 hex6>`）
+_PROCESS_TAG_SEGMENT_RE = re.compile(r"\d+:[0-9a-f]{6}")
+
+
+def _is_foreign_owner(owner_id: str) -> bool:
+    """owner_id 是否属于**其它**进程实例（孤儿锁判定）。
+
+    FIX 2026-10-26（P0 回归）：旧判定用 `NOT LIKE f"{_PROCESS_TAG}:%"`（前缀），
+    但 `make_owner_id` 的形态是 `{task}:{scope}:{_PROCESS_TAG}:{uuid}` ——
+    进程标识在**中间**，于是本进程自己的锁也被判成外来锁、每次 acquire 都被
+    回收 → 组锁彻底失效，所有并发冲突用例（409/续约）全线失败。
+    现按「是否含进程标识段」判定：含本进程标识 → 自己人；含其它进程标识 →
+    孤儿锁；不含任何进程标识（调用方自定义 owner）→ 视为自己人，不回收。
+    """
+    text = str(owner_id or "")
+    if not text:
+        return False
+    if _PROCESS_TAG in text:
+        return False
+    return bool(_PROCESS_TAG_SEGMENT_RE.search(text))
+
+
+def _reclaim_foreign_for_key(
+    conn: sqlite3.Connection, lock_key: str, moment: datetime
+) -> int:
+    """回收单个 key 下、不属于本进程实例的活跃锁（孤儿锁）。
+
+    单一后端进程是唯一锁仲裁者；本进程持有的活跃锁其 owner_id 含 `_PROCESS_TAG`
+    （pid + 实例 uuid）。带其它进程标识的活跃锁必然是已退出进程留下的残留
+    （例如软件被关闭时进程未优雅释放），必须过期回收，否则会一直挡住同组
+    新任务直到 30 分钟 TTL 到期。
+
+    Returns:
+        受影响行数。
+    """
+    rows = conn.execute(
+        "SELECT owner_id FROM task_locks WHERE status = 'active' AND lock_key = ?",
+        (lock_key,),
+    ).fetchall()
+    foreign = [
+        (row[0],) for row in rows if _is_foreign_owner(row[0])
+    ]
+    if not foreign:
+        return 0
+    cur = conn.executemany(
+        "UPDATE task_locks SET status = 'expired', released_at = ? "
+        "WHERE status = 'active' AND lock_key = ? AND owner_id = ?",
+        [(_fmt(moment), lock_key, owner) for (owner,) in foreign],
+    )
+    return cur.rowcount or 0
+
+
+def reclaim_foreign_locks(*, now: datetime | None = None) -> int:
+    """回收所有不属于本进程实例的活跃锁（跨进程孤儿锁）。返回回收条数。
+
+    典型用途：应用启动 / 关闭时调用，清理上一个（已退出）进程实例遗留的锁，
+    避免"关闭软件后锁未释放、再启动被自己挡住"。
+    """
+    moment = _now(now)
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT lock_key, owner_id FROM task_locks WHERE status = 'active'"
+        ).fetchall()
+        foreign = [
+            (row[0], row[1]) for row in rows if _is_foreign_owner(row[1])
+        ]
+        if not foreign:
+            return 0
+        cur = conn.executemany(
+            "UPDATE task_locks SET status = 'expired', released_at = ? "
+            "WHERE status = 'active' AND lock_key = ? AND owner_id = ?",
+            [(_fmt(moment), key, owner) for (key, owner) in foreign],
+        )
+        count = cur.rowcount or 0
+    if count:
+        logger.warning("[task-lock] 回收 %d 个跨进程残留锁（非本进程持有）", count)
+    return count
+
+
+def release_owned_locks(*, now: datetime | None = None) -> int:
+    """释放本进程实例持有的全部活跃锁。返回释放条数。
+
+    用于进程优雅退出（atexit / 关闭钩子）：进程退出后其持有的锁再也无法续约，
+    与其等 30 分钟 TTL 过期，不如主动释放，让同组任务可立即启动。
+    """
+    moment = _now(now)
+    with get_db() as conn:
+        cur = conn.execute(
+            "UPDATE task_locks SET status = 'released', released_at = ? "
+            "WHERE status = 'active' AND owner_id LIKE ?",
+            (_fmt(moment), f"%{_PROCESS_TAG}:%"),
+        )
+        count = cur.rowcount or 0
+    if count:
+        logger.info("[task-lock] 进程退出，释放 %d 个本进程持有的锁", count)
+    return count
+
+
+def _release_owned_locks_on_exit() -> None:
+    """atexit 回调：进程退出时尽力释放本进程持有的锁。
+
+    非优雅退出（SIGKILL / 断电）不会触发；但正常关闭、Ctrl-C、Docker 停容器
+    等会触发，覆盖绝大多数"关闭软件"场景。失败仅告警，不影响退出。
+    """
+    try:
+        release_owned_locks()
+    except Exception as _e:  # pragma: no cover - 退出期兜底
+        logger.warning("[task-lock] 进程退出释放锁失败（忽略）: %s", _e)
+
+
+atexit.register(_release_owned_locks_on_exit)
+
+
 # ---------------------------------------------------------------------------
 # 获取 / 续约 / 释放
 # ---------------------------------------------------------------------------
@@ -402,6 +517,13 @@ def acquire(
     with get_db() as conn:
         # 先回收超时锁，避免「持有者已死但锁还在」把任务永久挡住
         _reclaim(conn, moment)
+
+        # ENHANCE（修复"关闭软件后锁未释放"）：单一后端进程是唯一锁仲裁者，
+        # 正常情形下本进程持有的 active 锁其 owner_id 必以 _PROCESS_TAG 开头。
+        # 若发现该 key 已有 active 锁、但其 owner_id 不属本进程（来自已退出/
+        # 被关闭的旧进程实例），说明它是孤儿锁（进程退出时未来得及释放），
+        # 直接过期回收，避免它把新任务挡在 30 分钟 TTL 之外。
+        _reclaim_foreign_for_key(conn, key, moment)
 
         try:
             conn.execute(
@@ -674,7 +796,9 @@ __all__ = [
     "lock_key_for",
     "make_owner_id",
     "read_lock_state",
+    "reclaim_foreign_locks",
     "reclaim_stale",
     "release",
+    "release_owned_locks",
     "start_keepalive",
 ]

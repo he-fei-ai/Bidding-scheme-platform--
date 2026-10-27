@@ -318,7 +318,24 @@ class OpenAICompatibleProvider:
                         from ...ai_monitor import record_ai_call
                         task_type = options.get('task_type', '')
                         # BUG-FIX 2026-10-08（低）：用户取消不应记为成功调用（成功率虚高）
-                        record_ai_call(provider='openai_compatible', model=self.model, success=False, response_time=elapsed, task_type=task_type, error='操作已被用户取消')
+                        # BUG-FIX 2026-10-23（P1，日志实证 project=1871130 21:48~21:56）：
+                        # 此前**所有** CancelledError 一律记为「操作已被用户取消」。
+                        # 但 `workflows_base.with_timeout` 超时后由 asyncio.wait_for 取消
+                        # 在飞请求同样抛 CancelledError，与用户主动点「停止生成」无法区分，
+                        # 导致 AI 监控把超时全部归因成用户取消——生产日志中该文案出现
+                        # 69 次且与「[with_timeout] 超时」一一对应，失败率被推到 42%
+                        # （阈值 30%），运维按「用户取消」排查必然找错方向。
+                        # 判据：真正的用户取消一定伴随 cancel_event 被 set。
+                        _cancel_event = options.get('cancel_event')
+                        _user_cancelled = bool(
+                            _cancel_event is not None
+                            and getattr(_cancel_event, 'is_set', lambda: False)()
+                        )
+                        _cancel_reason = (
+                            '操作已被用户取消' if _user_cancelled
+                            else 'AI调用被中止（外层超时/任务取消，非用户主动取消）'
+                        )
+                        record_ai_call(provider='openai_compatible', model=self.model, success=False, response_time=elapsed, task_type=task_type, error=_cancel_reason)
                     except Exception as monitor_error:
                         logger.debug('监控记录失败: %s', monitor_error)
                     raise

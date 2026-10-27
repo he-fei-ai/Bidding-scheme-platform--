@@ -33,6 +33,11 @@ from .providers.base import AIMessage
 # 旧实现硬编码 `warnings[:10]` —— 大目录（数百三级节点）必然残留未修复脏标题，
 # 而该上限此前既无法调、也无法观测。
 from app.config import (  # noqa: E402
+    OUTLINE_BUSINESS_MAX_L2_PER_L1,
+    OUTLINE_BUSINESS_MIN_DEPTH,
+    OUTLINE_BUSINESS_MIN_L2_PER_L1,
+    OUTLINE_BUSINESS_MIN_L3_PER_L2,
+    OUTLINE_BUSINESS_VALIDATION_ENABLED,
     OUTLINE_L3_REPAIR_CONCURRENCY,
     OUTLINE_L3_REPAIR_MAX,
     OUTLINE_L3_REPAIR_MAX_ROUNDS,
@@ -503,13 +508,60 @@ def _dedupe_outline_titles(outline: list[dict]) -> list[dict]:
     return _walk(outline)
 
 
-def validate_outline_business(outline: list[dict]) -> tuple[bool, str]:
-    """业务校验目录（三层结构、标题非空、编号正确性）
+def _outline_depth(outline: list) -> int:
+    """计算目录树的最大嵌套深度（根节点为 1 层）。
 
-    V4.0 增强：
+    对应外部标准 `_outline_depth`：合法 JSON 不等于可用 JSON——
+    只有一级目录的返回语法合法，却不满足三级结构要求。
+    """
+    if not isinstance(outline, list):
+        return 0
+    max_depth = 0
+    for node in outline:
+        if not isinstance(node, dict):
+            continue
+        children = node.get("children")
+        child_depth = (
+            _outline_depth(children) if isinstance(children, list) else 0
+        )
+        max_depth = max(max_depth, 1 + child_depth)
+    return max_depth
+
+
+def _effective_business_rules() -> tuple[int, int, int, int]:
+    """解析生效的业务校验阈值：(最小深度, L2 下限, L2 上限, L3 下限)。
+
+    OUTLINE_BUSINESS_VALIDATION_ENABLED=false 时退化为历史 V4.0 口径
+    （不查深度、L2≥2、L3≥2、不设上限），保证运维可一键回退。
+    """
+    if OUTLINE_BUSINESS_VALIDATION_ENABLED:
+        return (
+            OUTLINE_BUSINESS_MIN_DEPTH,
+            OUTLINE_BUSINESS_MIN_L2_PER_L1,
+            OUTLINE_BUSINESS_MAX_L2_PER_L1,
+            OUTLINE_BUSINESS_MIN_L3_PER_L2,
+        )
+    return (0, 2, 0, 2)
+
+
+def validate_outline_business(outline: list[dict]) -> tuple[bool, str]:
+    """业务校验目录（三层结构、标题非空、编号正确性、数量契约）
+
+    V4.0 基线：
     1. 全局重复标题检测（跨章节、跨层级，剥离编号前缀后比较）
     2. 标题数字前缀残留检测（编号由系统自动生成，标题中严禁出现数字前缀）
     3. 最小节点数校验：每个一级 ≥2 个二级，每个二级 ≥2 个三级
+
+    《标书智能体（5）》增强（2026-10-23，配置化见 app.config
+    OUTLINE_BUSINESS_*）：把「合法 JSON ≠ 可用 JSON」落为确定性规则——
+    4. 完整目录最小深度校验（外部标准 _validate_complete_outline：
+       _outline_depth < 3 判负；本软件目录树三级，L3 为正文最小叶子节点）
+    5. 每个一级下二级数量区间校验（对齐骨架契约 generate_nodes_distribution
+       的 3~5；上限 0 表示不限制）
+    6. 每个二级下三级数量下限校验（对齐 _ensure_min_children(min_level3=5)
+       与 2026-09-04 用户定制「每个二级下三级应达 5~10 个」；只设下限，
+       与自检提示词「只设下限，不设上限」口径一致）
+    所有错误信息均具体到路径（第 x / 第 x.y / 第 x.y.z 项），供定向修复。
 
     BUG-OUTLINE-VALIDATE 修复：原代码硬依赖节点有 level 字段
     （item.get("level", 0) → 默认 0 → 0 != 1 → 拒绝所有合法目录）。
@@ -522,6 +574,18 @@ def validate_outline_business(outline: list[dict]) -> tuple[bool, str]:
     """
     if not isinstance(outline, list) or len(outline) == 0:
         return False, "目录为空"
+
+    _min_depth, _min_l2, _max_l2, _min_l3 = _effective_business_rules()
+
+    # 深度校验（外部标准：完整目录至少三级结构）。置于最前——深度缺失时
+    # 报「层级不全」比报「某章二级不足」更贴近根因，修复助手优先补层级。
+    if _min_depth > 0:
+        depth = _outline_depth(outline)
+        if depth < _min_depth:
+            return False, (
+                f"目录深度不足：实际 {depth} 层，完整目录至少需要 "
+                f"{_min_depth} 层（一级→二级→三级，三级为叶子节点）"
+            )
 
     # 2026-10-11 修正：重复判定作用域由「全树」收窄为「同级」。
     # 旧实现用一个全局集合，会把不同章节下**合法**的同名条目判为错误并
@@ -575,9 +639,14 @@ def validate_outline_business(outline: list[dict]) -> tuple[bool, str]:
         if not isinstance(children, list):
             children = []
 
-        # V4.0 最小节点数：每个一级 ≥2 个二级
-        if len(children) < 2:
-            return False, f"第 {i + 1} 项二级目录不足 2 个（实际 {len(children)} 个）"
+        # 二级数量契约：下限（历史 2 → 现行契约 3）与可选上限（默认 5）
+        if len(children) < _min_l2:
+            return False, f"第 {i + 1} 项二级目录不足 {_min_l2} 个（实际 {len(children)} 个）"
+        if _max_l2 > 0 and len(children) > _max_l2:
+            return False, (
+                f"第 {i + 1} 项二级目录超出 {_max_l2} 个（实际 {len(children)} 个），"
+                f"请按专业逻辑归并相近项"
+            )
 
         seen_l2: set[str] = set()  # 同级（该一级章下的二级之间）已见标题
         for j, child in enumerate(children):
@@ -599,10 +668,10 @@ def validate_outline_business(outline: list[dict]) -> tuple[bool, str]:
             if not isinstance(grandchildren, list):
                 grandchildren = []
 
-            # V4.0 最小节点数：每个二级 ≥2 个三级
-            if len(grandchildren) < 2:
+            # 三级数量契约：下限（历史 2 → 现行契约 5，只设下限不设上限）
+            if len(grandchildren) < _min_l3:
                 return False, (
-                    f"第 {i + 1}.{j + 1} 项三级目录不足 2 个"
+                    f"第 {i + 1}.{j + 1} 项三级目录不足 {_min_l3} 个"
                     f"（实际 {len(grandchildren)} 个）"
                 )
 
@@ -623,6 +692,76 @@ def validate_outline_business(outline: list[dict]) -> tuple[bool, str]:
                     return False, err
 
     return True, "ok"
+
+
+def make_full_outline_validator(target_description: str = "完整目录"):
+    """构造 collect_json_response 的 validator（业务校验回调）。
+
+    《标书智能体（5）》§三：所有 JSON 输出走统一封装，解析成功后先过
+    Pydantic Schema 校验、再过业务校验——合法 JSON 不等于可用 JSON。
+    本工厂产出的回调在统一封装内部对**模型原始输出**执行业务校验
+    （validate_outline_business），失败时抛 ValueError 触发定向修复链，
+    而不是把半成品目录交给上层后知后觉地回退。
+
+    兼容 AI 原始输出的常见形态：
+      - 顶层数组（标准）；
+      - {"outline": [...]} / {"children": [...]} 等包装（就地解包）；
+      - 叶子节点缺 children 键（视为叶子，不判深度不足）；
+      - 标题携带「第X章 / 1.1」等编号前缀（就地确定性剥离——外部标准原则七
+        「编号、映射关系交给程序保证」：前缀残留可由代码零成本修复，不值得
+        消耗一次 AI 修复调用；剥离后为空的标题仍会被业务校验判负）。
+
+    Args:
+        target_description: 目标结果类型描述（进入修复消息的「目标类型」段）。
+
+    Returns:
+        validator(parsed) -> (is_valid, error_msg)。
+    """
+    _wrapper_keys = (
+        "outline",
+        "children",
+        "data",
+        "items",
+        "subsections",
+        "sections",
+        "chapters",
+        "nodes",
+    )
+
+    def _strip_titles_inplace(nodes) -> None:
+        """递归剥离各级标题的编号前缀（与章节入口/导出端同一契约）。"""
+        if not isinstance(nodes, list):
+            return
+        for node in nodes:
+            if not isinstance(node, dict):
+                continue
+            title = node.get("title")
+            if isinstance(title, str):
+                stripped = _strip_title_number_prefix(title)
+                if stripped:
+                    node["title"] = stripped
+            _strip_titles_inplace(node.get("children"))
+
+    def _validator(payload):
+        data = payload
+        if isinstance(data, dict):
+            for key in _wrapper_keys:
+                value = data.get(key)
+                if isinstance(value, list):
+                    data = value
+                    break
+            else:
+                return False, f"{target_description}：返回的不是目录结构（缺少顶层数组）"
+        if not isinstance(data, list) or not data:
+            return False, f"{target_description}：目录为空或不是数组形态"
+        # 前缀剥离先行（确定性修复），再跑业务校验（结构/数量/标题质量）。
+        _strip_titles_inplace(data)
+        ok, msg = validate_outline_business(data)
+        if not ok:
+            return False, f"{target_description}业务校验未通过: {msg}"
+        return True, "ok"
+
+    return _validator
 
 
 def _normalize_title_core(title: str) -> str:
@@ -1088,7 +1227,13 @@ async def repair_l3_generic_titles(
     #   false = 回退历史口径（按告警序号截断 + 空标题静默跳过 → 永久泄漏）
     # 开关打开时不做截断，改由 count 自然终止。
     repair_tasks: list[tuple] = []
-    rule_only_tasks: list[tuple] = []  # 空标题节点：直接规则兜底，不调用 AI
+    rule_only_tasks: list[tuple] = []  # 泛化标题：纯规则模式下直接规则兜底
+    # BUG-FIX 2026-10-26（空标题被配额挤掉 → 节点消失）：空标题节点此前与
+    # 泛化标题共用 `max_repair` 配额，目录一大就会被挤出本轮；历史口径
+    # （OUTLINE_L3_REPAIR_QUOTA_BY_TASK=false）更是直接 `continue` 静默跳过。
+    # 而 `normalize_outline_items` 落库时会**删除**空标题节点 → 目录缺章。
+    # 空标题的修复是纯本地规则、零 AI 成本，故改为配额豁免、必参与本轮。
+    empty_tasks: list[tuple] = []
     _quota = max_repair if _repair_quota_by_task() else None
     for _i, w in enumerate(warnings):
         if _quota is None and _i >= max_repair:
@@ -1105,16 +1250,11 @@ async def repair_l3_generic_titles(
         l1_title = ancestors[0] if ancestors else ""
         l3_title = str(node.get("title") or "").strip()
         if not l3_title:
-            # BUG-FIX 2026-10-15（D3 · 空标题永久泄漏）：旧实现
-            # `if not l3_title: continue` 把空标题节点静默跳过，而
-            # `validate_l3_specificity` 恰恰会检出空标题 —— 于是一个比泛化标题
-            # 更严重的缺陷（落库后用户看到空条目）永远无人修复。空标题既没有
-            # 原标题可供 AI 参考，也不需要 AI 提示词，直接走规则兜底按父级
-            # 语义生成具体标题即可。
-            if _quota is None:  # 历史口径：保持静默跳过（向后兼容）
-                continue
-            rule_only_tasks.append((path, node, l1_title, parent_title, ""))
-        elif not _use_ai:
+            # 空标题既没有原标题可供 AI 参考，也不需要 AI 提示词，直接走规则
+            # 兜底按父级语义生成具体标题即可；且**不消耗配额**（见上方注释）。
+            empty_tasks.append((path, node, l1_title, parent_title, ""))
+            continue
+        if not _use_ai:
             # BUG-FIX 2026-10-17（L-1 · 离线泛化标题永久泄漏）：纯规则模式下
             # 非空泛化标题也直接走规则兜底，不再进 AI 任务队列。
             rule_only_tasks.append((path, node, l1_title, parent_title, l3_title))
@@ -1122,14 +1262,15 @@ async def repair_l3_generic_titles(
             repair_tasks.append((path, node, l1_title, parent_title, l3_title))
         if _quota is not None and (len(repair_tasks) + len(rule_only_tasks)) >= max_repair:
             break
-    _total_planned = len(repair_tasks) + len(rule_only_tasks)
-    if _total_planned < len(warnings):
+    _total_planned = len(repair_tasks) + len(rule_only_tasks) + len(empty_tasks)
+    if len(repair_tasks) + len(rule_only_tasks) < len(warnings) - len(empty_tasks):
         logger.warning(
-            "[L3修复] 单次上限 %d 条，本轮计划修复 %d 个，剩余 %d 个留待后续轮次"
-            "（OUTLINE_L3_REPAIR_MAX_ROUNDS=%d）",
+            "[L3修复] 单次上限 %d 条，本轮计划修复 %d 个（其中空标题 %d 个，配额豁免），"
+            "剩余 %d 个留待后续轮次（OUTLINE_L3_REPAIR_MAX_ROUNDS=%d）",
             max_repair,
             _total_planned,
-            len(warnings) - _total_planned,
+            len(empty_tasks),
+            len(warnings) - len(empty_tasks) - len(repair_tasks) - len(rule_only_tasks),
             OUTLINE_L3_REPAIR_MAX_ROUNDS,
         )
 
@@ -1273,13 +1414,15 @@ async def repair_l3_generic_titles(
             logger.warning("[L3修复] AI调用失败 (%s): %s", l3_title[:20], e)
             _fallback("AI 调用异常")
 
-    # 空标题节点 / 纯规则模式的泛化标题：直接规则兜底（同步执行，无 AI 调用）
+    # 空标题 / 纯规则模式的泛化标题：直接规则兜底（同步执行，无 AI 调用）
     #
     # BUG-FIX 2026-10-15（D3 · 空标题永久泄漏）：见上方 rule_only_tasks 的注释。
     # BUG-FIX 2026-10-17（L-1 · 离线泛化标题泄漏）：纯规则模式（use_ai=False）
     # 下非空泛化标题也进本队列；日志文案按原标题是否为空分别表述，
     # 不再一律写「空标题」（旧文案在规则模式下属于不准确日志）。
-    for _path, _node, _l1, _l2, _l3 in rule_only_tasks:
+    # BUG-FIX 2026-10-26：empty_tasks 单独成列且**优先**处理（零成本、
+    # 且空标题落库即丢节点），不受 max_repair 配额限制。
+    for _path, _node, _l1, _l2, _l3 in empty_tasks + rule_only_tasks:
         _new = _rule_based_fallback(_node, _l1, _l2, _path)
         _kind = "空标题" if not _l3 else "泛化标题"
         if _new and _new != _l3 and not _is_dirty_l3_title_deep(_new):
@@ -1294,6 +1437,36 @@ async def repair_l3_generic_titles(
                 "[L3修复] %s节点规则兜底失败，保留原标题「%s」（path=%s）",
                 _kind, _l3[:30], _path,
             )
+
+    # BUG-FIX 2026-10-26（空标题最终清扫）：`validate_l3_specificity` 只对
+    # 「能被路径定位」的节点产出告警，结构改动后可能仍有空标题漏在树里；
+    # 而 `normalize_outline_items` 落库时会直接删除空标题节点 → 章节消失。
+    # 这里对整树做一次幂等清扫，保证本函数返回的树里 level>=3 标题全部非空。
+    def _sweep_empty(nodes: Any, grand: str = "", parent: str = "", level: int = 1) -> int:
+        _n_fixed = 0
+        if not isinstance(nodes, list):
+            return _n_fixed
+        for _i, _n in enumerate(nodes):
+            if not isinstance(_n, dict):
+                continue
+            _t = (_n.get("title") or "").strip()
+            if level >= 3 and not _t:
+                _cand = _rule_based_fallback(_n, grand, parent, f"{level}.{_i + 1}")
+                if _cand and not _is_dirty_l3_title_deep(_cand):
+                    _n["title"] = _cand
+                    _global_used_titles.add(_cand)
+                    _n_fixed += 1
+                    logger.info(
+                        "[L3修复] 空标题最终清扫: level=%d idx=%d → %s", level, _i + 1, _cand[:30]
+                    )
+            _sub = _n.get("children")
+            if isinstance(_sub, list):
+                _n_fixed += _sweep_empty(_sub, _n.get("title") or "", _t or "", level + 1)
+        return _n_fixed
+
+    _swept = _sweep_empty(repaired)
+    if _swept:
+        logger.info("[L3修复] 空标题最终清扫共修复 %d 个节点", _swept)
 
     if repair_tasks:
         # 2026-10-10 加固：旧实现直接 asyncio.gather 全量并发，实际并发数等于

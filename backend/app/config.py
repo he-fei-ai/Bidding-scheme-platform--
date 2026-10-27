@@ -195,6 +195,15 @@ CONTENT_WORD_ADJUST_CONCURRENCY = max(
 )
 
 
+# ========== 上传解析模块：单文件大小上限 ==========
+# UPLOAD_MAX_FILE_SIZE_MB：所有格式（含图片）的通用上传上限，默认 50MB。
+# 此前该值在 routers/files.py 里硬编码为 `50 * 1024 * 1024`，改上限要改代码。
+# 向后兼容：不设置环境变量时行为与旧版完全一致（50MB）。
+# 注意与 OCR_MAX_FILE_SIZE_MB 的关系：图片还要额外受 OCR_MAX_FILE_SIZE_MB 约束
+# （两个上限取更严者），运维调大单文件上限时通常也需要同步调大 OCR 上限。
+UPLOAD_MAX_FILE_SIZE_MB = max(1, int(os.environ.get("UPLOAD_MAX_FILE_SIZE_MB", "50")))
+
+
 # ========== 增强 1.1: OCR 配置 ==========
 OCR_ENABLED = os.environ.get("OCR_ENABLED", "true").lower() == "true"
 OCR_ENGINE = os.environ.get("OCR_ENGINE", "mineru")  # mineru | paddleocr | none
@@ -265,6 +274,12 @@ OUTLINE_DIRECT_MAX_SCORING_CHARS = int(os.environ.get("OUTLINE_DIRECT_MAX_SCORIN
 OUTLINE_DIRECT_MAX_SCORING_ITEMS = int(os.environ.get("OUTLINE_DIRECT_MAX_SCORING_ITEMS", "8"))
 # 直出路径期望的目录规模上限（一级章数）
 OUTLINE_DIRECT_MAX_LEVEL1 = int(os.environ.get("OUTLINE_DIRECT_MAX_LEVEL1", "12"))
+# 文档方案一选择依据：模型最大输出 token 预算下限。运行模型输出预算低于此值
+# （弱模型）即便评分点规模短也强制走分步路径，避免一次性长 JSON 被截断。
+OUTLINE_DIRECT_MIN_OUTPUT_TOKENS = int(os.environ.get("OUTLINE_DIRECT_MIN_OUTPUT_TOKENS", "4096"))
+# 运维显式声明当前文本模型的最大输出 token（0=未声明，回退 provider 属性探测
+# 或仅按规模判别的旧口径）。弱模型（如输出预算 2k）应设为对应值以自动规避直出。
+OUTLINE_DIRECT_MODEL_MAX_OUTPUT_TOKENS = int(os.environ.get("OUTLINE_DIRECT_MODEL_MAX_OUTPUT_TOKENS", "0"))
 
 # ========== 增强 2026-10-08：目录生成各阶段 AI 调用 max_tokens 可调 ==========
 # PRD 描述目录生成 max_tokens=2000，但实际按阶段需要放大（长标书三级 JSON 体积大）。
@@ -312,11 +327,13 @@ OUTLINE_L3_REPAIR_MAX_ROUNDS = max(
 # 这确实消除了「（其N）」后缀污染，但也让**整章成套复用同一批泛化三级标题**
 # 失去任何约束 —— 生产库实测出现过单个标题（如「智能建造地下室施工工艺」）
 # 在 25 个互不相关的一级章下重复，用户反馈的「三级标题大量是占位式泛化名称」
-# 主要就是这一形态。合法复用（同一工序要点出现在 2~3 个相关章）与成套复制的
+# 主要就是这一形态。合法复用（同一工序要点出现在 2 个相关章）与成套复制的
 # 分界就是复用广度，故按父级个数设上限，超出的部分改由所在章主题重新生成。
+# 2026-10-27 第三轮收紧：默认从 3 降至 2（docx 实测 65 个 L3 标题重复 2-3 次，
+# 收紧上限可进一步降低跨章重复率）。
 # 设为 0 表示关闭该护栏（退回 2026-10-11 的历史行为，向后兼容）。
 OUTLINE_L3_MAX_PARENT_REUSE = max(
-    0, int(os.environ.get("OUTLINE_L3_MAX_PARENT_REUSE", "3"))
+    0, int(os.environ.get("OUTLINE_L3_MAX_PARENT_REUSE", "2"))
 )
 # 一级章节数硬上限（2026-10-19 新增，修复《岳阳路园区科研南楼室内装修工程》事故）。
 # 背景：L1 章节数此前与「评分项数量严格对应」，评分项被拆出 22 条时目录直接
@@ -328,6 +345,57 @@ OUTLINE_L3_MAX_PARENT_REUSE = max(
 # 设为 0 表示关闭上限（退回历史行为，向后兼容）。
 OUTLINE_L1_MAX_CHAPTERS = max(
     0, int(os.environ.get("OUTLINE_L1_MAX_CHAPTERS", "15"))
+)
+# ========== 2026-10-26：正文深层编号净化（遗留问题 1） ==========
+# 问题：正文（sections.content）里的 Markdown 子标题由 AI 自带编号
+# （如「### 3.1.2.1 施工准备」）。L1~L4 标题在导出端会被剥离并按目录树重新
+# 编号，但 L5+（≥3 段小数的深层编号）按既定设计保留 AI 原文 —— AI 编号漂移
+# 时（章节 3.1.2 的正文里写「3.2.1」）会与相邻 DB 子章节编号冲突，且只有发生
+# 结构变更（改名/换序/移动）才会被净化。
+#
+# 本开关在「正文落库前」把这些深层标题的编号改写为「章节路径 + 相对序号」
+# （3.1.2 下的第 1 个深层标题 → 3.1.2.1），保持「段数不变 → 解析层级不变」，
+# 既消除冲突又不破坏导出端的标题识别（导出依赖编号前缀识别标题，直接剥号
+# 会让标题退化为普通段落）。仅作用于 ≥3 段小数的标题；L4 及更浅标题仍由
+# 导出端统一重编号，行为完全不变。
+# 默认 true（新写入生效，存量正文不动）；设为 false 可回退到历史行为。
+CONTENT_DEEP_HEADING_RENUMBER_ENABLED = (
+    os.environ.get("CONTENT_DEEP_HEADING_RENUMBER_ENABLED", "true").lower() == "true"
+)
+# ---------------------------------------------------------------------------
+# 2026-10-23 引入《标书智能体（5）——如何让弱模型也能稳定输出复杂 JSON》：
+# 目录业务校验规则配置化（外部标准核心认知「合法 JSON ≠ 可用 JSON」——
+# json.loads 成功只代表语法合法，结构/数量/深度不达契约的 JSON 必须判负并
+# 进入定向修复链，而不是把「只有两级目录」这类半成品当可用结果交付）。
+#
+# 默认值与本软件生成契约严格一致（outline_common.generate_nodes_distribution：
+# 每个一级下二级 3~5、每个二级下三级 5~10；_ensure_min_children
+# (min_level2=3, min_level3=5)），因此默认开启不改变合规产物的通过率，
+# 只收紧「半成品目录」出口。每项均可独立关闭（0/false），便于按模型能力
+# 回退到历史宽松口径（历史规则：仅查标题非空/编号前缀/同级重复/L2≥2/L3≥2）。
+# ---------------------------------------------------------------------------
+# 业务校验总开关。false 时 validate_outline_business 退化为历史规则。
+OUTLINE_BUSINESS_VALIDATION_ENABLED = (
+    os.environ.get("OUTLINE_BUSINESS_VALIDATION_ENABLED", "true").lower() == "true"
+)
+# 完整目录最小深度（外部标准 _validate_complete_outline：_outline_depth < 3 判负）。
+# 本软件目录树为三级（L1→L2→L3，L3 为正文最小叶子节点），默认 3；0=关闭。
+OUTLINE_BUSINESS_MIN_DEPTH = max(
+    0, int(os.environ.get("OUTLINE_BUSINESS_MIN_DEPTH", "3"))
+)
+# 每个一级下二级数量区间（对齐骨架契约 generate_nodes_distribution 的
+# min_level2=3 浮动 0~2）。任一端设 0 表示不限制该端。
+OUTLINE_BUSINESS_MIN_L2_PER_L1 = max(
+    0, int(os.environ.get("OUTLINE_BUSINESS_MIN_L2_PER_L1", "3"))
+)
+OUTLINE_BUSINESS_MAX_L2_PER_L1 = max(
+    0, int(os.environ.get("OUTLINE_BUSINESS_MAX_L2_PER_L1", "5"))
+)
+# 每个二级下三级数量下限（对齐 _ensure_min_children(min_level3=5) 与 2026-09-04
+# 用户定制「每个二级下三级应达 5~10 个」）。不设上限——与自检提示词
+# 「只设下限，不设上限」的用户定制口径一致，数量溢出由后处理与门禁负责。
+OUTLINE_BUSINESS_MIN_L3_PER_L2 = max(
+    0, int(os.environ.get("OUTLINE_BUSINESS_MIN_L3_PER_L2", "5"))
 )
 # ---------------------------------------------------------------------------
 # 2026-10-20 引入易标 Aligned/Free 双模式目录生成（任务规格二.2）：
@@ -430,6 +498,28 @@ OUTLINE_L3_REPAIR_QUOTA_BY_TASK = (
 # 保持历史行为；>0 时强制使用该值，便于按模型速率限制调优（方案推荐 3-5，
 # 生产默认自动值远高于该推荐区间，是因为 provider 侧速率普遍宽裕）。
 OUTLINE_L2_CONCURRENCY = max(0, int(os.environ.get("OUTLINE_L2_CONCURRENCY", "0")))
+
+# ── 2026-10-23（P0，生产实证 project=1871130 21:47~21:56）─────────────────
+# L2 失败章节补偿重跑轮数。生产日志里 `_generate_level2_v51` 首轮 8/15、
+# 次轮 13/15 章节因 429 + 超时失败，全部直接落「默认目录」——用户拿到的是
+# 与本项目无关的模板目录，且后台只留一行 WARNING，前端完全无感。
+# 根因之一是首轮一次性把 N 章并发打出去，provider 侧 429 后 rate_gate 才把
+# 并发从 4 砍到 1，已发出的请求收不回来，集体撞上 20s/60s 超时预算。
+# 补偿策略：首轮失败后，用**低并发 + 全新预算**串行补跑失败章节，
+# 不再与首轮的 N 路并发争抢额度。0 = 关闭补偿（保持 2026-10-23 前的行为）。
+OUTLINE_L2_RETRY_FAILED_ROUNDS = max(
+    0, int(os.environ.get("OUTLINE_L2_RETRY_FAILED_ROUNDS", "1"))
+)
+# 补偿轮的并发上限。刻意取小值：补偿轮的目标是"救回质量"而非"抢速度"，
+# 高并发只会重演首轮的 429 雪崩。
+OUTLINE_L2_RETRY_CONCURRENCY = max(
+    1, int(os.environ.get("OUTLINE_L2_RETRY_CONCURRENCY", "2"))
+)
+# 降级告警阈值：兜底（默认目录）章节占比超过该比例时，除 WARNING 外额外打一条
+# 带 error_code 的 ERROR，使监控系统能直接按错误码聚合"目录质量退化"事件。
+OUTLINE_DEGRADED_ALERT_RATIO = min(
+    1.0, max(0.0, float(os.environ.get("OUTLINE_DEGRADED_ALERT_RATIO", "0.3")))
+)
 
 # 质量评分报告总开关（优化 6）。关闭后 `_self_check_v51` 不计算评分，
 # verdict 不含 quality_score，前端完成卡片不展示报告（向后兼容）。
@@ -538,6 +628,43 @@ EXPORT_IMAGE_DPI = int(os.environ.get("EXPORT_IMAGE_DPI", "300"))
 # 若需保留旧版可见的失败提示，设置环境变量 CHART_FAIL_PLACEHOLDER=true。
 CHART_FAIL_PLACEHOLDER = os.environ.get("CHART_FAIL_PLACEHOLDER", "false").lower() == "true"
 
+
+# ========== 标书智能体（6）图文控制对齐（2026-10-23）==========
+# 对齐外部引用软件《超长文本生成和图文控制》的核心机制：
+#   预编排（正文生成前 AI 提名配图素材）→ 正文只写正文 → 全部正文完成后统一配图。
+# 三项开关相互独立，默认值均保持「不改变既有行为」之外的最小风险组合。
+#
+# 1) CONTENT_ILLUSTRATION_PHASE_ENABLED
+#    开启「配图阶段」：启用内容编排（use_orchestration）时，正文改用
+#    CONTENT_SECTION_SYSTEM_PLANNED（严禁输出图表代码块），全部正文生成完成后
+#    由 illustration_phase 统一校验/修复/插入图表围栏（失败隔离，不影响正文）。
+#    关闭：完全回退到「正文自带图表围栏」的既有链路（零行为变更）。
+#    依赖：仅在 use_orchestration=true 时生效（编排关闭时无 plan 可执行）。
+CONTENT_ILLUSTRATION_PHASE_ENABLED = os.environ.get(
+    "CONTENT_ILLUSTRATION_PHASE_ENABLED", "true"
+).lower() == "true"
+
+# 2) CONTENT_ILLUSTRATION_MAX_CHARTS
+#    全文配图硬上限（mermaid + chart + image 合计），0 = 不限。
+#    对应外部文档「AI 提名、程序拍板」的全局择优：候选多于额度时按段择优。
+CONTENT_ILLUSTRATION_MAX_CHARTS = max(
+    0, int(os.environ.get("CONTENT_ILLUSTRATION_MAX_CHARTS", "12"))
+)
+
+# 3) ORCHESTRATION_PLAN_PAYLOAD_ENABLED
+#    编排阶段是否要求 AI 直接产出可执行素材（mermaid.code / chart.data / image.prompt）。
+#    开启后配图阶段可直接使用 plan 里的素材（外部文档口径：配图不是事后临时加，
+#    而是正文生成前就规划好）；关闭时只保留 needed/priority 判定，配图阶段回落到
+#    既有「按章节内容生成图表」链路。
+ORCHESTRATION_PLAN_PAYLOAD_ENABLED = os.environ.get(
+    "ORCHESTRATION_PLAN_PAYLOAD_ENABLED", "true"
+).lower() == "true"
+
+# 4) ORCHESTRATION_CHART_ENABLED
+#    编排阶段是否允许提名「数据型图表」（chart 块：甘特/架构/劳动力/对比/布置/时间线）。
+ORCHESTRATION_CHART_ENABLED = os.environ.get(
+    "ORCHESTRATION_CHART_ENABLED", "true"
+).lower() == "true"
 
 # ========== 遗留项 2026-10-08: 正文普通代码块剥离开关 ==========
 # 控制正文清洗（clean_generated_content）对「闭合」普通代码块（```python / ```json /
@@ -736,6 +863,66 @@ OUTLINE_MODE_DEFAULT = os.environ.get(
 # SPLIT_PROMPT_LAYERS=false 保持现有 build_chapter_content_messages 行为；
 # =true 时启用 8 层消息栈（system/项目概述/全局事实/参考素材/编排/上级/同级/当前）。
 SPLIT_PROMPT_LAYERS = os.environ.get("SPLIT_PROMPT_LAYERS", "false").lower() == "true"
+
+# ========== 标书智能体（4）提示词顺序优化与缓存命中（2026-10-23）==========
+# 外部引用标准四条原则：①system 只放稳定规则；②最大最稳定上下文尽量前置；
+# ③任务差异尽量放最后；④同一份数据的组织格式保持稳定（不塞时间戳/随机数）。
+# 以下开关默认全部保持「改造前的提示词内容」，只改消息组织顺序与格式稳定化，
+# 生成质量不变、成本可降；每项均可独立回退，向后兼容。
+
+# 缓存可观测性：按任务类型累计 prompt/cached token 并计算命中率，
+# 暴露于 /api/v1/ai/cache-metrics 的 task_types 字段。
+AI_CACHE_METRICS_ENABLED = (
+    os.environ.get("AI_CACHE_METRICS_ENABLED", "true").lower() == "true"
+)
+# 单次 AI 调用的缓存计量日志（DEBUG 级；正文生成每项目 50+ 次，不开 INFO 免淹没）。
+AI_CACHE_LOG_ENABLED = (
+    os.environ.get("AI_CACHE_LOG_ENABLED", "true").lower() == "true"
+)
+# 命中率告警阈值（0~1）。0=关闭（默认，与历史行为一致）；如 0.3 表示某任务
+# 累计命中率低于 30% 且样本足够时告警——稳定前缀被破坏的信号。
+AI_CACHE_HIT_RATE_ALERT_THRESHOLD = float(
+    os.environ.get("AI_CACHE_HIT_RATE_ALERT_THRESHOLD", "0")
+)
+# 触发告警所需的最小请求数（避免冷启动几条请求的噪声触发）。
+AI_CACHE_HIT_RATE_MIN_SAMPLES = int(
+    os.environ.get("AI_CACHE_HIT_RATE_MIN_SAMPLES", "20")
+)
+# 同一任务类型告警的最小间隔秒数（防止刷屏）。
+AI_CACHE_ALERT_THROTTLE_SECONDS = int(
+    os.environ.get("AI_CACHE_ALERT_THROTTLE_SECONDS", "600")
+)
+
+# 正文同级章节列表容量（含当前章节）。同一父章节下所有叶子共用同一个列表
+# （按父章节统一截取），sibling_context 字节级一致 → 前缀可命中缓存；
+# 任务差异消息里显式声明「请避免与除当前章节外的其他章节内容重复」。
+# 默认 8 与历史口径一致（防 token 爆炸）。
+CONTENT_SIBLING_MAX_ITEMS = int(os.environ.get("CONTENT_SIBLING_MAX_ITEMS", "8"))
+
+# 审计7增强（2026-10-27）：同级章节超长时的「降描述保留标题」扩容上限。
+# 同一父章节下孩子数超过 CONTENT_SIBLING_MAX_ITEMS 时，旧行为只取前 8 个 →
+# 第 9 个及之后的章节不在自己的同级列表里（自定位/兄弟感知缺失）。
+# 改为：超出时整表降级为仅标题（去 description），条数扩至本上限——
+# 标题很短（≤20字），40 条 ≈ 与旧 8 条+描述的 token 量相当；
+# 仍保持「按父章节共享同一列表」的缓存命中设计。
+CONTENT_SIBLING_TITLES_MAX_ITEMS = int(
+    os.environ.get("CONTENT_SIBLING_TITLES_MAX_ITEMS", "40")
+)
+
+# 各高频任务的提示词分层总开关（默认 true）。false 时该类任务退回
+# 「单条 user 消息」的旧组织方式（内容一致，仅消息条数不同），可独立回退。
+OUTLINE_PROMPT_LAYERS_ENABLED = (
+    os.environ.get("OUTLINE_PROMPT_LAYERS_ENABLED", "true").lower() == "true"
+)
+ORCHESTRATION_PROMPT_LAYERS_ENABLED = (
+    os.environ.get("ORCHESTRATION_PROMPT_LAYERS_ENABLED", "true").lower() == "true"
+)
+CHART_PROMPT_LAYERS_ENABLED = (
+    os.environ.get("CHART_PROMPT_LAYERS_ENABLED", "true").lower() == "true"
+)
+QUALITY_PROMPT_LAYERS_ENABLED = (
+    os.environ.get("QUALITY_PROMPT_LAYERS_ENABLED", "true").lower() == "true"
+)
 
 # ========== 提示词模块增强（2026-10-17）==========
 # 以下开关默认全部保持「修复前的默认行为」，可独立开启，向后兼容。

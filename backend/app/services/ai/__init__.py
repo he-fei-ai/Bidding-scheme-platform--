@@ -75,6 +75,16 @@ from .providers.anthropic_compatible import AnthropicCompatibleProvider
 from .providers.base import AIMessage
 from .providers.deepseek import DeepSeekProvider
 from .providers.openai_compatible import OpenAICompatibleProvider
+# 标书智能体（一）引入：五段式专项方案解析提取 Runner
+from .workflows_scheme_extraction import (
+    extract_basis_list,
+    extract_construction_condition,
+    extract_dangerous_work_params,
+    extract_project_overview,
+    extract_scheme_type,
+    run_all_scheme_extractions,
+    run_scheme_extraction,
+)
 
 
 __all__ = [
@@ -117,6 +127,14 @@ __all__ = [
     "AnthropicCompatibleProvider",
     "OpenAICompatibleProvider",
     "DeepSeekProvider",
+    # 标书智能体（一）引入：五段式专项方案解析提取 Runner
+    "extract_basis_list",
+    "extract_construction_condition",
+    "extract_dangerous_work_params",
+    "extract_project_overview",
+    "extract_scheme_type",
+    "run_scheme_extraction",
+    "run_all_scheme_extractions",
     # V3.1 图表校验（新增）
     "validate_architecture_tree",
     "validate_gantt_plan",

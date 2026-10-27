@@ -932,6 +932,10 @@ def _migrate(conn: sqlite3.Connection):
         if "duplicate column" not in str(e).lower():
             logger.warning("uploaded_files.updated_at 迁移失败（上传保存将受影响）: %s", e)
 
+    # 2026-10-20 遗留 3/5（Aligned 锁定与正文模式落库）：
+    # locked 由目录生成程序构造成的一级目录（评分项 R{n}/九大章节 S{n}）写入，
+    # 结构（标题/父级/顺序）不可编辑；content_mode 为易标 OutlineItem
+    # 正文字段（ai-generate 默认），正文生成入口 resolve_content_mode 消费。
     _ensure_table(
         conn,
         "sections",
@@ -950,6 +954,8 @@ def _migrate(conn: sqlite3.Connection):
             gantt_json TEXT DEFAULT NULL,
             illustration_type TEXT DEFAULT NULL,
             illustration_data TEXT DEFAULT NULL,
+            locked INTEGER NOT NULL DEFAULT 0,
+            content_mode TEXT DEFAULT NULL,
             content TEXT NOT NULL DEFAULT '',
             target_words INTEGER DEFAULT NULL,
             word_count INTEGER NOT NULL DEFAULT 0,
@@ -975,6 +981,9 @@ def _migrate(conn: sqlite3.Connection):
             "gantt_json": "TEXT DEFAULT NULL",
             "illustration_type": "TEXT DEFAULT NULL",
             "illustration_data": "TEXT DEFAULT NULL",
+            # 2026-10-20：与建表语句同步（DDL 双写漂移守卫口径）
+            "locked": "INTEGER NOT NULL DEFAULT 0",
+            "content_mode": "TEXT DEFAULT NULL",
             "content": "TEXT NOT NULL DEFAULT ''",
             "target_words": "INTEGER DEFAULT NULL",
             # BUG-FIX 2026-10-12（DDL 双写漂移守卫）：本列此前**只**在
@@ -1476,6 +1485,11 @@ def _migrate(conn: sqlite3.Connection):
     _ensure_column(conn, "analysis", "confirmed_construction_method", "INTEGER NOT NULL DEFAULT 0")
     _ensure_column(conn, "analysis", "global_facts_json", "TEXT NOT NULL DEFAULT '[]'")
     _ensure_column(conn, "analysis", "confirmed_facts", "INTEGER NOT NULL DEFAULT 0")
+    # ENHANCE 2026-10-23（标书智能体（一）引入）：五个专项方案解析提取任务的
+    # 结构化结果（工程概况/方案类型/危大参数/编制依据/施工条件）统一落此列，
+    # 存为 JSON 对象 {"project_overview":[...],"scheme_type":[...],...}。
+    # 增量迁移：仅添加列，老库零破坏（与既有 *_json 列同一 _ensure_column 口径）。
+    _ensure_column(conn, "analysis", "scheme_extraction_json", "TEXT NOT NULL DEFAULT '[]'")
     # ENHANCE 2026-09-29（全局事实）：一致性审计结果落库。
     # 原实现审计只回 HTTP 响应、不留痕迹：刷新页面就丢，用户只能反复点“一致性审计”
     # 重复烧 AI 配额；也无法对比“修完再审”的前后差异。现存本次报告 JSON + 时刻。
@@ -1702,6 +1716,7 @@ def _migrate(conn: sqlite3.Connection):
             outline_json TEXT NOT NULL DEFAULT '[]',
             status TEXT NOT NULL DEFAULT 'pending',
             coverage_audit_json TEXT NOT NULL DEFAULT '[]',
+            content_coverage_json TEXT NOT NULL DEFAULT '[]',
             created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
             updated_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
             FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE

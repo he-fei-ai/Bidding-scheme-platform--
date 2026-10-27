@@ -256,6 +256,28 @@ class TestBuildLeafDictsTreeOrder:
         )
         assert [lf["id"] for lf in leaves] == [ids[1], ids[3]]
 
+    def test_subtree_mode_root_section_id(self, project_with_two_subtrees):
+        """#5 子树模式：root_section_id 只生成该子树叶子，与全树同源、按树序，
+        且与旧 get_subtree_leaf_ids（DB 口径）结果一致（消除二次读库时序差）。"""
+        pid = project_with_two_subtrees["pid"]
+        by_id, children = self._maps(pid)
+        expected = project_with_two_subtrees["expected_order"]
+        l2_roots = sorted(
+            [r for r in by_id.values() if r.get("level") == 2],
+            key=lambda r: r["id"],
+        )
+        assert l2_roots, "夹具应含 L2 子树根"
+        l2a_id = l2_roots[0]["id"]
+        leaves = _build_leaf_dicts(
+            project_id=pid, sections_by_id=by_id, children_map=children,
+            root_section_id=l2a_id,
+        )
+        # 只含第一个 L2 子树下的两个叶子，且按树序
+        assert [lf["id"] for lf in leaves] == [expected[0], expected[1]]
+        # 交叉验证：与旧 DB 口径 get_subtree_leaf_ids 完全一致
+        from app.services.sections import get_subtree_leaf_ids
+        assert set(lf["id"] for lf in leaves) == set(get_subtree_leaf_ids(pid, l2a_id))
+
 
 # ======================= B. 批次与顺序生成 =======================
 

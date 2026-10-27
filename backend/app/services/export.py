@@ -59,7 +59,12 @@ from .ai.mermaid_renderer import (
     ChartCache,
     render_mermaid_to_bytes,
 )
-from .content_cleaning import ContentCleaner, extract_mermaid_title, parse_content
+from .content_cleaning import (
+    ContentCleaner,
+    clean_inline_text,
+    extract_mermaid_title,
+    parse_content,
+)
 from .export_presets import resolve_export_config
 
 # MODULARIZATION 2026-10-12：缓存层 + single-flight 并发合并 + 图号计数器 +
@@ -83,6 +88,11 @@ from .export_cache import (  # noqa: F401
     _figure_counter_state,
     _fig_counter_ctx_var,
     _FIG_NO_PREFIX_RE,
+    _used_chart_titles_ctx_var,
+    _claim_chart_title,
+    _reset_chart_title_registry,
+    _snapshot_chart_title_registry,
+    _restore_chart_title_registry,
     _inline_marker_cache,
     _inline_marker_cache_lock,
     _inline_marker_cache_ttl,
@@ -114,6 +124,8 @@ from .export_chart_pipeline import (  # noqa: F401
     _afc_enabled,
     _generate_local_mermaid_chart,
     _infer_chart_type_from_text,
+    _clean_lead_in_title,
+    _adaptive_batch_size,
     # Block 3: 通用格式化工具（纯函数，N 处消费者）
     _heading_font_for,
     _heading_size_for,
@@ -141,8 +153,11 @@ logger = logging.getLogger(__name__)
 # 覆盖：第X节/第X章、一、1、1.1、1.1.1、1）、a 等
 _HEADING_NUMBER_COMBINED = re.compile(
     r"^(?:第[一二三四五六七八九十百千万\d]+[章节][、，]?\s*"
-    r"|\d+\.\d+\.\d+\s*[、．.]\s*"
-    r"|\d+\.\d+\s*[、．.]\s*"
+    # FIX 2026-10-26（报告 G-1/G-2）：多级编号常以空格收尾（"1.2 工程概况"），
+    # 旧正则只认 、．. 三种分隔符 → 只剥掉 "1." 留下 "2 工程概况"，标题里残留
+    # 半截编号。多级编号额外接受「空白分隔」。
+    r"|\d+\.\d+\.\d+\s*(?:[、．.]\s*|\s+)"
+    r"|\d+\.\d+\s*(?:[、．.]\s*|\s+)"
     r"|\d+\s*[、．.]\s*"
     r"|[一二三四五六七八九十百千]+\s*[、．.]\s*"
     r"|\d+\s*[)）]\s*[、．.]\s*"
@@ -306,7 +321,7 @@ def _style_table_header(table, headers: list[str], config: ExportConfig):
         p = cell.paragraphs[0]
         p.alignment = WD_ALIGN_PARAGRAPH.CENTER
         _set_paragraph_indent_chars(p, first_line_chars=0)
-        run = p.add_run(header)
+        run = p.add_run(clean_inline_text(header) or "")
         _apply_font(run, config.font_title, 10.5, bold=True)
         # BUG-E-06: 使用配置的表头文字颜色；ENHANCE 2026-09-14：改为主题色优先
         run.font.color.rgb = RGBColor.from_string(header_fg)
@@ -394,7 +409,7 @@ def _set_cell_text(
     _set_paragraph_indent_chars(p, first_line_chars=0)
     # BUG-FIX：Word 单元格同样有 32767 字符上限，超长单元格会让 Word 打开时
     # 提示「文档需要修复」；同时补齐 XML 不安全字符清洗。
-    run = p.add_run(sanitize_for_docx(text, MAX_DOCX_TEXT_CHARS))
+    run = p.add_run(sanitize_for_docx(clean_inline_text(text), MAX_DOCX_TEXT_CHARS))
     _apply_font(run, font_name or "宋体", font_size or 10.5, bold=bold)
 
 
@@ -577,6 +592,7 @@ def _apply_heading_style(doc, paragraph, level: int):
 def check_document(
     project_id: int,
     strict_mode: bool = False,
+    block_on_high_conflicts: bool = False,
 ) -> DocumentCheckResult:
     """文档完整性检查（V1.0 增强：支持宽松/严格模式）
 
@@ -590,6 +606,13 @@ def check_document(
         project_id: 项目 ID
         strict_mode: 严格模式开关。True 时将所有 warning 升级为 error，
                      False 时 warning 仅作为提示，不影响 passed 状态
+        block_on_high_conflicts: 一致性校核×导出闸门（默认 False，向后兼容）。
+                     True 时统计本项目未解决的高严重度一致性冲突
+                     （``consistency_conflicts`` 中 ``resolved=0`` 且
+                     ``severity='high'``，含规则冲突与 AI 语义冲突），
+                     写入 ``high_conflicts_open`` 并追加一条 error；
+                     导出路由据此返回 400 阻断。查询失败时**放行**
+                     （仅告警），不让数据异常堵死导出主链路。
 
     Returns:
         DocumentCheckResult: 包含 passed、errors、warnings 等字段
@@ -831,6 +854,53 @@ def check_document(
     if total_chars == 0:
         errors.append("文档内容为空")
 
+    # ====== ENHANCE（本轮跨模块深度探索·审核×导出打通）======
+    # 一致性校核结果此前与导出**完全解耦**（export.py 全文 0 处引用
+    # consistency_auditor）：用户跑完审计、看到 high 冲突未修复，导出仍畅通，
+    # 「以事实为准」在导出边界落空。现由调用方显式开启本闸门
+    # （ExportConfig.block_on_high_conflicts，默认 False 保持历史行为）。
+    # 查询失败放行（仅告警）——数据异常不应堵死导出主链路。
+    high_conflicts_open = 0
+    if block_on_high_conflicts:
+        try:
+            with get_db() as conn:
+                _hrow = conn.execute(
+                    "SELECT COUNT(*) AS n FROM consistency_conflicts "
+                    "WHERE project_id = ? AND COALESCE(resolved, 0) = 0 "
+                    "AND LOWER(COALESCE(severity, '')) = 'high'",
+                    (project_id,),
+                ).fetchone()
+                high_conflicts_open = int(_hrow["n"] or 0) if _hrow else 0
+                _hnames = [
+                    r["fact_name"]
+                    for r in conn.execute(
+                        "SELECT fact_name FROM consistency_conflicts "
+                        "WHERE project_id = ? AND COALESCE(resolved, 0) = 0 "
+                        "AND LOWER(COALESCE(severity, '')) = 'high' "
+                        "ORDER BY id LIMIT 5",
+                        (project_id,),
+                    ).fetchall()
+                ]
+            if high_conflicts_open > 0:
+                _names = "、".join(_hnames) if _hnames else ""
+                errors.append(
+                    f"存在 {high_conflicts_open} 个未解决的高严重度一致性冲突"
+                    f"（如：{_names}），请先在「一致性校核」页处理后再导出"
+                    if _names
+                    else f"存在 {high_conflicts_open} 个未解决的高严重度一致性冲突，"
+                    f"请先在「一致性校核」页处理后再导出"
+                )
+                logger.info(
+                    "check_document: 一致性闸门命中 %d 个未解决 high 冲突（project_id=%d）",
+                    high_conflicts_open, project_id,
+                )
+        except Exception as _hc_e:
+            logger.warning(
+                "check_document: 一致性冲突统计失败（闸门放行，project_id=%d）: %s",
+                project_id, _hc_e,
+            )
+            high_conflicts_open = 0
+
     # V1.0 增强：严格模式 — 所有 warning 升级为 error
     if strict_mode and warnings:
         for w in warnings:
@@ -854,6 +924,7 @@ def check_document(
         invalid_images=invalid_images,
         estimated_pages=estimated_pages,
         quality_issues=quality_issues,
+        high_conflicts_open=high_conflicts_open,
     )
 
 
@@ -1098,7 +1169,7 @@ def _add_table_from_markup(doc, markup: str, config: ExportConfig):
         p = doc.add_paragraph()
         p.alignment = WD_ALIGN_PARAGRAPH.CENTER
         _set_paragraph_indent_chars(p, first_line_chars=0)
-        run = p.add_run(table_title)
+        run = p.add_run(clean_inline_text(table_title) or "")
         _apply_font(run, config.font_title, 10.5, bold=True)
         pPr = p._element.get_or_add_pPr()
         pPr.append(parse_xml(f'<w:spacing {nsdecls("w")} w:after="40"/>'))
@@ -1629,6 +1700,81 @@ def _render_commercial(
     cache_payload_str = _strip_fig_no_for_cache(payload)
     last_error = None
 
+    # BUG-FIX-03 / ENHANCE 2026-10-04（需求 9）：渲染失败时按
+    # CHART_FAIL_PLACEHOLDER 开关插入灰色文字说明（事实陈述，非伪造数据）。
+    # 默认 false：静默跳过（不占图号、不留失败说明）；true：保留可见排错提示。
+    # REFACTOR 2026-10-27：抽成闭包，渲染端语法闸门（上方策略 2 前）与
+    # 策略 2 失败尾部共用同一段占位逻辑，避免两处实现漂移。
+    def _emit_fail_note() -> None:
+        if preload_only or not CHART_FAIL_PLACEHOLDER:
+            return
+        try:
+            from docx.shared import Pt as _Pt
+
+            _fail_para = doc.add_paragraph()
+            # P1 修复 2026-09-29：渲染失败后图号会被回滚复用，失败说明
+            # 不能再携带该编号，否则正文会出现两个同号（一个假图一个真图）
+            _fail_label = _FIG_NO_PREFIX_RE.sub("", caption or "").strip()
+            # BUG-FIX 2026-10-04（P1 特殊字符）：caption 源于图表 JSON 标题，
+            # 含 XML 不安全字符时本兜底 add_run 会再炸一次，导致连「渲染失败
+            # 说明」都写不进去，文档该位置完全空白。
+            _fail_run = _fail_para.add_run(
+                sanitize_for_docx(f"【图表渲染失败】{_fail_label or typ}（请检查原始数据或重新导出）")
+            )
+            _fail_run.font.size = _Pt(9)
+            _fail_run.font.color.rgb = RGBColor(0x99, 0x99, 0x99)
+            _fail_run.italic = True
+        except Exception:
+            logger.warning("[商业级渲染] 插入渲染失败说明文字也失败，文档该位置将空白")
+
+    # 渲染端语法闸门（ENHANCE 2026-10-27，需求 6·校验与修复收口）：
+    # 围栏路径已在正文解析侧经 repair_mermaid → validate_mermaid → 删坏块；
+    # 但 DB 绑定 *_json 字段与 <<CHART>> 标记路径的纯 Mermaid code 载荷此前
+    # 未经校验直接进入渲染，非法语法会白白消耗 HTTP(≤20s)+PIL 渲染预算后
+    # 仍失败。此处对**纯 Mermaid 语法载荷**（dict 载荷的 code 字段为非 JSON
+    # 文本）执行 repair_mermaid 机械修复 → validate_mermaid 校验：
+    #   - 修复后合法：以修复后代码继续渲染（同步重建 payload_str 与缓存键，
+    #     保证 L1/持久化缓存查找与写入用同一把修复后钥匙，修复产物可复用）
+    #   - 修复后仍非法：直接判渲染失败（跳过该图、图号由调用方回滚），不再进策略 2
+    # 注意：闸门必须位于策略 0（L1 缓存查找）之前——若放在其后，未修复载荷
+    # 的缓存查找键与修复后写入键不一致，修复产物永远无法命中（实测复现）。
+    # JSON 数据载荷（labor/comparison/layout/timeline/architecture/gantt-plan）
+    # 不经过此闸门，由各自结构校验器在生成/解析侧负责。
+    if isinstance(payload, dict):
+        _gate_code = payload.get("code")
+        if (
+            isinstance(_gate_code, str)
+            and _gate_code.strip()
+            and not _gate_code.lstrip().startswith("{")
+        ):
+            try:
+                from .ai.image_engine import (
+                    repair_mermaid as _gate_repair,
+                    validate_mermaid as _gate_validate,
+                )
+
+                _gate_fixed = _gate_repair(_gate_code)
+                _gate_ok, _gate_msg = _gate_validate(_gate_fixed)
+                if not _gate_ok:
+                    logger.error(
+                        "[商业级渲染] Mermaid 语法校验未通过（修复后仍非法），跳过该图表: "
+                        "type=%s section=%s 原因=%s",
+                        typ,
+                        section_title,
+                        _gate_msg,
+                    )
+                    _emit_fail_note()
+                    return False
+                if _gate_fixed != _gate_code:
+                    logger.info(
+                        "[商业级渲染] Mermaid 语法机械修复后通过校验: type=%s", typ
+                    )
+                    payload = {**payload, "code": _gate_fixed}
+                    payload_str = json.dumps(payload, ensure_ascii=False)
+                    cache_payload_str = _strip_fig_no_for_cache(payload)
+            except ImportError:
+                logger.debug("渲染端语法闸门：image_engine 不可用，跳过校验（保持旧行为）")
+
     # V1.2 策略 0: L1 内存缓存（避免同一次导出中重复 render_mermaid_to_bytes）
     cached = _get_cached_chart_render(cache_payload_str, typ)
     if cached:
@@ -1741,30 +1887,8 @@ def _render_commercial(
         section_title,
         last_error,
     )
-    # BUG-FIX-03 修复：渲染失败时插入文字说明（非伪造数据），避免文档出现空白区域。
-    # 原实现直接 return False，文档中该图表位置完全空白，读者无法判断是遗漏还是渲染失败。
-    # 此处插入的是"渲染失败说明"（事实陈述），不是伪造的图表数据，符合无降级原则。
-    # ENHANCE 2026-10-04（需求 9）：受 CHART_FAIL_PLACEHOLDER 开关控制。
-    # 默认 false：静默跳过（不占图号、不留失败说明）；true：保留可见的排错提示。
-    if not preload_only and CHART_FAIL_PLACEHOLDER:
-        try:
-            from docx.shared import Pt as _Pt
-
-            _fail_para = doc.add_paragraph()
-            # P1 修复 2026-09-29：渲染失败后图号会被回滚复用，失败说明
-            # 不能再携带该编号，否则正文会出现两个同号（一个假图一个真图）
-            _fail_label = _FIG_NO_PREFIX_RE.sub("", caption or "").strip()
-            # BUG-FIX 2026-10-04（P1 特殊字符）：caption 源于图表 JSON 标题，
-            # 含 XML 不安全字符时本兜底 add_run 会再炸一次，导致连「渲染失败
-            # 说明」都写不进去，文档该位置完全空白。
-            _fail_run = _fail_para.add_run(
-                sanitize_for_docx(f"【图表渲染失败】{_fail_label or typ}（请检查原始数据或重新导出）")
-            )
-            _fail_run.font.size = _Pt(9)
-            _fail_run.font.color.rgb = RGBColor(0x99, 0x99, 0x99)
-            _fail_run.italic = True
-        except Exception:
-            logger.warning("[商业级渲染] 插入渲染失败说明文字也失败，文档该位置将空白")
+    # 渲染失败说明（见 _emit_fail_note 注释；ENHANCE 2026-10-27 复用闭包）
+    _emit_fail_note()
     return False
 
 
@@ -1895,6 +2019,11 @@ def _add_inline_chart(
                 if isinstance(chart_desc, str) and not chart_desc.startswith("{")
                 else caption_hint
             )
+            # ENHANCE 2026-10-27（需求 8·图题质量）：引导语是自然句子
+            # （"下图为施工进度计划："），直接当图名会把「下图为」「：」
+            # 框架词带进成品图题。仅对**引导语**一级清理框架词；载荷
+            # title / Mermaid title（第 1/2 优先级）本就是干净图名，不处理。
+            _lead_in = _clean_lead_in_title(_lead_in) if _lead_in else _lead_in
             if source_obj and isinstance(source_obj, dict):
                 title_text = (
                     source_obj.get("title")
@@ -1925,6 +2054,16 @@ def _add_inline_chart(
                 # 确保 source 是 dict 格式供渲染器使用
                 if isinstance(source, str):
                     source = source_obj
+                # FIX 2026-10-26（报告 F-2/B-4）：同一章内图题重复时只保留首图，
+                # 后续同题图直接跳过（不消耗图号，因此图号仍然连续）。
+                if not preload_only and not _claim_chart_title(
+                    _fig_parent, title_text, _project_id
+                ):
+                    logger.info(
+                        "[图表导出] 跳过同章重复图题: 章=%s 图题=%s",
+                        _fig_parent, title_text,
+                    )
+                    return True
                 # V7.0 注入图号 + 构建标书级图题
                 # BUG-FIX 2026-09-18（低）：预渲染（preload_only）阶段不得消耗图号计数器。
                 # 图号计数器是**导出会话级**的（build_docx 开头 _reset_figure_counter），
@@ -2038,13 +2177,36 @@ def _add_inline_chart(
                 inner_type, chart_type, _section_title,
             )
             return None
+        # FIX 2026-10-26（报告 F-2/B-4）：同章重复图题跳过（口径同上）。
+        # FIX 2026-10-27（图题口径统一·P2）：兜底分支的图题与去重键此前直接用
+        # chart_desc 原文——内联 JSON 描述时图题会退化为 JSON 原文（成品观感
+        # 如「图3-1 {"type": "gantt", ...}」），去重键也因载荷逐次不同而永不
+        # 命中。现与主路径同口径：载荷 title/caption > 非 JSON 描述（引导语，
+        # 经框架词清理）> 类型通用名。
+        _fb_title = ""
+        if isinstance(inline_data, dict):
+            _fb_title = str(
+                inline_data.get("title") or inline_data.get("caption") or ""
+            ).strip()
+        if not _fb_title and isinstance(chart_desc, str) and not chart_desc.lstrip().startswith("{"):
+            _fb_title = _clean_lead_in_title(chart_desc)
+        if not _fb_title:
+            _fb_title = _CHART_TYPE_MAP.get(inner_type, ("", "图表"))[1]
+        _fb_title = _fb_title.strip()[:24]
+        if not preload_only and not _claim_chart_title(
+            _fig_parent, _fb_title, _project_id
+        ):
+            logger.info(
+                "[图表导出] 跳过同章重复图题: 章=%s 图题=%s", _fig_parent, _fb_title
+            )
+            return True
         # V7.0 未识别类型也注入图号（同上：预渲染阶段不消耗会话级图号计数器）
         fig_no = (
             "" if preload_only else _next_figure_number(_fig_parent, _project_id)
         )
         if isinstance(inline_data, dict):
             inline_data["fig_no"] = fig_no
-        fb_caption = _figure_caption(fig_no, chart_desc, config)
+        fb_caption = _figure_caption(fig_no, _fb_title, config)
         # P2：透传渲染结果（原裸 return 永远 None，调用方无法感知失败）
         # P1 修复 2026-09-29：渲染失败回滚图号
         # FIX 2026-10-08（P1 图号虚跳）：同上，异常路径也必须回滚（见上方注释）。
@@ -2382,20 +2544,50 @@ def _collect_toc_entries(tree: list, max_level: int = 4) -> list[tuple[int, str]
     ENHANCE 2026-10-19（岳阳路事故·目录修复）：目录页此前只有「请右键更新域」
     占位文本，用户不手动更新域时目录完全空白。导出时预生成静态条目作为
     TOC 域的缓存结果，Word 打开即见完整章节结构。
+
+    FIX 2026-10-26（报告 G-5 / I-5·目录与正文不一致）：
+      旧实现直接取 `node.title` 原文，而正文标题是「程序编号 + 去编号标题」
+      （见 `_write_tree_content_with_progress` 的 numbering 拼接），于是静态
+      目录既缺编号、又可能保留 AI/导入残留的旧编号 → 目录与正文两套写法。
+      现用与正文**完全相同的计数器与 DFS 顺序**预演编号，保证目录条目与
+      正文标题逐字一致（Word 更新域后重新生成的目录也一致）。
     """
     entries: list[tuple[int, str]] = []
+    tracker = HeadingNumberingGeneratorV2()
 
-    def _walk(nodes: list, level: int) -> None:
-        for node in nodes:
+    def _parent_key(node, path: str) -> str:
+        """子节点的 parent 键：优先用节点 id（与正文一致），无 id 时退化为路径键。
+
+        FIX 2026-10-26：旧实现用 `getattr(node, "id", "")`，无 id 的树（dict 形态）
+        所有节点都得到空串，`update_counter` 认为父级从未变更 → 跨父级计数不复位
+        （1.2.1 → 1、2.1.1 → 2、2.1.2 → 3）。真实 ORM 节点有 id，但仍需兜底。
+        """
+        raw_id = getattr(node, "id", None)
+        if raw_id not in (None, ""):
+            return f"id:{raw_id}"
+        return f"path:{path}"
+
+    def _walk(nodes: list, level: int, parent_id: str, path_prefix: str) -> None:
+        for idx, node in enumerate(nodes):
             title = (getattr(node, "title", "") or "").strip()
+            # 与正文同口径：被业务过滤的章节既不出现在目录里，也不消耗编号
+            if _should_skip_section(title):
+                continue
+            path = f"{path_prefix}/{idx}"
+            raw_number = tracker.update_counter(level, parent_id)
+            display = (
+                f"{raw_number}、{_strip_heading_numbering(title)}"
+                if raw_number
+                else title
+            )
             if title:
-                entries.append((level, title))
+                entries.append((level, display))
             children = getattr(node, "children", None)
             if children and level < max_level:
-                _walk(children, level + 1)
+                _walk(children, level + 1, _parent_key(node, path), path)
 
     if isinstance(tree, list):
-        _walk(tree, 1)
+        _walk(tree, 1, "root", "")
     return entries
 
 
@@ -2630,7 +2822,10 @@ def _preload_chart_images_parallel(
     """
     if max_workers is None:
         # BUG-E-04 修复：限制并发数，避免 CPU 争抢导致整体变慢
-        max_workers = min(8, (os.cpu_count() or 4) * 2)
+        # ENHANCE 2026-10-27（需求 10·P3-2 接线）：默认值已在 chart_tasks
+        # 构建后按真实任务数取 _adaptive_batch_size(len(chart_tasks))
+        # （见下方赋值点），此处不再重复赋默认值。
+        pass
 
     # BUG-E-02 修复：如果调用方已传入 HTTP 检查结果，直接使用
     # 否则在此处执行一次性检查（向后兼容直接调用场景）
@@ -2662,6 +2857,12 @@ def _preload_chart_images_parallel(
 
     if not chart_tasks:
         return 0
+
+    # ENHANCE 2026-10-27（需求 10·P3-2 接线）：默认线程数改用自适应批量
+    # 大小 _adaptive_batch_size（小批量全速、中批量适度、大批量保守），
+    # 消除 CPU 争抢；显式传入 max_workers 时行为不变（向后兼容）。
+    if max_workers is None:
+        max_workers = _adaptive_batch_size(len(chart_tasks))
 
     logger.info(
         "并行预渲染 %d 个图表（线程池大小=%d, HTTP可用=%s）",
@@ -2842,10 +3043,14 @@ def build_docx(
 ) -> tuple[str, int | None]:
     _fig_ctx: dict[str, int] = {}
     _token = _fig_counter_ctx_var.set(_fig_ctx)
+    # FIX 2026-10-26（报告 F-2/B-4）：图题登记同样按导出会话隔离
+    _title_ctx: dict[str, set[str]] = {}
+    _title_token = _used_chart_titles_ctx_var.set(_title_ctx)
     try:
         return _build_docx_impl(project_id, config, output_path, on_progress)
     finally:
         _fig_counter_ctx_var.reset(_token)
+        _used_chart_titles_ctx_var.reset(_title_token)
 
 
 def _build_docx_impl(
@@ -2895,6 +3100,8 @@ def _build_docx_impl(
     # 同一文档内出现重复图号。（同项目并发的两个导出会话仍共享计数，
     # 由上游任务组锁保证同项目同时只有一个导出。）
     _reset_figure_counter(project_id)
+    # FIX 2026-10-26（报告 F-2/B-4）：图题唯一性登记按导出会话重置
+    _reset_chart_title_registry(project_id)
     # BUG-E-05 修复：移除此处的 _cleanup_section_cache() 调用
     # 原代码在每次导出开始时清理所有项目的缓存，导致并发导出互相干扰
     # _cleanup_section_cache() 仅在 _get_section_detail_with_cleanup 中按需调用
@@ -3969,6 +4176,16 @@ def _write_tree_content_with_progress(
                     "快照图号计数器失败（回滚将跳过图号还原）: node=%s err=%s",
                     getattr(node, "id", "?"), _snap_err,
                 )
+            # FIX 2026-10-26：图题去重登记与图号计数器同生共死——失败章节回滚后
+            # 重试必须能重新插入同名图，否则正文只剩图题、没有图。
+            _title_snapshot: dict[str, set[str]] = {}
+            try:
+                _title_snapshot = _snapshot_chart_title_registry() or {}
+            except Exception as _snap_err:
+                logger.warning(
+                    "快照图题登记失败（回滚将跳过图题还原）: node=%s err=%s",
+                    getattr(node, "id", "?"), _snap_err,
+                )
             try:
                 _add_section_heading(doc, node.title, node.level, config, numbering=numbering)
                 # 必须用 `_body_insertion_mark` 而不是 `len(list(body))`：python-docx
@@ -4037,6 +4254,12 @@ def _write_tree_content_with_progress(
                 except Exception:
                     logger.warning(
                         "还原失败章节的图号计数器失败，忽略: node=%s", node.id
+                    )
+                try:
+                    _restore_chart_title_registry(_title_snapshot)
+                except Exception:
+                    logger.warning(
+                        "还原失败章节的图题登记失败，忽略: node=%s", node.id
                     )
                 _ph = None
                 try:

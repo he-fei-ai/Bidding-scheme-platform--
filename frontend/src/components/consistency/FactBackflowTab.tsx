@@ -28,6 +28,10 @@ export interface FactBackflowTabProps {
  */
 export default function FactBackflowTab({ projectId }: FactBackflowTabProps) {
   const [loading, setLoading] = useState(false);
+  /** 采纳请求进行中（独立于扫描 loading，防重复提交） */
+  const [accepting, setAccepting] = useState(false);
+  /** 同步防重入守卫：React 批处理下同 tick 双击读不到最新 state，用 ref 兜底 */
+  const acceptingRef = useRef(false);
   const [proposals, setProposals] = useState<FactProposal[]>([]);
   const [selectedKeys, setSelectedKeys] = useState<React.Key[]>([]);
   const [minOccurrences, setMinOccurrences] = useState(3);
@@ -45,6 +49,10 @@ export default function FactBackflowTab({ projectId }: FactBackflowTabProps) {
     const seq = ++loadSeqRef.current;
     setLoading(true);
     setSelectedKeys([]);
+    // BUG-FIX 2026-10-27（P3·skipped 告警残留）：skipped 详情由「采纳」动作产生，
+    // 但重新扫描/调整参数后旧告警仍挂着，展示的是过期信息。扫描即代表开始
+    // 新一轮决策，先清掉；采纳后由 handleAccept 在刷新完成时重新回填。
+    setSkipped([]);
     try {
       const res = await proposeFactsFromConflicts(projectId, {
         minOccurrences,
@@ -65,10 +73,21 @@ export default function FactBackflowTab({ projectId }: FactBackflowTabProps) {
   }, [projectId, minOccurrences, isValidProject]);
 
   useEffect(() => {
-    load();
+    // BUG-FIX 2026-10-27（P3·逐键触发全量扫描）：minOccurrences 在 load 依赖里，
+    // antd InputNumber 每次敲键都 onChange → 每键一次全项目正文扫描（无防抖）。
+    // 现对 load 触发做 350ms 防抖：连续输入只发最后一次；projectId 切换的
+    // 首扫同样走此路径（延迟一个防抖窗口，可接受）。
+    const t = window.setTimeout(() => {
+      load();
+    }, 350);
+    return () => window.clearTimeout(t);
   }, [load]);
 
   const handleAccept = async () => {
+    // BUG-FIX 2026-10-27（P3·采纳无独立 loading）：原实现按钮 loading 复用扫描态，
+    // 采纳请求期间按钮可再次点击 → 重复 POST（第二次被后端锁串行化后回
+    // added=0 再弹一次 success）。现用独立 accepting 态 + ref 同步守卫防重入。
+    if (acceptingRef.current) return;
     if (selectedKeys.length === 0) {
       message.warning("请先勾选要采纳的候选事实");
       return;
@@ -76,12 +95,15 @@ export default function FactBackflowTab({ projectId }: FactBackflowTabProps) {
     const picked = proposals.filter(
       (p) => selectedKeys.includes(p.conflict_id),
     );
+    acceptingRef.current = true;
+    setAccepting(true);
     try {
       const res = await acceptFactProposals(projectId, picked);
       if (res.status === "ok") {
         // ENHANCE 2026-10-13（第六轮·R-14 闭环）：被基准类别互斥挡下的候选
         // 必须显式告知 —— 否则用户看到「采纳 0 条」无从得知是被冲突规则拦了。
-        setSkipped(res.skipped ?? []);
+        // 注意：load() 现在会先清空 skipped（BUG-FIX 2026-10-27），所以这里
+        // 必须在刷新完成后再回填本次结果，否则告警会被自己的刷新吞掉。
         if (res.skipped?.length) {
           message.warning(
             `已采纳 ${res.added} 条；另有 ${res.skipped.length} 条未采纳（与既有事实冲突）`,
@@ -92,11 +114,15 @@ export default function FactBackflowTab({ projectId }: FactBackflowTabProps) {
           );
         }
         await load();
+        setSkipped(res.skipped ?? []);
       } else {
         message.warning(`采纳完成但返回非 ok 状态：${res.status}`);
       }
     } catch (e) {
       message.error(extractApiError(e));
+    } finally {
+      acceptingRef.current = false;
+      setAccepting(false);
     }
   };
 
@@ -194,7 +220,7 @@ export default function FactBackflowTab({ projectId }: FactBackflowTabProps) {
               type="primary"
               icon={<CheckOutlined />}
               disabled={selectedKeys.length === 0}
-              loading={loading}
+              loading={accepting}
               onClick={handleAccept}
             >
               采纳选中 ({selectedKeys.length})

@@ -51,6 +51,18 @@ SECTIONS_WORD_COLUMNS = (
     "readable_word_count",
     "word_count_target",
     "word_count_deviation",
+    # ENHANCE（本轮跨模块深度探索）：单节点档位覆盖列。check_document 的
+    # L3 区间判定、build_tree / update_section_word_count_tier 都读它。
+    "word_count_tier",
+    # ENHANCE（本轮跨模块深度探索）：图表数据列。导出侧
+    # _batch_load_section_details / _render_section_charts 直接 SELECT。
+    "gantt_json",
+    "architecture_json",
+    "labor_json",
+    "inlined_chart_json",
+    "comparison_json",
+    "layout_json",
+    "timeline_json",
 )
 
 #: R12 阶段引入、迁移侧**必须**补齐的列（老库升级后要能回写偏差）
@@ -58,6 +70,17 @@ SECTIONS_WORD_COLUMNS_MIGRATION_REQUIRED = (
     "readable_word_count",
     "word_count_target",
     "word_count_deviation",
+    # ENHANCE（本轮跨模块深度探索）：这 8 列 2026-10-21 前只在 db.py::
+    # init_db 侧声明，「只跑迁移不跑 init_db」的路径会 no such column，
+    # 现补入迁移链（db_migrations 步骤 37）并由本守卫钉住不再回退。
+    "word_count_tier",
+    "gantt_json",
+    "architecture_json",
+    "labor_json",
+    "inlined_chart_json",
+    "comparison_json",
+    "layout_json",
+    "timeline_json",
 )
 
 

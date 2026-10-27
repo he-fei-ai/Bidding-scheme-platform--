@@ -69,6 +69,11 @@ class TestDependencyBehavior:
         host = "10.99.0.1"
         request = _fake_request(host)
 
+        # Redis 后端的计数跨进程保留（key 过期时间 = window+1 秒），
+        # 上一个用例/上一次套件跑留下的条目会让「空桶」前提不成立 → 先重置。
+        limiter = rl.get_rate_limiter()
+        asyncio.run(limiter.reset(f"ip_{host}"))
+
         async def _run():
             for _ in range(50):
                 await rl.rate_limit_dependency(request)
@@ -76,7 +81,6 @@ class TestDependencyBehavior:
         asyncio.run(_run())
 
         # 配额未被消耗（否则说明放行路径仍在计数，仍会撞墙）
-        limiter = rl.get_rate_limiter()
         allowed, remaining = asyncio.run(
             limiter.allow(f"ip_{host}", limit=100, window=60)
         )
@@ -88,6 +92,9 @@ class TestDependencyBehavior:
         monkeypatch.setattr(rl, "_rate_limit_bypassed_in_tests", lambda: False)
         host = "10.99.0.2"  # 独立标识符，避免与其它用例共享计数
         request = _fake_request(host)
+
+        # 同上：Redis 计数跨进程保留，先清空该标识符的历史条目。
+        asyncio.run(rl.get_rate_limiter().reset(f"ip_{host}"))
 
         async def _run():
             # limit=2：前 2 次放行

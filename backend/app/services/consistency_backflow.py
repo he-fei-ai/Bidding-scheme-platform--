@@ -279,8 +279,25 @@ def plan_fact_merge(
         }
         # dedup 兜底：`dedup_key` 优先比较 key、无 key 时退化为 label（不含 value）。
         # 由于 key 恒为 `audit_<conflict_id>`，这条主要兜住「同一冲突被重复采纳」
-        # 的幂等场景；suggested_key 恰好撞上既有 key 时也会在此被拦下。
+        # 的幂等场景；suggested_key 撞上既有 key 时也会在此被拦下。
+        # BUG-FIX 2026-10-27（P2·静默丢弃）：原实现此处裸 `continue`，被拦候选
+        # 既不进 skipped 也不计数 —— 跨轮场景（正文改口径后 rescan 出新 winner，
+        # 同 conflict_id 的 key 撞上旧条目）响应 `{added:0, skipped:[]}`，前端
+        # 弹「已采纳 0 条候选」且查不出原因，正是 R-14 声称已闭环的问题在
+        # dedup 路径上的残留。现与基准类别互斥同口径：计入 skipped 并带可读原因。
         if any(dedup_key(new_item) == dedup_key(it) for it in items):
+            skipped.append(
+                {
+                    "fact_name": fact_name,
+                    "value": value,
+                    "category": new_item["category"],
+                    "reason": (
+                        f"同名候选此前已采纳过（建议键 {new_item['key']} 已存在）。"
+                        "若正文口径已变更，请先在全局事实库修改既有事实的取值，"
+                        "或删除旧条目后重新扫描采纳。"
+                    ),
+                }
+            )
             continue
         # R-14：基准类别互斥——同类别已有异值事实则拒绝（含本批次内互相冲突）
         conflict_with = _find_baseline_conflict(items, new_item)

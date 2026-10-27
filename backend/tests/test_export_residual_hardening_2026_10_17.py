@@ -132,7 +132,21 @@ class TestPreloadBypassesSharedRenderPool:
             project_id=None,
             title="施工进度计划",
             content="本节描述施工部署。",
-            gantt_json=json.dumps({"type": "gantt", "code": "gantt\n    title t", "title": "t"}),
+            # ENHANCE 2026-10-27（渲染端语法闸门）：夹具原为退化载荷
+            # {"code": "gantt\n    title t"}（缺 dateFormat/任务）——旧管线会
+            # 渲染出无信息量空图；新闸门（需求 6）对修复后仍非法的 Mermaid
+            # 直接跳过。钉桩意图（绕过共享池 + 如实计数）不变，夹具改为合法
+            # 甘特载荷以通过闸门。
+            gantt_json=json.dumps(
+                {
+                    "type": "gantt",
+                    "code": (
+                        "gantt\n    title t\n    dateFormat YYYY-MM-DD\n"
+                        "    section 准备\n    场地平整 :a1, 2025-01-01, 30d"
+                    ),
+                    "title": "t",
+                }
+            ),
         )
         ok = export_mod._preload_chart_images_parallel(
             {1: section},

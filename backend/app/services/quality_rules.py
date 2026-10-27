@@ -38,6 +38,8 @@ Issue 与 `chart_validators.check_duplicate_title_in_content`（CMP-07）同形�
 
 from __future__ import annotations
 
+import inspect
+import json
 import logging
 import re
 from dataclasses import dataclass
@@ -126,8 +128,25 @@ SCHEME_TYPE_PROFILES: tuple[SchemeProfile, ...] = (
             ("PC工程吊装", rules.SEVERITY_HIGH),
             ("吊装专项", rules.SEVERITY_HIGH),
             ("深基坑", rules.SEVERITY_HIGH),
+            ("基坑支护", rules.SEVERITY_HIGH),
+            ("基坑降水", rules.SEVERITY_HIGH),
+            ("基坑排水", rules.SEVERITY_HIGH),
+            ("桩基", rules.SEVERITY_HIGH),
+            ("土方开挖", rules.SEVERITY_HIGH),
+            ("塔吊", rules.SEVERITY_HIGH),
+            ("大体积混凝土", rules.SEVERITY_HIGH),
             ("高支模", rules.SEVERITY_MEDIUM),
             ("脚手架专项", rules.SEVERITY_MEDIUM),
+            # FIX 2026-10-26（《招投标软件导出文档 — 分类问题报告》D-1~D-7）：
+            # 既有科研楼室内装修项目混入土建/外立面章节。以下术语在室内装修
+            # 项目中通常不适用，但可能出现在「地下室装修」等合理场景，
+            # 故统一降为 medium，仅告警不阻断。
+            ("脚手架连墙件", rules.SEVERITY_MEDIUM),
+            ("外墙脚手架", rules.SEVERITY_MEDIUM),
+            ("外墙技术交底", rules.SEVERITY_MEDIUM),
+            ("混凝土养护", rules.SEVERITY_MEDIUM),
+            ("主体结构", rules.SEVERITY_MEDIUM),
+            ("地下室", rules.SEVERITY_MEDIUM),
         ),
     ),
     SchemeProfile(
@@ -820,6 +839,506 @@ def detect_duplicate_numbering(sections: list) -> list[dict]:
 
 
 # ===========================================================================
+# 修复 25：标题-正文语义错位（CMP-09）/ 正文截断（DLV-02）
+# 《招投标软件导出文档 — 分类问题报告》C-1~C-9 / H-1
+# ===========================================================================
+
+#: 标题/正文比对时忽略的通用词二元组 —— 它们在任意章节都会出现，
+#: 若计入会让「标题-正文」重合度虚高，掩盖真正的文不对题。
+_TITLE_GENERIC_BIGRAMS: frozenset[str] = frozenset(
+    {
+        "措施", "方案", "要求", "指标", "工艺", "技术", "施工", "管理",
+        "控制", "计划", "配置", "程序", "标准", "验收", "要点", "方法",
+        "体系", "工作", "工程", "项目", "质量", "安全", "组织", "实施",
+        "应用", "分析", "规定", "内容", "相关", "进行", "确保", "加强",
+        "落实", "建立", "完善", "提高", "保证", "情况", "方面", "过程",
+    }
+)
+
+#: 标题里需要剔除的装饰性字符（编号、标点、括号、连接符）
+_TITLE_NOISE_RE = re.compile(r"[\s\u3000，。；：、（）()《》“”\"'\[\]【】\-—…·/]+")
+
+#: 判定阈值：标题非通用二元组在正文中的命中率低于该值即视为错位
+_TITLE_MATCH_MIN_RATIO = 0.15
+#: 正文过短/标题过短时不判罚（样本不足，易误报）
+_TITLE_MATCH_MIN_CONTENT_CHARS = 100
+_TITLE_MATCH_MIN_TITLE_CHARS = 5
+#: 单次预检最多报 15 条，防止刷屏
+_TITLE_MATCH_MAX_ISSUES = 15
+
+
+def _title_bigrams(title: str) -> set[str]:
+    """标题 → 非通用字符二元组集合（用于与正文做字面重合度比对）。"""
+    cleaned = _LEADING_NUMBER_TOKEN_RE.sub("", title or "")
+    cleaned = _TITLE_NOISE_RE.sub("", cleaned)
+    grams = {cleaned[i: i + 2] for i in range(len(cleaned) - 1)}
+    return {g for g in grams if g not in _TITLE_GENERIC_BIGRAMS}
+
+
+def detect_title_content_mismatch(sections: list) -> list[dict]:
+    """修复 25：标题与正文语义错位（CMP-09，报告 C-1~C-9）。
+
+    报告实例：「消防管线支吊架固定」的正文却是「安全管理与文明施工」、
+    「给排水管道耐压耐腐蚀指标」的正文却是「工程概况」。此类错位会让
+    评标专家一眼判定为模板拼接，必须阻断。
+
+    实现：标题去掉编号与标点后取二元组（剔除通用词），与正文做字面重合
+    检查。标题的主题词在正文中完全找不到（命中率 < 15%）且正文长度足够，
+    判定为错位。宁可漏报不误报：标题过短或正文过短一律跳过。
+    """
+    issues: list[dict] = []
+    for s in sections:
+        if len(issues) >= _TITLE_MATCH_MAX_ISSUES:
+            break
+        title = _sec_title(s)
+        content = _sec_content(s)
+        cleaned_title = _TITLE_NOISE_RE.sub(
+            "", _LEADING_NUMBER_TOKEN_RE.sub("", title)
+        )
+        if len(cleaned_title) < _TITLE_MATCH_MIN_TITLE_CHARS:
+            continue
+        if len(content.strip()) < _TITLE_MATCH_MIN_CONTENT_CHARS:
+            continue
+        grams = _title_bigrams(title)
+        if not grams:
+            continue
+        hit = sum(1 for g in grams if g in content)
+        ratio = hit / len(grams)
+        if ratio >= _TITLE_MATCH_MIN_RATIO:
+            continue
+        issues.append(
+            make_issue(
+                "CMP-09",
+                rules.SEVERITY_HIGH,
+                "标题与正文不符",
+                (
+                    f"章节「{title}」的正文与该标题主题无关"
+                    f"（主题词命中率 {ratio:.0%}），疑似模板内容错位"
+                ),
+                "围绕标题重写该章节正文，或修正标题使其与正文一致",
+                section_id=_sec_id(s),
+                section_title=title,
+            )
+        )
+    return issues
+
+
+#: 正文以这些字符收尾 → 句子未写完（正常的段落应终于句号/问号/右括号）
+_TRUNCATED_TAIL_CHARS = ("，", ",", "、", "：", ":", "；", ";", "（", "(")
+
+
+#: 同级标题重复检测的最小标题长度（短标题噪声大，不参与）
+_DUP_TITLE_MIN_CHARS = 4
+#: 单次预检最多报 15 条
+_DUP_TITLE_MAX_ISSUES = 15
+
+
+def detect_duplicate_titles(sections: list) -> list[dict]:
+    """修复 25：同级标题重复（CMP-10，报告 B-5 / I-1）。
+
+    报告实例：第十五节「一、主要分部工程施工方案」与「二、关键工序施工技术
+    措施」下各有一个「1、施工工艺流程与要点」；多个子节反复使用同一
+    「工程概况」标题（报告 B-2）。同一层级下标题完全相同的节点只会让
+    目录看起来像模板复制，评标专家会直接扣分。
+    """
+    groups: dict[tuple[int, str], list] = {}
+    for s in sections:
+        title = _sec_title(s)
+        if len(title) < _DUP_TITLE_MIN_CHARS:
+            continue
+        # 去掉显式编号后再比对：「1、施工工艺流程与要点」与「施工工艺流程与要点」
+        # 视为同名（编号由导出端按树位置重排，不构成区分信息）。
+        normalized = _LEADING_NUMBER_TOKEN_RE.sub("", title).strip()
+        if len(normalized) < _DUP_TITLE_MIN_CHARS:
+            continue
+        level = int(getattr(s, "level", 0) or 0)
+        groups.setdefault((level, normalized), []).append(s)
+
+    issues: list[dict] = []
+    for (level, normalized), group in groups.items():
+        if len(group) < 2:
+            continue
+        issues.append(
+            make_issue(
+                "CMP-10",
+                rules.SEVERITY_MEDIUM,
+                "同级标题重复",
+                (
+                    f"第 {level} 级目录中标题「{normalized}」重复出现 "
+                    f"{len(group)} 次（{('、'.join(_sec_title(s) for s in group[:4]))}）"
+                ),
+                "合并重复章节或改用与本章内容对应的差异化标题",
+                section_id=_sec_id(group[0]),
+                section_title=_sec_title(group[0]),
+            )
+        )
+        if len(issues) >= _DUP_TITLE_MAX_ISSUES:
+            break
+    return issues
+
+
+def detect_truncated_sections(sections: list) -> list[dict]:
+    """修复 25：正文疑似截断（DLV-02，报告 H-1）。
+
+    报告实例：「废料暂存点与清运路线」只写了开头两段就出现系统提示并被截断。
+    系统提示已在清洗管线删除，但截断留下的半句仍需暴露给用户：
+    正文以逗号/顿号/冒号等「非句末标点」收尾即判定为疑似截断。
+    """
+    issues: list[dict] = []
+    for s in sections:
+        content = _sec_content(s).strip()
+        if len(content) < _EMPTY_SECTION_MIN_CHARS:
+            continue  # 空/过短已由 DLV-01 承载
+        if not content.endswith(_TRUNCATED_TAIL_CHARS):
+            continue
+        issues.append(
+            make_issue(
+                "DLV-02",
+                rules.SEVERITY_HIGH,
+                "正文疑似截断",
+                f"章节「{_sec_title(s) or '?'}」正文以「{content[-1]}」收尾，疑似未写完",
+                "重新生成该章节或补全结尾内容",
+                section_id=_sec_id(s),
+                section_title=_sec_title(s),
+            )
+        )
+    return issues
+
+
+# ===========================================================================
+# 修复 26：图表一致性（CHT-01 图题无图 / CHT-02 图题重复）
+# 《招投标软件导出文档 — 分类问题报告》F-2 / F-5 / E-6 / B-4
+# ===========================================================================
+
+#: Section 上承载图表数据的 JSON 字段（与 models.Section 保持一致）
+_CHART_JSON_FIELDS: tuple[str, ...] = (
+    "flowchart_json",
+    "gantt_json",
+    "architecture_json",
+    "labor_json",
+    "comparison_json",
+    "layout_json",
+    "timeline_json",
+    "inlined_chart_json",
+)
+
+#: 正文中以「图X-Y」开头的图题行（行首锚定，避免误伤「如图1-1所示」）
+_FIG_CAPTION_LINE_RE = re.compile(r"^[ \t]*图\s*\d+\s*[-－—]\s*\d+")
+#: 图题前缀（归一化时剥离）
+_FIG_NO_PREFIX_TITLE_RE = re.compile(r"^\s*图\s*\d+\s*[-－—]\s*\d+\s*[：:]?\s*")
+#: 正文内的图表围栏 / 占位标记
+_CHART_FENCE_RE = re.compile(r"```[ \t]*(?:mermaid|chart-json)", re.IGNORECASE)
+_CHART_PLACEHOLDER_RE = re.compile(r"<<\s*(?:图表|CHART)\b|【\s*图表")
+#: Markdown 图片 / HTML img（有真实图片引用时不算「图题无图」）
+_INLINE_IMAGE_RE = re.compile(r"!\[|<img\b", re.IGNORECASE)
+#: 图题重复判定最小长度（归一化后）
+_CHART_TITLE_MIN_CHARS = 4
+_CHART_ISSUE_MAX = 15
+
+
+def _chart_payload_present(section) -> bool:
+    """章节是否绑定了非空图表数据。"""
+    for field in _CHART_JSON_FIELDS:
+        value = getattr(section, field, None)
+        if not isinstance(value, str):
+            continue
+        text = value.strip()
+        if text and text not in ("{}", "[]", "null"):
+            return True
+    return False
+
+
+def _chart_titles(section) -> list[str]:
+    """提取章节图表数据中的标题（title / caption）。"""
+    titles: list[str] = []
+    for field in _CHART_JSON_FIELDS:
+        raw = getattr(section, field, None)
+        if not isinstance(raw, str) or not raw.strip():
+            continue
+        try:
+            obj = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        items = obj if isinstance(obj, list) else [obj]
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            title = item.get("title") or item.get("caption")
+            if isinstance(title, str) and title.strip():
+                titles.append(title.strip())
+    return titles
+
+
+def detect_figure_without_payload(sections: list) -> list[dict]:
+    """修复 26：正文有图题但无图（CHT-01，报告 F-5 / E-6）。
+
+    报告现场：「图1-1装饰装修独立区段」等图题后没有任何图对象 —— AI 只写了
+    图题文字，图表数据字段为空，导出时既不插图也不会报错。此处检出
+    「有图题、无图表数据、无图表围栏、无图片引用」的章节。
+    """
+    issues: list[dict] = []
+    for s in sections:
+        if len(issues) >= _CHART_ISSUE_MAX:
+            break
+        content = _sec_content(s)
+        if not content.strip():
+            continue
+        if _chart_payload_present(s):
+            continue
+        if _CHART_FENCE_RE.search(content) or _CHART_PLACEHOLDER_RE.search(content):
+            continue
+        if _INLINE_IMAGE_RE.search(content):
+            continue
+        captions = [
+            line.strip()
+            for line in content.splitlines()
+            if _FIG_CAPTION_LINE_RE.match(line)
+        ]
+        if not captions:
+            continue
+        issues.append(
+            make_issue(
+                "CHT-01",
+                rules.SEVERITY_HIGH,
+                "图题无对应图",
+                (
+                    f"章节「{_sec_title(s) or '?'}」正文出现 {len(captions)} 条图题，"
+                    f"但本章没有图表数据或图表块（如「{captions[0][:30]}」）"
+                ),
+                "补充该图的图表数据，或删除无图的孤立图题",
+                section_id=_sec_id(s),
+                section_title=_sec_title(s),
+            )
+        )
+    return issues
+
+
+def _chapter_root_map(sections: list) -> dict[int, int]:
+    """parent_id 链路上溯到一级章节 id（图题重复只在同一章内判罚）。"""
+    by_id = {}
+    for s in sections:
+        sid = _sec_id(s)
+        if sid is not None:
+            by_id[sid] = s
+
+    def _root(section) -> int:
+        seen: set[int] = set()
+        cur = section
+        while True:
+            sid = _sec_id(cur)
+            parent = getattr(cur, "parent_id", None)
+            if sid in seen or parent is None or parent not in by_id:
+                return sid if sid is not None else -1
+            seen.add(sid)
+            cur = by_id[parent]
+
+    result: dict[int, int] = {}
+    for s in sections:
+        sid = _sec_id(s)
+        if sid is not None:
+            result[sid] = _root(s)
+    return result
+
+
+def detect_duplicate_figure_titles(sections: list) -> list[dict]:
+    """修复 26：同一章内图题重复（CHT-02，报告 F-2 / B-4）。
+
+    报告现场：「图7-2、图7-3、图7-4」三张图共用同一图题，评标时会被判为
+    模板堆砌。归一化后（剥图号与标点）同名且同属一级章即判重复。
+    """
+    root_map = _chapter_root_map(sections)
+    groups: dict[tuple[int, str], list[tuple[object, str]]] = {}
+    for s in sections:
+        sid = _sec_id(s)
+        root = root_map.get(sid, -1)
+        for title in _chart_titles(s):
+            key = _TITLE_NOISE_RE.sub("", _FIG_NO_PREFIX_TITLE_RE.sub("", title))
+            if len(key) < _CHART_TITLE_MIN_CHARS:
+                continue
+            groups.setdefault((root, key), []).append((s, title))
+
+    issues: list[dict] = []
+    for (_root, key), group in groups.items():
+        if len(group) < 2:
+            continue
+        issues.append(
+            make_issue(
+                "CHT-02",
+                rules.SEVERITY_MEDIUM,
+                "同一章图题重复",
+                (
+                    f"同一章内图题「{key}」重复出现 {len(group)} 次，"
+                    "导出后会出现多张同名图"
+                ),
+                "保留一张图，其余改用能区分内容的图题或删除",
+                section_id=_sec_id(group[1][0]),
+                section_title=_sec_title(group[1][0]),
+            )
+        )
+        if len(issues) >= _CHART_ISSUE_MAX:
+            break
+    return issues
+
+
+# ===========================================================================
+# 修复 26：正文混用多级编号（CMP-11，报告 G-1 / G-2 / G-4）
+# ===========================================================================
+
+#: 行首多级点号编号（如 "1.2.1.1 围挡设置标准"），要求至少三段
+_DOTTED_HEADING_LINE_RE = re.compile(r"^[ \t]*\d+(?:\.\d+){2,}[、．.]?\s*\S")
+#: 只判定短行（标题形态），长行是正文叙述里的数据引用
+_DOTTED_HEADING_MAX_CHARS = 60
+
+
+def detect_content_numbering_style(sections: list) -> list[dict]:
+    """修复 26：正文残留 AI 自编多级编号（CMP-11，报告 G-1 / G-2 / G-4）。
+
+    平台口径是「编号由程序按章节树生成，AI 不输出编号」。正文里出现的
+    「1.2.1.1 围挡设置标准」这类多级点号编号会与导出端自动编号叠加，
+    形成报告所述的「1、施工隔离围挡设置」下直接挂 「1.2.1.1」的层级断裂。
+    """
+    issues: list[dict] = []
+    for s in sections:
+        if len(issues) >= _DUP_TITLE_MAX_ISSUES:
+            break
+        hits: list[str] = []
+        for line in _sec_content(s).splitlines():
+            stripped = line.strip()
+            if not stripped or len(stripped) > _DOTTED_HEADING_MAX_CHARS:
+                continue
+            if _DOTTED_HEADING_LINE_RE.match(stripped):
+                hits.append(stripped[:40])
+        if not hits:
+            continue
+        issues.append(
+            make_issue(
+                "CMP-11",
+                rules.SEVERITY_MEDIUM,
+                "正文残留多级编号",
+                (
+                    f"章节「{_sec_title(s) or '?'}」正文含 {len(hits)} 处"
+                    f"AI 自编多级编号（如「{hits[0]}」），会与程序自动编号叠加"
+                ),
+                "删除正文中的编号前缀，编号统一由导出端按章节树生成",
+                section_id=_sec_id(s),
+                section_title=_sec_title(s),
+            )
+        )
+    return issues
+
+
+# ===========================================================================
+# 修复 26：必需表格 / 关键图缺失（DLV-03 / DLV-04，报告 H-9 / H-10）
+# ===========================================================================
+
+#: 方案类型 → 必需表格（表名, 正文候选关键词）
+_REQUIRED_TABLES: dict[str, tuple[tuple[str, tuple[str, ...]], ...]] = {
+    "装饰装修": (
+        ("材料进场检验记录表", ("材料进场检验", "材料进场验收")),
+        ("隐蔽工程验收记录表", ("隐蔽工程验收", "隐蔽验收")),
+        ("消防联动调试记录表", ("消防联动调试", "联动调试")),
+    ),
+    "脚手架": (
+        ("脚手架验收记录表", ("脚手架验收",)),
+    ),
+    "临时用电": (
+        ("临时用电验收记录表", ("临时用电验收",)),
+    ),
+}
+
+#: 方案类型 → 关键图（图名, 承载字段候选, 正文关键词候选）
+_REQUIRED_CHARTS: dict[
+    str, tuple[tuple[str, tuple[str, ...], tuple[str, ...]], ...]
+] = {
+    "装饰装修": (
+        ("施工总平面布置图", ("layout_json",), ("总平面布置",)),
+        ("施工进度计划横道图", ("gantt_json",), ("横道图", "进度计划")),
+        ("劳动力计划曲线图", ("labor_json",), ("劳动力曲线", "劳动力计划")),
+    ),
+    "脚手架": (
+        ("脚手架施工进度横道图", ("gantt_json",), ("横道图",)),
+    ),
+    "临时用电": (
+        ("临时用电系统布置图", ("layout_json",), ("布置图",)),
+    ),
+}
+
+
+def _resolve_scheme(sections: list, project_name: str) -> str | None:
+    return infer_scheme_type(project_name, [_sec_title(s) for s in sections])
+
+
+def detect_missing_required_tables(sections: list, project_name: str = "") -> list[dict]:
+    """修复 26：必需表格缺失（DLV-03，报告 H-9）。
+
+    装饰装修投标文件的评标细则通常要求材料进场检验、隐蔽工程验收、
+    消防联动调试三类记录表；缺失直接影响评标得分。
+    """
+    scheme = _resolve_scheme(sections, project_name)
+    if not scheme:
+        return []
+    required = _REQUIRED_TABLES.get(scheme)
+    if not required:
+        return []
+    all_text = "\n".join(
+        f"{_sec_title(s)}\n{_sec_content(s)}" for s in sections
+    )
+    issues: list[dict] = []
+    for table_name, candidates in required:
+        if any(kw in all_text for kw in candidates):
+            continue
+        issues.append(
+            make_issue(
+                "DLV-03",
+                rules.SEVERITY_HIGH,
+                "关键表格缺失",
+                f"{scheme}方案缺少关键表格：{table_name}",
+                "在相应章节插入该记录表模板（表头与必填字段需完整）",
+            )
+        )
+    return issues
+
+
+def detect_missing_key_charts(sections: list, project_name: str = "") -> list[dict]:
+    """修复 26：关键图缺失（DLV-04，报告 H-10 / F-4）。
+
+    判据：既无图表数据字段，也没有「图表围栏 + 图名关键词」的组合 ——
+    只有文字描述（报告 F-4 的「施工总平面布置图只有文字描述」）不算覆盖。
+    """
+    scheme = _resolve_scheme(sections, project_name)
+    if not scheme:
+        return []
+    required = _REQUIRED_CHARTS.get(scheme)
+    if not required:
+        return []
+    all_text = "\n".join(_sec_content(s) for s in sections)
+    payload_fields: set[str] = set()
+    for s in sections:
+        for field in _CHART_JSON_FIELDS:
+            value = getattr(s, field, None)
+            if isinstance(value, str) and value.strip() not in ("", "{}", "[]", "null"):
+                payload_fields.add(field)
+    has_fence = bool(_CHART_FENCE_RE.search(all_text))
+
+    issues: list[dict] = []
+    for chart_name, fields, keywords in required:
+        if any(f in payload_fields for f in fields):
+            continue
+        if has_fence and any(kw in all_text for kw in keywords):
+            continue
+        issues.append(
+            make_issue(
+                "DLV-04",
+                rules.SEVERITY_HIGH,
+                "关键图缺失",
+                f"{scheme}方案缺少关键图：{chart_name}（仅有文字描述不算覆盖）",
+                "补充该图的图表数据，或在对应章节生成并插入该图",
+            )
+        )
+    return issues
+
+
+# ===========================================================================
 # 编排入口
 # ===========================================================================
 
@@ -834,12 +1353,20 @@ _QUALITY_ISSUE_CAP = 200
 #: 规则执行顺序：高价值规则在前，截断时优先保留
 _RULE_PIPELINE = (
     validate_scheme_sections,
+    detect_title_content_mismatch,
     validate_schedule_consistency,
     validate_standard_references,
     validate_limit_units,
     detect_duplicate_numbering,
+    detect_duplicate_titles,
+    detect_content_numbering_style,
+    detect_figure_without_payload,
+    detect_duplicate_figure_titles,
     detect_content_overlap,
     detect_empty_sections,
+    detect_truncated_sections,
+    detect_missing_required_tables,
+    detect_missing_key_charts,
     detect_filler_content,
     detect_terminology_issues,
 )
@@ -858,7 +1385,7 @@ def run_quality_checks(sections: list, project_name: str = "") -> list[dict]:
     issues: list[dict] = []
     for func in _RULE_PIPELINE:
         try:
-            if func is detect_terminology_issues:
+            if "project_name" in inspect.signature(func).parameters:
                 issues.extend(func(sections, project_name=project_name))
             else:
                 issues.extend(func(sections))
@@ -916,4 +1443,12 @@ __all__ = [
     "detect_content_overlap",
     "detect_empty_sections",
     "detect_duplicate_numbering",
+    "detect_title_content_mismatch",
+    "detect_duplicate_titles",
+    "detect_truncated_sections",
+    "detect_content_numbering_style",
+    "detect_figure_without_payload",
+    "detect_duplicate_figure_titles",
+    "detect_missing_required_tables",
+    "detect_missing_key_charts",
 ]

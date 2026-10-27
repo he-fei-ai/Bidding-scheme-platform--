@@ -49,8 +49,14 @@ import {
   EMPTY_BATCH_TOTALS,
   resolveAccept,
   FALLBACK_ACCEPT,
+  resolveUploadLimitMb,
+  isOcrDisabled,
   buildTextPreview,
   formatEmptyPreviewText,
+  isInFlightFileStatus,
+  parseProjectId,
+  checkReadyForExtraction,
+  NEEDS_REANALYSIS_MESSAGE,
   type UploadBatchTotals,
 } from "../utils";
 import PageHeader from "@/components/PageHeader";
@@ -85,10 +91,17 @@ function statusTag(status: string) {
 export default function FileUploadPage() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
-  const projectId = id ? Number(id) : null;
+  // BUG-FIX 2026-10-26：路由参数严格校验为正整数（原 `Number(id)` 会把 "1.5" 放行，
+  // 带着小数去请求 /projects/1.5/files；SummaryReviewPage 已有同类守卫，此处补齐）
+  const projectId = parseProjectId(id);
 
   const [files, setFiles] = useState<FileInfo[]>([]);
   const [loading, setLoading] = useState(true);
+  // BUG-FIX 2026-10-26（静默失败谎报空态）：此前 loadFiles 的 catch 完全静默，
+  // 且 loading 只在 finally 里置 false、从不置 true。首次加载失败（项目被删 /
+  // 403 无权访问）时 files 恒为 []，用户看到的是「暂无文件，请先上传招标文件」
+  // 而非「加载失败」，并误以为可以正常上传。现把失败原因显式化，与空态区分开。
+  const [loadError, setLoadError] = useState<string | null>(null);
   // BUG-FIX 2026-10-04（P1 批量上传状态错乱）：Upload.Dragger 设了 multiple，
   // antd 会对每个文件并发回调 customRequest。此前用单个 uploading 布尔，
   // 每个回调 finally 都置 false —— 第一个文件上传完就解除 loading/禁用，
@@ -105,11 +118,20 @@ export default function FileUploadPage() {
   const loadFilesRef = useRef(false);
   // Gap-1 2026-10-11：清空提取按钮的在途状态（防重复点击）
   const [clearing, setClearing] = useState(false);
+  // BUG-FIX 2026-10-26（删除无防重）：删除是不可逆操作且此前既无二次确认也无
+  // 在途标记，连点同一文件第二次会拿到 404 并弹「请求的资源不存在」。
+  const [deletingIds, setDeletingIds] = useState<Set<number>>(new Set());
+  // BUG-FIX 2026-10-26（重提取/后台解析无防重）：后端 re_extract_text 会同步阻塞
+  // 并清解析缓存，连点会重复解析并产生多条 file_parse_tasks 记录。
+  const [busyFileId, setBusyFileId] = useState<number | null>(null);
   // TD6 2026-10-12：accept 由后端单一真相端点下发，拉取失败回落本地常量。
   const [acceptAttr, setAcceptAttr] = useState<string>(FALLBACK_ACCEPT);
   // TD6 2026-10-12：单文件大小上限同样由后端下发，避免前端 50MB 硬编码
   // 与后端 MAX_FILE_SIZE 漂移（后端调大后前端仍按 50MB 拦，用户传不上去）。
   const [maxFileSizeMb, setMaxFileSizeMb] = useState<number>(50);
+  // BUG-FIX 2026-10-26（ocr_enabled 零消费）：后端已下发 OCR 开关，前端此前不消费，
+  // OCR 关闭时仍鼓励上传图片，用户必然得到「解析成功但文本为空」。
+  const [ocrDisabled, setOcrDisabled] = useState(false);
   // 提取文本预览（激活 getFileText 死链）
   const [previewOpen, setPreviewOpen] = useState(false);
   const [previewLoading, setPreviewLoading] = useState(false);
@@ -132,13 +154,15 @@ export default function FileUploadPage() {
   const parseTaskRegistry = useRef<Map<number, string>>(new Map());
 
   // 与 loadFiles 刷新的 files 同步：注册新出现的未终态文件、完成已终态文件
+  // BUG-FIX 2026-10-26（幽灵任务）：判定口径改为共享纯函数 isInFlightFileStatus。
+  // 此前把 `pending` 也算作在途，而 pending 只有 clear_project_texts 一个写入方
+  // （它不会派发任何解析任务）——「清空提取」后顶栏会凭空多出 N 条「文件解析 0%」
+  // 且永远不进终态，用户只能靠离开页面清理。
   useEffect(() => {
     if (!projectId) return;
     const registry = parseTaskRegistry.current;
     for (const f of files) {
-      const inFlight =
-        f.status === "processing" || f.status === "queued" || f.status === "pending";
-      if (inFlight && !registry.has(f.id)) {
+      if (isInFlightFileStatus(f.status) && !registry.has(f.id)) {
         const taskId = `file_parse_${f.id}`;
         registry.set(f.id, taskId);
         taskStore.startTask({
@@ -155,8 +179,7 @@ export default function FileUploadPage() {
     }
     for (const [fileId, taskId] of [...registry.entries()]) {
       const f = files.find((x) => x.id === fileId);
-      const settled =
-        !f || (f.status !== "processing" && f.status !== "queued" && f.status !== "pending");
+      const settled = !f || !isInFlightFileStatus(f.status);
       if (settled) {
         taskStore.completeTask(
           taskId,
@@ -191,7 +214,11 @@ export default function FileUploadPage() {
         const info = await fetchSupportedFormats(projectId);
         if (cancelled) return;
         setAcceptAttr(resolveAccept(info));
-        if (info?.max_file_size_mb > 0) setMaxFileSizeMb(info.max_file_size_mb);
+        // BUG-FIX 2026-10-26：优先用后端下发的精确 MB 值（含小数），避免
+        // max_file_size_mb 的整数截断造成「前端放行、后端 400」的区间。
+        const limitMb = resolveUploadLimitMb(info);
+        if (limitMb > 0) setMaxFileSizeMb(limitMb);
+        setOcrDisabled(isOcrDisabled(info));
       } catch {
         // 格式查询失败不影响上传主流程，静默使用本地兜底常量
         if (!cancelled) setAcceptAttr(FALLBACK_ACCEPT);
@@ -208,11 +235,22 @@ export default function FileUploadPage() {
     // 导致竞态和不必要的网络请求。用 ref 标记在途状态，已有请求在途时跳过。
     if (loadFilesRef.current) return;
     loadFilesRef.current = true;
+    // BUG-FIX 2026-10-26：拉取期间必须显式进入 loading 态（此前 loading 只在
+    // finally 里置 false、从不置 true），否则列表刷新时的短暂空白无反馈。
+    setLoading(true);
     try {
       const data = await fetchFiles(projectId);
       setFiles(data || []);
-    } catch {
-      // 静默处理
+      setLoadError(null);
+    } catch (err: any) {
+      // BUG-FIX 2026-10-26（静默失败谎报空态）：此前 catch 完全静默，
+      // 项目被删 / 403 无权访问时 users 看到的是「暂无文件，请先上传」。
+      // 详情提示权交给 axios 拦截器，这里只记录原因供页面显式展示。
+      const detail =
+        (err as any)?.response?.data?.detail ||
+        (err as Error)?.message ||
+        "文件列表加载失败";
+      setLoadError(String(detail));
     } finally {
       setLoading(false);
       loadFilesRef.current = false;
@@ -266,27 +304,16 @@ export default function FileUploadPage() {
 
   const handleUpload = async (options: UploadRequestOptions) => {
     const { file, onSuccess, onError } = options;
+    const fileName = (file as File).name;
     // BUG-FIX 2026-10-16：此前这里直接 return 而不调用 onError —— antd 的
     // customRequest 契约要求必须回调 onSuccess/onError 之一，否则该上传项
     // 永远停留在「上传中」态（showUploadList=false 时用户看不到列表，但
     // rc-upload 内部状态与后续 disabled 判断仍被污染）。路由参数异常
     // （/projects/undefined/files）时可达该分支，现如实报错并结束请求。
-    if (!projectId) {
-      message.error("项目 ID 无效，无法上传文件");
-      onError?.(new Error("项目 ID 无效"));
-      return;
-    }
-
-    // BUG-FIX 2026-10-08：客户端文件大小校验，避免超大文件先读入内存再被后端拒绝
-    // TD6 2026-10-12：上限改由后端 supported-formats 端点下发（默认仍是 50MB），
-    // 与后端 MAX_FILE_SIZE 不再需要人工保持一致。
-    const MAX_FILE_SIZE = maxFileSizeMb * 1024 * 1024;
-    if ((file as File).size > MAX_FILE_SIZE) {
-      message.error(`${(file as File).name} 文件大小超过 ${maxFileSizeMb}MB 限制`);
-      onError?.(new Error(`文件大小超过 ${maxFileSizeMb}MB 限制`));
-      return;
-    }
-
+    // BUG-FIX 2026-10-26（批尾汇总漏计）：计数递增移到所有前置校验**之前**、
+    // 校验移入 try 块 —— 原先「项目 ID 无效 / 文件超限」在 pendingRef 递增前
+    // 就 return，既不进批尾汇总也不解除任何状态，10 个文件全超限时用户只看到
+    // 10 条独立 toast 而没有任何「本批结果」提示。
     pendingRef.current += 1;
     setUploadingCount(pendingRef.current);
     const finish = () => {
@@ -303,13 +330,32 @@ export default function FileUploadPage() {
       }
     };
 
+    const reject = (reason: string) => {
+      batchRef.current = accumulateBatchTotals(batchRef.current, "error");
+      message.error(formatUploadFailureText(fileName, "error", reason));
+      onError?.(new Error(reason));
+    };
+
     try {
+      if (!projectId) {
+        reject("项目 ID 无效");
+        return;
+      }
+
+      // BUG-FIX 2026-10-08：客户端文件大小校验，避免超大文件先读入内存再被后端拒绝
+      // TD6 2026-10-12：上限改由后端 supported-formats 端点下发（默认仍是 50MB），
+      // 与后端 MAX_FILE_SIZE 不再需要人工保持一致。
+      const MAX_FILE_SIZE = maxFileSizeMb * 1024 * 1024;
+      if ((file as File).size > MAX_FILE_SIZE) {
+        reject(`文件大小超过 ${maxFileSizeMb}MB 限制`);
+        return;
+      }
+
       const result = await uploadFile(projectId, file as File);
       // BUG-FIX 2026-10-05（B1）：后端「HTTP 200 但 status=failed」（已入库、解析
       // 失败）此前被计入成功，批尾汇总谎报"全部成功"。按结果分类计数。
       const outcome = classifyUploadResult(result);
       batchRef.current = accumulateBatchTotals(batchRef.current, outcome);
-      const fileName = (file as File).name;
       if (outcome === "parse_failed") {
         message.error(formatUploadFailureText(fileName, "parse_failed", result?.message));
       } else if (shouldNotifySingle(pendingRef.current, batchRef.current)) {
@@ -319,12 +365,16 @@ export default function FileUploadPage() {
           outcome === "pending" ? `${fileName} 上传成功，正在后台解析` : `${fileName} 上传成功`,
         );
       }
+      // BUG-FIX 2026-10-26（needs_reanalysis 上传路径零消费）：后端 save_upload 在
+      // 上传新主文件挤掉旧主文件时返回 needs_reanalysis（旧摘要/评分仍基于旧文本）。
+      // 此前只有手动切角色路径提示（handleToggleRole），上传路径用户完全无感。
+      if (result?.needs_reanalysis) {
+        message.warning(NEEDS_REANALYSIS_MESSAGE, 6);
+      }
       onSuccess?.({}, new XMLHttpRequest());
     } catch (err: any) {
       batchRef.current = accumulateBatchTotals(batchRef.current, "error");
-      message.error(
-        formatUploadFailureText((file as File).name, "error", err?.message),
-      );
+      message.error(formatUploadFailureText(fileName, "error", err?.message));
       onError?.(err);
     } finally {
       // 每份文件落库后刷新一次列表（批量下由 loadFiles 幂等覆盖，无副作用）
@@ -335,6 +385,11 @@ export default function FileUploadPage() {
 
   const handleDelete = async (fileId: number) => {
     if (!projectId) return;
+    // BUG-FIX 2026-10-26（删除无防重）：连点同一文件第二次会拿到 404 并弹
+    // 「请求的资源不存在」，与刚删除成功的语义自相矛盾。
+    if (deletingIds.has(fileId)) return;
+    setDeletingIds((prev) => new Set(prev).add(fileId));
+    const rollbackFiles = files;
     try {
       const res = await deleteFile(projectId, fileId);
       setFiles((prev) => prev.filter((f) => f.id !== fileId));
@@ -354,7 +409,18 @@ export default function FileUploadPage() {
       }
       await loadFiles();
     } catch (err: any) {
-      message.error(err.message || "删除失败");
+      // BUG-FIX 2026-10-26：乐观删除失败必须回滚，否则后端实际未删而界面已删，
+      // 且后续 loadFiles 又失败时该行永不再出现（数据丢失的观感）。
+      setFiles(rollbackFiles);
+      message.error(
+        (err as any)?.response?.data?.detail || (err as Error)?.message || "删除失败",
+      );
+    } finally {
+      setDeletingIds((prev) => {
+        const next = new Set(prev);
+        next.delete(fileId);
+        return next;
+      });
     }
   };
 
@@ -365,7 +431,8 @@ export default function FileUploadPage() {
   // 遗留修复 2026-10-06（L2）：图片等耗时解析交给后台任务队列，避免 OCR 长时间
   // 占住请求。无 broker 时后端会降级为进程内直调（dispatched_via="inline"）。
   const handleAsyncReparse = async (fileId: number) => {
-    if (!projectId) return;
+    if (!projectId || busyFileId !== null) return;
+    setBusyFileId(fileId);
     try {
       const res = await asyncReparseFile(projectId, fileId);
       if (res.dispatched_via === "celery") {
@@ -378,11 +445,18 @@ export default function FileUploadPage() {
       await loadFiles();
     } catch (err: any) {
       message.error(err?.response?.data?.detail || err.message || "提交后台解析失败");
+    } finally {
+      setBusyFileId(null);
     }
   };
 
   const handleReExtract = async (fileId: number) => {
     if (!projectId) return;
+    // BUG-FIX 2026-10-26（重提取无防重）：后端 re_extract_text 是同步阻塞解析，
+    // 连点会重复解析同一文件并产生多条 file_parse_tasks 记录；此前只有
+    // message.loading 提示，没有任何禁用/在途标记。
+    if (busyFileId !== null) return;
+    setBusyFileId(fileId);
     try {
       message.loading({ content: "正在重新提取...", key: "reextract" });
       // BUG-FIX 2026-10-06（R5）：此前不检查返回体，HTTP 200 一律弹「成功」。
@@ -400,6 +474,8 @@ export default function FileUploadPage() {
       await loadFiles();
     } catch (err: any) {
       message.error({ content: err.message || "重新提取失败", key: "reextract" });
+    } finally {
+      setBusyFileId(null);
     }
   };
 
@@ -422,7 +498,7 @@ export default function FileUploadPage() {
         // REVIEW-FIX 2026-10-04（m2）：主文件换源后旧摘要/评分仍基于旧文本，
         // 后端已有缓存产物时提醒重新生成（否则“提取项目”页会短路返回旧结果）
         if (res.needs_reanalysis) {
-          message.warning("主文件已变更，请到「提取项目」重新生成摘要与评分点", 6);
+          message.warning(NEEDS_REANALYSIS_MESSAGE, 6);
         }
       } else {
         message.success("已设为辅助文件");
@@ -515,6 +591,29 @@ export default function FileUploadPage() {
     }
   };
 
+  const closePreview = useCallback(() => {
+    // BUG-FIX 2026-10-26（预览状态残留）：原实现只 setPreviewOpen(false)，
+    // preview 里的最多 2 万字正文常驻内存，且再次打开另一个文件时，
+    // setPreview 清空与请求返回之间存在窗口 —— Modal 标题会闪现上一份文件名。
+    // 现关闭即清理全部预览状态，并递增序号让在途请求的结果被守卫丢弃。
+    previewSeqRef.current += 1;
+    setPreviewOpen(false);
+    setPreviewLoading(false);
+    setPreview(null);
+  }, []);
+
+  // BUG-FIX 2026-10-26（流程入口零门禁）：此前「下一步」只看 files.length > 0，
+  // 只上传了 OCR 失败的扫描件也能进去，直到点「生成摘要」才被后端 400 拦住。
+  const handleNextStep = useCallback(() => {
+    if (!projectId) return;
+    const gate = checkReadyForExtraction(files);
+    if (!gate.ready) {
+      message.warning(gate.reason);
+      return;
+    }
+    navigate(`/projects/${projectId}/review`);
+  }, [projectId, files, navigate]);
+
   return (
     <div>
       <PageHeader
@@ -541,7 +640,7 @@ export default function FileUploadPage() {
               </Popconfirm>
               <Button
                 type="primary"
-                onClick={() => navigate(`/projects/${projectId}/review`)}
+                onClick={handleNextStep}
               >
                 {t("upload.nextExtract")} <ArrowRightOutlined />
               </Button>
@@ -557,6 +656,18 @@ export default function FileUploadPage() {
             showIcon
             style={{ borderRadius: 8 }}
             message={parseStatusText}
+          />
+        ) : null}
+        {/* BUG-FIX 2026-10-26（ocr_enabled 零消费）：后端 OCR 关闭时前端仍在
+            accept 里放行 png/jpg 并鼓励上传，用户必然得到「解析成功但文本为空」。
+            只有后端明确返回 ocr_enabled=false 才显示（老后端缺字段时不显示）。 */}
+        {ocrDisabled ? (
+          <Alert
+            type="warning"
+            showIcon
+            style={{ borderRadius: 8 }}
+            message="OCR 引擎未启用，图片扫描件（png/jpg 等）无法解析出文本"
+            description="请先到「图片配置」页启用 OCR 引擎，或改上传 Word/PDF 等可直接解析的格式。"
           />
         ) : null}
         <Card
@@ -624,6 +735,23 @@ export default function FileUploadPage() {
             <div style={{ textAlign: "center", padding: "40px 0" }}>
               <Spin />
             </div>
+          ) : loadError ? (
+            // BUG-FIX 2026-10-26（静默失败谎报空态）：项目被删 / 403 无权访问时
+            // 必须与「真的没有文件」区分开，否则用户会对着失败页面继续上传。
+            <Alert
+              type="error"
+              showIcon
+              style={{ borderRadius: 8 }}
+              message="文件列表加载失败"
+              description={
+                <Space direction="vertical" size={8}>
+                  <Text type="danger" style={{ fontSize: 12 }}>{loadError}</Text>
+                  <Button size="small" icon={<ReloadOutlined />} onClick={loadFiles}>
+                    {t("upload.refresh")}
+                  </Button>
+                </Space>
+              }
+            />
           ) : files.length === 0 ? (
             <div className="empty-state" style={{ borderStyle: "dashed" }}>
               <InfoCircleOutlined style={{ fontSize: 28, color: "#b4bccb", marginBottom: 12 }} />
@@ -668,6 +796,7 @@ export default function FileUploadPage() {
                         size="small"
                         type="text"
                         icon={<ReloadOutlined />}
+                        disabled={busyFileId !== null}
                         onClick={() =>
                           isImageFile(file.file_type, file.filename)
                             ? handleAsyncReparse(file.id)
@@ -677,16 +806,29 @@ export default function FileUploadPage() {
                         {/* 遗留修复 L2：图片走后台异步解析（OCR 耗时），其余格式同步重提取 */}
                         {isImageFile(file.file_type, file.filename) ? t("upload.asyncParse") : t("upload.reExtract")}
                       </Button>,
-                      <Button
+                      /* BUG-FIX 2026-10-26（删除无二次确认）：删除不可逆且此前
+                         连点会触发第二次 404。与「清空提取」同口径补 Popconfirm。 */
+                      <Popconfirm
                         key="delete"
-                        size="small"
-                        type="text"
-                        danger
-                        icon={<DeleteOutlined />}
-                        onClick={() => handleDelete(file.id)}
+                        title="确定删除该文件？"
+                        description="删除后不可恢复，原始文件与已提取文本都会被移除。"
+                        okText="确认删除"
+                        okButtonProps={{ danger: true }}
+                        cancelText={t("common.cancel")}
+                        onConfirm={() => handleDelete(file.id)}
+                        disabled={deletingIds.has(file.id) || uploading}
+                      >
+                        <Button
+                          size="small"
+                          type="text"
+                          danger
+                          icon={<DeleteOutlined />}
+                          loading={deletingIds.has(file.id)}
+                          disabled={deletingIds.has(file.id) || uploading}
                         >
-                        {t("upload.delete")}
-                        </Button>,
+                          {t("upload.delete")}
+                        </Button>
+                      </Popconfirm>,
                     ]}
                   >
                     <List.Item.Meta
@@ -735,7 +877,7 @@ export default function FileUploadPage() {
       <Modal
         open={previewOpen}
         title={preview ? `${t("upload.previewModalTitle")} · ${preview.filename}` : t("upload.previewModalTitle")}
-        onCancel={() => setPreviewOpen(false)}
+        onCancel={closePreview}
         footer={null}
         width={900}
         destroyOnHidden

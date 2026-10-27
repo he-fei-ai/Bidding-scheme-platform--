@@ -160,4 +160,76 @@ describe.skipIf(!hasDom)("FactBackflowTab", () => {
       );
     });
   });
+
+  // BUG-FIX 2026-10-27（P3·采纳无独立 loading）：采纳请求进行中双击不得重复
+  // POST —— ref 同步守卫（React 批处理下同 tick 双击读不到最新 state）。
+  it("采纳请求进行中双击只发一次 POST（防重入）", async () => {
+    let release!: (v: unknown) => void;
+    acceptMock.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          release = resolve;
+        }),
+    );
+    render(<FactBackflowTab projectId={1} />);
+    await waitFor(() => {
+      expect(screen.getByText(/工期/)).toBeTruthy();
+    });
+    const checkbox = document.querySelector(
+      'input[type="checkbox"]',
+    ) as HTMLInputElement | null;
+    fireEvent.click(checkbox as HTMLInputElement);
+
+    const acceptBtn = screen.getByRole("button", { name: /采纳选中/ });
+    await waitFor(() => {
+      expect((acceptBtn as HTMLButtonElement).disabled).toBe(false);
+    });
+    // 同 tick 双击：两次 onClick 都会触发，第二次必须被 ref 守卫拦下
+    fireEvent.click(acceptBtn);
+    fireEvent.click(acceptBtn);
+
+    // 请求仍在挂起（release 未调用）——此时只应有 1 次 POST
+    await new Promise((r) => setTimeout(r, 50));
+    expect(acceptMock).toHaveBeenCalledTimes(1);
+    // 请求期间按钮进入 loading（禁用态）
+    expect((acceptBtn as HTMLButtonElement).disabled).toBe(true);
+
+    release({ status: "ok", added: 1, merged_total: 1 });
+    await waitFor(() => {
+      expect((screen.getByRole("button", { name: /采纳选中/ }) as HTMLButtonElement).disabled).toBe(
+        false,
+      );
+    });
+  });
+
+  // BUG-FIX 2026-10-27（P2·dedup 撞键静默丢弃）：后端 dedup 撞键的候选现以
+  // skipped 条目回传（带可读原因），前端应渲染告警而不是只弹「采纳 0 条」。
+  it("采纳返回 skipped 条目时渲染未采纳原因告警", async () => {
+    acceptMock.mockResolvedValue({
+      status: "ok",
+      added: 0,
+      merged_total: 0,
+      skipped: [
+        {
+          fact_name: "工期",
+          value: "45天",
+          category: "schedule",
+          reason: "同名候选此前已采纳过（建议键 audit_c1 已存在）。若正文口径已变更，请先在全局事实库修改既有事实的取值，或删除旧条目后重新扫描采纳。",
+        },
+      ],
+    });
+    render(<FactBackflowTab projectId={1} />);
+    await waitFor(() => {
+      expect(screen.getByText(/工期/)).toBeTruthy();
+    });
+    const checkbox = document.querySelector(
+      'input[type="checkbox"]',
+    ) as HTMLInputElement | null;
+    fireEvent.click(checkbox as HTMLInputElement);
+    fireEvent.click(screen.getByRole("button", { name: /采纳选中/ }));
+
+    await waitFor(() => {
+      expect(screen.getAllByText(/已采纳过/).length).toBeGreaterThan(0);
+    });
+  });
 });

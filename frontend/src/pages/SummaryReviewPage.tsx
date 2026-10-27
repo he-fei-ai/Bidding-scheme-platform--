@@ -2,15 +2,15 @@ import { useEffect, useState, useCallback, useMemo } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import {
   Button, Card, Skeleton, message, Space, Typography, Tag, Input, Empty, Divider, Switch, Table, Tooltip,
-  Progress, Select, Alert, Modal,
+  Progress, Select, Alert, Modal, Tabs,
 } from "antd";
 const { Text } = Typography;
-import { ClearOutlined, ArrowLeftOutlined, CheckCircleOutlined, ThunderboltOutlined, EditOutlined, CodeOutlined, DatabaseOutlined, TeamOutlined, ToolOutlined, FileTextOutlined, LoadingOutlined, DeleteOutlined, PlusOutlined, SaveOutlined } from "@ant-design/icons";
-import { getProject, getAnalysis, generateSummary, generateScoring, confirmSummary, confirmScoring, clearAnalysis, analyzeBoq, confirmBoq, analyzeWorkInterface, confirmWorkInterface, analyzeConstructionMethod, confirmConstructionMethod, getFacts, saveFacts, generateFacts, confirmFacts, auditFactsConsistency } from "../api";
+import { ClearOutlined, ArrowLeftOutlined, CheckCircleOutlined, ThunderboltOutlined, EditOutlined, CodeOutlined, DatabaseOutlined, TeamOutlined, ToolOutlined, FileTextOutlined, LoadingOutlined, DeleteOutlined, PlusOutlined, SaveOutlined, FileSearchOutlined } from "@ant-design/icons";
+import { getProject, getAnalysis, generateSummary, generateScoring, confirmSummary, confirmScoring, clearAnalysis, analyzeBoq, confirmBoq, analyzeWorkInterface, confirmWorkInterface, analyzeConstructionMethod, confirmConstructionMethod, getFacts, saveFacts, generateFacts, confirmFacts, auditFactsConsistency, generateSchemeExtraction, fetchSchemeOutlineTemplate } from "../api";
 import { extractApiError, isValidSummary, parseScoringPoints, parseArrayData, classifyAuditOutcome } from "../utils";
 import type { ScoringPoint } from "../utils";
 import type { FactsMissingValuePolicy, FactConflict } from "../api";
-import type { AnalysisResult } from "../types";
+import type { AnalysisResult, SchemeExtractionResult, SchemeOutlineTemplateResult } from "../types";
 
 const { TextArea } = Input;
 
@@ -89,12 +89,20 @@ export default function SummaryReviewPage() {
   const [generatingConstructionMethod, setGeneratingConstructionMethod] = useState(false);
   const [generatingPhase, setGeneratingPhase] = useState<string>("");
 
+  // ENHANCE 2026-10-26（R9，专项方案解析接入）：此前后端已具备五类专项提取与
+  // 目录模板推荐，前端完全无入口（死链路）。现补状态并与目录生成共享同一份结果。
+  const [schemeExtraction, setSchemeExtraction] = useState<SchemeExtractionResult>({});
+  const [generatingScheme, setGeneratingScheme] = useState(false);
+  const [outlineTemplate, setOutlineTemplate] = useState<SchemeOutlineTemplateResult | null>(null);
+  const [schemeTab, setSchemeTab] = useState("project_overview");
+
   const GENERATING_PHASES: Record<string, { message: string; percent: number }> = {
     summary: { message: "正在生成招标摘要，AI 分析招标文件...", percent: 30 },
     scoring: { message: "正在识别评分点，AI 提取技术要求...", percent: 50 },
     boq: { message: "正在分析清单工程量，AI 提取项目特征...", percent: 40 },
     work_interface: { message: "正在分析工作界面，AI 识别接口关系...", percent: 40 },
     construction_method: { message: "正在分析工程作法，AI 提取技术要求...", percent: 40 },
+    scheme_extraction: { message: "正在专项解析方案，AI 并发提取五类要点...", percent: 55 },
     facts: { message: "正在提取事实变量，AI 分析项目关键信息...", percent: 50 },
     audit_facts: { message: "正在进行事实一致性审计...", percent: 70 },
   };
@@ -153,6 +161,17 @@ export default function SummaryReviewPage() {
       setConstructionMethodData(parseArrayData(a.construction_method_json));
       setConstructionMethodText(a.construction_method_json || "[]");
       setConstructionMethodConfirmed(a.confirmed_construction_method || false);
+      // ENHANCE 2026-10-26（R9）：回显已落库的专项解析结果；有结果时一并取回
+      // 推荐目录模板（与目录生成自动选型同源），刷新页面不丢「将用哪个模板」。
+      const se = a.scheme_extraction || {};
+      setSchemeExtraction(se);
+      if (Object.keys(se).length > 0) {
+        try {
+          setOutlineTemplate(await fetchSchemeOutlineTemplate(projectId));
+        } catch {
+          // 模板预览失败不阻塞页面（后端会安全降级为通用模板）
+        }
+      }
       const f = await getFacts(projectId);
       setFactsData(f.items || []);
       setFactsConfirmed(f.confirmed);
@@ -387,6 +406,78 @@ export default function SummaryReviewPage() {
     }
   };
 
+  /**
+   * 专项方案解析：并发提取工程概况/方案类型/危大参数/编制依据/施工条件。
+   *
+   * 结果落 analysis.scheme_extraction_json 后，目录生成会据此自动选模板，
+   * 因此这里同时刷新「推荐目录模板」预览，让用户在生成前就确认选型是否正确。
+   * 单任务失败由后端隔离（该项为 {error}），前端按项展示告警而不整体报错。
+   */
+  const handleGenerateSchemeExtraction = async () => {
+    setGeneratingScheme(true);
+    setGeneratingPhase("scheme_extraction");
+    try {
+      const r = await generateSchemeExtraction(projectId);
+      const data = r.scheme_extraction || {};
+      setSchemeExtraction(data);
+      const failed = Object.entries(data).filter(
+        ([, v]) => v && !Array.isArray(v) && typeof v === "object" && "error" in (v as any),
+      );
+      try {
+        setOutlineTemplate(await fetchSchemeOutlineTemplate(projectId));
+      } catch {
+        // 模板预览是辅助信息，失败不影响提取结果展示
+      }
+      if (failed.length > 0) {
+        message.warning(`专项解析完成，但有 ${failed.length} 个子任务失败，可重试`);
+      } else {
+        message.success("专项方案解析完成");
+      }
+    } catch (e: any) {
+      message.error(extractApiError(e));
+    } finally {
+      setGeneratingScheme(false);
+      setGeneratingPhase("");
+    }
+  };
+
+  /** 单类专项结果的渲染（数组 → 键值卡片；{error} → 告警；空 → 空态）。 */
+  const renderSchemeTask = (taskKey: string, emptyHint: string) => {
+    const raw = (schemeExtraction as Record<string, any>)[taskKey];
+    if (!raw) return <Empty description={emptyHint} />;
+    if (!Array.isArray(raw)) {
+      return (
+        <Alert
+          type="warning"
+          showIcon
+          message="该专项任务未成功"
+          description={String(raw?.error || "AI 未返回有效结果，请重试")}
+        />
+      );
+    }
+    if (raw.length === 0) return <Empty description="未提取到内容（可检查招标文件是否包含相关章节）" />;
+    return (
+      <Space direction="vertical" style={{ width: "100%" }} size={8}>
+        {raw.map((item: any, idx: number) => {
+          const entries = item && typeof item === "object"
+            ? Object.entries(item).filter(([, v]) => v !== null && v !== undefined && v !== "")
+            : [["值", item]];
+          return (
+            <Card key={idx} size="small" styles={{ body: { padding: "8px 12px" } }}>
+              {entries.map(([k, v]) => (
+                <div key={k} style={{ fontSize: 13, lineHeight: "22px" }}>
+                  <Text type="secondary">{k}</Text>
+                  <span style={{ margin: "0 6px" }}>：</span>
+                  <Text>{Array.isArray(v) ? v.join("、") : String(v)}</Text>
+                </div>
+              ))}
+            </Card>
+          );
+        })}
+      </Space>
+    );
+  };
+
   const scoringColumns = [
     {
       title: "评分项",
@@ -565,7 +656,7 @@ export default function SummaryReviewPage() {
               size="small"
             />
             <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-              {(["summary", "scoring", "boq", "work_interface", "construction_method", "facts", "audit_facts"] as const).map((phase) => {
+              {(["summary", "scoring", "boq", "work_interface", "construction_method", "scheme_extraction", "facts", "audit_facts"] as const).map((phase) => {
                 const cfg = GENERATING_PHASES[phase];
                 const isActive = phase === generatingPhase;
                 return (
@@ -739,6 +830,94 @@ export default function SummaryReviewPage() {
           { key: "quality_standard", label: "质量标准" },
         ],
       )}
+
+      {/* ENHANCE 2026-10-26（R9）：专项方案解析（五类要点提取）。后端据此自动选目录模板。 */}
+      <Card
+        title={
+          <Space>
+            <FileSearchOutlined />
+            <span>专项方案解析</span>
+            {schemeExtraction?.scheme_type && Array.isArray(schemeExtraction.scheme_type) && schemeExtraction.scheme_type.length > 0 && (
+              <Tag color="blue">
+                方案类型：{(schemeExtraction.scheme_type[0] as any)?.scheme_type || "已识别"}
+              </Tag>
+            )}
+          </Space>
+        }
+        style={{ marginBottom: 24 }}
+        extra={
+          <Button
+            type="primary"
+            icon={<ThunderboltOutlined />}
+            loading={generatingScheme}
+            onClick={handleGenerateSchemeExtraction}
+          >
+            {Object.keys(schemeExtraction || {}).length > 0 ? "重新解析" : "开始解析"}
+          </Button>
+        }
+      >
+        <Alert
+          type="info"
+          showIcon
+          style={{ marginBottom: 12 }}
+          message="解析结果将用于目录生成时自动匹配方案类型与深化危大工程章节，请确认下方推荐模板是否符合预期。"
+        />
+        <Tabs
+          activeKey={schemeTab}
+          onChange={setSchemeTab}
+          items={[
+            {
+              key: "project_overview",
+              label: "工程概况",
+              children: renderSchemeTask("project_overview", "尚未解析工程概况"),
+            },
+            {
+              key: "scheme_type",
+              label: "方案类型",
+              children: renderSchemeTask("scheme_type", "尚未识别专项方案类型"),
+            },
+            {
+              key: "dangerous_work_params",
+              label: "危大工程参数",
+              children: renderSchemeTask("dangerous_work_params", "尚未提取危大工程判定参数"),
+            },
+            {
+              key: "basis_list",
+              label: "编制依据",
+              children: renderSchemeTask("basis_list", "尚未提取编制依据清单"),
+            },
+            {
+              key: "construction_condition",
+              label: "施工条件",
+              children: renderSchemeTask("construction_condition", "尚未提取施工条件"),
+            },
+          ]}
+        />
+        {outlineTemplate && (
+          <div style={{ marginTop: 8 }}>
+            <Divider style={{ margin: "8px 0 12px" }} />
+            <Space style={{ marginBottom: 8 }} wrap>
+              <Text strong>推荐目录模板</Text>
+              {outlineTemplate.is_default ? (
+                <Tag>通用模板（未识别方案类型/无危大参数）</Tag>
+              ) : (
+                <Tag color="processing">已按 {outlineTemplate.scheme_type || "危大参数"} 自动选型</Tag>
+              )}
+              <Text type="secondary" style={{ fontSize: 12 }}>
+                共 {outlineTemplate.outline_template?.length || 0} 章
+              </Text>
+            </Space>
+            <div style={{ maxHeight: 220, overflow: "auto", background: "#fafafa", padding: "8px 12px", borderRadius: 6 }}>
+              {(outlineTemplate.outline_template || []).map((ch) => (
+                <div key={ch.id} style={{ fontSize: 13, lineHeight: "22px", paddingLeft: ((ch.level || 1) - 1) * 12 }}>
+                  {ch.title}
+                  {ch.source ? <Text type="secondary" style={{ fontSize: 12 }}>（{ch.source}）</Text> : null}
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+      </Card>
 
       <Card
         title={

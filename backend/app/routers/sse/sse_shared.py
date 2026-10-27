@@ -4,10 +4,24 @@
 """
 import asyncio
 import logging
+import os
 from typing import Any
 
-# SSE 超时本地常量（秒）—— 目录生成 V5.1 三级流水线需更长时间
-SSE_TOTAL_TIMEOUT_DEFAULT = 1800  # 30分钟
+# SSE 总超时（秒）—— 目录生成 V5.1 三级流水线对超大型标书可能耗时较长。
+#
+# 历史值 1800s（30 分钟）对大项目偏紧：后台 _run_outline_task 与 SSE 显示解耦
+# （任务在 task_registry 中独立运行，SSE 断开不影响其继续生成），30 分钟时仅仅
+# 代表「SSE 显示连接已达上限」，任务本身仍在正常跑，却被前端误报成
+# "生成超过30分钟，已自动终止" 的致命错误（BUG：本仓库此前的超时分支会发送
+# status=error 并声称已终止，但实际后台任务从未被取消，仍在占用任务组锁并继续
+# 生成，用户既看不到进度也拿不到结果）。
+#
+# 修复策略：
+#   1) 放宽默认到 3600s（60 分钟）作为真正的防死循环安全网，并可通过环境变量
+#      SSE_TOTAL_TIMEOUT_OUTLINE 调整；
+#   2) 超时不再致命终止：sse_outline.py 改为发送非终态 `sse_timeout`，前端据此
+#      自动重连并复用运行中的后台任务（task_registry 重连机制），直至任务真正完成。
+SSE_TOTAL_TIMEOUT_DEFAULT = int(os.environ.get("SSE_TOTAL_TIMEOUT_OUTLINE", "3600"))  # 60分钟（可配置）
 
 # BUG-FIX 2026-10-09（跨模块协议统一）：SSE 终态集合此前在两处各写一份字面量，
 # 且**目录流少了 "cancelled"**：

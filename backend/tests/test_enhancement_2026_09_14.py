@@ -4172,7 +4172,10 @@ def test_outline_sse_registers_snapshot_and_finishes():
     src = _read_backend_source("app/routers/sse/sse_outline.py")
     assert "task_snapshot.register" in src
     assert "task_snapshot.finish" in src
-    assert 'task_snapshot.list_interruptions, project_id, task_type="outline_v51"' in src
+    # 2026-10-26：开始时不再查询并提示「上次未正常结束的任务」，改为直接清除
+    # 旧快照、重新开始（需求：未完成不再保留、直接重新开始）。
+    assert "task_snapshot.delete_for_project" in src
+    assert 'task_snapshot.list_interruptions, project_id, task_type="outline_v51"' not in src
 
 
 def test_outline_sse_has_dedicated_heartbeat_loop():
@@ -4237,6 +4240,8 @@ def test_tasks_router_exposes_interrupted_endpoints():
 
 
 async def test_status_reports_interrupted_snapshot(snap_pid):
+    """2026-10-26：未完成的目录生成快照不再进入 recovery_options / tasks，
+    前端不再展示「上次未正常结束的任务」横幅，直接重新开始。"""
     from app.routers.tasks import get_all_tasks_status
     from app.services import task_snapshot as ts
 
@@ -4246,10 +4251,10 @@ async def test_status_reports_interrupted_snapshot(snap_pid):
     result = await get_all_tasks_status(snap_pid, None)
 
     types = [o["type"] for o in result["recovery_options"]]
-    assert "outline_interrupted" in types
-    assert result["has_pending_tasks"] is True
-    assert result["recovery_available"] is True
-    assert result["tasks"]["interrupted_outline_v51"]["phase"] == "二级目录生成"
+    assert "outline_interrupted" not in types
+    assert "interrupted_outline_v51" not in result.get("tasks", {})
+    # 陈旧中断不再被视为可恢复 / 待处理
+    assert result.get("recovery_available") is False
 
 
 async def test_interrupted_endpoint_returns_items(snap_pid):
@@ -4345,16 +4350,20 @@ def test_duplicate_acquires_lock_before_creating_task():
 def test_export_acquires_lock_before_build_starts():
     """SSE 导出的构建必须跑在锁内。
 
-    原实现把 `asyncio.create_task(asyncio.to_thread(_run_build))` 放在路由层、
-    锁却是在 SSE 生成器里才 `async with` —— 而 `asyncio.to_thread` 会**立即**
-    把 `_run_build` 提交到线程池，于是 `build_docx` 全程跑在锁外面。
+    原实现把构建启动放在路由层、锁却是在 SSE 生成器里才 `async with` ——
+    于是 `build_docx` 全程跑在锁外面。
+
+    BUG-FIX 2026-10-27 更新：构建提交改为
+    `run_in_executor(None, _run_build)` 直接提交线程池 —— 不依赖事件循环
+    调度（`create_task(to_thread(...))` 的任务若在首次调度前被取消，构建
+    永不运行，keepalive 会把组锁焊死）。锁先于构建的**不变量本身不变**。
     """
     src = _read_backend_source("app/routers/export.py")
     lock_line = _line_of(src, "lock_key, owner_id = await _acquire_export_lock(project_id)")
-    build_line = _line_of(src, "asyncio.create_task(asyncio.to_thread(_run_build))")
+    build_line = _line_of(src, "_build_task = asyncio.get_running_loop().run_in_executor(None, _run_build)")
     assert lock_line < build_line, "抢锁(L%d) 必须早于构建启动(L%d)" % (lock_line, build_line)
     # 构建只能启动一次（曾经因为补丁失误留了两处）
-    assert src.count("asyncio.create_task(asyncio.to_thread(_run_build))") == 1
+    assert src.count("run_in_executor(None, _run_build)") == 1
 
 
 def test_export_dropped_the_in_process_lock():

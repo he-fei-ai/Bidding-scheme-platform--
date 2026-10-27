@@ -71,7 +71,7 @@ def _ai_payload() -> list:
 
 class TestV51DirectPathIntegration:
     def test_direct_path_builds_three_level_tree(self, monkeypatch):
-        """活跃路径：一次 AI 调用产出标准三级目录，且一级标题带第X章编号"""
+        """活跃路径：一次 AI 调用产出标准三级目录，一级标题保持纯文本（不再回填第X章）"""
 
         async def _fake_collect(provider, messages, **kwargs):
             assert messages and len(messages) >= 2, "提示词链路未构建 system/user 消息"
@@ -84,8 +84,9 @@ class TestV51DirectPathIntegration:
         )
         assert outline, "直出路径未产出目录"
         assert len(outline) == 1
-        # 一级标题补齐第X章编号（_normalize_direct_outline 契约）
-        assert outline[0]["title"].startswith("第一章")
+        # 2026-10-23：一级标题为纯文本（已移除「第X章」回填——编号由导出端按树
+        # 位置现算，带前缀既会在导出端双重编号，又会触发业务校验前缀残留判负）。
+        assert not outline[0]["title"].startswith("第"), outline[0]["title"]
 
         l2 = outline[0]["children"]
         assert len(l2) >= 3, "二级目录数量不足"

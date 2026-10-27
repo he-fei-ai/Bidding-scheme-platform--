@@ -235,6 +235,74 @@ describe.skipIf(!hasDom)("ExportConfigPage 组件级交互（导出链契约）"
     rtl.cleanup();
   });
 
+  // BUG-FIX 2026-10-27（P2·误降级同步导出）：已收到 stream_id 说明构建已在
+  // 后端启动并持有导出组锁 —— 降级同步 exportDocx 必然撞 409 或重复构建。
+  // 页面必须转「后台继续」分支：不调 exportDocx，任务以 completed 收尾并提示
+  // 用户到导出历史下载。
+  it("SSE 流中断且构建已启动时转后台执行，不降级同步导出", async () => {
+    const rtl = await loadRtl();
+    if (!rtl) return;
+    exportDocxMock.mockClear();
+    exportDocxStreamMock.mockClear();
+    // 构造一个「已处理过」的 rejected promise：页面在 await 前存在微任务间隙，
+    // 直接 mockReturnValueOnce({promise: Promise.reject(...)}) 会触发 Node 的
+    // unhandledRejection（vitest 记为 Errors, 退出码 1）。
+    const bgRejection = Promise.reject(
+      Object.assign(new Error("导出流连接中断，导出任务仍在后台执行"), {
+        __stream_started: true,
+      }),
+    );
+    bgRejection.catch(() => {});
+    exportDocxStreamMock.mockReturnValueOnce({
+      abort: vi.fn(),
+      promise: bgRejection,
+    });
+    const completeSpy = vi.spyOn(taskStore, "completeTask");
+
+    const Page = await import("./ExportConfigPage");
+    rtl.render(<Page.default />);
+
+    const btn = await rtl.screen.findByText("导出 DOCX");
+    rtl.fireEvent.click(btn);
+
+    await vi.waitFor(() =>
+      expect(completeSpy).toHaveBeenCalledWith(
+        "export-1",
+        "completed",
+        expect.stringContaining("导出历史"),
+      ),
+    );
+    // 关键契约：不降级 —— 同步接口绝不能被再次调用（409 误报 / 重复构建）
+    expect(exportDocxMock).not.toHaveBeenCalled();
+    completeSpy.mockRestore();
+    rtl.cleanup();
+  });
+
+  // 对照用例：stream_id 尚未下发（构建未启动）的传输失败仍走同步降级
+  it("SSE 流异常结束且构建未启动时仍降级同步导出", async () => {
+    const rtl = await loadRtl();
+    if (!rtl) return;
+    exportDocxMock.mockClear();
+    exportDocxStreamMock.mockClear();
+    const fallRejection = Promise.reject(new Error("SSE 流异常结束，未收到完成事件"));
+    fallRejection.catch(() => {});
+    exportDocxStreamMock.mockReturnValueOnce({
+      abort: vi.fn(),
+      promise: fallRejection,
+    });
+
+    const Page = await import("./ExportConfigPage");
+    rtl.render(<Page.default />);
+
+    const btn = await rtl.screen.findByText("导出 DOCX");
+    rtl.fireEvent.click(btn);
+
+    // 降级同步导出完成后正常渲染成功卡片
+    expect(await rtl.screen.findByText("导出成功", {}, { timeout: 20_000 })).toBeTruthy();
+    expect(exportDocxMock).toHaveBeenCalledTimes(1);
+    rtl.cleanup();
+  });
+
   it("渲染导出历史记录", async () => {
     const rtl = await loadRtl();
     if (!rtl) return;

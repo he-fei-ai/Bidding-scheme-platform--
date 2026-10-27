@@ -1004,6 +1004,61 @@ if (d.status === "failed") {
           } else {
             message.info(d.message || "正在进行全文一致性审计...", 3);
           }
+        } else if (d.status === "verification") {
+          // BUG-FIX（本轮跨模块深度探索·P3 SSE 事件无前端消费）：后端 sse_content.py
+          // 收尾段推送的综合校验结果（顺序/完整性/事实调用/上下文注入/长上下文降级）
+          // 此前无任何前端分支，全进日志，用户与运维都不可见——灰度开关
+          // CONTENT_CONTEXT_DEGRADE_ENABLED 的决策数据因此缺失。
+          // 有错误 → 警告通知列出前几条；仅警告（如上下文降级）→ info 提示。
+          const issues = Array.isArray(d.issues) ? d.issues : [];
+          const warnings = Array.isArray(d.warnings) ? d.warnings : [];
+          if (d.ok === false || issues.length > 0) {
+            notification.warning({
+              message: d.message || `生成后校验发现 ${issues.length} 个问题`,
+              description:
+                issues
+                  .slice(0, 5)
+                  .map((it: { detail?: string } | string) =>
+                    typeof it === "string" ? it : it?.detail || JSON.stringify(it),
+                  )
+                  .join("\n") || undefined,
+              duration: 8,
+              key: "generationVerification",
+            });
+          } else if (warnings.length > 0) {
+            const details = warnings
+              .slice(0, 5)
+              .map((it: { detail?: string } | string) =>
+                typeof it === "string" ? it : it?.detail || JSON.stringify(it),
+              )
+              .join("\n");
+            notification.info({
+              message: d.message || `生成后校验通过（${warnings.length} 条提醒）`,
+              description: details || undefined,
+              duration: 6,
+              key: "generationVerification",
+            });
+          }
+        } else if (d.status === "template_coverage") {
+          // BUG-FIX（本轮跨模块深度探索·P3）：模板覆盖率审计结果此前只进日志，
+          // 用户看不到「原方案要点覆盖情况」。按 covered/partial/missing 计数展示。
+          const rate =
+            typeof d.coverage_rate === "number" ? d.coverage_rate.toFixed(1) : null;
+          const missing = typeof d.missing === "number" ? d.missing : 0;
+          if (rate !== null) {
+            if (missing > 0) {
+              notification.warning({
+                message: `原方案覆盖率 ${rate}%`,
+                description:
+                  d.message ||
+                  `已覆盖 ${d.covered ?? 0} · 部分覆盖 ${d.partial ?? 0} · 未覆盖 ${missing}`,
+                duration: 6,
+                key: "templateCoverage",
+              });
+            } else {
+              message.info(d.message || `原方案覆盖率 ${rate}%，要点已全覆盖`, 4);
+            }
+          }
         } else if (d.status === "word_adjust_progress") {
           // 易标 R9/R10（2026-10-12）：多轮字数调整的**阶段进度**实时反馈。
           // 该阶段可能持续数十秒（每轮并发调 AI），无反馈会被误判为「卡住」。

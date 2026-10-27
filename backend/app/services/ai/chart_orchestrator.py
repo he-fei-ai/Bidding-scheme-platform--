@@ -73,26 +73,37 @@ def generate_chart_payload(
     title_hint: str = "",
     ai_client: Any = None,
 ) -> dict | None:
-    """AI 智能生成图表载荷。"""
+    """AI 智能生成图表载荷。
+
+    ENHANCE 2026-10-27（需求 3·AI 优先）：提供 ``ai_client`` 时**优先 AI 生成**——
+    AI 载荷基于章节真实内容（真实工序/任务/人数），本地模板只是兜底。旧实现
+    本地模板先行且对全部 7 类恒成功，AI 载荷生成是**死代码**，与「AI 自动生成
+    Mermaid/JSON 载荷」需求相悖。无 ``ai_client`` 时行为与旧版完全一致（本地
+    模板快速路径），零回归。
+    """
     if not chart_type or chart_type == "none":
         return None
 
-    # 本地生成（快速路径）
-    local_payload = _local_payload_generation(section_title, content, chart_type, title_hint)
-    if local_payload:
-        return local_payload
-
-    # AI 生成（可选）
+    # AI 生成（优先路径：载荷反映章节真实内容）
+    ai_payload: dict | None = None
     if ai_client is not None:
         try:
             ai_payload = _ai_payload_generation(
                 section_title, content, chart_type, title_hint, ai_client
             )
-            if ai_payload:
-                return ai_payload
         except Exception as e:
-            logger.debug("AI 载荷生成失败，回退本地生成: %s", e)
+            logger.debug("AI 载荷生成失败，回退本地模板: %s", e)
 
+    if ai_payload:
+        # A3 建议 1（显式披露）：打来源标记，前端据 source="local" 打
+        # 「模板数据」标签引导用户核定，导出链路据此决定是否挂披露括注。
+        ai_payload["source"] = "ai"
+        return ai_payload
+
+    # 本地生成（快速路径 / AI 不可用或失败时的兜底）
+    local_payload = _local_payload_generation(section_title, content, chart_type, title_hint)
+    if local_payload:
+        local_payload["source"] = "local"
     return local_payload
 
 
@@ -269,27 +280,162 @@ def _paragraphs_to_hint(content: str, chart_type: str) -> str:
 # AI 增强函数
 # ============================================================
 
+# 标书智能体（4）——提示词顺序优化（缓存命中）：图表分析/载荷生成的稳定规则
+# （图表类型标准 + 输出契约 + Mermaid/JSON 语法约束）抽成独立 system 消息，
+# 跨调用完全一致 → 稳定前缀可命中服务商缓存；项目信息（稳定）与当前章节
+# 任务（易变）拆成独立 user 消息，任务差异放最后。
+_CHART_ANALYSIS_SYSTEM = """你是标书图表编排专家，负责判断章节是否需要配图并选择图表类型。
+
+【图表类型标准】
+architecture=组织架构/体系图；flowchart=工艺流程/施工流程；gantt=进度计划/工期安排；
+comparison=方案比选；layout=总平面/现场布置；labor=劳动力配置；timeline=里程碑时间线；
+none=不需要配图（纯文字章节）。
+
+【输出契约】
+只返回 JSON 对象，不要任何解释、Markdown 代码围栏：
+{"needed":true/false,"chart_type":"上述类型之一","confidence":0-1,"reason":"原因",
+ "title_hint":"标题","insert_after":"段落提示"}
+
+【判断规则】
+1. needed 仅当图表能显著提升表达时取 true；confidence 表示确信程度（0-1）。
+2. chart_type 必须与章节内容特征匹配，不得随意指定。
+3. reason 不超过 100 字；title_hint 不超过 30 字。"""
+
+_CHART_PAYLOAD_SYSTEM = """你是标书图表载荷生成专家，负责把章节内容转成图表源码或结构化数据。
+
+【输出契约】
+- flowchart/gantt：返回纯 Mermaid 代码（无围栏、无解释）。
+- 其他类型：返回纯 JSON 载荷对象（含 type/title 与对应数据字段），无解释文字。
+
+【Mermaid 语法约束】
+1. 节点文本使用引号包裹，禁用未转义的特殊字符（括号、引号、分号）。
+2. 不使用 mermaid 主题指令、%%init%% 或 HTML 标签。
+3. 流程图方向统一 TD；甘特图 dateFormat 统一 YYYY-MM-DD。
+
+【数据约束】
+只使用章节内容中真实存在的信息，禁止虚构数据；标题用 title_hint 或章节标题。"""
+
+
+def _resolve_chart_provider(ai_client: Any) -> Any:
+    """把调用方传入的 ai_client 解析为平台 AI provider。
+
+    BUG-FIX 2026-10-23（标书智能体（4）引入时发现）：routers/charts_orchestration.py
+    传入的是 ``get_ai_config()`` 返回的**配置 dict**，而旧实现直接调用
+    ``ai_client.chat_completion(...)``（OpenAI SDK 形态）——dict 没有该方法，
+    AttributeError 被 analyze_chart_needs 的 except 静默吞掉 →「AI 图表分析」
+    在生产环境从未真正执行过（永远走本地推断），且平台未安装 openai SDK、
+    全仓库无第二处 chat_completion 调用（死代码实证）。
+
+    现统一收敛到平台 provider（provider.chat + AIMessage）：
+      - 传入对象已有 .chat → 直接使用（平台 provider / 测试 fake）；
+      - dict / None → 经 provider_factory 创建（DB 配置 → 降级链）；
+      - 创建失败 → None（调用方按本地推断继续，不阻塞）。
+    """
+    if ai_client is None:
+        return None
+    if hasattr(ai_client, "chat"):
+        return ai_client
+    try:
+        from .provider_factory import create_provider_with_fallback
+
+        provider, _name = create_provider_with_fallback(
+            ai_client if isinstance(ai_client, dict) else None
+        )
+        return provider
+    except Exception as e:
+        logger.debug("图表 AI provider 创建失败，走本地推断: %s", e)
+        return None
+
+
+def _chart_response_text(response: Any) -> str:
+    """provider.chat 返回值 → 纯文本（兼容 str / dict / 对象三种形态）。"""
+    if response is None:
+        return ""
+    if isinstance(response, str):
+        return response
+    if isinstance(response, dict):
+        return str(response.get("content", "") or "")
+    return str(getattr(response, "content", "") or "")
+
+
+def _run_chat_sync(provider: Any, messages: list, **kwargs: Any) -> Any:
+    """在同步函数里驱动异步 provider.chat。
+
+    图表编排链路（analyze_chart_needs / generate_chart_payload /
+    batch_analyze_sections ...）是同步函数，且被 async 路由在**运行中的事件
+    循环内**调用（routers/charts_orchestration.py），不能直接 asyncio.run。
+    策略：当前线程无运行循环 → asyncio.run；有运行循环 → 丢到工作线程跑
+    独立 loop（provider 的 httpx 客户端惰性创建，跨 loop 顺序使用；图表调用
+    失败有本地推断兜底，风险可控）。
+    """
+    import asyncio
+    import concurrent.futures
+
+    coro = provider.chat(messages, **kwargs)
+    if not asyncio.iscoroutine(coro):
+        return coro  # 同步 provider（测试 fake 等）直接返回
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(asyncio.run, coro).result()
+
+
+def _record_chart_cache(provider: Any, task_type: str, section_id: str = "") -> None:
+    """图表链路缓存用量记账（标书智能体（4），fail-soft）。"""
+    try:
+        from .cache_metrics import record_provider_cache_usage
+
+        record_provider_cache_usage(provider, task_type=task_type, section_id=section_id)
+    except Exception:  # pragma: no cover - 防御性
+        pass
+
 
 def _ai_chart_analysis(
     section_title: str, content: str, project_summary: str, ai_client: Any
 ) -> dict[str, Any]:
-    """AI 图表需求分析（调用 LLM）。"""
-    prompt = f"""判断以下章节是否需要图表，返回JSON:
-{{"needed":true/false,"chart_type":"architecture|flowchart|gantt|comparison|layout|labor|timeline|none",
-"confidence":0-1,"reason":"原因","title_hint":"标题","insert_after":"段落"}}
+    """AI 图表需求分析（调用 LLM）。
 
-标题：{section_title}
-内容：{content[:300]}
-项目：{project_summary[:200]}"""
+    标书智能体（4）：system 只放稳定规则（图表类型标准+输出契约），项目信息
+    （同项目稳定）与当前章节任务（易变）拆成独立 user 消息、任务放最后 →
+    同项目多章节分析时稳定前缀命中缓存。
+    """
+    provider = _resolve_chart_provider(ai_client)
+    if provider is None:
+        raise RuntimeError("图表 AI provider 不可用")
 
-    response = ai_client.chat_completion(
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.3,
-        max_tokens=500,
-    )
+    from .prompt_order import build_cache_friendly_messages
 
     try:
-        text = response.choices[0].message.content.strip()
+        from app.config import CHART_PROMPT_LAYERS_ENABLED as _LAYERS_ON
+    except Exception:  # pragma: no cover - 配置读取兜底
+        _LAYERS_ON = True
+    task_block = (
+        f"标题：{section_title}\n"
+        f"内容：{(content or '')[:300]}\n"
+        f"项目：{(project_summary or '')[:200]}"
+    )
+    if _LAYERS_ON:
+        _stable = (
+            [f"项目信息：{(project_summary or '')[:200]}"]
+            if (project_summary or "").strip() else []
+        )
+        messages = build_cache_friendly_messages(
+            _CHART_ANALYSIS_SYSTEM, _stable, task_block
+        )
+    else:
+        messages = [
+            {"role": "system", "content": _CHART_ANALYSIS_SYSTEM},
+            {"role": "user", "content": task_block},
+        ]
+
+    response = _run_chat_sync(provider, messages, temperature=0.3, max_tokens=500)
+    _record_chart_cache(provider, "chart_analysis", section_title)
+    text = _chart_response_text(response)
+
+    try:
+        text = text.strip()
         if text.startswith("```"):
             text = re.sub(r"^```(?:json)?\s*", "", text)
             text = re.sub(r"\s*```$", "", text)
@@ -309,19 +455,40 @@ def _ai_chart_analysis(
 def _ai_payload_generation(
     section_title: str, content: str, chart_type: str, title_hint: str, ai_client: Any
 ) -> dict | None:
-    """AI 图表载荷生成（调用 LLM）。"""
-    prompt = f"""生成{chart_type}类型图表载荷，标题：{title_hint or section_title}
-内容：{content[:500]}
-仅返回纯载荷（Mermaid代码或JSON），无解释文字。"""
+    """AI 图表载荷生成（调用 LLM）。
 
-    response = ai_client.chat_completion(
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.2,
-        max_tokens=1000,
-    )
+    标书智能体（4）：system 放稳定规则（Mermaid/JSON 语法约束+数据约束），
+    当前图表类型与章节内容作为任务差异放最后一条 user 消息。
+    """
+    provider = _resolve_chart_provider(ai_client)
+    if provider is None:
+        raise RuntimeError("图表 AI provider 不可用")
+
+    from .prompt_order import build_cache_friendly_messages
 
     try:
-        text = response.choices[0].message.content.strip()
+        from app.config import CHART_PROMPT_LAYERS_ENABLED as _LAYERS_ON
+    except Exception:  # pragma: no cover - 配置读取兜底
+        _LAYERS_ON = True
+    task_block = (
+        f"生成{chart_type}类型图表载荷，标题：{title_hint or section_title}\n"
+        f"内容：{(content or '')[:500]}\n"
+        "仅返回纯载荷（Mermaid代码或JSON），无解释文字。"
+    )
+    if _LAYERS_ON:
+        messages = build_cache_friendly_messages(_CHART_PAYLOAD_SYSTEM, [], task_block)
+    else:
+        messages = [
+            {"role": "system", "content": _CHART_PAYLOAD_SYSTEM},
+            {"role": "user", "content": task_block},
+        ]
+
+    response = _run_chat_sync(provider, messages, temperature=0.2, max_tokens=1000)
+    _record_chart_cache(provider, "chart_payload", section_title)
+    text = _chart_response_text(response)
+
+    try:
+        text = text.strip()
         if text.startswith("```"):
             text = re.sub(r"^```(?:mermaid|json)?\s*", "", text)
             text = re.sub(r"\s*```$", "", text)

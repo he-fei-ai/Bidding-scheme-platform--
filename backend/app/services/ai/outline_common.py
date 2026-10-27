@@ -529,11 +529,17 @@ _L3_SUFFIX_POOL: dict[str, tuple[str, ...]] = {
         "材料与机具配置",
         "安全防护与技术交底",
         "常见通病与防治措施",
-        "进度安排与资源保障",
-        "成品保护与现场管理",
+        # 2026-10-27 修复（BUG-OUTLINE-2026-10-27-L2POOL）：旧值「进度计划与资源保障」
+        # 与 _L2_SUFFIX_POOL["work"] 完全相同，L3 直接吐出 L2 章名。
+        "进度安排与资源协调",
+        # 2026-10-27 修复：旧值「成品保护与现场管理」与 _L2_SUFFIX_POOL["work"] 完全相同。
+        "成品保护与文明施工",
         "检验试验与记录管理",
         "测量放线与工序交接",
         "季节性施工与应急措施",
+        # 2026-10-27 第三轮扩容：增加动作型条目，缓解跨 L2 重复问题。
+        "工序穿插与界面协调",
+        "施工准备与作业面移交",
     ),
     "quality": (
         "过程检查与验收标准",
@@ -544,6 +550,12 @@ _L3_SUFFIX_POOL: dict[str, tuple[str, ...]] = {
         "问题整改闭环机制",
         "关键工序旁站监督",
         "分项工程质量验收",
+        # 2026-10-27 第三轮扩容
+        "隐蔽工程验收与资料移交",
+        "实测实量与数据复核",
+        # 2026-10-27 第四轮（遗留加固 P1）：扩容至 12+ 项。
+        "原材料进场与复检",
+        "成品保护与养护管理",
     ),
     "safety": (
         "教育培训与技术交底",
@@ -554,6 +566,12 @@ _L3_SUFFIX_POOL: dict[str, tuple[str, ...]] = {
         "职业健康与劳动保护",
         "现场安全巡查制度",
         "安全技术措施交底",
+        # 2026-10-27 第三轮扩容
+        "临时用电与消防管理",
+        "高处作业与临边防护",
+        # 2026-10-27 第四轮（遗留加固 P1）：扩容至 12+ 项。
+        "机械设备安全防护装置",
+        "有限空间作业管理",
     ),
     "schedule": (
         "里程碑节点控制",
@@ -562,20 +580,54 @@ _L3_SUFFIX_POOL: dict[str, tuple[str, ...]] = {
         "偏差监测与纠偏措施",
         "周月计划分解与考核",
         "工期风险预警与应对",
+        # 2026-10-27 第三轮扩容
+        "工序穿插与流水段划分",
+        "劳动力与机械动态调配",
+        # 2026-10-27 第四轮（遗留加固 P1）：扩容至 12+ 项。
+        "里程碑节点跟踪管理",
+        "进度计划调整与优化",
+        "工期索赔与延误处理",
+        "资源调配与保障",
     ),
     "cost": (
-        "目标成本分解与控制",
+        # 2026-10-27 修复（BUG-OUTLINE-2026-10-27-L2POOL）：旧值「目标成本分解与控制」
+        # 与 _L2_SUFFIX_POOL["cost"] 完全相同，L3 直接吐出 L2 章名。
+        "成本目标分解与动态控制",
         "变更签证与索赔管理",
         "资金计划与支付管理",
-        "成本核算与偏差分析",
+        # 2026-10-27 修复：旧值「成本核算与偏差分析」与 _L2_SUFFIX_POOL["cost"] 完全相同。
+        "成本核算与偏差分析管理",
         "材料量价双控措施",
+        # 2026-10-27 第三轮扩容
+        "分包结算与资料归档",
+        "人工与机械成本分析",
+        # 2026-10-27 第四轮（遗留加固 P1）：扩容至 12+ 项。
+        "成本偏差分析与预警",
+        "材料采购与价格管控",
+        "分包成本控制措施",
+        "成本台账与归集管理",
+        "结算资料与审核管理",
     ),
     "org": (
-        "组织架构与职责分工",
-        "管理制度与考核机制",
-        "沟通协调与例会制度",
-        "人才配置与梯队建设",
-        "信息化管理与报表",
+        # 2026-10-27 修复（BUG-OUTLINE-2026-10-27-L2POOL）：旧值全部 5 个条目
+        # 与 _L2_SUFFIX_POOL["org"] 高度相似或完全相同（「组织架构与职责分工」
+        # 「管理制度与考核机制」完全相同，「沟通协调与例会制度」vs「沟通协调机制」，
+        # 「信息化管理与报表」vs「信息化管理平台建设」），导致 L3 直接吐出 L2 章名。
+        # 现替换为动作型条目，与 generic 域的修复口径一致。
+        "组织架构设置与职责明确",
+        "管理制度建立与考核实施",
+        "例会组织与纪要归档",
+        "人员培训与技能认证",
+        "信息化平台建设与数据管理",
+        "绩效考核与奖惩实施",
+        "岗位配置与职责落实",
+        "沟通协调与问题反馈",
+        # 2026-10-27 第三轮扩容
+        "分包管理与协同机制",
+        "制度宣贯与培训落实",
+        # 2026-10-27 第四轮（遗留加固 P1）：扩容至 12+ 项。
+        "组织架构调整与优化",
+        "制度执行与监督检查",
     ),
     "tech": (
         "施工工艺流程与要点",
@@ -586,6 +638,12 @@ _L3_SUFFIX_POOL: dict[str, tuple[str, ...]] = {
         "成品保护与验收要求",
         "常见问题与防治措施",
         "技术交底与作业指导",
+        # 2026-10-27 第三轮扩容
+        "深化设计与方案优化",
+        "BIM 模型应用与协调",
+        # 2026-10-27 第四轮（遗留加固 P1）：扩容至 12+ 项。
+        "工艺参数试验与确定",
+        "新技术应用与效益评估",
     ),
     # generic 域专供 L3：必须是「动作型条目」，不得是 L2 级章名。
     # 2026-10-10 遗留建议 2：旧值（「总体实施策划」「分阶段推进计划」
@@ -602,6 +660,12 @@ _L3_SUFFIX_POOL: dict[str, tuple[str, ...]] = {
         "技术措施落实与核查",
         "责任分工与考核评价",
         "总结复盘与改进闭环",
+        # 2026-10-27 第三轮扩容
+        "任务分解与节点跟踪",
+        "风险清单与应对方案",
+        # 2026-10-27 第四轮（遗留加固 P1）：扩容至 12+ 项。
+        "计划执行与动态调整",
+        "验收评估与成果移交",
     ),
 }
 
@@ -616,6 +680,10 @@ _L2_SUFFIX_POOL: dict[str, tuple[str, ...]] = {
         "进度计划与资源保障",
         "成品保护与现场管理",
         "检验试验与资料管理",
+        # 2026-10-27 第三轮扩容：缓解跨 L1 L2 重复问题。
+        "施工准备与临建工程",
+        "施工界面与专业协调",
+        "竣工资料与验收移交",
     ),
     "quality": (
         "质量保证组织体系",
@@ -623,6 +691,9 @@ _L2_SUFFIX_POOL: dict[str, tuple[str, ...]] = {
         "创优目标分解与实施",
         "质量通病防治措施",
         "质量检查与考核机制",
+        # 2026-10-27 第三轮扩容
+        "质量目标与奖惩制度",
+        "质量培训与技术交底",
     ),
     "safety": (
         "安全管理组织体系",
@@ -630,15 +701,37 @@ _L2_SUFFIX_POOL: dict[str, tuple[str, ...]] = {
         "应急预案与演练计划",
         "隐患排查与治理机制",
         "文明施工与环保措施",
+        # 2026-10-27 第三轮扩容
+        "安全教育与培训制度",
+        "劳动保护与职业卫生",
     ),
     "schedule": (
         "进度计划编制与平衡",
         "关键线路分析与控制",
         "资源投入与保障措施",
         "进度动态监测与纠偏",
+        # 2026-10-27 第三轮扩容
+        "施工进度考核与奖惩",
+        "进度计划执行与跟踪",
     ),
-    "cost": ("成本管理组织体系", "目标成本分解与控制", "合同与索赔管理", "成本核算与偏差分析"),
-    "org": ("组织架构与职责分工", "管理制度与考核机制", "沟通协调机制", "信息化管理平台建设"),
+    "cost": (
+        "成本管理组织体系",
+        "目标成本分解与控制",
+        "合同与索赔管理",
+        "成本核算与偏差分析",
+        # 2026-10-27 第三轮扩容
+        "资金计划与动态调配",
+        "变更签证与索赔处理",
+    ),
+    "org": (
+        "组织架构与职责分工",
+        "管理制度与考核机制",
+        "沟通协调机制",
+        "信息化管理平台建设",
+        # 2026-10-27 第三轮扩容
+        "人员配置与培训计划",
+        "绩效考核与奖惩制度",
+    ),
     "tech": (
         "主要分部工程施工方案",
         "关键工序施工技术措施",
@@ -646,6 +739,9 @@ _L2_SUFFIX_POOL: dict[str, tuple[str, ...]] = {
         "施工测量与试验检测",
         "季节性施工措施",
         "施工机械与设备保障",
+        # 2026-10-27 第三轮扩容
+        "BIM 应用与三维协调",
+        "施工工艺与作业指导",
     ),
     "generic": (
         "总体方案与实施策划",
@@ -653,6 +749,9 @@ _L2_SUFFIX_POOL: dict[str, tuple[str, ...]] = {
         "资源配置与协调保障",
         "过程控制与考核机制",
         "总结评估与持续改进",
+        # 2026-10-27 第三轮扩容
+        "实施风险识别与应对",
+        "责任落实与节点跟踪",
     ),
 }
 
@@ -966,8 +1065,91 @@ _L3_TITLE_FRAGMENTS = frozenset({
 # （因为刚加的数字又被剥掉）→ 必然死循环。裸数字结尾的判定改由
 # `_BARE_NUM_TAIL_RE` 单独负责（只判定、不剥离），产出方也已改为语义化标题。
 _ORDINAL_SUFFIX_RE = re.compile(
-    r"[（(]\s*第?\s*[0-9一二三四五六七八九十百]+\s*项?\s*[）)]\s*$"
+    r"[（(]\s*第?\s*[0-9一二三四五六七八九十百ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩ]+\s*项?\s*[）)]\s*$"
 )
+
+# BUG-FIX 2026-10-27（L1/L2/L3/L4 · 占位泛化漏检）：以下形态此前穿过
+# `_is_dirty_l3_title_deep`，是用户复报「占位式泛化名称 + 编号冲突后缀」的漏网之鱼。
+#
+# 形态 1：裸中文/罗马序数后缀（无括号、无「之」前缀）——「总体实施策划二」
+#   「总体实施策划三」—— 与合法的「总体实施策划之二」（消歧产物）只差一个「之」。
+#   旧 `_ORDINAL_SUFFIX_RE` 要求 `[（(]` 括号包裹，裸序数完全穿透；`_BARE_NUM_TAIL_RE`
+#   只认阿拉伯数字，中文/罗马序数完全穿透。
+# 形态 2：「第N」无括号后缀——「总体实施策划第二」—— 语义上等同「（第二）」/「（二）」，
+#   但少了括号让旧正则不匹配。
+#
+# 口径：
+#   - 括号式序号由 `_ORDINAL_SUFFIX_RE` 处理（已扩展到罗马数字 Ⅰ-Ⅹ）；
+#   - 「之N」由 `_is_generic_stem_only_title` 刻意豁免（本函数负向后视 `(?!之)` 与
+#     剥离步骤保持一致，双保险）；
+#   - 剥离后剩余的 base 必须**非空**且属于 `_GENERIC_ONLY_TITLES`/`_L3_L2LIKE_TITLES`
+#     才判脏，避免过度拦截「质量管理二」「混凝土三」这类含具体实体的合法标题。
+_BARE_ORDINAL_SUFFIX_RE = re.compile(
+    r"(?<![之第])"
+    r"(?:第[一二三四五六七八九十百ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩ]|"
+    r"[一二三四五六七八九十百ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩ]+)\s*$"
+)
+
+# 单字符标题整段就是序号（「1」「一」「Ⅱ」）—— 剥离后 base 为空。
+# 与 `_PLACEHOLDER_ORDINAL_ONLY_RE` 的区别：后者要求主体词（内容/项目等）+ 数字；
+# 本形态整段就是序号、无任何主体，语义为零。
+_SINGLE_ORDINAL_TITLE_RE = re.compile(
+    r"^(?:第[一二三四五六七八九十百ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩ]|[一二三四五六七八九十百ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩ]+|[0-9]+)$"
+)
+
+
+def _is_generic_stem_ordinal_suffix(title: str) -> bool:
+    """检测标题是否以「泛化词干 × 裸序号」形态结尾（无括号、无「之」消歧）。
+
+    BUG-FIX 2026-10-27：用户复报「总体实施策划二」「总体实施策划（Ⅱ）」
+    「总体实施策划第二」等形态穿过脏判定，是「编号冲突后缀（3）（2）」的
+    镜像漏网。本函数补齐裸中文/罗马序数与「第N」无括号两种漏网形态。
+
+    判定逻辑（幂等，从末尾反复剥离）：
+      1. 匹配裸序号（无「之」/「第」前缀，或「第+序数」组合），若剥后剩余
+         base 与「之」相连（如「总体实施策划之二」），说明是合法消歧，返回 False；
+      2. 反复剥离直至无裸序号匹配；
+      3. 最终 base 为空 或 属于泛化词表 → 判脏；否则合法。
+
+    样例（判脏）：
+        「总体实施策划二」→ base=「总体实施策划」∈ 泛化词表
+        「总体实施策划（Ⅱ）」→ 括号式，由 _ORDINAL_SUFFIX_RE 直接判脏（不进本函数）
+        「总体实施策划第二」→ 剥离「第二」得「总体实施策划」
+        「1」/「一」→ base 空
+
+    样例（不判脏）：
+        「总体实施策划之二」→ 剥离「二」后 base 以「之」结尾 → 合法消歧豁免
+        「质量管理二」→ base=「质量管理」不在泛化词表
+        「混凝土施工三」→ base 不在泛化词表
+    """
+    t = (title or "").strip()
+    if not t:
+        return False
+    matched_any = False
+    changed = True
+    while changed:
+        changed = False
+        m = _BARE_ORDINAL_SUFFIX_RE.search(t)
+        if m and m.group(0).strip():
+            matched_any = True
+            base = t[: m.start()].strip()
+            # 「之+序数」是合法消歧：剥离后 base 以「之」结尾说明原本是「之+序数」形态
+            while base.endswith("之"):
+                base = base[:-1].strip()
+                if not base:
+                    break
+            t = base
+            changed = True
+        else:
+            break
+    if not matched_any:
+        # 标题本身不含裸序号后缀 —— 是否泛化由其它规则（如 `_GENERIC_ONLY_TITLES`
+        # 直查）判断，本函数只负责「泛化词干 + 裸序号」这一特定形态。
+        return False
+    # 剥离完毕后：空标题 / 泛化词表成员 → 判脏
+    if not t:
+        return True
+    return t in (_GENERIC_ONLY_TITLES | _L3_L2LIKE_TITLES)
 
 # ========== 2026-10-17 第六轮：编号前缀形态（BUG-OUTLINE-2026-10-17-01） ==========
 # 用户复报症状「编号冲突后缀（2）（3）」的**镜像形态**：AI 输出与人工编辑会把
@@ -1018,6 +1200,50 @@ def _strip_ordinal_prefix(title: str) -> str:
 # （天/米/层/根/年/月，如「工期365天」「2026年施工组织计划」）。
 # 即：仅当标题以纯数字结尾且数字后无任何字符时才判定为裸编号后缀。
 _BARE_NUM_TAIL_RE = re.compile(r"[0-9]{1,4}(?![0-9A-Za-z%％\u4e00-\u9fff])\s*$")
+
+
+def _is_placeholder_numbered_title(title: str) -> bool:
+    """层级无关的「编号式占位」判定（只认编号/序数，不含泛化词规则）。
+
+    BUG-FIX 2026-10-26（L2 占位标题无人拦截）：`_cleanup_placeholder_titles`
+    与 `_is_dirty_l3_title` 只作用于 **level>=3**，理由是「其他/概述/说明」
+    这类词在 L1/L2 合法。但「专项方案2」「内容3」「第6项」「总体实施策划（2）」
+    这类**带裸编号/序数后缀**的标题在 L2 同样无语义，此前完全穿过
+    `_post_process_title_quality`（其 L2 判定只有 8 条锚定正则 + 「（第N项）」
+    结尾）→ 二级审核界面直接展示，落库链路也不清洗。
+    本函数刻意只覆盖编号类形态（不碰泛化词），避免误伤 L1/L2 合法词。
+    """
+    t = (title or "").strip()
+    if not t:
+        return True
+    if (
+        _PLACEHOLDER_ANYWHERE_RE.search(t)
+        or _PLACEHOLDER_PREFIXED_RE.search(t)
+        or _PLACEHOLDER_TAIL_NUM_RE.search(t)
+        or _PLACEHOLDER_ORDINAL_ONLY_RE.match(t)
+        or _ORDINAL_ITEM_ONLY_RE.match(t)
+    ):
+        return True
+    # 括号式 / 列表式编号后缀与前缀（（2）/（第3项）/2、/（二））
+    if _ORDINAL_SUFFIX_RE.search(t) or _ORDINAL_PREFIX_RE.match(t):
+        return True
+    # 裸数字结尾（「总体实施策划2」）：剥数字后若主体是泛化词才是占位，
+    # 避免误伤「工期365天」（CJK 量词结尾不匹配）与「C30 混凝土」这类合法标题。
+    if _BARE_NUM_TAIL_RE.search(t):
+        _rest = _BARE_NUM_TAIL_RE.sub("", t).strip()
+        if not _rest or _rest in (_GENERIC_ONLY_TITLES | _L3_L2LIKE_TITLES):
+            return True
+    # 泛化词干 + 裸序号（无括号、无「之」）—— 与 L3 脏判定保持同口径，
+    # 确保 L2 审核界面也会拦截「总体实施策划二」「总体实施策划第三」这类
+    # 编号冲突形态，而不是只在三级被清。
+    if _is_generic_stem_ordinal_suffix(t):
+        return True
+    # 整段就是序号的标题（「1」「一」「Ⅱ」）
+    if _SINGLE_ORDINAL_TITLE_RE.match(t):
+        return True
+    return False
+
+
 # 纯泛化标题词表：标题恰好等于其中之一即判定为占位泛化
 _GENERIC_ONLY_TITLES = frozenset({
     "总体实施策划", "总体部署", "总体安排", "总体方案", "总体思路", "总体规划",
@@ -1042,9 +1268,47 @@ _GENERIC_ONLY_TITLES = frozenset({
 # 不应在脏标题判定阶段预先判死（否则会误删合法内容）。
 # 本表只保留「总体方案与实施策划」这类纯泛化、读起来像章名而非条目的短语。
 _L3_L2LIKE_TITLES = frozenset({
+    # generic 域
     "总体方案与实施策划", "总体实施策划", "分阶段推进计划",
     "资源配置与协调保障", "过程控制与考核评价", "过程控制与考核机制",
     "总结评估与持续改进",
+    # 2026-10-27 新增（BUG-OUTLINE-2026-10-27-L2POOL）：以下条目曾出现在
+    # _L3_SUFFIX_POOL 中，但与 _L2_SUFFIX_POOL 完全相同，导致 L3 直接吐出 L2 章名。
+    # 现从 L3 池替换为动作型条目，同时在此拦截旧数据中残留的 L2 级 L3 标题。
+    "组织架构与职责分工", "管理制度与考核机制",
+    "进度计划与资源保障", "成品保护与现场管理",
+    "目标成本分解与控制", "成本核算与偏差分析",
+    # 2026-10-27 第三轮新增（BUG-OUTLINE-2026-10-27-CROSS-L1）：
+    # 以下条目是 _L2_SUFFIX_POOL 中的 L2 级章名，在 docx 实测中以 L3 身份出现
+    # （由 _l3_entity_candidates 的实体×维度组合产出，或 L3 池残留）。
+    # 这些标题读起来像章名而非条目，应拦截。
+    # 注：「质量保证组织体系」刻意不拦截——回归测试 test_does_not_false_positive_on_concrete_titles
+    # 明确断言其为具体标题（语义可读、合法），属过度拦截。
+    "沟通协调机制", "信息化管理平台建设",
+    "总体施工部署与区段划分", "主要分项工程施工方案",
+    "主要分部工程施工方案", "关键工序施工技术措施",
+    "专项施工方案与技术措施", "专项施工方案与工艺",
+    "质量控制与验收要求",
+    "安全管理组织体系", "安全防护与技术措施",
+    "应急预案与演练计划", "隐患排查与治理机制",
+    "文明施工与环保措施", "创优目标分解与实施",
+    "质量通病防治措施", "进度计划编制与平衡",
+    "关键线路分析与控制", "资源投入与保障措施",
+    "合同与索赔管理", "质量检查与考核机制",
+    "施工测量与试验检测", "季节性施工措施",
+    "施工机械与设备保障",
+    # 2026-10-27 第三轮扩容新增
+    "安全防护与文明施工措施", "检验试验与资料管理",
+    "施工准备与临建工程", "施工界面与专业协调",
+    "竣工资料与验收移交", "质量目标与奖惩制度",
+    "质量培训与技术交底", "安全教育与培训制度",
+    "劳动保护与职业卫生", "进度动态监测与纠偏",
+    "施工进度考核与奖惩", "进度计划执行与跟踪",
+    "成本管理组织体系", "资金计划与动态调配",
+    "变更签证与索赔处理", "人员配置与培训计划",
+    "绩效考核与奖惩制度", "BIM 应用与三维协调",
+    "施工工艺与作业指导", "实施风险识别与应对",
+    "责任落实与节点跟踪",
 })
 
 
@@ -1280,6 +1544,23 @@ def _is_dirty_l3_title(title: str) -> bool:
     #    镜像症状。判脏后 `_cleanup_placeholder_titles` 先剥前缀保主体，
     #    主体仍泛化才整体重写（与后缀侧同口径）。
     if _strip_ordinal_prefix(t) != t:
+        return True
+    # 12. 「泛化词干 + 裸序号」形态（2026-10-27 · BUG-OUTLINE-2026-10-27-L1~L4）：
+    #     「总体实施策划二」「总体实施策划第三」—— 无括号、无「之」的裸序数后缀，
+    #     与合法的「总体实施策划之二」消歧只差一个「之」字。这是用户复报的
+    #     「总体实施策划（2）」「总体实施策划（3）」去掉括号后的镜像漏网形态：
+    #     `_ORDINAL_SUFFIX_RE` 要求 `[（(]` 包裹，裸序数完全穿透旧判定。
+    #     「（Ⅱ）/（Ⅲ）」罗马数字括号由本规则前一步 `_ORDINAL_SUFFIX_RE` 兜住
+    #     （已在字符类扩展到 Ⅰ-Ⅹ），「第N」无括号由本函数一并处理。
+    #     「之N」合法消歧由 `_is_generic_stem_only_title` 与本函数各自豁免，双保险。
+    if _is_generic_stem_ordinal_suffix(t):
+        return True
+    # 13. 单字符/整段序号标题（2026-10-27 · BUG-OUTLINE-2026-10-27-L4）：
+    #     「1」「一」「Ⅱ」等整段就是序号、无任何主体的标题，语义为零。
+    #     与 `_PLACEHOLDER_ORDINAL_ONLY_RE`（要求主体词+数字）与
+    #     `_ORDINAL_ITEM_ONLY_RE`（要求「项/条」量词）都不同——纯序号单段
+    #     是第三种形态，旧判定完全放行。
+    if _SINGLE_ORDINAL_TITLE_RE.match(t):
         return True
     return False
 
@@ -1673,6 +1954,28 @@ def _l3_entity_candidates(
     chapter_entities = tuple(
         e for e in (extra_entities or ()) if e and e not in dom_entities
     )
+    # 2026-10-27 第四轮（P2 · L3 与 L2 主题对应）：提取 **L2 专属实体**，
+    # 使 L3 标题与父级 L2 主题语义相关（修复 docx 实测 66% 的 L2-L3 语义脱节）。
+    #
+    # 规则 3 禁止 L3 继承 L2 **核心短语**（`_core_for_derive` 的结果），但允许
+    # 使用 L2 中的其他具体实体。例：L2「土方与基坑支护工程」→ 核心词「土方」，
+    # 实体「基坑支护」非核心词，可作为 L3 实体 →「基坑支护施工工艺」。
+    # 单实体 L2（如「脚手架工程」→ 实体=核心词「脚手架」）会被过滤，
+    # 回落到域池，不违反规则 3。
+    #
+    # 过滤链：
+    #   1. `_title_entity_fragments` 已过滤泛化词段（总体方案/实施策划等）；
+    #   2. 过滤已在域池的实体（避免与域池重复）；
+    #   3. 过滤含 L2 核心词的实体（规则 3 严格口径）。
+    _l2_core = _core_for_derive(parent_title)
+    l2_entities = tuple(
+        e
+        for e in _title_entity_fragments(parent_title)
+        if e
+        and e not in dom_entities
+        and not (_l2_core and _l2_core in e)
+        and not (context_title and _l2_core and _l2_core in context_title)
+    )
     # 维度使用短动作词池（2~4 字），与实体词拼接后读得通；
     # 不用 _L3_SUFFIX_POOL（那里是「施工工艺流程与要点」这类完整短语，
     # 与实体词拼接会产生「样板引路施工工艺流程与要点」伪标题）。
@@ -1687,6 +1990,9 @@ def _l3_entity_candidates(
     entity_stages: list[tuple[str, ...]] = []
     if chapter_entities:
         entity_stages.append(chapter_entities)
+    # P2: L2 专属实体排在域池之前，保证 L3 与 L2 主题对应。
+    if l2_entities:
+        entity_stages.append(l2_entities)
     entity_stages.append(dom_entities)
     for entities in entity_stages:
         ent_len = len(entities)
@@ -2590,6 +2896,128 @@ def _cap_intra_chapter_repetition(
     if fixed_total:
         logger.info("同章复用护栏: 共改写 %d 个同章成套照抄的三级标题", fixed_total)
     return level1, fixed_total
+
+
+def _cap_cross_chapter_l2_repetition(
+    level1: list[dict], max_reuse: int = 2
+) -> tuple[list[dict], int]:
+    """限制同一个二级标题在**不同一级章**下的复用广度，超出部分按所在章重新生成。
+
+    2026-10-27 第三轮新增，修复《岳阳路园区科研南楼室内装修工程》docx 中
+    16 个 L2 标题跨 L1 重复的问题（如「组织架构与职责分工」出现在 3 个 L1 中，
+    「主要分部工程施工方案」出现在 5 个 L1 中）。
+
+    根因：`_L2_SUFFIX_POOL` 按语义域共享，多个 L1 属于同一域时复用相同 L2 池，
+    产出完全相同的 L2 标题。
+
+    与既有护栏的关系（互补、不重叠）：
+      - `_cap_cross_chapter_repetition`：只作用于三级及以下节点；
+      - `_cap_intra_chapter_repetition`：只作用于同一 L1 内的 L3 节点；
+      - 本函数：只作用于二级节点，跨 L1 计数。
+
+    规则：
+      - 只作用于二级节点；
+      - 按 `_title_core` 归一化统计「不同 L1 父级实例」个数；
+      - 保留前 `max_reuse` 个出现（先到先得，幂等）；
+      - 超出部分从 _L2_SUFFIX_POOL 中选取未使用的池条目，或基于 L1 标题生成
+        唯一 L2 标题；永不产出「（N）」式裸编号后缀。
+
+    Args:
+        level1: 一级目录树（就地修改）
+        max_reuse: 同一 L2 标题允许出现的不同 L1 个数上限；<=0 表示关闭护栏
+
+    Returns:
+        (目录树, 被改写的节点数)
+    """
+    if not isinstance(level1, list) or max_reuse <= 0:
+        return level1, 0
+
+    # 收集 L2 节点：core -> [(node, l1_title, l2_index), ...]
+    # 同时收集所有 L2 标题的归一化核心词（不含 L3），用于生成唯一标题时排除
+    occurrences: dict[str, list[tuple[dict, str, int]]] = {}
+    all_l2_cores: set[str] = set()
+
+    for l1 in level1:
+        if isinstance(l1, dict):
+            l2_children = l1.get("children")
+            if isinstance(l2_children, list):
+                for l2 in l2_children:
+                    if isinstance(l2, dict):
+                        t = str(l2.get("title") or "").strip()
+                        if t:
+                            core = _title_core(t)
+                            if core:
+                                all_l2_cores.add(core)
+
+    _l1_seq = 0
+    for l1 in level1:
+        if not isinstance(l1, dict):
+            continue
+        l1_title = str(l1.get("title") or "").strip()
+        l2_children = l1.get("children")
+        if not isinstance(l2_children, list):
+            continue
+        for j, l2 in enumerate(l2_children):
+            if not isinstance(l2, dict):
+                continue
+            title = str(l2.get("title") or "").strip()
+            if title:
+                core = _title_core(title)
+                if core:
+                    occurrences.setdefault(core, []).append(
+                        (l2, l1_title, j)
+                    )
+
+    # used 集合含归一化核心词：_derive_child_title 返回的池条目（无编号）
+    # 会被判为已占用，从而跳过旧标题、选取不同池条目
+    used = set(all_l2_cores)
+    fixed = 0
+    for core, items in occurrences.items():
+        if len(items) <= max_reuse:
+            continue
+        # 统计不同 L1 父级个数
+        l1_titles = list(dict.fromkeys(item[1] for item in items))
+        if len(l1_titles) <= max_reuse:
+            continue
+        kept_l1s = set(l1_titles[:max_reuse])
+        seq = 0
+        rewritten = 0
+        sample_title = str(items[0][0].get("title") or "").strip()
+        for l2, l1_title, j in items:
+            if l1_title in kept_l1s:
+                continue
+            old_title = str(l2.get("title") or "").strip()
+            # 用 L1 标题作为 context，生成与本章对应的唯一 L2 标题
+            new_title = _derive_child_title(
+                l1_title, j + seq * 7, used, level=2, grandparent_title=""
+            )
+            if (
+                not new_title
+                or new_title == old_title
+            ):
+                logger.warning(
+                    "跨章 L2 复用护栏: 「%s」重生成失败（L1=%s），保留原标题",
+                    old_title,
+                    l1_title,
+                )
+                continue
+            l2["title"] = new_title
+            used.add(_title_core(new_title))
+            rewritten += 1
+            seq += 1
+        if rewritten:
+            logger.info(
+                "跨章 L2 复用护栏: 「%s」出现在 %d 个 L1（上限 %d），改写超出的 %d 个",
+                sample_title,
+                len(l1_titles),
+                max_reuse,
+                rewritten,
+            )
+            fixed += rewritten
+
+    if fixed:
+        logger.info("跨章 L2 复用护栏: 共改写 %d 个跨章重复的二级标题", fixed)
+    return level1, fixed
 
 
 # ========== 专业隔离（跨领域术语串台修复，2026-10-19） ==========

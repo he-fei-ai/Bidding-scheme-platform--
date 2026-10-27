@@ -341,7 +341,11 @@ async def delete_section_route(project_id: int, section_id: int, current_user: A
         await require_project_permission(project_id, current_user)
     _reject_if_generation_running(project_id)
     _ensure_section_in_project(project_id, section_id)
-    result = await asyncio.to_thread(delete_section_tree, section_id)
+    try:
+        result = await asyncio.to_thread(delete_section_tree, section_id)
+    except ValueError as e:
+        # 2026-10-20 遗留 3：Aligned 锁定章节拒绝删除，转 400 可读提示
+        raise HTTPException(status_code=400, detail=str(e))
     if result.get('deleted_count', 0) == 0:
         raise HTTPException(status_code=404, detail='章节不存在')
     return {'status': 'deleted'}
@@ -370,7 +374,12 @@ async def move_section_route(project_id: int, section_id: int, direction: str=Qu
         await require_project_permission(project_id, current_user)
     _reject_if_generation_running(project_id)
     _ensure_section_in_project(project_id, section_id)
-    if not move_section(section_id, direction):
+    try:
+        _moved = move_section(section_id, direction)
+    except ValueError as e:
+        # 2026-10-20 遗留 3：Aligned 锁定章节拒绝移动，转 400 可读提示
+        raise HTTPException(status_code=400, detail=str(e))
+    if not _moved:
         raise HTTPException(status_code=400, detail='无法移动章节：已在边界位置或章节不存在')
     return await asyncio.to_thread(build_tree, project_id)
 

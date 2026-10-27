@@ -66,7 +66,9 @@ const translations: Record<LanguageCode, Record<string, string>> = {
     'upload.okClear': '确认清空',
     'upload.nextExtract': '下一步：要点提取',
     'upload.dragTitle': '点击选择文件，或拖拽文件到此处',
-    'upload.dragHint': '支持 Word / PDF / Excel 清单 / PPT / Markdown / HTML 等格式，可同时上传多个文件',
+    // BUG-FIX 2026-10-26（格式提示与 accept 不一致）：此前未提 .wps 与图片，
+    // 而 accept 实际放行 18 种格式（含 .wps 与 6 种图片），提示与能力不符。
+    'upload.dragHint': '支持 Word（含 .wps）/ PDF / Excel 清单 / PPT / Markdown / HTML / 图片扫描件（png/jpg 等）等格式，可同时上传多个文件',
     'upload.uploadedFiles': '已上传文件',
     'upload.refresh': '刷新',
     'upload.empty': '暂无文件，请先上传招标文件',

@@ -19,6 +19,7 @@ from ...config import (
 )
 from ...utils.json_parser import extract_json_from_text
 from .heading_standard import HeadingNumberingGenerator, build_heading_spec_prompt
+from .json_issues import format_issues_text
 from .prompts import get_prompt
 from .prompts._output_repair import extract_json_body, try_parse_json
 from .prompts._registry import _resolve_shared
@@ -1237,6 +1238,16 @@ async def collect_json_response(
                 # JSON 主体提取）+ try_parse_json 处理 AI 常见的「合法 JSON 被代码围栏包裹」
                 # 或「JSON 前后有解释文字」场景。静态修复成功则直接返回，省去一次 AI 调用
                 # （节省成本 + 降低延迟）；失败则继续走既有 AI 修复链路（行为完全不变）。
+                #
+                # 《标书智能体（5）》§三·记录日志：校验失败类型随 attempt 落日志，
+                # 便于运维区分「模型不会输出 JSON」与「输出合法但业务不合格」。
+                logger.info(
+                    "JSON 校验失败（第 %d/%d 次，类型=%s），进入修复链: %s",
+                    attempt + 1,
+                    max_retries,
+                    type(e).__name__,
+                    _err_str[:200],
+                )
                 _static_json_text = extract_json_body(raw_content or "")
                 _static_parsed, _static_err = try_parse_json(_static_json_text)
                 if (
@@ -1263,18 +1274,29 @@ async def collect_json_response(
                 # 要求其输出严格合法的 JSON。这是弱模型稳定产出 JSON 的关键（设计文档五）。
                 # 注意：provider.chat 要求 AIMessage 对象（按属性访问 .role/.content），
                 # 此前误用 dict 会静默抛 AttributeError 使修复链路整体失效。
+                #
+                # 《标书智能体（5）》§五·校验问题格式化：错误信息必须具体到位置
+                # （JSON 解析错误带行列号、Pydantic 错误带 loc 路径、业务错误带目录
+                # 路径），修复助手才知道改哪里——「格式不对」这类笼统信息会让弱模型
+                # 反复犯同样的错误。format_issues_text 统一三种错误的格式化口径。
                 repair_messages = [
                     AIMessage(role="system", content=json_repair_prompt),
                     AIMessage(
                         role="user",
                         content=f"目标类型: {schema.__name__ if schema else 'JSON'}\n"
-                        f"校验问题: {e}\n"
+                        f"校验问题: {format_issues_text(e)}\n"
                         f"原始输出: {raw_content or '(空)'}",
                     ),
                 ]
+                # 修复调用继承原调用的 max_tokens 预算：长 JSON（如整棵目录树）
+                # 的修复结果与原始输出同量级，不传会让 provider 用默认小预算
+                # 把修复结果截断，白烧一次修复调用。
+                _repair_kwargs: dict[str, Any] = {"temperature": 0.3}
+                if max_tokens:
+                    _repair_kwargs["max_tokens"] = max_tokens
                 try:
                     repaired_content = await with_timeout(
-                        provider.chat(repair_messages, temperature=0.3),
+                        provider.chat(repair_messages, **_repair_kwargs),
                         timeout=AI_CALL_TIMEOUT,
                     )
                     parsed = extract_json_from_text(repaired_content)

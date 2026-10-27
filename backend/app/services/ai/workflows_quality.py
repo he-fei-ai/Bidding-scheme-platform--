@@ -234,7 +234,16 @@ class ContentQualityEvaluator:
         repetition_score: float,
         cancel_event: "asyncio.Event | None" = None,
     ) -> dict:
-        """使用AI评估内容维度（结构、专业性、相关性）"""
+        """使用AI评估内容维度（结构、专业性、相关性）
+
+        标书智能体（4）——提示词顺序优化（缓存命中）：质量评估是每章节一次的
+        高频调用，旧实现把「评估维度/要求/输出格式」（稳定规则）与「章节标题/
+        正文内容」（任务差异）拼进单条 user 且易变内容在前 → 每次调用前缀在
+        消息起始处就漂移，稳定规则无法命中缓存。现以哨兵占位符渲染模板后拆成
+        「稳定规则段 + 任务差异段」两条 user 消息（任务差异放最后），同项目
+        所有章节共享稳定前缀。开关 QUALITY_PROMPT_LAYERS_ENABLED（默认 true），
+        false 时保持旧的单条 user 行为（内容一致，仅消息条数不同）。
+        """
 
         # 截取内容前5000字进行评估（避免token超限）
         content_sample = content[:5000] if len(content) > 5000 else content
@@ -242,15 +251,12 @@ class ContentQualityEvaluator:
         # ENHANCE 2026-10-18（审计遗留 D2 批次 2 收编）：user 侧收编为
         # QUALITY_EVAL_USER（system 侧早已于 BUG-FIX-PROMPT-E4 收编）。
         # 正文为 AI 生成的标书内容（下游数据，非原始外部输入），做元标记中和。
-        prompt = get_prompt(
-            "QUALITY_EVAL_USER",
-            section_title=section_title,
-            content_sample=content_sample,
-            sanitize=True,
-        ) or f"""请评估以下标书章节的内容质量，从以下几个维度打分（0-100分）：
+        _TITLE_MARKER = "@@SECTION_TITLE@@"
+        _CONTENT_MARKER = "@@CONTENT_SAMPLE@@"
+        _eval_fallback = f"""请评估以下标书章节的内容质量，从以下几个维度打分（0-100分）：
 
 【章节标题】
-{section_title}
+{_TITLE_MARKER}
 
 【评估维度】
 1. 结构完整性（structure_score）：是否有清晰的段落划分、逻辑层次是否分明
@@ -273,28 +279,71 @@ class ContentQualityEvaluator:
 }}
 
 【正文内容】
-{content_sample}
+{_CONTENT_MARKER}
 """
+        rendered = get_prompt(
+            "QUALITY_EVAL_USER",
+            section_title=_TITLE_MARKER,
+            content_sample=_CONTENT_MARKER,
+            sanitize=True,
+        ) or _eval_fallback
 
-        messages = [
-            # BUG-FIX-PROMPT-E4（inline 系统提示词未注册）：原以字面量形式
-            # inline 存在，管理页无法查看/编辑/覆盖。现统一走 get_prompt()
-            # （DB 优先 → 注册表 → 硬编码回退）。
-            AIMessage(
-                role="system",
-                content=(
-                    get_prompt("QUALITY_EVAL_SYSTEM")
-                    or "你是一个标书内容质量评估专家，擅长客观评估标书章节的质量。"
-                ),
-            ),
-            AIMessage(role="user", content=prompt),
-        ]
+        _sys_text = (
+            get_prompt("QUALITY_EVAL_SYSTEM")
+            or "你是一个标书内容质量评估专家，擅长客观评估标书章节的质量。"
+        )
+        try:
+            from app.config import QUALITY_PROMPT_LAYERS_ENABLED as _LAYERS_ON
+        except Exception:  # pragma: no cover - 配置读取兜底
+            _LAYERS_ON = True
+
+        # 任务差异：章节标题 + 正文内容（唯一随请求变化的部分，放最后）
+        from .prompts import sanitize_prompt_value as _sanitize
+
+        _safe_title = _sanitize(section_title) if _sanitize else section_title
+        _safe_content = _sanitize(content_sample) if _sanitize else content_sample
+        _task_block = (
+            f"【章节标题】\n{_safe_title}\n\n"
+            f"【正文内容】\n{_safe_content}"
+        )
+        if _LAYERS_ON:
+            from .prompt_order import (
+                build_cache_friendly_messages,
+                split_rendered_template,
+            )
+
+            # 稳定段 = 标题哨兵之前的文本 + 两个哨兵之间的文本（评估规则全集）
+            _before, _mid_after = split_rendered_template(rendered, _TITLE_MARKER)
+            _mid, _tail = split_rendered_template(_mid_after, _CONTENT_MARKER)
+            _stable_parts = [p.strip() for p in (_before, _mid, _tail) if p.strip()]
+            messages = build_cache_friendly_messages(
+                _sys_text, _stable_parts, _task_block
+            )
+        else:
+            _full_user = (
+                rendered
+                .replace(_TITLE_MARKER, _safe_title)
+                .replace(_CONTENT_MARKER, _safe_content)
+            )
+            messages = [
+                AIMessage(role="system", content=_sys_text),
+                AIMessage(role="user", content=_full_user),
+            ]
 
         response = await with_timeout(
             self.provider.chat(messages, temperature=0.3, cancel_event=cancel_event),
             timeout=60,
             error_msg="质量评估AI调用超时",
         )
+        # 标书智能体（4）缓存可观测性：按任务类型记账（fail-soft）。
+        try:
+            from .cache_metrics import record_provider_cache_usage
+
+            record_provider_cache_usage(
+                self.provider, task_type="quality_eval", section_id=section_title
+            )
+        except Exception:  # pragma: no cover - 防御性
+            pass
 
         # BUG 修复：response 可能为 None（AI 返回空），需安全处理
         if not response:
@@ -596,6 +645,24 @@ _OUTLINE_REVIEW_LABELS = {
     "__INDUSTRY_PROFILE__": "行业背景（如房建、市政、修缮改造等）",
 }
 
+# 目录审核模板可能出现的占位符名（单花括号 {NAME} 与双下划线 __NAME__ 两种风格）。
+# BUG-FIX 2026-10-23（P1，标书智能体（4）引入时发现）：注册表默认模板
+# （prompts/outline.py OUTLINE_REVIEW_USER）使用 **{SCORING_POINTS} 单花括号
+# 风格**，而 _fill_template 的匹配模式只认 __NAME__ 双下划线风格 →
+# 占位符原样穿过填充逻辑发给模型：AI 审核链路实际看不到评分点/待审核目录/
+# 项目概述（提示词里全是字面量 `{SCORING_POINTS}`），「AI 审核目录」长期处于
+# 盲审状态；既有守卫测试只断言双下划线字面量不存在，对单花括号残留 vacuously
+# 通过。修法：填充前把已知占位符名规范化为双下划线风格（仅限已知名单，
+# 不碰模板里的 JSON 示例花括号）。
+_REVIEW_PLACEHOLDER_NAMES = ("SCORING_POINTS", "OUTLINE", "SUMMARY", "INDUSTRY_PROFILE")
+
+
+def _normalize_review_placeholders(template: str) -> str:
+    """把 {NAME} 单花括号占位符规范化为 __NAME__（仅限已知名单）。"""
+    for _name in _REVIEW_PLACEHOLDER_NAMES:
+        template = template.replace("{" + _name + "}", "__" + _name + "__")
+    return template
+
 
 def _build_outline_review_texts(
     scoring_points: str,
@@ -609,9 +676,16 @@ def _build_outline_review_texts(
     两个占位符若既不在 mapping 也不在 labels 里，_fill_template 会兜底保留原样，
     发给模型的提示词出现字面量占位符，模型无法执行项目契合度 / 行业特征校验。
     这里统一在 labels 里登记，供「初次审核」与「修复后复检」两条路径共用。
+
+    BUG-FIX 2026-10-23（P1）：模板占位符风格规范化（见
+    _normalize_review_placeholders），单花括号风格不再原样漏出。
+    注意：先以 get_prompt 直接赋值（保持 tests/test_prompts_module_2026_10_06.py
+    的 AST 静态守卫可解析「提示词 → 注入点」链路），再包一层风格规范化。
     """
     review_sys = get_prompt("OUTLINE_REVIEW_SYSTEM")
     review_user = get_prompt("OUTLINE_REVIEW_USER")
+    review_sys = _normalize_review_placeholders(review_sys)
+    review_user = _normalize_review_placeholders(review_user)
     # SECURITY 2026-10-06：审核链路注入的评分点/目录/概述均为外部衍生数据，开启
     # sanitize=True 与全平台高注入风险链路（workflows_analysis）口径对齐，做
     # 元标记中和纵深防御；默认脱敏保持关闭以免误伤结构化文本（如需再开 desensitize）。
@@ -628,6 +702,47 @@ def _build_outline_review_texts(
         sanitize=True,
     )
     return review_sys_text, review_user_text
+
+
+#: 目录审核模板拆分的易变占位符哨兵（标书智能体（4）缓存友好拆分用）。
+_OUTLINE_MARKER = "@@OUTLINE_UNDER_REVIEW@@"
+
+
+def _build_outline_review_messages(
+    scoring_points: str,
+    outline: str,
+    summary: str = "",
+    industry_profile: str = "",
+) -> list:
+    """构造目录审核的缓存友好消息栈（稳定规则前置、待审核目录后置）。
+
+    标书智能体（4）——提示词顺序优化（缓存命中，冲突时以外部引用标准为准）：
+    目录审核的 user 模板把「待审核目录」（易变）放在「输入数据」段最前面，
+    而评分点列表/项目概述/审核维度/输出格式（稳定）都在其后 → 单条 user
+    下每次调用前缀在消息起始处就漂移，稳定规则完全无法命中缓存。
+
+    现以哨兵占位符渲染模板（复用 _build_outline_review_texts 的 sanitize/
+    labels 口径），按哨兵切分为：
+      [稳定前段]（输入数据：评分点/项目概述）
+      [稳定后段]（任务/审核维度/原则/输出格式）
+      [任务差异]（当前目录 + 输出指令，放最后）
+    """
+    from .prompt_order import (
+        build_cache_friendly_messages,
+        split_rendered_template,
+    )
+
+    review_sys_text, review_user_text = _build_outline_review_texts(
+        scoring_points, _OUTLINE_MARKER, summary, industry_profile
+    )
+    before, after = split_rendered_template(review_user_text, _OUTLINE_MARKER)
+    blocks = [b.strip() for b in (before, after) if b.strip()]
+    blocks.append(
+        "### 当前目录（待审核）\n"
+        f"{outline}\n\n"
+        "请基于评分点列表和上述审核维度，直接输出 JSON 对象。"
+    )
+    return build_cache_friendly_messages(review_sys_text, blocks, "")
 
 
 async def review_outline(
@@ -661,12 +776,30 @@ async def review_outline(
     review_sys_text, review_user_text = _build_outline_review_texts(
         scoring_points, outline_text, summary, industry_profile
     )
-    messages = [
-        AIMessage(role="system", content=review_sys_text),
-        AIMessage(role="user", content=review_user_text),
-    ]
+    # 标书智能体（4）：稳定规则前置、待审核目录后置的缓存友好消息栈；
+    # 开关 QUALITY_PROMPT_LAYERS_ENABLED（默认 true），false 时退回旧的双消息。
+    try:
+        from app.config import QUALITY_PROMPT_LAYERS_ENABLED as _LAYERS_ON
+    except Exception:  # pragma: no cover - 配置读取兜底
+        _LAYERS_ON = True
+    if _LAYERS_ON:
+        messages = _build_outline_review_messages(
+            scoring_points, outline_text, summary, industry_profile
+        )
+    else:
+        messages = [
+            AIMessage(role="system", content=review_sys_text),
+            AIMessage(role="user", content=review_user_text),
+        ]
     try:
         result = await collect_json_response(provider, messages, max_retries=1)
+        # 标书智能体（4）缓存可观测性：按任务类型记账（fail-soft）。
+        try:
+            from .cache_metrics import record_provider_cache_usage
+
+            record_provider_cache_usage(provider, task_type="outline_review")
+        except Exception:  # pragma: no cover - 防御性
+            pass
     except Exception as e:
         logger.warning("目录审核 AI 调用失败: %s", e)
         result = None
@@ -759,13 +892,24 @@ async def review_outline_with_autofix(
                     # BUG-FIX 2026-09-15（中）：复检提示词原先手工拼模板，labels
                     # 只登记了 2 个占位符，__SUMMARY__ / __INDUSTRY_PROFILE__ 会以
                     # 字面量形式发给模型；统一走 _build_outline_review_texts。
-                    _, review_user_text = _build_outline_review_texts(
-                        scoring_points, fixed_outline, summary, industry_profile
-                    )
-                    review_messages = [
-                        AIMessage(role="system", content=review_sys_text),
-                        AIMessage(role="user", content=review_user_text),
-                    ]
+                    # 标书智能体（4）：改走缓存友好消息栈（稳定规则前置、
+                    # 修复后目录后置），与首轮审核共享稳定前缀。
+                    try:
+                        from app.config import QUALITY_PROMPT_LAYERS_ENABLED as _LAYERS_ON
+                    except Exception:  # pragma: no cover - 配置读取兜底
+                        _LAYERS_ON = True
+                    if _LAYERS_ON:
+                        review_messages = _build_outline_review_messages(
+                            scoring_points, fixed_outline, summary, industry_profile
+                        )
+                    else:
+                        _, review_user_text = _build_outline_review_texts(
+                            scoring_points, fixed_outline, summary, industry_profile
+                        )
+                        review_messages = [
+                            AIMessage(role="system", content=review_sys_text),
+                            AIMessage(role="user", content=review_user_text),
+                        ]
                     recheck = await collect_json_response(provider, review_messages, max_retries=2)
 
                     if isinstance(recheck, dict) and recheck.get("passed", False):

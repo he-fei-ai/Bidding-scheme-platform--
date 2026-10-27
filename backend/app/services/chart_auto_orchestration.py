@@ -59,6 +59,11 @@ _CHART_TYPE_LABELS: dict[str, str] = {
 # Mermaid 代码型图表集合（围栏语言判定：mermaid vs chart-json）——已废弃：
 # 围栏语言最终按**载荷形态**（是否含 code 字段）判定，见 build_chart_fence。
 
+#: 本地模板数据披露括注（A3 建议 1·显式披露）。挂在 source="local" 载荷的
+#: Mermaid 引导语上，前端打「模板数据」标签 + DOCX 正文双重可见；
+#: 导出图题链路 _clean_lead_in_title 会剥离该括注，保证图题干净。
+_LOCAL_TEMPLATE_DISCLAIMER = "（模板示例数据，请按项目实际核定）"
+
 
 # ============================================================
 # 纯函数：围栏构建 / 去重检测 / 位置插入（可独立单元测试）
@@ -86,7 +91,15 @@ def build_chart_fence(chart_type: str, payload: dict[str, Any]) -> tuple[str, st
     code = str(payload.get("code") or "").strip()
     if code:
         fence = "```mermaid\n" + code + "\n```"
-        lead_in = f"下图为{title or _CHART_TYPE_LABELS.get((chart_type or '').lower(), '图表')}："
+        base = title or _CHART_TYPE_LABELS.get((chart_type or "").lower(), "图表")
+        # A3 建议 1（显式披露）：本地模板载荷的 Mermaid 图无内嵌 title，
+        # 披露括注挂引导语（DOCX 正文可见）；图题链路经 _clean_lead_in_title
+        # 剥离括注，导出图题保持干净。AI 载荷与 chart-json 型不加括注——
+        # chart-json 的披露责任在前端「模板数据」标签（source 键随 JSON
+        # 序列化进围栏，前端可读），塞进 title 会污染导出图题。
+        if str(payload.get("source") or "") == "local":
+            base += _LOCAL_TEMPLATE_DISCLAIMER
+        lead_in = f"下图为{base}："
         return lead_in, fence
     # 结构化 JSON 载荷：title 内嵌于载荷（图题第 1 优先级）
     fence = "```chart-json\n" + json.dumps(payload, ensure_ascii=False) + "\n```"
@@ -243,6 +256,24 @@ def auto_orchestrate_section(
     result["payload"] = fixed_payload
     if insert_into_content and content and not content_has_chart_fence(content):
         lead_in, fence = build_chart_fence(chart_type, fixed_payload)
+        # RACE-GUARD 2026-10-27（需求 11·并发竞态）：自「读取正文」到「写回」
+        # 之间存在窗口，其他编排请求/生成任务可能已写入围栏或改写正文。
+        # 插入前重读最新正文：已含围栏 → 跳过（防同章双图/图号虚跳）；
+        # 正文已变 → 以最新正文重算插入位置，保证图文连贯。
+        try:
+            _latest = get_sec(section_id) or {}
+            _latest_content = _latest.get("content", "") or ""
+        except Exception:
+            _latest_content = content
+        if _latest_content and content_has_chart_fence(_latest_content):
+            result["skipped_reason"] = "chart_fence_exists"
+            return result
+        if _latest_content != content:
+            content = _latest_content
+            analysis["insert_paragraph_index"] = suggest_insertion_position(
+                content, chart_type
+            )
+            result["insert_paragraph_index"] = analysis["insert_paragraph_index"]
         new_content = insert_fence_at_paragraph(
             content, fence, lead_in, analysis["insert_paragraph_index"]
         )

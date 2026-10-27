@@ -235,7 +235,11 @@ class TestOutlineSseStaticHygiene:
 
     def test_unused_imports_removed(self):
         src = _read_source("app/routers/sse/sse_outline.py")
-        for dead in ("import hashlib", "import logging", "from ...db import get_db"):
+        # 注：历史上 `from ...db import get_db` 曾是死代码，已在 2026-10-15 清理并加入本断言。
+        # 2026-10-23 标书智能体（一）按方案类型自动选用目录模板时，
+        # `_detect_scheme_type_for_outline` 需读取 analysis.scheme_extraction_json，
+        # 该导入转为"已使用"，故从死导入清单移除；下面仅保留仍为死代码的导入。
+        for dead in ("import hashlib", "import logging"):
             assert dead not in src, f"未使用导入残留: {dead}"
 
     def test_still_exposes_public_entrypoints(self):

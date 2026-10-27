@@ -14,9 +14,9 @@ I-2  缓存未失效：Celery 异步重解析入口不先清解析缓存，补�
 I-3  缓存未失效：clear_project_texts 只删 texts/ 与合并文本缓存，
      _parse_result_cache 仍按原路径保留旧结果，「清空后重提取」在 TTL 内复活旧文本。
 I-4  跨项目串改：uploaded_files 的 UPDATE 只按 id 定位，未按 project_id 作用域收敛。
-O-1  超长内容崩溃：_int_to_chinese_num(n>=100) 抛 IndexError；
-     _normalize_direct_outline 在规模护栏之前补「第X章」前缀 → 整次直出崩溃，
-     异常被上层吞掉后静默回退分步路径，白白浪费一次完整 AI 调用。
+O-1  超长内容崩溃：_int_to_chinese_num(n>=100) 抛 IndexError（历史）；
+     规模护栏已前移，且 2026-10-23 起 _normalize_direct_outline 不再回填
+     「第X章」前缀（编号契约改为纯文本、由导出端现算），该 IndexError 路径已无。
 O-2  编号命名空间统一：_renumber_items 是死代码，落库目录树从不携带 number，
      前端/导出/正文/API 消费方各算一遍。
 
@@ -405,8 +405,10 @@ class TestDirectOutlineScaleGuard:
         monkeypatch.setattr(wo, "collect_json_response", _fake)
         out = asyncio.run(wo.generate_outline_direct(object(), "概述", "[]", "工程"))
         assert len(out) == 3
-        assert out[0]["title"].startswith("第一章"), out[0]["title"]
-        assert out[2]["title"].startswith("第三章"), out[2]["title"]
+        # 2026-10-23 契约变更：直出标题不再回填「第X章」前缀（编号由导出端按树
+        # 位置现算），此处锁定前缀自由的纯文本契约（首章即章节1）。
+        assert out[0]["title"] == "章节1", out[0]["title"]
+        assert out[2]["title"] == "章节3", out[2]["title"]
 
     def test_normalize_handles_hundreds_without_indexerror(self):
         """_normalize_direct_outline 自身也不能因大编号崩溃（防御纵深）。"""
@@ -414,8 +416,9 @@ class TestDirectOutlineScaleGuard:
         payload = [{"title": f"T{i}"} for i in range(1, 130)]
         outline = _normalize_direct_outline(payload)
         assert len(outline) == 129
-        assert outline[0]["title"].startswith("第一章")
-        assert "章" in outline[110]["title"]
+        # 2026-10-23 起不再回填「第X章」前缀（O-1 的 IndexError 路径已无）。
+        assert outline[0]["title"] == "T1"
+        assert outline[110]["title"] == "T111"
 
 
 # ============================================================================

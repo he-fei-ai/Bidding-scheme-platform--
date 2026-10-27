@@ -165,3 +165,100 @@ def test_extract_content_image_refs_html():
     assert data_url in refs, f"data URL 未被识别: {refs}"
     assert any(r.endswith("a.png") for r in refs), f"本地路径未被识别: {refs}"
 
+
+def test_export_cleans_residue_and_table_cells():
+    """导出链路端到端：LaTeX/HTML/系统提示不得进入正文，表格单元格同步清洗。
+
+    对应《招投标软件导出文档 — 分类问题报告》A-2 / A-3 / E-1。
+    """
+    doc = Document()
+    config = ExportConfig(font_body="宋体", size_body=12)
+    content = (
+        r"合格率 \(100\%\)，单层厚度控制在 \(5\sim 7mm\)。"
+        "\n\n北侧物料主入口<br>1.5 m×2.2m装配式大门"
+        "\n\n请确认是否生成正式投标文本。"
+        "\n\n<<表格：材料进场检验记录表\n"
+        "| 检验项目 | 指标要求 |\n"
+        r"| 合格率 | \(100\%\) |"
+        "\n>>"
+    )
+    _add_parsed_content(doc, content, config)
+
+    texts = "\n".join(p.text for p in doc.paragraphs)
+    assert "\\(" not in texts and "\\)" not in texts, texts
+    assert "<br>" not in texts, texts
+    assert "请确认是否生成" not in texts, texts
+    assert "合格率 100%" in texts, texts
+    assert "北侧物料主入口" in texts and "1.5 m×2.2m装配式大门" in texts
+
+    cell_texts = [c.text for t in doc.tables for r in t.rows for c in r.cells]
+    assert any("100%" in c for c in cell_texts), cell_texts
+    assert not any("\\%" in c or "<br>" in c for c in cell_texts), cell_texts
+
+
+def test_collect_toc_entries_matches_body_numbering():
+    """报告 G-5/I-5：静态目录条目必须与正文标题（程序编号 + 去旧编号）逐字一致。"""
+    from types import SimpleNamespace
+
+    from app.services.export import _collect_toc_entries
+
+    tree = [
+        SimpleNamespace(
+            id=1,
+            title="施工组织设计",
+            level=1,
+            children=[
+                SimpleNamespace(
+                    id=2,
+                    title="一、编制依据与适用标准",
+                    level=2,
+                    children=[
+                        SimpleNamespace(
+                            id=3, title="1、设计与施工规范依据", level=3, children=[]
+                        ),
+                        SimpleNamespace(id=4, title="材料标准要求", level=3, children=[]),
+                    ],
+                ),
+            ],
+        ),
+        SimpleNamespace(id=5, title="施工方案", level=1, children=[]),
+    ]
+
+    assert _collect_toc_entries(tree) == [
+        (1, "第一节、施工组织设计"),
+        (2, "一、编制依据与适用标准"),
+        (3, "1、设计与施工规范依据"),
+        (3, "2、材料标准要求"),  # 旧编号被剥离后按树位置重排
+        (1, "第二节、施工方案"),
+    ]
+
+
+def test_claim_chart_title_dedupes_within_chapter():
+    """报告 F-2/B-4：同一章同名图题只保留一张，跨章同名允许。
+
+    图题去重必须在**消耗图号之前**判定（跳过时不占号），否则图号会断档。
+    """
+    from app.services.export_cache import (
+        _claim_chart_title,
+        _reset_chart_title_registry,
+        _used_chart_titles_ctx_var,
+    )
+
+    token = _used_chart_titles_ctx_var.set({})
+    try:
+        _reset_chart_title_registry()
+        assert _claim_chart_title("7", "环保与速干材料交叉施工协调") is True
+        # 带图号/冒号/标点的同一图题归一化后重复 → 跳过
+        assert _claim_chart_title("7", "图7-2：环保与速干材料交叉施工协调") is False
+        # 跨章同名图合法（各章都可能有一张进度横道图）
+        assert _claim_chart_title("8", "环保与速干材料交叉施工协调") is True
+        # 过短标题不参与去重
+        assert _claim_chart_title("9", "图9-1 示意") is True
+        assert _claim_chart_title("9", "图9-2 示意") is True
+    finally:
+        _used_chart_titles_ctx_var.reset(token)
+
+    # 会话上下文缺席（非导出链路直接调用）→ 一律放行，不做去重
+    assert _claim_chart_title("7", "环保与速干材料交叉施工协调") is True
+    assert _claim_chart_title("7", "环保与速干材料交叉施工协调") is True
+

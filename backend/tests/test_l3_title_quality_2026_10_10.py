@@ -1019,9 +1019,11 @@ class TestDirectPathQualityCloseout:
         # 直出分支在 return 之前调用收口（确保产物经过清洗/去重/校验）
         src = Path(v51.__file__).read_text(encoding="utf-8")
         # 2026-10-20 易标机制引入：直出分支条件追加了 aligned 模式排除（
-        # `and OUTLINE_ALIGNED_MODE != "aligned"`），锁点改用前缀匹配以免
-        # 尾部条件演进再次误报。
-        start = src.index("if should_use_direct_outline(scoring_points, outline_mode)")
+        # `and OUTLINE_ALIGNED_MODE != "aligned"`），且调用被拆成多行
+        # （新增 `model_max_output_tokens=` 实参）。锁点改用**调用起始前缀**
+        # 定位，避免尾部条件/实参演进再次误报；定位到调用后仍须在同一直出
+        # 分支内、完成 `return direct` 之前找到收口调用（断言强度不降）。
+        start = src.index("if should_use_direct_outline(")
         end = src.index('logger.warning("[V5.1] 直出路径未产出结果，回退分步路径")')
         direct_seg = src[start:end]
         assert "_apply_l3_quality_closeout(" in direct_seg, "直出路径未接入共用质量收口"

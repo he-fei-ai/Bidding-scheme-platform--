@@ -157,6 +157,15 @@ class RedisSlidingWindowLimiter:
 
         now = time.time()
 
+        # BUG-FIX 2026-10-26（Redis 模式限流完全失效）：此前调用
+        # `eval(lua_script, 1, limit, window, now)` 漏传 key —— numkeys=1 时
+        # 第一个参数会被当作 KEYS[1]，于是 KEY 变成了 limit 的字符串值
+        # （所有不同标识符共用同一个桶），ARGV 整体左移一位：脚本里的
+        # `now` 取到 nil → `table.insert(t, nil)` 长度仍为 0 →
+        # 每次请求都返回「允许」且计数永不增长，限流形同虚设
+        # （实测空桶返回 remaining=61 而非 99）。
+        key = f"{self.key_prefix}{identifier}"
+
         # Lua 脚本：滑动窗口计数检查
         lua_script = """
         local key = KEYS[1]
@@ -201,7 +210,9 @@ class RedisSlidingWindowLimiter:
             # BUG-FIX 2026-09-16（高 事件循环阻塞）：本函数是 `async def`，
             # 而 redis-py 的 `eval` 是同步阻塞 IO。这个限流器挂在 export/images
             # 依赖链上，Redis 往返（网络抖动时可达数百毫秒）期间整个进程停摆。
-            result = await asyncio.to_thread(self.client.eval, lua_script, 1, limit, window, now)
+            result = await asyncio.to_thread(
+                self.client.eval, lua_script, 1, key, limit, window, now
+            )
             allowed = bool(result[0])
             remaining = int(result[1]) if result[1] else 0
             return allowed, remaining

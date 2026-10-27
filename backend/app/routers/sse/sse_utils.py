@@ -33,8 +33,6 @@ from ...services.sections import (
 
     build_tree,
 
-    get_subtree_leaf_ids,
-
     update_section,
 
 )
@@ -541,7 +539,7 @@ async def _fetch_project_data_async(project_id: int) -> dict | None:
 
                 all_rows = conn.execute(
 
-                    "SELECT id, parent_id, title, level, sort_order, section_type, scoring_point_id, status, content, target_words FROM sections WHERE project_id = ? ORDER BY sort_order, id",
+                    "SELECT id, parent_id, title, level, sort_order, section_type, scoring_point_id, status, content, target_words, locked, content_mode FROM sections WHERE project_id = ? ORDER BY sort_order, id",
 
                     (project_id,),
 
@@ -876,6 +874,26 @@ def _build_leaf_dicts(
 
 
 
+    def _resolve_content_mode(node: dict) -> str | None:
+        """沿父链继承最近的 content_mode（2026-10-20 遗留 5）。
+
+        content_mode 当前只写在程序构造的一级目录上（ai-generate），正文
+        生成的对象是叶子章节。不继承会导致叶子一律拿到 None，模式契约在
+        生成侧名存实亡。子节点显式设置的 content_mode 优先于祖先。
+        """
+        seen: set = set()
+        cur = node
+        while cur is not None and cur.get("id") not in seen:
+            seen.add(cur.get("id"))
+            mode = cur.get("content_mode")
+            if mode:
+                return str(mode)
+            pid = cur.get("parent_id")
+            cur = sections_by_id.get(pid) if pid is not None else None
+        return None
+
+
+
     # 根据参数过滤叶子节点
 
     if regenerate_ids:
@@ -902,9 +920,22 @@ def _build_leaf_dicts(
 
             raise ValueError("指定的章节不存在")
 
-        subtree_leaf_ids = set(get_subtree_leaf_ids(project_id, root_section_id))
+        # ENHANCE 2026-10-21（正文 #5）：子树叶子集合改用**同一份** sections_by_id
+        # 内存数据派生，消除原先 get_subtree_leaf_ids 的二次读库，及其与 all_leaves
+        # （缓存/略早快照）之间的时序差，保证子树选集与叶子判定严格同源。
+        _children: dict[int | None, list[int]] = {}
+        for _s in all_sections:
+            _children.setdefault(_s["parent_id"], []).append(_s["id"])
+        _subtree_ids: set[int] = set()
+        _stack = [root_section_id]
+        while _stack:
+            _nid = _stack.pop()
+            if _nid in _subtree_ids:
+                continue
+            _subtree_ids.add(_nid)
+            _stack.extend(_children.get(_nid, []))
 
-        leaves = [l for l in all_leaves if l["id"] in subtree_leaf_ids]
+        leaves = [l for l in all_leaves if l["id"] in _subtree_ids]
 
         if regenerate_missing:
 
@@ -1157,6 +1188,11 @@ def _build_leaf_dicts(
                 "section_type": leaf["section_type"],
 
                 "scoring_point_id": leaf["scoring_point_id"],
+
+                # 2026-10-20 遗留 5：目录落库的正文模式随叶子字典下发，
+                # 沿父链继承最近的 content_mode（默认 ai-generate），
+                # 正文生成入口 resolve_content_mode 消费。
+                "content_mode": _resolve_content_mode(leaf),
 
                 "path": path,
 

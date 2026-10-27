@@ -29,12 +29,42 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from app.services.ai.prompts import _context as _ctx  # noqa: E402
 from app.services.ai.prompts._context import (  # noqa: E402
     _CJK_DELETE_TABLE,
     _fit_to_token_budget,
     _heuristic_fast_fits,
     estimate_tokens,
 )
+
+
+@pytest.fixture(autouse=True)
+def _force_heuristic_estimate_mode():
+    """把 `estimate_tokens` 强制切到「无 tiktoken」启发式分支。
+
+    FIX 2026-10-23（P2·护栏失效，全量回归实测 6 条断言长期红灯）：
+
+    本文件的等价性基准 `_reference_fits` / `_reference_fit` 是按**启发式口径**
+    （`cjk + (non_cjk + 3) // 4`）写的；而 `estimate_tokens` 在 tiktoken 可用时
+    走 BPE 精确计数（`len(encoder.encode(text))`），两者**不可比**——BPE 计数
+    （实测 5157 字符 → 5995 tokens）与启发式（3577 tokens）相差数倍，
+    等价性断言必然失败。
+
+    后果不只是"测试红"：这 6 条断言是 `_heuristic_fast_fits` **唯一的**
+    正确性护栏，长期红灯等于护栏形同虚设，真实回归混在其中无法被识别
+    （全量回归日志里这 6 条与其它红灯一起被当成"已知噪声"）。
+
+    而 `_heuristic_fast_fits` 的启用条件本就是「`ids is None`，即 tiktoken
+    不可用」（见 `_fit_to_token_budget` 第 402 行）与文档串「仅无 tiktoken
+    环境启用」。因此等价性验证**必须**在该前提下进行——这里把
+    `_TIKTOKEN_ENCODER` 置空来锁定该前提，而非放宽断言。
+    """
+    saved = getattr(_ctx, "_TIKTOKEN_ENCODER", None)
+    _ctx._TIKTOKEN_ENCODER = None
+    try:
+        yield
+    finally:
+        _ctx._TIKTOKEN_ENCODER = saved
 
 
 # 原始实现的 _fits 口径（等价性基准，逐字复制自已提交版本）
@@ -144,18 +174,26 @@ class TestPerformance:
         text = "中文测试内容abc123" * 20000
         # 预热（建表/导入的一次性成本不计入断言）
         _fit_to_token_budget(text, 100000, "", "标")
-        best = min(
-            (
-                (lambda t0: (
-                    _fit_to_token_budget(text, 100000, "", "标"),
-                    time.perf_counter() - t0,
-                )[1])(time.perf_counter())
+        def _best(fn, rounds=3):
+            return min(
+                (
+                    (lambda t0: (fn(), time.perf_counter() - t0)[1])(time.perf_counter())
+                )
+                for _ in range(rounds)
             )
-            for _ in range(3)
-        )
+
+        best = _best(lambda: _fit_to_token_budget(text, 100000, "", "标"))
         assert best < 0.4, f"长文本裁剪应远低于 0.4s 断言线，实测 {best:.3f}s"
-        # 数量级验证：至少比原始回退实现的量级快 3 倍以上
-        assert best < 0.12, f"期望 ~0.06s 量级，实测 {best:.3f}s（优化可能未生效）"
+        # 数量级验证：改为**与同轮次内实测的参考实现对比**（相对口径）。
+        # FIX 2026-10-23：原断言是绝对墙钟 `best < 0.12`，满负载机器上实测
+        # 0.122s 即红（与 R118 同族的墙钟抖动），既假失败又无法反映
+        # "优化是否真的生效"。改成相对基准后既不抖动，检测力反而更强：
+        # 一旦快速路径被意外关闭，耗时会回到参考实现的量级，比值立刻 >1。
+        ref_best = _best(lambda: _reference_fit(text, 100000, "", "标"))
+        assert best < ref_best * 0.6, (
+            f"快速路径应显著快于参考实现：fast={best:.3f}s ref={ref_best:.3f}s"
+            "（优化可能未生效）"
+        )
 
 
 if __name__ == "__main__":

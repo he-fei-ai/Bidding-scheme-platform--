@@ -103,6 +103,10 @@ class Section(BaseModel):
     sort_order: int = 0
     section_type: str = "text"
     scoring_point_id: str | None = None
+    # 2026-10-20 遗留 3/5：Aligned 程序构造的一级目录落库后保留锁定/正文模式
+    # （此前仅存在于内存树，刷新即丢失）。locked 仅保护结构字段。
+    locked: bool = False
+    content_mode: str | None = None
     ai_prompt_snapshot: str | None = None
     flowchart_json: str | None = None
     gantt_json: str | None = None
@@ -183,6 +187,10 @@ class SectionTreeNode(BaseModel):
     sort_order: int
     section_type: str
     scoring_point_id: str | None = None
+    # 2026-10-20 遗留 3/5：前端读取 locked 后禁编辑锁定章节的结构；
+    # content_mode 透出供正文编辑页展示"生成模式"。
+    locked: bool = False
+    content_mode: str | None = None
     target_words: int | None = None
     # 2026-10-08 新增：字数档位相关字段（仅三级目录叶子有意义）
     word_count_tier: str | None = None
@@ -218,6 +226,13 @@ class ExportConfig(BaseModel):
     gantt_max_columns: int = 18
     # V1.0 增强：严格模式开关，开启后预检 warning 升级为 error
     strict_mode: bool = False
+    # ENHANCE（本轮跨模块深度探索·审核×导出打通）：一致性校核结果接入导出闸门。
+    # True 时，check_document 增加「未解决的高严重度一致性冲突」判据
+    # （consistency_conflicts 中 resolved=0 且 severity='high' 的规则/AI 冲突），
+    # 命中即阻断导出并提示先去一致性校核页处理。
+    # 默认 False：保持历史行为（审计结果与导出解耦），旧调用方零影响；
+    # 由前端导出配置页暴露开关，用户显式勾选后才生效。
+    block_on_high_conflicts: bool = False
     # D5 加固（2026-10-07）：图表标题兜底补图开关。开启后，章节无图表数据/无图表标记时，
     # 按标题本地模板自动补图（仅命中强关键词的图表相关章节）。默认关闭以保持历史行为；
     # 亦可由环境变量 AUTO_FALLBACK_CHARTS=1 全局开启。
@@ -299,6 +314,11 @@ class DocumentCheckResult(BaseModel):
     # 同类问题已聚合成 warnings 中的「[内容质量] …」条目；本字段供前端
     # 渲染可定位到章节的问题列表。向后兼容：默认空列表，旧调用方不受影响。
     quality_issues: list[dict] = []
+    # ENHANCE（本轮跨模块深度探索·审核×导出打通）：未解决的高严重度一致性
+    # 冲突数（consistency_conflicts 中 resolved=0 且 severity='high'）。
+    # 仅在调用方显式传入 block_on_high_conflicts=True 时统计；默认 0，
+    # 旧调用方行为不变。导出路由据此返回 400 阻断并引导去校核页处理。
+    high_conflicts_open: int = 0
 
 
 # ========== 废标检查模块 ==========

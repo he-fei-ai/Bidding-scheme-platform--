@@ -18,6 +18,9 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
+# 《标书智能体（5）》§五：校验问题格式化（具体到位置的错误信息供修复消息使用）
+from .json_issues import format_issues_from_list  # noqa: E402
+
 
 # ========== 快速提取 ==========
 
@@ -102,6 +105,8 @@ async def repair_json_with_ai(
     ai_call: Callable[[List[Dict[str, str]]], Any],
     *,
     max_rounds: int = 3,
+    target_description: str = "",
+    issues: Optional[List[str]] = None,
 ) -> RepairResult:
     """用 AI 修复 JSON。
 
@@ -109,6 +114,11 @@ async def repair_json_with_ai(
         invalid_text: 包含无效 JSON 的原始文本。
         ai_call: AI 调用函数，接收 messages 列表，返回响应内容。
         max_rounds: 最大修复轮数。
+        target_description: 目标结果类型（如「完整目录」「一级目录」），
+            《标书智能体（5）》§四：修复时须把三部分信息传给模型——
+            目标结果类型、当前校验问题、原始内容。缺省时不输出该段。
+        issues: 当前校验问题列表（如 validate_outline_json 的返回值）。
+            具体到位置的错误信息能显著提高弱模型的修复成功率。
 
     Returns:
         RepairResult 包含修复结果和尝试历史。
@@ -120,11 +130,21 @@ async def repair_json_with_ai(
         # 构建修复提示词
         # ENHANCE 2026-10-12：优先从 prompts 注册表取完整版提示词（JSON_REPAIR_PROMPT），
         # 硬编码 _REPAIR_SYSTEM_PROMPT 作为 DB 不可用时的最小 fallback。
+        # ENHANCE 2026-10-23（《标书智能体（5）》§四/§五）：修复消息从单一
+        # 「请修复以下 JSON」升级为三部分结构——目标类型 + 校验问题 + 原始内容；
+        # 旧调用方不传新参数时行为兼容（仅省略对应段落）。
         from .prompts import get_prompt as _gp
         sys_prompt = _gp("JSON_REPAIR_PROMPT") or _REPAIR_SYSTEM_PROMPT
+        _user_parts: List[str] = []
+        if target_description:
+            _user_parts.append(f"目标类型: {target_description}")
+        _issues_text = format_issues_from_list(issues)
+        if _issues_text:
+            _user_parts.append(f"校验问题:\n{_issues_text}")
+        _user_parts.append(f"原始输出:\n{current_text}")
         messages = [
             {"role": "system", "content": sys_prompt},
-            {"role": "user", "content": f"请修复以下 JSON：\n\n{current_text}"},
+            {"role": "user", "content": "\n\n".join(_user_parts)},
         ]
 
         # 调用 AI
@@ -179,12 +199,20 @@ async def repair_outline_json(
     ai_call: Callable[[List[Dict[str, str]]], Any],
     *,
     max_rounds: Optional[int] = None,
+    target_description: str = "标书目录 JSON（三级结构，叶子 children 为空数组）",
+    issues: Optional[List[str]] = None,
 ) -> RepairResult:
     """修复目录 JSON（使用 config.OUTLINE_JSON_REPAIR_ROUNDS）。"""
     from ...config import OUTLINE_JSON_REPAIR_ROUNDS
     if max_rounds is None:
         max_rounds = OUTLINE_JSON_REPAIR_ROUNDS
-    return await repair_json_with_ai(invalid_text, ai_call, max_rounds=max_rounds)
+    return await repair_json_with_ai(
+        invalid_text,
+        ai_call,
+        max_rounds=max_rounds,
+        target_description=target_description,
+        issues=issues,
+    )
 
 
 async def repair_content_json(
@@ -192,12 +220,20 @@ async def repair_content_json(
     ai_call: Callable[[List[Dict[str, str]]], Any],
     *,
     max_rounds: Optional[int] = None,
+    target_description: str = "正文 JSON（sections 数组）",
+    issues: Optional[List[str]] = None,
 ) -> RepairResult:
     """修复正文 JSON（使用 config.CONTENT_JSON_REPAIR_ROUNDS）。"""
     from ...config import CONTENT_JSON_REPAIR_ROUNDS
     if max_rounds is None:
         max_rounds = CONTENT_JSON_REPAIR_ROUNDS
-    return await repair_json_with_ai(invalid_text, ai_call, max_rounds=max_rounds)
+    return await repair_json_with_ai(
+        invalid_text,
+        ai_call,
+        max_rounds=max_rounds,
+        target_description=target_description,
+        issues=issues,
+    )
 
 
 def validate_outline_json(data: Any) -> List[str]:

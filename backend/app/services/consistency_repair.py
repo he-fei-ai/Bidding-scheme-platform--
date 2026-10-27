@@ -218,8 +218,14 @@ async def generate_patches(
 
 
 def _load_context(project_id: int, section_ids: list[int] | None) -> dict:
-    """读取事实变量、未解决冲突、待修小节。"""
-    with get_db() as conn:
+    """读取事实变量、未解决冲突、待修小节。
+
+    PERF 2026-10-27（并发·纯读跳过全局写锁）：三段 SELECT 纯读，此前用无参
+    ``get_db()`` 抢全局写锁 —— 与 fix-suggestion / 冲突列表已修的同类问题，
+    写高峰期（任一项目的审计/autofix/导出落库）会把 AI 修复的上下文准备
+    卡在锁队列上。WAL 下 readonly 连接走并发读通道。
+    """
+    with get_db(readonly=True) as conn:
         facts_row = conn.execute(
             "SELECT global_facts_json FROM analysis WHERE project_id = ?", (project_id,)
         ).fetchone()

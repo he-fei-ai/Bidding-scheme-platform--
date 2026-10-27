@@ -197,6 +197,12 @@ describe.skipIf(!hasDom)("FileUploadPage 删除链路与异步解析轮询（202
       expect(delBtn, "应渲染出删除按钮").toBeTruthy();
       rtl.fireEvent.click(delBtn as HTMLElement);
 
+      // BUG-FIX 2026-10-26：删除不可逆，必须经过二次确认才真正调用 deleteFile
+      await rtl.waitFor(() => {
+        expect(rtl.screen.getByRole("button", { name: "确认删除" })).toBeTruthy();
+      });
+      rtl.fireEvent.click(rtl.screen.getByRole("button", { name: "确认删除" }));
+
       // ① 提示如实说明主文件已被自动提升
       await rtl.waitFor(() => {
         expect(infoSpy).toHaveBeenCalledWith(
@@ -247,6 +253,12 @@ describe.skipIf(!hasDom)("FileUploadPage 删除链路与异步解析轮询（202
       const delBtn = findRowButton(rtl, "工程量清单.txt", /删除/);
       expect(delBtn).toBeTruthy();
       rtl.fireEvent.click(delBtn as HTMLElement);
+
+      // BUG-FIX 2026-10-26：同上一用例 —— 删除必须经过二次确认
+      await rtl.waitFor(() => {
+        expect(rtl.screen.getByRole("button", { name: "确认删除" })).toBeTruthy();
+      });
+      rtl.fireEvent.click(rtl.screen.getByRole("button", { name: "确认删除" }));
 
       await rtl.waitFor(() => {
         expect(successSpy).toHaveBeenCalledWith("文件已删除");

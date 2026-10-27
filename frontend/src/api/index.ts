@@ -16,6 +16,7 @@ import type {
   ChartType, ValidationResult,
   AIPProfile, UsageSummary, HealthProvider, DailyTrend, BudgetStatus,
   TextProviderConfig, TextProviderSavePayload, ImageProviderConfig,
+  SchemeExtractionResult, SchemeOutlineTemplateResult,
 } from "../types";
 
 // ========== 认证 Token 管理 ==========
@@ -289,8 +290,16 @@ http.interceptors.response.use(
           scheduleReconnectCheck();
         }
       } else {
-        console.error("请求失败:", detail);
-        message.error(`请求失败: ${detail}`);
+        // BUG-FIX 2026-10-26（错误提示双弹）：业务校验类 4xx（后端通过
+        // X-Error-Code 响应头或请求配置 quiet 标记）由调用方负责给用户唯一的
+        // 中文提示（如上传失败会拼出「文件名 + 失败原因」），这里不再重复弹窗。
+        // 未标记的 4xx 保持原有行为，零回归。
+        const errCode =
+          (originalConfig?.headers && (originalConfig.headers as Record<string, string>)["X-Error-Code"]) ||
+          (error.response?.headers && (error.response.headers as Record<string, string>)["x-error-code"]);
+        const quiet = !!originalConfig?.quiet || !!errCode;
+        console.error(quiet ? "[静默] 请求失败:" : "请求失败:", detail);
+        if (!quiet) message.error(`请求失败: ${detail}`);
       }
     } else if (error.code === "ECONNABORTED") {
       // BUG-F-06 修复：超时不再误报为"请求超时"并触发恐慌
@@ -522,7 +531,14 @@ export async function uploadFile(
   const formData = new FormData();
   formData.append("file", file);
   if (fileRole) formData.append("file_role", fileRole);
-  const res = await http.post<UploadResult>(`/projects/${projectId}/files`, formData);
+  // BUG-FIX 2026-10-26（错误提示双弹）：上传的 400 业务校验错误由 FileUploadPage
+  // 统一用 formatUploadFailureText 拼出「文件名 + 原因」的唯一提示，这里 quiet
+  // 掉拦截器的通用弹窗，否则用户先看到「请求失败: 文件内容为空」再看到中文文案。
+  const res = await http.post<UploadResult>(
+    `/projects/${projectId}/files`,
+    formData,
+    { quiet: true } as any,
+  );
   return res.data;
 }
 
@@ -559,6 +575,8 @@ export async function fetchFileParsingStatus(
 
 export async function reExtractFileText(projectId: number, fileId: number): Promise<{
   file_id: number; filename: string; status: string; message: string; text_length: number;
+  /** F-G 2026-10-26：仅在「提取成功但文本写盘失败」时出现——旧解析结果是否仍可用。 */
+  text_preserved?: boolean;
 }> {
   const res = await http.post(`/projects/${projectId}/files/${fileId}/re-extract`);
   return res.data;
@@ -600,6 +618,8 @@ export async function clearProjectTexts(projectId: number): Promise<{
   status: "cleared";
   files_reset: number;
   tasks_cleared: number;
+  /** BUG-FIX 2026-10-26：在途解析行未被重置的数量（>0 时应提示用户其仍会解析完成） */
+  files_kept_processing?: number;
   /** M-5 2026-10-15：非空 == 文本已删但 DB 状态未重置成功，必须降级为告警 */
   warning?: string;
 }> {
@@ -619,7 +639,12 @@ export async function fetchSupportedFormats(projectId: number): Promise<{
   image_extensions: string[];
   max_file_size: number;
   max_file_size_mb: number;
+  /** BUG-FIX 2026-10-26：精确 MB 值（老后端无此字段，可选）。前端优先使用它做上限判断，
+   *  避免 max_file_size_mb 的整数截断造成「前端放行、后端 400」的区间。 */
+  max_file_size_exact_mb?: number;
   ocr_enabled: boolean;
+  /** BUG-FIX 2026-10-26：图片 OCR 的独立大小上限（MB），0 表示不限制（老后端无此字段） */
+  ocr_max_file_size_mb?: number;
 }> {
   const res = await http.get<{
     extensions: string[];
@@ -627,7 +652,9 @@ export async function fetchSupportedFormats(projectId: number): Promise<{
     image_extensions: string[];
     max_file_size: number;
     max_file_size_mb: number;
+    max_file_size_exact_mb?: number;
     ocr_enabled: boolean;
+    ocr_max_file_size_mb?: number;
   }>(`/projects/${projectId}/files/supported-formats`);
   return res.data;
 }
@@ -694,6 +721,38 @@ export async function analyzeConstructionMethod(projectId: number): Promise<{ co
 
 export async function confirmConstructionMethod(projectId: number): Promise<void> {
   await http.post(`/projects/${projectId}/ai/construction-method/confirm`);
+}
+
+// Scheme Extraction（专项方案解析：五类结构化提取）
+/**
+ * 并发执行工程概况/方案类型/危大参数/编制依据/施工条件五项提取。
+ *
+ * BUG-FIX 2026-10-26（R9，前后端接口不一致）：后端 2026-10-23 已上线本端点，但前端
+ * 从未封装 → 用户无法触发，专项提取结果永远为空，目录生成只能走通用模板。
+ * 五个子任务并发（信号量 5），单任务失败被隔离（该项为 `{error}`），耗时可达分钟级，
+ * 与 /ai/summary、/facts/generate 对齐走 httpPostLong。
+ */
+export async function generateSchemeExtraction(
+  projectId: number,
+): Promise<{ scheme_extraction_json: string; scheme_extraction: SchemeExtractionResult }> {
+  const res = await httpPostLong<{
+    scheme_extraction_json: string;
+    scheme_extraction: SchemeExtractionResult;
+  }>(`/projects/${projectId}/ai/scheme-extraction`);
+  return res.data;
+}
+
+/**
+ * 按已识别的方案类型 + 危大工程判定参数返回推荐的目录模板（用于生成前预览确认）。
+ * 未识别时返回通用 23 章模板（`is_default=true`）。
+ */
+export async function fetchSchemeOutlineTemplate(
+  projectId: number,
+): Promise<SchemeOutlineTemplateResult> {
+  const res = await http.get<SchemeOutlineTemplateResult>(
+    `/projects/${projectId}/ai/scheme-outline-template`,
+  );
+  return res.data;
 }
 
 // Global Facts
@@ -2333,11 +2392,23 @@ export function exportDocxStream(
           // BUG 修复：abort 发生在同步行处理期间时，循环直接 break 且
           // streamEnded=false，Promise 永不 settle（调用方 await 永久挂起）。
           // 统一在循环出口处理：已取消 → reject 取消；流异常结束且无终止事件 → reject。
+          // BUG-FIX 2026-10-27（P2·误降级同步导出）：已收到 stream_id 说明构建
+          // 已在后端启动并持有导出组锁 —— 此刻 reject 普通「流异常结束」会让
+          // 调用方 classifyExportFailure 判为 fallback 重跑同步 exportDocx：
+          // 后端构建未结束时必然撞锁 409（用户看到「导出冲突」误报），恰已
+          // 结束则重复完整构建一份 DOCX。现给错误挂 __stream_started 标记，
+          // 调用方据此转「后台继续」分支（提示查导出历史），不再降级。
           if (settled) return;
           if (aborted) {
             settleErr(new Error("SSE 导出已被取消"));
           } else {
-            settleErr(new Error("SSE 流异常结束，未收到完成事件"));
+            const err = new Error(
+              streamId
+                ? "导出流连接中断，导出任务仍在后台执行，完成后可在导出历史中下载"
+                : "SSE 流异常结束，未收到完成事件",
+            );
+            (err as any).__stream_started = Boolean(streamId);
+            settleErr(err);
           }
         })
         .catch((e: any) => {

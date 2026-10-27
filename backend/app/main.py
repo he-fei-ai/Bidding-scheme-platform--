@@ -779,6 +779,18 @@ async def _startup():
     except Exception as e:
         logger.warning("任务组锁回收失败（不影响核心功能）: %s", e)
 
+    # ENHANCE（修复"关闭软件后锁未释放"）：启动时额外回收「跨进程孤儿锁」——
+    # 上一个进程实例（被关闭/崩溃）未来得及释放、且 owner_id 不属本进程的全部
+    # active 锁。仅按进程标识判定，不影响多 worker 下"本进程正在跑"的任务。
+    try:
+        from .services import task_lock as _task_lock
+
+        foreign = _task_lock.reclaim_foreign_locks()
+        if foreign:
+            logger.info("任务组锁回收完成，清理跨进程残留锁 %d 个", foreign)
+    except Exception as e:
+        logger.warning("跨进程残留锁回收失败（不影响核心功能）: %s", e)
+
     # ENHANCE 2026-09-15（Task 9）：后台任务快照对账。
     # 移植易标 `recoverInterruptedOutlineGenerationTask` 的核心语义 —— 启动时
     # 把「上次进程异常退出留下的、心跳已停的活跃任务」落到明面上，而不是让它
@@ -866,6 +878,16 @@ async def _shutdown():
     for _t in list(_background_tasks):
         _t.cancel()
     _background_tasks.clear()
+
+    # ENHANCE（修复"关闭软件后锁未释放"）：优雅关闭时主动释放本进程持有的
+    # 任务组锁。进程退出后锁再也无人续约，与其等 30 分钟 TTL 过期才允许同组
+    # 新任务启动，不如现在就释放。atexit 也会兜底，这里覆盖 lifespan 关闭路径。
+    try:
+        from .services import task_lock as _task_lock
+
+        _task_lock.release_owned_locks()
+    except Exception as e:
+        logger.warning("关闭时释放任务组锁失败（忽略）: %s", e)
 
 
 # ENHANCE 2026-09-29（on_event 弃用迁移）：以 lifespan context manager 注册

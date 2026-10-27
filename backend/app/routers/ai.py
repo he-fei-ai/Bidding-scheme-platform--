@@ -7,13 +7,20 @@ from pydantic import BaseModel
 from ..db import get_db
 from ..services.ai.provider_factory import get_ai_config, get_working_provider
 from ..services.ai.workflows_analysis import analyze_boq as wbq_analyze_boq, analyze_construction_method as wbq_analyze_construction_method, analyze_work_interface as wbq_analyze_work_interface, extract_global_facts, extract_scoring_points, generate_tender_summary
+from ..services.ai.workflows_scheme_extraction import parse_scheme_extraction_raw, run_all_scheme_extractions
+from ..services.ai.workflows_outline_v51 import recommend_outline_reference
 from ..services.facts_service import parse_stored_items
 from ..services.files import get_boq_file_text, get_construction_method_file_text, get_work_interface_file_text, latest_extracted_text
 from ..services.projects import update_step
 from ..services.tender_context import extract_tender_context_async
 from ..security.auth import get_current_user
 from .project_access import enforce_project_access
-_ALLOWED_FIELD_NAMES = frozenset({'summary_json', 'scoring_points_json', 'boq_json', 'work_interface_json', 'construction_method_json', 'global_facts_json', 'scope', 'confirmed_summary', 'confirmed_scoring', 'confirmed_boq', 'confirmed_work_interface', 'confirmed_construction_method', 'confirmed_facts'})
+# BUG-FIX 2026-10-26（R9，专项提取结果永不落库）：2026-10-23 新增
+# POST /ai/scheme-extraction 以 `scheme_extraction_json` 落库，但本白名单漏配该列，
+# `_sync_insert_or_update` 的 `_validate_field_name` 直接抛 ValueError；端点又用
+# try/except 吞掉异常仅 warning → 专项提取结果**从未写入 analysis 表**，
+# 下游 GET /analysis、目录自动选型（sse_outline）永远读不到已识别方案类型。
+_ALLOWED_FIELD_NAMES = frozenset({'summary_json', 'scoring_points_json', 'boq_json', 'work_interface_json', 'construction_method_json', 'global_facts_json', 'scheme_extraction_json', 'scope', 'confirmed_summary', 'confirmed_scoring', 'confirmed_boq', 'confirmed_work_interface', 'confirmed_construction_method', 'confirmed_facts'})
 
 #: analysis 表可被置位为「已确认」的列白名单（confirmed_* 布尔标记）。
 #: BUG-FIX 2026-10-05（P1 安全/数据完整性）：`_sync_confirm_field` 与
@@ -71,7 +78,7 @@ def _sync_get_analysis(project_id: int) -> dict | None:
     with get_db() as conn:
         # ENHANCE 2026-09-29（facts-ns）：补读 facts_policy。Step02 评分流程的自动事实
         # 提取以前拿不到用户所选缺值策略，永远按 fabricate 运行。
-        row = conn.execute('SELECT summary_json, scoring_points_json, confirmed_summary, confirmed_scoring, boq_json, work_interface_json, construction_method_json, confirmed_boq, confirmed_work_interface, confirmed_construction_method, global_facts_json, confirmed_facts, scope, COALESCE(facts_policy, \'fabricate\') AS facts_policy FROM analysis WHERE project_id = ?', (project_id,)).fetchone()
+        row = conn.execute('SELECT summary_json, scoring_points_json, confirmed_summary, confirmed_scoring, boq_json, work_interface_json, construction_method_json, confirmed_boq, confirmed_work_interface, confirmed_construction_method, global_facts_json, confirmed_facts, scheme_extraction_json, scope, COALESCE(facts_policy, \'fabricate\') AS facts_policy FROM analysis WHERE project_id = ?', (project_id,)).fetchone()
         return dict(row) if row else None
 
 def _sync_update_scope(project_id: int, scope: str) -> None:
@@ -138,8 +145,12 @@ def _sync_clear_analysis(project_id: int) -> None:
         # （列可能尚未迁移的老库，做存在性守卫）
         cols = {row['name'] for row in conn.execute('PRAGMA table_info(analysis)').fetchall()}
         _ef_clear = ", extraction_fields_json = ''" if 'extraction_fields_json' in cols else ''
+        # BUG-FIX 2026-10-26（R9，清除分析残留旧方案类型）：专项提取结果同样属于
+        # 本项目分析产物，此前未清 → 用户「清除分析」后 analysis.scheme_extraction_json
+        # 仍保留旧的方案类型/危大参数，目录生成会自动按旧数据选模板（跨模块数据残留）。
+        _se_clear = ", scheme_extraction_json = '[]'" if 'scheme_extraction_json' in cols else ''
         if existing:
-            conn.execute(f"UPDATE analysis SET\n                   summary_json = '', scoring_points_json = '[]',\n                   confirmed_summary = 0, confirmed_scoring = 0,\n                   boq_json = '[]', work_interface_json = '[]', construction_method_json = '[]',\n                   confirmed_boq = 0, confirmed_work_interface = 0, confirmed_construction_method = 0,\n                   global_facts_json = '[]', confirmed_facts = 0,\n                   scope = NULL{_ef_clear}, updated_at = datetime('now', 'localtime')\n                   WHERE project_id = ?", (project_id,))
+            conn.execute(f"UPDATE analysis SET\n                   summary_json = '', scoring_points_json = '[]',\n                   confirmed_summary = 0, confirmed_scoring = 0,\n                   boq_json = '[]', work_interface_json = '[]', construction_method_json = '[]',\n                   confirmed_boq = 0, confirmed_work_interface = 0, confirmed_construction_method = 0,\n                   global_facts_json = '[]', confirmed_facts = 0,\n                   scope = NULL{_ef_clear}{_se_clear}, updated_at = datetime('now', 'localtime')\n                   WHERE project_id = ?", (project_id,))
         else:
             conn.execute("INSERT INTO analysis\n                   (project_id, summary_json, scoring_points_json,\n                    confirmed_summary, confirmed_scoring)\n                   VALUES (?, '', '[]', 0, 0)", (project_id,))
     # 事实集已清空，旧审计同步作废（新建行分支无审计可残，无需处理）
@@ -245,7 +256,7 @@ async def get_analysis(project_id: int, current_user: Annotated[object, Depends(
         # 与 `facts_policy` 两键，而有行分支都有 —— 同一端点在「analysis 行存在与否」
         # 两种状态下形态不同，消费方（测试/集成调用）按有行形态读键会 KeyError。
         # 补齐为与有行分支一致的默认形态。
-        return {'summary_json': '', 'scoring_points_json': '[]', 'confirmed_summary': False, 'confirmed_scoring': False, 'boq_json': '[]', 'work_interface_json': '[]', 'construction_method_json': '[]', 'confirmed_boq': False, 'confirmed_work_interface': False, 'confirmed_construction_method': False, 'global_facts_json': '[]', 'global_facts_items': [], 'confirmed_facts': False, 'scope': '', 'facts_policy': 'fabricate'}
+        return {'summary_json': '', 'scoring_points_json': '[]', 'confirmed_summary': False, 'confirmed_scoring': False, 'boq_json': '[]', 'work_interface_json': '[]', 'construction_method_json': '[]', 'confirmed_boq': False, 'confirmed_work_interface': False, 'confirmed_construction_method': False, 'global_facts_json': '[]', 'global_facts_items': [], 'confirmed_facts': False, 'scheme_extraction_json': '[]', 'scheme_extraction': {}, 'scope': '', 'facts_policy': 'fabricate'}
     result = dict(row)
     scoring_json = result.get('scoring_points_json', '[]')
     if scoring_json and scoring_json != '[]':
@@ -275,6 +286,15 @@ async def get_analysis(project_id: int, current_user: Annotated[object, Depends(
     except Exception:
         result['global_facts_items'] = []
     result['confirmed_facts'] = bool(row['confirmed_facts']) if 'confirmed_facts' in row.keys() else False
+    # ENHANCE 2026-10-23（标书智能体（一）引入）：五个专项提取结果统一存于
+    # scheme_extraction_json，解析为 dict 一并返回（缺列/解析失败则回退空对象）。
+    se_json = row.get('scheme_extraction_json') if 'scheme_extraction_json' in row.keys() else None
+    se_json = se_json or '{}'
+    try:
+        result['scheme_extraction'] = json.loads(se_json) if isinstance(se_json, str) else (se_json or {})
+    except Exception:
+        result['scheme_extraction'] = {}
+    result['scheme_extraction_json'] = se_json if isinstance(se_json, str) else json.dumps(se_json, ensure_ascii=False)
     return result
 
 class ScopeUpdate(BaseModel):
@@ -434,6 +454,87 @@ async def generate_scoring(project_id: int, current_user: Annotated[object, Depe
         logger.error('[评分] 提取全局事实失败（评分点已保存，不阻断返回）: %s', _facts_e)
         global_facts = []
     return {'scoring_points_json': scoring_json, 'summary_json': summary, 'global_facts': global_facts}
+
+@router.post('/scheme-extraction')
+async def generate_scheme_extraction(project_id: int, current_user: Annotated[object, Depends(get_current_user)]=None):
+    """专项方案解析提取：并发产出工程概况/方案类型/危大参数/编制依据/施工条件五类结构化结果。
+
+    对标 ``generate_scoring`` 的编排形态，但一次性把五个专项任务并发跑完（共享同一份
+    文档全文，由 ``run_all_scheme_extractions`` 用信号量限制并发度），结果聚合为
+    一个 JSON 对象落 ``analysis.scheme_extraction_json``，供目录生成（方案类型选型）、
+    全局事实（危大参数判定）等下游消费。
+    """
+    await enforce_project_access(project_id, current_user)
+    full_text = await latest_extracted_text(project_id)
+    if not full_text:
+        raise HTTPException(status_code=400, detail='请先上传文件')
+    provider, used_fb = await get_working_provider(get_ai_config())
+    if used_fb:
+        logger.info('专项方案提取已降级到兜底提供商: %s', used_fb)
+    try:
+        # 五个任务并发提取，单任务失败被隔离（结果含 {"error": ...}），不影响其余返回。
+        results = await run_all_scheme_extractions(provider, full_text)
+    except Exception as e:
+        # 配置/网络层故障（provider 构造已在外部完成，这里只剩 AI 调用）：统一映射 502。
+        logger.exception('专项方案提取失败: %s', e)
+        raise HTTPException(status_code=502, detail=f'AI服务调用失败: {str(e)[:200]} | 请检查AI配置或稍后重试') from e
+    payload = json.dumps(results, ensure_ascii=False, indent=2)
+    try:
+        await asyncio.to_thread(_sync_insert_or_update, project_id, payload, 'scheme_extraction_json')
+    except Exception as _e:
+        # 落库失败不应吞掉已成功的 AI 结果；返回中仍带结果，便于前端立即展示。
+        logger.warning('[专项提取] 落库失败（结果仍返回前端）: %s', _e)
+    return {'scheme_extraction_json': payload, 'scheme_extraction': results}
+
+# 已知会追加特有重点章节的方案类型（与 workflows_outline_v51._SCHEME_TYPE_EXTRA_CHAPTERS 对应）。
+# 其余类型（含「其他」、空串、未识别）一律回退通用目录模板。
+_SCHEME_TYPES_WITH_TEMPLATE = {
+    "基坑工程", "模板工程及支撑体系", "脚手架工程",
+    "起重吊装及安装拆卸工程", "拆除工程",
+}
+
+
+def _read_scheme_extraction(project_id: int) -> "tuple[str, list]":
+    """读取项目已识别的专项方案类型与危大工程判定参数（标书智能体（一）引入）。
+
+    取自 ``analysis.scheme_extraction_json`` 的 ``scheme_type`` 与 ``dangerous_work_params``；
+    缺列/未识别/读取失败一律安全降级为 ``("", [])``，调用方据此回退通用目录模板，绝不中断请求。
+    解析口径统一走 :func:`parse_scheme_extraction_raw`（与目录生成侧共用同一真相）。
+    """
+    try:
+        with get_db() as conn:
+            row = conn.execute(
+                "SELECT scheme_extraction_json FROM analysis WHERE project_id = ?",
+                (project_id,),
+            ).fetchone()
+    except Exception as _e:
+        logger.debug("[目录模板] 读取方案提取失败（忽略）: %s", _e)
+        return "", []
+    if not row:
+        return "", []
+    return parse_scheme_extraction_raw(row[0] or "{}")
+
+
+@router.get('/scheme-outline-template')
+async def get_scheme_outline_template(
+    project_id: int, current_user: Annotated[object, Depends(get_current_user)] = None
+):
+    """按已识别的方案类型 + 危大工程判定参数返回推荐的目录模板（标书智能体（一）引入）。
+
+    与后台目录生成自动选用的是同一份推荐逻辑（``recommend_outline_reference``）。
+    前端可据此预览「根据识别的方案类型与危大参数，推荐的目录模板」，并在触发目录生成时
+    将其作为 ``reference_outline`` 显式传入，实现人工确认/选择；当方案类型未识别且无危大
+    参数时返回通用 23 章模板（``is_default=true``）。
+    """
+    await enforce_project_access(project_id, current_user)
+    scheme_type, dangerous_params = _read_scheme_extraction(project_id)
+    template = recommend_outline_reference(scheme_type, dangerous_params)
+    is_default = not scheme_type and not dangerous_params
+    return {
+        "scheme_type": scheme_type,
+        "is_default": is_default,
+        "outline_template": template,
+    }
 
 @router.post('/summary/confirm')
 async def confirm_summary(project_id: int, data: SummaryConfirm, current_user: Annotated[object, Depends(get_current_user)]=None):

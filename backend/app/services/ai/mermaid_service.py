@@ -111,6 +111,13 @@ class MermaidServiceClient:
     # 后端可用性缓存 TTL（秒）
     _BACKEND_CACHE_TTL: float = 60.0
 
+    # 熔断器（ENHANCE 2026-10-27 健康监控）：
+    # 连续失败 ≥ _BACKEND_FAIL_THRESHOLD 后进入冷却期，冷却期内不再发起
+    # 探测（每次探测要花至多 5s 超时，渲染高峰期反复探测死服务会拖慢导出），
+    # 冷却结束后放行一次探测以确认恢复。成功即复位。
+    _BACKEND_FAIL_THRESHOLD: int = 2
+    _BACKEND_FAIL_COOLDOWN: float = 300.0
+
     def __init__(
         self,
         docker_url: str = "",
@@ -151,6 +158,81 @@ class MermaidServiceClient:
             MermaidRenderBackend.DOCKER: 0.0,
             MermaidRenderBackend.RAILWAY: 0.0,
             MermaidRenderBackend.MMDC: 0.0,
+        }
+        # 健康监控状态（ENHANCE 2026-10-27）：探测延迟 / 连续失败计数 /
+        # 最近一次错误信息，供 get_health_snapshot 与运维端点消费。
+        self._backend_health: dict[MermaidRenderBackend, dict] = {
+            b: {"latency_ms": None, "consecutive_failures": 0, "last_error": ""}
+            for b in MermaidRenderBackend
+        }
+
+    # ---------------------------------------------------------------
+    # 健康监控（ENHANCE 2026-10-27）
+    # ---------------------------------------------------------------
+
+    def _probe_allowed(self, backend: MermaidRenderBackend, now: float) -> bool:
+        """熔断器：连续失败达阈值后，冷却期内不再探测（返回 False）。"""
+        h = self._backend_health[backend]
+        if h["consecutive_failures"] < self._BACKEND_FAIL_THRESHOLD:
+            return True
+        return (now - self._backend_cache_time[backend]) >= self._BACKEND_FAIL_COOLDOWN
+
+    def _mark_probe(
+        self,
+        backend: MermaidRenderBackend,
+        available: bool,
+        now: float,
+        latency_ms: float | None = None,
+        error: str = "",
+    ) -> None:
+        """记录一次探测结果：更新缓存时间/延迟/连续失败计数，状态翻转时打结构化日志。"""
+        h = self._backend_health[backend]
+        prev = self._backend_available[backend]
+        if available:
+            h["consecutive_failures"] = 0
+            h["last_error"] = ""
+        else:
+            h["consecutive_failures"] = int(h["consecutive_failures"]) + 1
+            h["last_error"] = str(error)[:200]
+        h["latency_ms"] = round(latency_ms, 1) if latency_ms is not None else None
+        self._backend_available[backend] = available  # 可用性结果必须落缓存
+        self._backend_cache_time[backend] = now
+        if prev is not None and prev != available:
+            logger.warning(
+                "[Mermaid健康] 后端 %s 状态翻转: %s → %s（连续失败=%s, 延迟=%sms, 错误=%s）",
+                backend.value,
+                "可用" if prev else "不可用",
+                "可用" if available else "不可用",
+                h["consecutive_failures"],
+                h["latency_ms"],
+                h["last_error"] or "-",
+            )
+
+    def get_health_snapshot(self) -> dict:
+        """健康快照（只读缓存状态，不发起探测），供运维端点/日志使用。"""
+        backends = {}
+        for b in MermaidRenderBackend:
+            h = self._backend_health[b]
+            avail = self._backend_available[b]
+            cache_age = (
+                round(__import__("time").time() - self._backend_cache_time[b], 1)
+                if self._backend_cache_time[b]
+                else None
+            )
+            backends[b.value] = {
+                "available": avail,
+                "cache_age_s": cache_age,
+                "latency_ms": h["latency_ms"],
+                "consecutive_failures": h["consecutive_failures"],
+                "last_error": h["last_error"],
+                "circuit_open": int(h["consecutive_failures"]) >= self._BACKEND_FAIL_THRESHOLD,
+            }
+        return {
+            "backends": backends,
+            "cache_ttl_s": self._BACKEND_CACHE_TTL,
+            "fail_threshold": self._BACKEND_FAIL_THRESHOLD,
+            "fail_cooldown_s": self._BACKEND_FAIL_COOLDOWN,
+            "urls": {"docker": self._docker_url, "railway": self._railway_url},
         }
 
     # ---------------------------------------------------------------
@@ -279,24 +361,31 @@ class MermaidServiceClient:
         return elapsed < self._BACKEND_CACHE_TTL
 
     async def check_docker_available(self) -> bool:
-        """检测 Docker mermaid-service 是否可达（带 TTL 缓存）"""
+        """检测 Docker mermaid-service 是否可达（带 TTL 缓存 + 熔断器）"""
+        _now = __import__("time").time()
         if self._is_cache_valid(MermaidRenderBackend.DOCKER):
             return self._backend_available[MermaidRenderBackend.DOCKER]
+        if not self._probe_allowed(MermaidRenderBackend.DOCKER, _now):
+            return False  # 熔断冷却期内：直接判不可用，不发探测
 
         if not self._docker_url:
-            self._backend_available[MermaidRenderBackend.DOCKER] = False
-            self._backend_cache_time[MermaidRenderBackend.DOCKER] = __import__("time").time()
+            self._mark_probe(MermaidRenderBackend.DOCKER, False, _now)
             return False
 
+        _t0 = __import__("time").perf_counter()
         try:
             client = await self._get_client()
             resp = await client.get(f"{self._docker_url}/health", timeout=5)
+            _latency = (__import__("time").perf_counter() - _t0) * 1000.0
             available = resp.status_code == 200
-            self._backend_available[MermaidRenderBackend.DOCKER] = available
-            self._backend_cache_time[MermaidRenderBackend.DOCKER] = __import__("time").time()
+            self._mark_probe(
+                MermaidRenderBackend.DOCKER, available, _now, _latency,
+                error=f"HTTP {resp.status_code}",
+            )
             if available:
                 logger.info(
-                    "MermaidServiceClient: Docker mermaid-service 可用 (%s)", self._docker_url
+                    "MermaidServiceClient: Docker mermaid-service 可用 (%s, %.0fms)",
+                    self._docker_url, _latency,
                 )
             else:
                 logger.info(
@@ -305,42 +394,59 @@ class MermaidServiceClient:
                 )
             return available
         except Exception as e:
-            self._backend_available[MermaidRenderBackend.DOCKER] = False
-            self._backend_cache_time[MermaidRenderBackend.DOCKER] = __import__("time").time()
+            _latency = (__import__("time").perf_counter() - _t0) * 1000.0
+            self._mark_probe(
+                MermaidRenderBackend.DOCKER, False, _now, _latency, error=str(e)
+            )
             logger.debug("MermaidServiceClient: Docker mermaid-service 检测失败: %s", e)
             return False
 
     async def check_railway_available(self) -> bool:
-        """检测 Railway Cloud 服务是否可达（带 TTL 缓存）"""
+        """检测 Railway Cloud 服务是否可达（带 TTL 缓存 + 熔断器）"""
+        _now = __import__("time").time()
         if self._is_cache_valid(MermaidRenderBackend.RAILWAY):
             return self._backend_available[MermaidRenderBackend.RAILWAY]
+        if not self._probe_allowed(MermaidRenderBackend.RAILWAY, _now):
+            return False  # 熔断冷却期内：直接判不可用，不发探测
 
         if not self._railway_url:
-            self._backend_available[MermaidRenderBackend.RAILWAY] = False
-            self._backend_cache_time[MermaidRenderBackend.RAILWAY] = __import__("time").time()
+            self._mark_probe(MermaidRenderBackend.RAILWAY, False, _now)
             return False
 
+        _t0 = __import__("time").perf_counter()
         try:
             client = await self._get_client()
             resp = await client.get(f"{self._railway_url}/health", timeout=5)
+            _latency = (__import__("time").perf_counter() - _t0) * 1000.0
             available = resp.status_code == 200
-            self._backend_available[MermaidRenderBackend.RAILWAY] = available
-            self._backend_cache_time[MermaidRenderBackend.RAILWAY] = __import__("time").time()
+            self._mark_probe(
+                MermaidRenderBackend.RAILWAY, available, _now, _latency,
+                error=f"HTTP {resp.status_code}",
+            )
             if available:
-                logger.info("MermaidServiceClient: Railway Cloud 可用 (%s)", self._railway_url)
+                logger.info(
+                    "MermaidServiceClient: Railway Cloud 可用 (%s, %.0fms)",
+                    self._railway_url, _latency,
+                )
             return available
         except Exception as e:
-            self._backend_available[MermaidRenderBackend.RAILWAY] = False
-            self._backend_cache_time[MermaidRenderBackend.RAILWAY] = __import__("time").time()
+            _latency = (__import__("time").perf_counter() - _t0) * 1000.0
+            self._mark_probe(
+                MermaidRenderBackend.RAILWAY, False, _now, _latency, error=str(e)
+            )
             logger.debug("MermaidServiceClient: Railway Cloud 检测失败: %s", e)
             return False
 
     def check_mmdc_available(self) -> bool:
-        """检测本地 mmdc CLI 是否可用（带 TTL 缓存）"""
+        """检测本地 mmdc CLI 是否可用（带 TTL 缓存 + 熔断器）"""
+        _now = __import__("time").time()
         if self._is_cache_valid(MermaidRenderBackend.MMDC):
             return self._backend_available[MermaidRenderBackend.MMDC]
+        if not self._probe_allowed(MermaidRenderBackend.MMDC, _now):
+            return False  # 熔断冷却期内：直接判不可用，不发探测
 
         mmdc = self._mmdc_path or "mmdc"
+        _t0 = __import__("time").perf_counter()
         try:
             result = subprocess.run(
                 [mmdc, "--version"],
@@ -349,15 +455,20 @@ class MermaidServiceClient:
                 timeout=10,
                 shell=sys.platform == "win32",
             )
+            _latency = (__import__("time").perf_counter() - _t0) * 1000.0
             available = result.returncode == 0
-            self._backend_available[MermaidRenderBackend.MMDC] = available
-            self._backend_cache_time[MermaidRenderBackend.MMDC] = __import__("time").time()
+            self._mark_probe(
+                MermaidRenderBackend.MMDC, available, _now, _latency,
+                error=f"exit {result.returncode}",
+            )
             if available:
-                logger.info("MermaidServiceClient: mmdc CLI 可用 (%s)", mmdc)
+                logger.info("MermaidServiceClient: mmdc CLI 可用 (%s, %.0fms)", mmdc, _latency)
             return available
         except Exception as e:
-            self._backend_available[MermaidRenderBackend.MMDC] = False
-            self._backend_cache_time[MermaidRenderBackend.MMDC] = __import__("time").time()
+            _latency = (__import__("time").perf_counter() - _t0) * 1000.0
+            self._mark_probe(
+                MermaidRenderBackend.MMDC, False, _now, _latency, error=str(e)
+            )
             logger.debug("MermaidServiceClient: mmdc CLI 检测失败: %s", e)
             return False
 

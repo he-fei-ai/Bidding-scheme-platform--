@@ -112,7 +112,7 @@ except ImportError:  # pragma: no cover - 兜底路径
 logger = logging.getLogger(__name__)
 
 
-def _resolve_section_system_prompt() -> str:
+def _resolve_section_system_prompt(planned: bool = False) -> str:
     """解析章节正文 system 提示词（唯一正本：prompts/content.py）。
 
     FIX 2026-10-08（遗留9）：此处原先存在一份「兜底提示词」，其配图口径是
@@ -123,15 +123,26 @@ def _resolve_section_system_prompt() -> str:
 
     与其静默降级到矛盾文案，不如明确失败：注册正本缺失属于严重配置缺陷，
     必须被听见。
+
+    标书智能体（6）（2026-10-23）：`planned=True` 时改用
+    `CONTENT_SECTION_SYSTEM_PLANNED`——**正文与配图严格分离**口径：
+    正文只写文字/列表/表格，严禁输出任何图表代码块，配图由系统在全部正文
+    生成完成后统一执行（失败隔离，不影响正文）。
     """
     if get_prompt is not None:
-        try:
-            _prompt = get_prompt("CONTENT_SECTION_SYSTEM")
-        except Exception as _e:  # 注册表损坏：与缺失同等对待
-            logger.error("[提示词] CONTENT_SECTION_SYSTEM 读取失败: %s", _e)
-            _prompt = None
-        if _prompt:
-            return _prompt
+        keys = (
+            ("CONTENT_SECTION_SYSTEM_PLANNED", "CONTENT_SECTION_SYSTEM")
+            if planned
+            else ("CONTENT_SECTION_SYSTEM",)
+        )
+        for key in keys:
+            try:
+                _prompt = get_prompt(key)
+            except Exception as _e:  # 注册表损坏：与缺失同等对待
+                logger.error("[提示词] %s 读取失败: %s", key, _e)
+                _prompt = None
+            if _prompt:
+                return _prompt
     raise RuntimeError(
         "CONTENT_SECTION_SYSTEM 提示词不可用（prompts 注册表未加载或提示词为空）。"
         "已拒绝使用历史兜底文案（其配图口径与注册正本相反）。"
@@ -915,7 +926,9 @@ def build_chapter_content_messages(chapter_info: dict, facts: Any = None,
     # ENHANCE 2026-10-05（D-4）：文案正本注册在 prompts/content.py 的
     # CONTENT_SECTION_SYSTEM，提示词管理页可编辑。
     # FIX 2026-10-08（遗留9）：注册表不可用时明确报错，不再回落到矛盾口径的兜底文案。
-    sys_prompt = _resolve_section_system_prompt()
+    sys_prompt = _resolve_section_system_prompt(
+        planned=bool(kwargs.get("illustration_phase_planned"))
+    )
     # ENHANCE 2026-10-14（facts-ns P1-3，对齐易标 buildContentFactCompletenessInstruction）：
     # omit/placeholder 模式下追加「缺值口径铁律」——正文引用笼统承诺/【待填写】
     # 事实时沿用口径不得自行补具体值。fabricate 模式指令为空串，行为不变；
@@ -1065,24 +1078,33 @@ def build_chapter_content_messages(chapter_info: dict, facts: Any = None,
         # 可追溯：记录本章实际注入的字段（标签 / 来源 / 值预览），
         # 供生成后自检与「章节 → 所需事实」调用完整性审计（二.3）。
         if isinstance(_field_trace, list):
+            # ENHANCE 2026-10-21（正文 #4）：追溯键补 section_id，供生成后
+            # 校验按章节 id 而非 title 匹配（同名章碰撞/标题 sanitize 不再误报）。
+            _sec_id = chapter_info.get("id")
             for _lbl, _val in (_chapter_fields.get("extraction") or {}).items():
                 if _val:
                     _field_trace.append({
                         "chapter": title, "field": _lbl, "source": "extraction",
-                        "value": str(_val)[:60],
+                        "section_id": _sec_id, "value": str(_val)[:60],
                     })
             for _lbl, _val in (_chapter_fields.get("facts") or {}).items():
                 if _val:
                     _field_trace.append({
                         "chapter": title, "field": _lbl, "source": "facts",
-                        "value": str(_val)[:60],
+                        "section_id": _sec_id, "value": str(_val)[:60],
                     })
 
     # --- [2] 上级章节（承接关系）---
+    # 参考标准（外部引用软件）：字段访问用安全取值，避免缺字段/None 值抛异常
+    # 或把 None 渲染成字面量 "None" 进入提示词。
     if parent_chapters:
         _p_lines = []
         for _p in parent_chapters:
-            _pt = _p.get("title", "")
+            if not isinstance(_p, dict):
+                continue
+            _pt = _p.get("title") or ""
+            if not _pt:
+                continue
             _pd = (_p.get("description") or "")[:80]
             _p_lines.append(f"  - {_pt}" + (f"（{_pd}）" if _pd else ""))
         if _p_lines:
@@ -1091,15 +1113,25 @@ def build_chapter_content_messages(chapter_info: dict, facts: Any = None,
             ))
 
     # --- [3] 同级章节（避免重复）---
+    # 标书智能体（4）关键改进（缓存命中，冲突时以外部引用标准为准）：
+    # 同级章节列表**包含当前章节**且不按叶子过滤——同一父章节下所有叶子
+    # 渲染出字节级一致的 sibling_context，稳定前缀可命中服务商缓存（旧实现
+    # 在此排除当前章节，同父章节下每个叶子的同级列表都不同，前缀逐叶子漂移）。
+    # 「AI 自我参考/内容重复」的风险由本消息头与任务差异消息里的显式指令
+    # 约束：「请避免与除当前章节外的其他章节内容重复」。
     if sibling_chapters:
         _s_lines = []
         for _s in sibling_chapters:
-            _st = _s.get("title", "")
+            if not isinstance(_s, dict):
+                continue
+            _st = _s.get("title") or ""
+            if not _st:
+                continue
             _sd = (_s.get("description") or "")[:60]
             _s_lines.append(f"  - {_st}" + (f"（{_sd}）" if _sd else ""))
         if _s_lines:
             messages.append(AIMessage(
-                role="user", content="同级章节（请避免内容重复，突出本章节独特性）:\n" + "\n".join(_s_lines)
+                role="user", content="同级章节（列表含当前章节；请避免与除当前章节外的其他章节内容重复，突出本章节独特性）:\n" + "\n".join(_s_lines)
             ))
 
     # --- [3.2] 2026-10-18 ENHANCE: 章节位置与必含要素 ---
@@ -1465,23 +1497,50 @@ def build_chapter_content_messages(chapter_info: dict, facts: Any = None,
         _tbl = _plan.get("table") or {}
         _mmd = _plan.get("mermaid") or {}
         _img = _plan.get("image") or {}
+        _cht = _plan.get("chart") or {}
         orch_lines = []
 
         if _tbl.get("needed"):
             _tpurpose = _tbl.get("purpose", "")[:80]
             orch_lines.append(f"表格: 需要（{_tpurpose}）" if _tpurpose else "表格: 需要")
 
+        # 标书智能体（6）：配图意图**完整**传给正文模型（外部文档关键点——
+        # 「预编排结果不只是给程序看的，也会传给正文生成模型」，让正文提前
+        # 为图铺垫，避免图文两张皮）。这里给出图类型与图名，正文据此把该图
+        # 要表达的关系与要素用文字讲清楚。
+        _mmd_title = str(_mmd.get("title") or "")[:40]
         if _ill_type == "mermaid" or (_mmd.get("needed") and not _img.get("needed")):
             _mreason = _mmd.get("reason", "")[:60]
-            orch_lines.append(f"Mermaid图: 计划配图（{_mreason}）" if _mreason else "Mermaid图: 计划配图")
+            _line = "Mermaid图: 计划配图"
+            if _mmd_title:
+                _line += f"（图名：{_mmd_title}）"
+            elif _mreason:
+                _line += f"（{_mreason}）"
+            orch_lines.append(_line)
+
+        _cht_type = str(_cht.get("type") or "")[:20]
+        _cht_title = str(_cht.get("title") or "")[:40]
+        if _ill_type == "chart" or _cht.get("needed"):
+            _line = f"数据型图表: 计划配图（类型：{_cht_type or '待定'}）"
+            if _cht_title:
+                _line += f"（图名：{_cht_title}）"
+            orch_lines.append(_line)
 
         if _ill_type == "ai" or _img.get("needed"):
             _ipriority = _img.get("priority", 0)
             _ipriority = _normalize_priority_for_prompt(_ipriority)
             _ptag = f"（优先级 {_ipriority}）" if _ipriority else ""
-            orch_lines.append(f"AI配图: 计划配图{_ptag}")
+            _img_title = str(_img.get("title") or "")[:40]
+            _line = f"AI配图: 计划配图{_ptag}"
+            if _img_title:
+                _line += f"（图名：{_img_title}）"
+            orch_lines.append(_line)
 
         if orch_lines:
+            orch_lines.append(
+                "（以上配图由系统在正文生成完成后统一插入；正文请把该图要表达的"
+                "关系与要素写清楚，但不要输出任何图表代码块或图片语法）"
+            )
             prompt_parts.append("正文编排决策:\n" + "\n".join(orch_lines))
 
     # --- [4.5] 2026-10-18 ENHANCE: 顺序约束与输出结构约束 ---
@@ -1501,7 +1560,7 @@ def build_chapter_content_messages(chapter_info: dict, facts: Any = None,
     if _tree_index and _tree_total:
         _order_lines.append(
             f"⑦ 本章为按目录树顺序生成的第 {_tree_index}/{_tree_total} 个章节，"
-            "须与上级章节逻辑相承、避免与同级章节内容重复"
+            "须与上级章节逻辑相承、避免与除当前章节外的同级章节内容重复"
             + ("，并自然承接前一节内容" if kw_prev_sections else "") + "。"
         )
     prompt_parts.append("【顺序与结构约束】\n" + "\n".join(_order_lines))
@@ -2578,14 +2637,51 @@ async def _auto_continue_on_length(
 
 
 
+def _context_message_priority(content: str) -> int:
+    """上下文消息裁剪优先级（tier 越小越先被裁剪）。
+
+    依据外部引用软件《标书智能体（3）——生成标书正文代码+提示词》的关键细节：
+    「上下文过长时按优先级截断，优先保留上级章节与当前章节信息」。
+
+    tier 语义：
+      0 同级章节（仅用于防重复，可最先裁）→ 1 事实变量 → 2 下级目录章节
+      → 3 全篇叙事骨架 → 4 前序章节内容摘要 → 5 知识库素材 → 6 其他参考段
+      → 7 项目稳定上下文 → 8 上级章节（最后裁）→ 9 当前章节任务（永不裁）
+    """
+    head = (content or "")[:60]
+    if head.startswith("# 章节: "):
+        return 9
+    for tier, prefix in (
+        (0, "同级章节"),
+        (1, "事实变量:"),
+        (2, "下级目录章节"),
+        (3, "全篇叙事骨架"),
+        (4, "前序章节内容摘要"),
+        (5, "知识库素材"),
+        (6, "章节位置:"),
+        (7, "项目摘要:"),
+        (7, "承包范围:"),
+        (7, "招标文件已载明的工程作法"),
+        (7, "适用规范清单"),
+        (8, "上级章节"),
+    ):
+        if head.startswith(prefix):
+            return tier
+    return 6
+
+
+# tier 9 = 当前章节任务信息，按参考标准「优先保留当前章节信息」永不裁剪。
+_CONTEXT_TIER_NEVER_TRUNCATE = 9
+
+
 def _degrade_long_context_messages(messages: list, section: dict) -> list:
     """长上下文确定性降级（2026-10-20 易标机制引入，规格三.7）。
 
     易标在消息总长超模型上下文 70%（AGENT_CONTEXT_THRESHOLD_RATIO）时自动
     切 Agent 隔离环境处理；本软件无 Agent 运行时，等效降级策略：
       1. 总长 ≤ limit×ratio 阈值 → 原样返回（零开销路径，默认关闭时不进本函数）；
-      2. 超阈值 → 从最长的非 system 消息开始裁剪参考资料段（保留 system
-         铁律与章节定位信息），逐条削减直到总长回到阈值内；
+      2. 超阈值 → **按优先级**裁剪参考资料段（优先保留上级章节与当前章节信息，
+         见 _context_message_priority），逐条削减直到总长回到阈值内；
       3. 被裁剪的消息尾部追加「已截断」标记，避免模型把半截资料当完整资料；
       4. section['_context_degraded'] 留痕，供上游 SSE verification 事件上报。
 
@@ -2615,25 +2711,42 @@ def _degrade_long_context_messages(messages: list, section: dict) -> list:
 
         overflow = total - threshold
         truncated_any = False
-        # 非 system 消息按长度降序：优先削减最长的参考资料段
-        candidates = [
-            (i, _content_of(m)) for i, m in enumerate(messages)
-            if getattr(m, "role", None) != "system" and not (
+        # 截断标记长度：必须按实际长度计入预算，否则「裁剪后补标记」会再次
+        # 撑破阈值，剩余溢出量转而去裁更高优先级段（上级章节），与参考标准
+        # 「优先保留上级章节与当前章节信息」相悖。
+        _MARKER = "\n…（参考资料因超出模型上下文已截断，以完整资料页为准）"
+        _marker_len = len(_MARKER)
+        # 裁剪顺序 = 语义优先级升序（同级章节 → 事实 → 骨架 → … → 上级章节），
+        # 当前章节任务（tier 9）永不进入候选。
+        # BUG-FIX 2026-10-23（对齐外部引用标准「优先保留上级章节与当前章节信息」）：
+        # 原实现按「消息长度降序」裁剪 —— 最长的「当前章节任务」段（标题+概要+
+        # 评分要点+字数区间+生成要求，通常是全栈最长）**最先被裁**，「上级章节」
+        # 段也可能先于同级被裁，与参考标准正好相反。现改为按优先级裁剪。
+        candidates = []
+        for i, m in enumerate(messages):
+            if getattr(m, "role", None) == "system" or (
                 isinstance(m, dict) and m.get("role") == "system"
-            )
-        ]
-        candidates.sort(key=lambda x: -len(x[1]))
-        for idx, content in candidates:
+            ):
+                continue
+            content = _content_of(m)
+            tier = _context_message_priority(content)
+            if tier >= _CONTEXT_TIER_NEVER_TRUNCATE:
+                continue  # 当前章节任务信息：参考标准要求优先保留，绝不裁剪
+            candidates.append((tier, i, content))
+        # 同优先级内仍按长度降序（长段先裁，收敛更快）
+        candidates.sort(key=lambda x: (x[0], -len(x[2])))
+        for _tier, idx, content in candidates:
             if overflow <= 0:
                 break
-            # 每条最多削减自身 80%，保留主体语境；预留 12 字标记位
+            # 每条最多削减自身 80%，保留主体语境；
+            # 裁剪量需覆盖「溢出量 + 标记长度」，保证裁完即回到阈值内
+            # （否则会溢出到更高优先级段）。
             cut = min(len(content) - 200 if len(content) > 400 else 0,
-                      overflow + 12, int(len(content) * 0.8))
+                      overflow + _marker_len, int(len(content) * 0.8))
             if cut <= 0:
                 continue
             new_content = (
-                content[: len(content) - cut]
-                + "\n…（参考资料因超出模型上下文已截断，以完整资料页为准）"
+                content[: len(content) - cut] + _MARKER
             )
             m = messages[idx]
             if isinstance(m, dict):
@@ -2649,7 +2762,7 @@ def _degrade_long_context_messages(messages: list, section: dict) -> list:
         if truncated_any:
             section["_context_degraded"] = True
             logger.warning(
-                "[长上下文降级] 章节 %s 消息总长超阈值 %.0f%%，已裁剪至 %d 字（阈值 %d）",
+                "[长上下文降级] 章节 %s 消息总长超阈值 %.0f%%，已按优先级裁剪至 %d 字（阈值 %d）",
                 section.get("id", "?"),
                 CONTENT_CONTEXT_DEGRADE_RATIO * 100,
                 _total_len(messages),
@@ -2747,12 +2860,22 @@ async def _do_generate_section_with_optimizations(
         if isinstance(response, dict):
             content = response.get("content", "")
             finish_reason = response.get("finish_reason", "stop")
-            # ENHANCE 2026-10-05（P-23）：采集 Anthropic prompt cache token 用量
-            record_prompt_cache(response.get("usage"))
+            # ENHANCE 2026-10-05（P-23）：采集 prompt cache token 用量；
+            # 标书智能体（4）（2026-10-23）：带 task_type/section_id 记账，
+            # 使命中率可按任务类型观测（缓存优化是否生效可量化）。
+            record_prompt_cache(
+                response.get("usage"),
+                task_type=context.get("task_type") or "section_content",
+                section_id=str(section.get("id", "")),
+            )
         elif hasattr(response, 'content'):
             content = response.content
             finish_reason = getattr(response, "finish_reason", "stop")
-            record_prompt_cache(getattr(response, "usage", None))
+            record_prompt_cache(
+                getattr(response, "usage", None),
+                task_type=context.get("task_type") or "section_content",
+                section_id=str(section.get("id", "")),
+            )
         else:
             content = str(response)
             finish_reason = "stop"
@@ -2790,6 +2913,18 @@ async def generate_section_content(
         async def cb(section_id, title, status, progress, message, word_count=0)
     """
     context = context or {}
+    # 2026-10-20 遗留 5（content_mode 消费点）：目录生成落库的 content_mode
+    # 在正文生成入口统一解析。当前仅 ai-generate 有实现；模板填充/点对点
+    # 模式若出现在历史/外部数据中，resolve_content_mode 会显式告警并回落，
+    # 避免该字段“只透出不生效”。未来在此按模式分流到不同生成实现。
+    #
+    # 注意：必须在**调用方原 dict** 上原地归一化，不能 `section = dict(section)`
+    # 拷贝——`_do_generate_section_with_optimizations` 会把 `_context_check` /
+    # `_context_degraded` 挂在 section 上作为侧信道，`generate_sections` 的
+    # `_gen_one` 从原对象读回；拷贝会让上下文校验/降级观测静默丢失。
+    from .outline_alignment import resolve_content_mode
+
+    section["content_mode"] = resolve_content_mode(section)
     section_id = section.get("id", "")
     section_title = section.get("title", "")
     try:
@@ -2887,6 +3022,10 @@ async def generate_sections(
         # 表现为「扫描到了但正文永远注入不到」的幽灵功能。
         "hazard_info": "hazard_info",
         "standards_list": "standards_list",
+        # 标书智能体（6）：是否启用「预编排驱动」的正文口径（正文与配图分离）。
+        # 必须在此登记——漏登记会被静默丢弃，表现为「配图阶段开着、正文却还在
+        # 输出图表围栏」。
+        "illustration_phase_planned": "illustration_phase_planned",
     }
     # P0-TEXT-FLOW: 注入同级/上级章节映射（防车轱辘话、承上启下）
     # 从 sections_by_id + children_map 计算，每个 _gen_one 时按需取用
@@ -2894,21 +3033,51 @@ async def generate_sections(
     _cld_map = kwargs.get("children_map") or {}
 
     # siblings 映射: section_id -> [{id, title, description}]
+    # 标书智能体（4）关键改进（缓存命中，冲突时以外部引用标准为准）：
+    # 同级章节列表**包含当前章节**，且同一父章节下所有叶子共用**同一个列表
+    # 对象**（按父章节统一构造+统一截取）→ 渲染出的 sibling_context 对所有
+    # 叶子字节级一致。旧实现在此按叶子排除当前章节（`b.get("id") != _sid`），
+    # 同父章节下每个叶子的同级列表都不同 → 服务商看到的请求前缀逐叶子漂移，
+    #  prompt cache 只能部分命中。「AI 把自己当作参考对象」的风险改由任务
+    # 差异消息里的显式指令约束（build_chapter_content_messages 的
+    # 「请避免与除当前章节外的其他章节内容重复」），不再靠数据层过滤。
     _siblings_map: dict = {}
     _parents_map: dict = {}
+    _sibling_list_by_parent: dict = {}
+    try:
+        from ...config import CONTENT_SIBLING_MAX_ITEMS as _SIBLING_CAP
+    except Exception:  # pragma: no cover - 配置读取兜底
+        _SIBLING_CAP = 8
+    try:
+        # 审计7增强（2026-10-27）：超长目录降描述保留标题的扩容上限
+        from ...config import CONTENT_SIBLING_TITLES_MAX_ITEMS as _SIBLING_TITLES_CAP
+    except Exception:  # pragma: no cover - 配置读取兜底
+        _SIBLING_TITLES_CAP = 40
     for _s in sections:
         _sid = _s.get("id")
         if not _sid:
             continue
         _pid = _s.get("parent_id")
-        # 找 siblings（同父节点的其他孩子）
+        # 找 siblings（同父节点的全部孩子，含当前章节；同父章节统一截取）
         if _pid and _pid in _cld_map:
-            _brothers = [
-                {"id": b.get("id"), "title": b.get("title", ""), "description": b.get("description", "")}
-                for b in _cld_map[_pid]
-                if b.get("id") != _sid and b.get("title")
-            ]
-            _siblings_map[_sid] = _brothers[:8]  # 最多 8 个防 token 爆
+            if _pid not in _sibling_list_by_parent:
+                _children = [
+                    {"id": b.get("id"), "title": b.get("title", ""), "description": b.get("description", "")}
+                    for b in _cld_map[_pid]
+                    if b.get("title")
+                ]
+                if len(_children) > max(1, _SIBLING_CAP):
+                    # 超长目录（孩子数 > 容量）：旧口径只取前 8 个 → 第 9 个及
+                    # 之后的章节不在自己的同级列表里（自定位/兄弟感知缺失）。
+                    # 改为整表降描述仅保留标题、条数扩至 titles 上限：
+                    # 标题很短，token 量与旧口径相当；仍按父章节共享同一列表，
+                    # 前缀缓存命中设计不变（渲染端对空 description 安全）。
+                    _children = [
+                        {"id": c.get("id"), "title": c.get("title", ""), "description": ""}
+                        for c in _children
+                    ][: max(max(1, _SIBLING_CAP), _SIBLING_TITLES_CAP)]
+                _sibling_list_by_parent[_pid] = _children
+            _siblings_map[_sid] = _sibling_list_by_parent[_pid]
         # 找 parent 链（向上最多 3 层）
         _parents_list = []
         _cur_pid = _pid
@@ -3287,6 +3456,7 @@ async def generate_sections(
                 field_trace=merged_context.get("field_trace"),
                 facts=merged_context.get("facts"),
                 order_tracker=_order_tracker,
+                industry=kwargs.get("industry"),
             )
             # 实际完成顺序随结果透传（SSE 复核试后的最终顺序用）
             _clean_results = [r for r in results if r is not None]

@@ -482,6 +482,12 @@ describe.skipIf(!hasDom)("FileUploadPage 组件级交互", () => {
         .getAllByRole("button", { name: /删除/ })[0];
       rtl.fireEvent.click(delBtn);
 
+      // BUG-FIX 2026-10-26：删除不可逆，必须经过二次确认才真正调用 deleteFile
+      await rtl.waitFor(() => {
+        expect(rtl.screen.getByRole("button", { name: "确认删除" })).toBeTruthy();
+      });
+      rtl.fireEvent.click(rtl.screen.getByRole("button", { name: "确认删除" }));
+
       await rtl.waitFor(() => {
         expect(API_MOCKS.deleteFile).toHaveBeenCalledWith(1, 1);
       });

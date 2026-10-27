@@ -29,14 +29,6 @@ router = APIRouter(prefix='/projects/{project_id}/tasks', tags=['tasks'])
 _projects_has_created_by = None
 _projects_created_by_warned = False
 
-# ENHANCE 2026-09-15（Task 9）：中断快照 → 前端 recovery_options 的 type 取值。
-# 与「真能续跑」的 v51_outline / content_generation 区分开，前端据此改按钮文案
-# （中断没有检查点，只能重新生成；写成「恢复」会误导用户以为进度还在）。
-_INTERRUPTED_OPTION_TYPES = {
-    'outline_v51': 'outline_interrupted',
-    'content_generation': 'content_interrupted',
-}
-
 def _load_project_owner_row_tasks(project_id: int):
     """PERF（2026-10-05）：权限门同步 DB 读取段，供 `asyncio.to_thread` 派发。
 
@@ -101,7 +93,8 @@ async def get_all_tasks_status(project_id: int, current_user: Annotated[Any, Dep
     if v51_state and (not v51_state.cancelled):
         result['tasks']['v51_outline'] = {'status': 'active', 'phase': v51_state.current_phase, 'has_edited_outline': v51_state.edited_outline is not None, 'cancelled': v51_state.cancelled}
         result['has_pending_tasks'] = True
-        result['recovery_options'].append({'type': 'v51_outline', 'label': 'V5.1 目录生成', 'phase': v51_state.current_phase, 'description': f'目录生成进行到 {v51_state.current_phase} 阶段，可继续生成'})
+        # REMOVED 2026-10-26：不再把大纲生成作为恢复项推给前端横幅
+        # （需求：未完成不再保留、直接重新开始）。仅保留状态字段供诊断。
     else:
         try:
             # BUG-FIX 2026-09-16（高）：这是被前端轮询的高频**纯读**接口，
@@ -124,9 +117,10 @@ async def get_all_tasks_status(project_id: int, current_user: Annotated[Any, Dep
                     try:
                         exp_dt = datetime.strptime(expired_at, '%Y-%m-%d %H:%M:%S')
                         if datetime.now() <= exp_dt:
+                            # REMOVED 2026-10-26：陈旧 v51 快照不再作为「可恢复」
+                            # 提示推给前端（需求：未完成不再保留、直接重新开始）。
+                            # 仅保留状态字段供诊断，不再加入 recovery_options。
                             result['tasks']['v51_outline'] = {'status': 'recoverable', 'phase': row['current_phase'], 'cancelled': bool(row['cancelled'])}
-                            result['recovery_available'] = True
-                            result['recovery_options'].append({'type': 'v51_outline', 'label': 'V5.1 目录生成', 'phase': row['current_phase'], 'description': f"目录生成在 {row['current_phase']} 阶段中断，可恢复"})
                     except ValueError:
                         pass
         except Exception as e:
@@ -164,32 +158,12 @@ async def get_all_tasks_status(project_id: int, current_user: Annotated[Any, Dep
                 result['recovery_options'].append({'type': 'task_registry', 'task_type': task_info.task_type, 'task_id': task_info.task_id, 'label': f'{task_info.task_type} 任务', 'progress': task_info.progress, 'description': task_info.message or '任务进行中'})
     except Exception as e:
         logger.warning('查询 TaskRegistry 状态失败: %s', e)
-    # ENHANCE 2026-09-15（Task 9）：后台任务快照的中断对账结果。
-    # 进程被强杀时 `finally` 不执行，目录生成这类长任务不会有任何收尾痕迹；
-    # 靠 background_tasks 的心跳判定「这个任务其实已经死了」，在这里如实告知用户。
-    # 注意：这里是**纯读**（list_interruptions 不写库），不能因为用户刷页面就改库。
-    try:
-        for _item in task_snapshot.list_interruptions(project_id):
-            _ttype = _item.get('task_type') or 'unknown'
-            _summary = task_snapshot.interruption_summary(_item)
-            result['tasks'][f'interrupted_{_ttype}'] = {
-                'status': 'interrupted',
-                'phase': _item.get('phase'),
-                'progress': _item.get('progress'),
-                'task_type': _ttype,
-                'heartbeat_age_seconds': _item.get('heartbeat_age_seconds'),
-                'message': _summary,
-            }
-            result['recovery_options'].append({
-                'type': _INTERRUPTED_OPTION_TYPES.get(_ttype, f'{_ttype}_interrupted'),
-                'label': _item.get('task_type_label') or _ttype,
-                'phase': _item.get('phase'),
-                'progress': _item.get('progress'),
-                'description': _summary,
-            })
-            result['recovery_available'] = True
-    except Exception as e:
-        logger.warning('查询后台任务中断快照失败: %s', e)
+    # REMOVED 2026-10-26（需求：未完成的任务不再保留、直接重新开始）：
+    # 原先会在此把 background_tasks 中「心跳超时 / interrupted」的快照作为
+    # recovery_options 推给前端，前端据此展示「发现 N 个上次未正常结束的任务 /
+    # 上次目录生成在 X 阶段中断（进度约 Y%），请重新发起」。该提示已按需求移除，
+    # 目录生成不再提示历史中断、直接重新开始。历史 interrupted 行仍保留在表中
+    # 仅供审计，不再进入 recovery_options。
     result['has_pending_tasks'] = len(result.get('recovery_options', [])) > 0 or result.get('has_pending_tasks', False)
     return result
 

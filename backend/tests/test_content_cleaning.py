@@ -83,3 +83,106 @@ def test_parse_content_does_not_confuse_table_marker():
     content = "<<表格：表1 人员配置\n| 岗位 | 人数 |\n| 项目经理 | 1 |\n>>"
     blocks = parse_content(content)
     assert any(b.type == "table" for b in blocks), "表格占位符应解析为 table 块"
+
+
+# ============================================================================
+# 《招投标软件导出文档 — 分类问题报告》A-1/A-3/A-4/E-1~E-5（2026-10-26）
+# ============================================================================
+
+
+def test_clean_removes_system_residue():
+    """系统提示 / 内部章节标记 / 示意性注释不得进入正文（E-1/E-3/E-5）。"""
+    raw = (
+        "这是正常正文，长度足够写满一句话。\n\n"
+        "请确认是否生成正式投标文本。\n\n"
+        "【章节L3】应急预案与风险控制（第9章）\n\n"
+        "注：图中数据为资金分配逻辑示例，非真实数据。"
+    )
+    out = clean_generated_content(raw)
+    assert "请确认是否生成" not in out
+    assert "【章节L3】" not in out
+    assert "资金分配逻辑示例" not in out
+    assert "这是正常正文" in out
+
+
+def test_clean_removes_non_body_block():
+    """【…非正文…】标记及其后整段审阅稿一并删除（E-2）。"""
+    raw = (
+        "正式正文第一段，内容完整。\n\n"
+        "【本章背景补充（供审阅溯源，非正文）】\n"
+        "这段是审阅用的背景补充，不应出现在标书里。\n\n"
+        "正式正文第二段，内容完整。"
+    )
+    out = clean_generated_content(raw)
+    assert "非正文" not in out
+    assert "审阅用的背景补充" not in out
+    assert "正式正文第一段" in out and "正式正文第二段" in out
+
+
+def test_clean_git_conflict_keeps_head_side():
+    """Git 冲突块默认保留 HEAD 一侧，dev 侧与标记全部删除（E-4）。"""
+    raw = (
+        "冲突前的正文。\n\n"
+        "<<<<<<< HEAD\n"
+        "HEAD 侧应保留的内容。\n"
+        "=======\n"
+        "dev 侧应丢弃的内容。\n"
+        ">>>>>>> dev\n\n"
+        "冲突后的正文。"
+    )
+    out = clean_generated_content(raw)
+    assert "HEAD 侧应保留的内容" in out
+    assert "dev 侧应丢弃的内容" not in out
+    assert "<<<<<<<" not in out and "=======" not in out and ">>>>>>>" not in out
+
+
+def test_clean_strips_html_tags():
+    """正文 `<br>` 折行、其余 HTML 标签删除（A-3）。"""
+    raw = "北侧物料主入口<br>1.5 m×2.2m装配式大门<p>叉车水平搬运</p>额定1.5吨"
+    out = clean_generated_content(raw)
+    assert "<br>" not in out and "<p>" not in out
+    assert "北侧物料主入口" in out and "1.5 m×2.2m装配式大门" in out
+    assert "叉车水平搬运" in out and "额定1.5吨" in out
+
+
+def test_clean_strips_stray_mermaid_lines():
+    """漏在围栏外的 Mermaid 关键字/连线行应删除（A-4）。"""
+    raw = (
+        "施工区段入口设置告示牌。\n\n"
+        "graph LR\n"
+        "A[施工区段入口] \\(\\rightarrow\\) B[告示牌/当日作业信息牌]\n\n"
+        "flowchart LR\n\n"
+        "后续正常正文，内容完整。"
+    )
+    out = clean_generated_content(raw)
+    assert "graph LR" not in out and "flowchart LR" not in out
+    assert "A[施工区段入口]" not in out
+    assert "施工区段入口设置告示牌" in out
+    assert "后续正常正文" in out
+
+
+def test_clean_dedupes_consecutive_paragraphs():
+    """连续重复段落只保留一次（A-1/B-1）；首段带编号、次段无编号也能识别。"""
+    para = "围挡采用2.5m高彩钢板，底部设置30cm高砖砌挡水台，转角处加设斜撑固定。"
+    raw = f"1.2.1.1 {para}\n\n{para}\n\n后续不同内容，必须保留。"
+    out = clean_generated_content(raw)
+    assert out.count(para) == 1, out
+    assert "后续不同内容" in out
+
+
+def test_clean_keeps_short_repeated_lines():
+    """短句/列表项重复不属于段落重复，不得误删。"""
+    raw = "（1）检查\n\n（1）检查\n\n正常段落内容。"
+    out = clean_generated_content(raw)
+    assert out.count("（1）检查") == 2, out
+
+
+def test_clean_inline_text_for_table_cells():
+    """表格单元格行内清洗：LaTeX 与 HTML 残留不得进入 DOCX（A-2/A-3）。"""
+    from app.services.content_cleaning import clean_inline_text
+
+    assert clean_inline_text(r"合格率 \(100\%\)") == "合格率 100%"
+    assert clean_inline_text("北侧物料主入口<br>1.5 m×2.2m装配式大门") == (
+        "北侧物料主入口\n1.5 m×2.2m装配式大门"
+    )
+    assert "<br>" not in clean_inline_text("叉车水平搬运<br>额定1.5吨")

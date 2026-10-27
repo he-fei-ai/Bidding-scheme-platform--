@@ -229,6 +229,86 @@ def _reset_figure_counter(project_id: int | None = None):
                 _figure_counter_state.pop(k, None)
 
 
+# ============================================================
+# 图题唯一性登记（FIX 2026-10-26，《招投标软件导出文档 — 分类问题报告》
+# F-2 / B-4：同一章连续三张图共用同一个图题）
+# ============================================================
+#
+# 报告现场：「图7-2、图7-3、图7-4均为"环保与速干材料交叉施工协调"」。
+# 图号由计数器分配，天然唯一；但**图题文本**没有任何去重，AI 对同型图表
+# 复用了同一标题 → 成品连续三张同名图，评标时被判为模板堆砌。
+#
+# 口径：仅在同一「章」内去重（跨章同名图是合理的，如各章都有一张
+# 「施工进度横道图」）；图题归一化后长度 <4 字不参与（噪声标题不足以判定重复）。
+
+_CHART_TITLE_NOISE_RE = re.compile(r"[\s\u3000，。；：、（）()《》“”\"'【】\[\]\-—…·/]+")
+
+_used_chart_titles_ctx_var: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "export_used_chart_titles", default=None
+)
+
+
+def _chart_title_key(title: str) -> str:
+    """图题归一化：剥离图号前缀与标点空白，用于重复判定。"""
+    text = _FIG_NO_PREFIX_RE.sub("", str(title or "")).strip()
+    return _CHART_TITLE_NOISE_RE.sub("", text)
+
+
+def _claim_chart_title(
+    parent_section: str, title: str, project_id: int | None = None
+) -> bool:
+    """登记图题；返回 True 表示可插入，False 表示本章已有同名图（应跳过）。
+
+    空标题 / 过短标题（归一化后 <4 字）一律放行，避免误杀。
+
+    FIX 2026-10-26：去重只在 `build_docx` 建立的会话上下文内生效。上下文缺席
+    （单元测试、其他模块直接调用 `_add_inline_chart`）一律放行——旧实现的进程级
+    兜底字典会跨调用/跨用例累积，导致非导出链路的同名图被静默吞掉。
+    """
+    ctx = _used_chart_titles_ctx_var.get()
+    if ctx is None:
+        return True
+    key = _chart_title_key(title)
+    if len(key) < 4:
+        return True
+    chapter = _fig_chapter(parent_section) or "default"
+    bucket = _figure_counter_key(chapter, project_id)
+    used = ctx.setdefault(bucket, set())
+    if key in used:
+        return False
+    used.add(key)
+    return True
+
+
+def _reset_chart_title_registry(project_id: int | None = None):
+    """重置当前会话的图题登记（口径同 _reset_figure_counter）。"""
+    ctx = _used_chart_titles_ctx_var.get()
+    if ctx is not None:
+        ctx.clear()
+
+
+def _snapshot_chart_title_registry() -> dict[str, set[str]]:
+    """快照当前会话的图题登记（配合章节渲染失败回滚）。"""
+    ctx = _used_chart_titles_ctx_var.get()
+    if ctx is None:
+        return {}
+    return {key: set(titles) for key, titles in ctx.items()}
+
+
+def _restore_chart_title_registry(snapshot: dict[str, set[str]] | None) -> None:
+    """还原图题登记；章节渲染失败回滚正文后，重试才能重新插入同名图。
+
+    FIX 2026-10-26（回归修复）：图题去重登记若不同步回滚，失败章节重试时同名
+    图会被判为「重复」而跳过 → 正文出现图题但无图（比原问题更严重）。
+    """
+    ctx = _used_chart_titles_ctx_var.get()
+    if ctx is None:
+        return
+    ctx.clear()
+    for key, titles in (snapshot or {}).items():
+        ctx[key] = set(titles)
+
+
 def _drop_fig_no(obj):
     """**递归**剔除任意层级的 `fig_no` 键（缓存键归一化）。"""
     if isinstance(obj, dict):
@@ -432,6 +512,10 @@ __all__ = [
     "_single_flight_render",
     "_figure_counter_key",
     "_reset_figure_counter",
+    "_used_chart_titles_ctx_var",
+    "_chart_title_key",
+    "_claim_chart_title",
+    "_reset_chart_title_registry",
     "_drop_fig_no",
     "_strip_fig_no_for_cache",
     "_next_figure_number",

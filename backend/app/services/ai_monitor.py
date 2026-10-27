@@ -110,7 +110,14 @@ class AICallMonitor:
         self._stats = MonitorStats()
 
         # 告警状态
-        self._last_alert_time: float = 0
+        # FIX 2026-10-23（P1，日志实证 21:53:37 失败率 42% 告警）：
+        # 原实现三种告警（high_failure_rate / high_latency / slow_request）
+        # **共用同一个冷却时间戳**，于是任何一条先触发的告警都会把随后
+        # `cooldown_seconds`（默认 300s）内的其它告警全部静默——一条 info 级
+        # 「检测到慢请求」就能吞掉 5 分钟里的 critical 级失败率告警。
+        # 改为按 alert type 各自冷却，互不遮挡。
+        self._last_alert_time: float = 0  # 保留字段供既有测试/外部读取（全局最近一次告警时刻）
+        self._last_alert_time_by_type: dict[str, float] = {}
         self._active_alerts: list[dict] = []
 
         # 线程锁
@@ -229,14 +236,19 @@ class AICallMonitor:
 
         now = time.time()
 
-        # 检查冷却时间
-        if now - self._last_alert_time < self.alert_config.cooldown_seconds:
-            return
+        # 检查冷却时间：按 alert type 各自冷却（FIX 2026-10-23，见 __init__ 注释）。
+        # 先按类型过滤一遍，全部都在冷却期内才整体返回，避免"一条告警静默全部"。
+        def _in_cooldown(alert_type: str) -> bool:
+            last = self._last_alert_time_by_type.get(alert_type, 0.0)
+            return now - last < self.alert_config.cooldown_seconds
 
         alerts_triggered = []
 
         # 检查失败率
-        if self._stats.failure_rate > self.alert_config.failure_rate_threshold:
+        if (
+            self._stats.failure_rate > self.alert_config.failure_rate_threshold
+            and not _in_cooldown("high_failure_rate")
+        ):
             alerts_triggered.append(
                 {
                     "type": "high_failure_rate",
@@ -247,7 +259,10 @@ class AICallMonitor:
             )
 
         # 检查响应时间
-        if self._stats.avg_response_time > self.alert_config.response_time_threshold:
+        if (
+            self._stats.avg_response_time > self.alert_config.response_time_threshold
+            and not _in_cooldown("high_latency")
+        ):
             alerts_triggered.append(
                 {
                     "type": "high_latency",
@@ -258,7 +273,10 @@ class AICallMonitor:
             )
 
         # 检查单个慢请求
-        if latest_record.response_time > self.alert_config.response_time_threshold * 2:
+        if (
+            latest_record.response_time > self.alert_config.response_time_threshold * 2
+            and not _in_cooldown("slow_request")
+        ):
             alerts_triggered.append(
                 {
                     "type": "slow_request",
@@ -271,6 +289,8 @@ class AICallMonitor:
         # 触发告警
         if alerts_triggered:
             self._last_alert_time = now
+            for alert in alerts_triggered:
+                self._last_alert_time_by_type[alert["type"]] = now
             self._active_alerts.extend(alerts_triggered)
 
             # 记录日志

@@ -5,6 +5,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 from ..security.auth import get_current_user
+from ..config import UPLOAD_MAX_FILE_SIZE_MB, OCR_MAX_FILE_SIZE_MB
 from ..services import files as file_service
 from ..services.projects import update_step
 from .project_access import enforce_project_access
@@ -25,7 +26,11 @@ router = APIRouter(prefix='/projects/{project_id}/files', tags=['files'])
 # 服务层导出的唯一真相 SUPPORTED_EXTENSIONS 派生；两个集合必须相等的约束由
 # tests/test_import_enhancements_2026_10_05.py 钉住。
 ALLOWED_EXTENSIONS = set(file_service.SUPPORTED_EXTENSIONS)
-MAX_FILE_SIZE = 50 * 1024 * 1024
+# BUG-FIX 2026-10-26（配置硬编码 · TD-配置）：此前 `50 * 1024 * 1024` 写死在路由层，
+# 运维要调单文件上限只能改代码。现从 config.UPLOAD_MAX_FILE_SIZE_MB 派生
+# （默认仍是 50MB，行为完全向后兼容）。模块级常量保留，测试仍可按
+# `files_router.MAX_FILE_SIZE = 4096` monkeypatch（见 test_import_module_hardening_2026_10_15c.py）。
+MAX_FILE_SIZE = UPLOAD_MAX_FILE_SIZE_MB * 1024 * 1024
 
 
 class FileRoleUpdate(BaseModel):
@@ -42,7 +47,13 @@ class SupportedFormatsResponse(BaseModel):
     image_extensions: list[str] = Field(..., description='走 OCR 的图片扩展名')
     max_file_size: int = Field(..., description='单文件大小上限（字节）')
     max_file_size_mb: int = Field(..., description='单文件大小上限（MB，便于展示）')
+    # BUG-FIX 2026-10-26（前后端上限漂移）：max_file_size_mb 是整数除法，
+    # 运维把上限调成 51MB / 25.5MB 这类非整 MB 值时前端拿到的仍是向下截断值，
+    # 于是「前端放行、后端 400」的区间重新出现。补一个精确浮点字段供前端优先使用；
+    # 老字段保留不动，老前端与既有测试（断言 == MAX_FILE_SIZE // 1024**2）零回归。
+    max_file_size_exact_mb: float = Field(..., description='单文件大小上限（MB，精确值）')
     ocr_enabled: bool = Field(..., description='OCR 引擎是否已启用（图片能否解析出文本）')
+    ocr_max_file_size_mb: float = Field(..., description='图片 OCR 的独立大小上限（MB），0 表示不限制')
 
 def allowed_extension(filename: str) -> bool:
     """检查文件扩展名是否允许"""
@@ -57,16 +68,32 @@ def get_file_extension(filename: str) -> str:
         return ''
     return os.path.splitext(filename)[1].lower()
 
+
+def _upload_http_error(detail: str, code: str) -> HTTPException:
+    """构造带机器可读错误码的 4xx（前端据此抑制响应拦截器的重复弹窗）。
+
+    BUG-FIX 2026-10-26（错误提示双弹）：上传被 400 拒绝时，axios 响应拦截器
+    先弹一次「请求失败: {detail}」，组件 catch 再弹一次「XX 上传失败: ...」，
+    用户连续看到两条内容重复的 toast。约定：本端点抛出的业务校验类 4xx 都带
+    ``X-Error-Code`` 响应头，前端拦截器见到该头即跳过通用弹窗，把唯一提示权
+    交给调用方（调用方会用 formatUploadFailureText 拼出带文件名的中文文案）。
+    ``detail`` 保持字符串，既有的 detail 断言与老前端完全兼容。
+    """
+    return HTTPException(status_code=400, detail=detail, headers={'X-Error-Code': code})
+
 @router.post('')
 async def upload_file(project_id: int, file: UploadFile=File(...), file_role: str=Form(''), current_user: Annotated[object, Depends(get_current_user)]=None):
     """上传文件（带安全校验）"""
     # 属权校验兼项目存在性校验（无权 403、不存在 404，与其余模块同口径）
     await enforce_project_access(project_id, current_user)
     if not file.filename:
-        raise HTTPException(status_code=400, detail='文件名为空')
+        raise _upload_http_error('文件名为空', 'file_name_empty')
     if not allowed_extension(file.filename):
         ext = get_file_extension(file.filename)
-        raise HTTPException(status_code=400, detail=f"不支持的文件类型 '{ext}'，允许的类型：{', '.join(sorted(ALLOWED_EXTENSIONS))}")
+        raise _upload_http_error(
+            f"不支持的文件类型 '{ext}'，允许的类型：{', '.join(sorted(ALLOWED_EXTENSIONS))}",
+            'file_type_unsupported',
+        )
     # BUG-FIX 2026-09-18（中）：原实现 `content = await file.read()` 先把整个文件
     # 读进内存，之后才比较 MAX_FILE_SIZE —— 大小限制形同虚设：上传一个数 GB 的
     # 文件会直接把进程内存打爆（OOM），而不是被拒绝。改为分块累积、超限立即中断。
@@ -79,11 +106,13 @@ async def upload_file(project_id: int, file: UploadFile=File(...), file_role: st
             break
         _total += len(_chunk)
         if _total > MAX_FILE_SIZE:
-            raise HTTPException(status_code=400, detail=f'文件大小超过 {MAX_FILE_SIZE // (1024 * 1024)}MB 限制')
+            raise _upload_http_error(
+                f'文件大小超过 {MAX_FILE_SIZE // (1024 * 1024)}MB 限制', 'file_too_large'
+            )
         _chunks.append(_chunk)
     content = b''.join(_chunks)
     if not content:
-        raise HTTPException(status_code=400, detail='文件内容为空')
+        raise _upload_http_error('文件内容为空', 'file_empty')
     try:
         result = await asyncio.to_thread(file_service.save_upload, project_id, file.filename, content, file_role)
         if result.get('status') == 'success':
@@ -130,7 +159,9 @@ async def get_supported_formats(
         image_extensions=sorted(file_service.IMAGE_EXTENSIONS),
         max_file_size=MAX_FILE_SIZE,
         max_file_size_mb=MAX_FILE_SIZE // (1024 * 1024),
+        max_file_size_exact_mb=MAX_FILE_SIZE / (1024 * 1024),
         ocr_enabled=bool(getattr(file_service, "OCR_ENABLED", False)),
+        ocr_max_file_size_mb=float(OCR_MAX_FILE_SIZE_MB or 0),
     )
 
 

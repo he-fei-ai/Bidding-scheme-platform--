@@ -72,6 +72,10 @@ vi.mock("../api", () => ({
   generateFacts: vi.fn(),
   confirmFacts: vi.fn(),
   auditFactsConsistency: vi.fn(),
+  // R9 2026-10-26：页面新增专项方案解析卡片（loadData 会读取 scheme_extraction，
+  // 有结果时再取推荐模板），mock 必须补齐这两个导出，否则组件渲染时调用 undefined。
+  generateSchemeExtraction: vi.fn(),
+  fetchSchemeOutlineTemplate: vi.fn(),
 }));
 
 vi.mock("react-router-dom", async () => {

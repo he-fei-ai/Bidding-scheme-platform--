@@ -18,9 +18,13 @@ source_requirement_id/locked）。默认 `"free"` 保持历史行为不变。
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
+
+
+logger = logging.getLogger(__name__)
 
 
 _SCORING_HEADER_RE = re.compile(
@@ -212,6 +216,64 @@ def merge_aligned_l1_with_children(
     return result
 
 
+#: 易标 OutlineItem.content_mode 的四种取值（对齐参考软件 outline.ts）。
+#: 本平台当前只有 ai-generate 有正文生成实现；其余三种为未来模式预留，
+#: 落库后由正文生成侧 resolve_content_mode 统一告警并回落，避免「死字段」。
+CONTENT_MODE_AI_GENERATE = "ai-generate"
+CONTENT_MODE_TEMPLATE_FILL = "template-fill"
+CONTENT_MODE_POINT_TO_POINT = "point-to-point"
+CONTENT_MODE_OTHER = "other"
+CONTENT_MODES = (
+    CONTENT_MODE_AI_GENERATE,
+    CONTENT_MODE_TEMPLATE_FILL,
+    CONTENT_MODE_POINT_TO_POINT,
+    CONTENT_MODE_OTHER,
+)
+
+#: 正文生成侧已有消费实现的模式（2026-10-20 遗留 5）
+IMPLEMENTED_CONTENT_MODES = frozenset({CONTENT_MODE_AI_GENERATE})
+
+#: 历史/外部数据的常见别名（大小写与下划线在 normalize 中先归一）
+_CONTENT_MODE_ALIASES = {
+    "ai": CONTENT_MODE_AI_GENERATE,
+    "template": CONTENT_MODE_TEMPLATE_FILL,
+    "point-to-point": CONTENT_MODE_POINT_TO_POINT,
+}
+
+
+def normalize_content_mode(value: Any) -> str:
+    """归一 content_mode 取值。
+
+    空值/未知值一律回落 ``ai-generate``（历史默认，保证旧数据零行为变化）；
+    已知但暂未实现的模式（template-fill/point-to-point/other）保持原值，
+    由消费点显式告警，而不是在落库时被静默改写。
+    """
+    raw = str(value or "").strip().lower().replace("_", "-")
+    if not raw:
+        return CONTENT_MODE_AI_GENERATE
+    raw = _CONTENT_MODE_ALIASES.get(raw, raw)
+    return raw if raw in CONTENT_MODES else CONTENT_MODE_AI_GENERATE
+
+
+def resolve_content_mode(section: Dict[str, Any] | None) -> str:
+    """正文生成侧 content_mode 消费点（2026-10-20 遗留 5）。
+
+    当前生成链路只有 ``ai-generate`` 一种实现。模板填充/点对点模式若
+    出现在数据里（历史导入/外部对接），必须显式告警并回落，保证：
+    ``content_mode`` 是可被消费的契约字段，而不是只在内存里透出的死数据。
+    未来接入新实现时，只需扩展 ``IMPLEMENTED_CONTENT_MODES`` 并在此分流。
+    """
+    mode = normalize_content_mode((section or {}).get("content_mode"))
+    if mode not in IMPLEMENTED_CONTENT_MODES:
+        logger.warning(
+            "[正文生成] content_mode=%s 暂无消费实现，章节「%s」回落 ai-generate",
+            mode,
+            str((section or {}).get("title") or "")[:60],
+        )
+        return CONTENT_MODE_AI_GENERATE
+    return mode
+
+
 def augment_aligned_l1(l1_items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """为程序构造的对齐 L1 回填易标 OutlineItem 扩展字段（2026-10-20 P0-2）。
 
@@ -232,7 +294,11 @@ def augment_aligned_l1(l1_items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if not node.get("source_requirement_title"):
             node["source_requirement_title"] = str(node.get("title") or "")
         if not node.get("content_mode"):
-            node["content_mode"] = "ai-generate"
+            node["content_mode"] = CONTENT_MODE_AI_GENERATE
+        else:
+            # 幂等归一：已知别名（ai/template…）收敛到标准值；未知值回落默认，
+            # 与正文生成侧 resolve_content_mode 共用同一份取值契约。
+            node["content_mode"] = normalize_content_mode(node.get("content_mode"))
         node.setdefault("locked", True)
     # None 入参归一化为 []（与全仓防御口径一致），list 入参原地修改后原样返回
     return l1_items if l1_items is not None else []

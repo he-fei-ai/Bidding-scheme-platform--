@@ -129,8 +129,8 @@ class TestConfigBackwardCompat:
     def test_defaults_are_enabled(self):
         assert OUTLINE_L3_GENERIC_STEM_GUARD_ENABLED is True
         assert OUTLINE_L3_REPAIR_QUOTA_BY_TASK is True
-        # 第四轮护栏保持默认开启，不与本轮冲突
-        assert OUTLINE_L3_MAX_PARENT_REUSE == 3
+        # 第四轮护栏保持默认开启，不与本轮冲突；2026-10-27 收紧至 2
+        assert OUTLINE_L3_MAX_PARENT_REUSE == 2
         assert OUTLINE_L3_REPAIR_MAX >= 1
 
     @pytest.mark.parametrize("dirty_case", [
@@ -397,25 +397,34 @@ class TestRepairQuotaAndEmptyTitle:
         assert not [t for t in titles if _is_dirty_l3_title_deep(t)], titles
 
     def test_quota_counts_only_executable_tasks(self, monkeypatch):
-        """空标题占据队首时配额不得被浪费，靠后位置仍能被纳入本轮。"""
+        """空标题不占配额：配额只约束需要修复逻辑的任务。"""
         monkeypatch.setattr("app.config.OUTLINE_L3_REPAIR_QUOTA_BY_TASK", True)
         tr = _l3_tree(["", "", "总体实施策划（2）", "专项6"])
         out = asyncio.run(_repair(tr, max_repair=3))
         titles = [c["title"] for c in out[0]["children"][0]["children"]]
-        # 3 个配额 → 前 3 个节点全部得到具体标题
-        assert len(titles[:3]) == 3
-        assert all(t.strip() for t in titles[:3]), titles
-        # 第 4 个节点因配额已满而留待后续轮次
-        assert titles[3] == "专项6", titles
+        # 变更（2026-10-26 空标题配额豁免）：2 个空标题走纯规则兜底、不占配额；
+        # 2 个可执行任务 ≤ 配额 3 → 本轮到第 4 个节点仍能被修复。
+        assert all(t.strip() for t in titles), titles
+        assert not [t for t in titles if _is_dirty_l3_title_deep(t)], titles
+
+        # 配额对「可执行任务」仍然生效：4 个泛化标题 + 配额 2 → 仅前 2 个修复
+        tr2 = _l3_tree(["专项1", "专项2", "专项3", "专项4"])
+        out2 = asyncio.run(_repair(tr2, max_repair=2))
+        titles2 = [c["title"] for c in out2[0]["children"][0]["children"]]
+        assert len([t for t in titles2 if _is_dirty_l3_title_deep(t)]) == 2, titles2
 
     def test_quota_backwards_compat_flag(self, monkeypatch):
-        """关闭新口径 = 回退历史截断行为：队首空标题浪费配额。"""
+        """关闭新口径 = 回退历史「按告警序号截断」，但空标题仍必须修复。"""
         monkeypatch.setattr("app.config.OUTLINE_L3_REPAIR_QUOTA_BY_TASK", False)
         tr = _l3_tree(["", "", "总体实施策划（2）", "专项6"])
         out = asyncio.run(_repair(tr, max_repair=3))
         titles = [c["title"] for c in out[0]["children"][0]["children"]]
-        # 历史口径：2 个空标题被静默跳过 → 配额浪费，仍留空
-        assert titles[0] == "" and titles[1] == "", titles
+        # 2026-10-26：空标题配额豁免对两种口径都生效（否则空标题节点会在
+        # normalize_outline_items 落库时被删除，造成目录缺节）
+        assert titles[0].strip() and titles[1].strip(), titles
+        assert not _is_dirty_l3_title_deep(titles[2]), titles
+        # 历史截断口径保留：第 4 个（下标 3）超出 max_repair=3 的告警序号窗口
+        assert titles[3] == "专项6", titles
 
     def test_all_dirty_are_eventually_covered(self):
         """大目录（> max_repair）经多轮修复后不再残留脏标题。"""

@@ -293,7 +293,21 @@ async def generate_content_impl(
 
     # 因为 HTTPException 会返回 JSON 响应，导致 EventSource 触发 onerror
 
+    # 标书智能体（6）：预编排驱动模式（正文与配图严格分离）。
+    # 启用条件：内容编排开启（编排关闭时无 plan 可执行）+ 配图阶段开关开启。
+    # 该标志在编排成功后置 True，控制三件事：
+    #   ① 正文改用 CONTENT_SECTION_SYSTEM_PLANNED（严禁输出图表代码块）；
+    #   ② 不再把章节入队走「边写边配图」的并行链路（配图统一后置执行）；
+    #   ③ 全部正文生成完成后执行配图阶段（校验 → 修复 → 插入 → 落库）。
+    _illustration_phase_planned = False
+    try:
+        from ...config import CONTENT_ILLUSTRATION_PHASE_ENABLED as _ILL_PHASE_ON
+    except Exception:  # pragma: no cover - 配置读取兜底
+        _ILL_PHASE_ON = False
+
     async def event_generator():
+
+        nonlocal _illustration_phase_planned
 
         yield f"data: {json.dumps({'status': 'connected'}, ensure_ascii=False)}\n\n"
 
@@ -545,11 +559,14 @@ async def generate_content_impl(
 
                 # BUG-FIX 2026-09-14（中）：缓存键末段是 section_id 而非 title，
                 # 传标题做子串匹配恒不命中；改为按 id 精确失效。
-                _regen_ids = [ld.get("id") for ld in leaf_dicts]
+                # 审计7更名（2026-10-27）：_regen_ids → _selected_ids。旧名暗示
+                # 「仅重生成章节」，实际是本次选中的**全部**叶子（首生成同样
+                # 需要预失效，防外部改文后命中陈旧缓存）。
+                _selected_ids = [ld.get("id") for ld in leaf_dicts]
 
-                if _regen_ids:
+                if _selected_ids:
 
-                    _invalidated = await _sec_cache.invalidate_by_ids(project_id, _regen_ids)
+                    _invalidated = await _sec_cache.invalidate_by_ids(project_id, _selected_ids)
 
                     if _invalidated:
 
@@ -791,6 +808,15 @@ async def generate_content_impl(
         # 区分「已取走(含处理中)」与「取消跳过」，排障不再误导。
         chart_skipped_count = 0
 
+        # 审计7加固（2026-10-27）：chart_processed 改用 worker 真实完成计数。
+        # 旧口径 chart_enqueued - qsize 把「已出队尚未完成」的任务也计为已处理
+        # （收尾日志自注释「含处理中≈」），且收尾瞬间 qsize=0 会把仍在处理的
+        # 任务全部计满。现在 worker 每完整处理完一章（成功或失败落日志）+1，
+        # overall_progress 与收尾日志均用真实值；asyncio 协作式调度下
+        # 「读-改-写」无 await 点，多 worker 并发自增安全。
+        # 取消跳过不计入 done（单列 chart_skipped_count）。
+        chart_done_count = 0
+
         # BUG-P2b FIX 2026-10-11：整体进度推送节流。
         # 防止每完成一个章节就推一次相同 percent 值 → 日志噪声。
         _last_overall_progress_event_at = 0
@@ -944,7 +970,7 @@ async def generate_content_impl(
 
             """从 chart_queue 取章节，调配图引擎"""
 
-            nonlocal chart_skipped_count
+            nonlocal chart_skipped_count, chart_done_count
 
             while not chart_done_event.is_set() or not chart_queue.empty():
 
@@ -1005,6 +1031,10 @@ async def generate_content_impl(
                     except Exception as _e:
 
                         logger.warning("配图生成失败 section_id=%s: %s", result.get("id"), _e)
+
+                    # 审计7加固（2026-10-27）：无论成功/失败（已落日志），
+                    # 完整处理完才计 done；取消跳过走上面的 continue 不计。
+                    chart_done_count += 1
 
 
 
@@ -1176,8 +1206,11 @@ async def generate_content_impl(
 
 
             # PERF-P0-B1: 章节正文 DB 保存后立即入队配图任务，与剩余章节的 LLM 生成并行
-
-            if status == "completed" and not cancel_event.is_set():
+            #
+            # 标书智能体（6）：预编排驱动模式下**不入队**——配图统一在全部正文
+            # 生成完成后由「配图阶段」执行（外部文档：配图与正文分离，图失败不
+            # 影响正文；且避免「边写边配图」与后置配图重复落图）。
+            if status == "completed" and not cancel_event.is_set() and not _illustration_phase_planned:
 
                 # BUG-FIX 2026-09-14（中）：chart_queue 是 maxsize=50 的有界队列，
                 # 但原实现用 `await chart_queue.put(...)`——队列满时会一直等待，
@@ -1367,7 +1400,7 @@ async def generate_content_impl(
                     "failed": failed_count,
                     "cancelled": cancelled_count,
                     "chart_enqueued": chart_enqueued_count,
-                    "chart_processed": chart_enqueued_count - chart_queue.qsize(),  # BUG-P3-A FIX
+                    "chart_processed": chart_done_count,  # 审计7：worker 真实完成计数（旧=入队−qsize，含处理中早计）
                     "chart_queue_size": chart_queue.qsize(),
                     "total": _total,
                     "done": _done,
@@ -1388,7 +1421,10 @@ async def generate_content_impl(
 
         async def run_generation():
 
-            nonlocal finished, error_sent, stopped, saved_count, failed_count, cancelled_count
+            # _illustration_phase_planned 在本函数内被赋值（编排成功后置位），
+            # 必须声明 nonlocal，否则会被当作 run_generation 的局部变量，
+            # 读取时抛 UnboundLocalError（闭包赋值陷阱）。
+            nonlocal finished, error_sent, stopped, saved_count, failed_count, cancelled_count, _illustration_phase_planned
 
             _gen_total_start = time.time()
 
@@ -1545,6 +1581,14 @@ async def generate_content_impl(
                     # 同时写入 plan(table/mermaid/image 决策) + illustration_type + section_type
                     if isinstance(orchestration_result, list):
                         apply_orchestration_to_leaves(leaf_dicts, orchestration_result)
+
+                        # 标书智能体（6）：预编排驱动模式。
+                        # 编排成功 → 正文改为「只写正文」口径 + 配图统一后置执行。
+                        _illustration_phase_planned = bool(_ILL_PHASE_ON)
+                        logger.info(
+                            "[正文生成] 预编排驱动模式：%s（正文与配图分离）",
+                            "开启" if _illustration_phase_planned else "关闭",
+                        )
 
                         # ENHANCE 2026-10-17（加固）：编排后验证 facts.titles 完整性
                         # 对齐参考软件 validateContentPlan —— 编排开关开启但全部空时告警
@@ -1815,6 +1859,10 @@ async def generate_content_impl(
                     standards_list=standards_list,
                     order_tracker=_order_tracker,
 
+                    # 标书智能体（6）：预编排驱动模式 → 正文改用「只写正文」提示词
+                    # （严禁输出图表代码块），配图由后置配图阶段统一执行。
+                    illustration_phase_planned=_illustration_phase_planned,
+
                 )
 
                 # === BUG-C-04 修复：失败章节指数退避重试 ===
@@ -1931,9 +1979,17 @@ async def generate_content_impl(
                                 ]
                                 if not _retry_sections:
                                     break
+                                # BUG-FIX（本轮深度探索·P5 轮次语义重复）：
+                                # 旧实现 round 用 `_round + 1`，而首条事件
+                                # （循环前）已宣告 round=1「开始重试 Round 1/2」。
+                                # 于是第 1 轮失败后这条又报 round=1，前端
+                                # `第 {round}/{total} 轮` 连续两次展示「第 1/2 轮」，
+                                # 与 message 文案「继续 Round 2/2」自相矛盾。
+                                # 本事件的语义是「下一轮（round+2）即将开始」，
+                                # round 置 `_round + 2` 与文案对齐。
                                 await queue.put({
                                     "status": "retry_round",
-                                    "round": _round + 1,
+                                    "round": _round + 2,
                                     "total_rounds": _MAX_RETRY_ROUNDS,
                                     "retry_count": len(_retry_sections),
                                     "message": f"重试 Round {_round + 1} 仍失败 {len(_retry_sections)} 章，继续 Round {_round + 2}/{_MAX_RETRY_ROUNDS}",
@@ -1983,6 +2039,7 @@ async def generate_content_impl(
                             field_trace=field_trace,
                             facts=global_facts,
                             order_tracker=_tracker_for_verify,
+                            industry=industry,
                         )
                         _ctx_bad = [
                             r.get("title") for r in results
@@ -2742,14 +2799,68 @@ async def generate_content_impl(
 
                     _chart_enqueued = chart_enqueued_count
                     remaining = chart_queue.qsize()
-                    chart_processed = max(_chart_enqueued - remaining, 0)
+                    # 审计7加固（2026-10-27）：改用 worker 真实完成计数，
+                    # 不再用「入队 − 队列剩余」估算（把处理中任务计满）。
+                    chart_processed = chart_done_count
 
                     logger.info(
-                        "自动配图流水线完成: 总入队=%d, 已取走(含处理中)≈%d, "
+                        "自动配图流水线完成: 总入队=%d, 已完成=%d, "
                         "队列剩余=%d, 取消跳过=%d, 落库成功章节=%d",
                         _chart_enqueued, chart_processed, remaining,
                         chart_skipped_count, saved_count,
                     )
+
+
+                # === 标书智能体（6）：配图阶段（正文全部生成完成后统一执行）===
+                # 外部文档《超长文本生成和图文控制》：「正文生成完成后，再执行配图」
+                # ——「图和文字的失败成本不一样：正文失败是真失败，配图失败不应
+                # 影响正文结果」。本阶段按预编排 plan 逐节执行：校验 → AI 修复 →
+                # 构建围栏 → 插入正文最佳位置 → 落库；任一图失败只跳过该图。
+                if _illustration_phase_planned and saved_count > 0 and not cancel_event.is_set():
+                    try:
+                        from ...services.ai.illustration_phase import (
+                            collect_illustration_targets,
+                            execute_illustration_phase,
+                        )
+                        try:
+                            from ...config import CONTENT_ILLUSTRATION_MAX_CHARTS as _ILL_MAX
+                        except Exception:  # pragma: no cover - 配置读取兜底
+                            _ILL_MAX = 0
+
+                        _ill_targets = collect_illustration_targets(
+                            leaf_dicts, max_charts=_ILL_MAX
+                        )
+                        if _ill_targets:
+                            await queue.put({
+                                "status": "illustration_phase",
+                                "total": len(_ill_targets),
+                                "message": f"配图阶段开始：{len(_ill_targets)} 张候选图",
+                            })
+                            _ill_result = await execute_illustration_phase(
+                                project_id,
+                                _ill_targets,
+                                provider=provider,
+                            )
+                            logger.info(
+                                "[配图阶段] 完成 project=%s 候选=%d 插入=%d 跳过=%d 失败=%d",
+                                project_id, _ill_result.get("total", 0),
+                                _ill_result.get("inserted", 0),
+                                _ill_result.get("skipped", 0),
+                                _ill_result.get("failed", 0),
+                            )
+                            await queue.put({
+                                "status": "illustration_phase_done",
+                                "inserted": _ill_result.get("inserted", 0),
+                                "skipped": _ill_result.get("skipped", 0),
+                                "failed": _ill_result.get("failed", 0),
+                                "message": (
+                                    f"配图完成：成功 {_ill_result.get('inserted', 0)} 张，"
+                                    f"跳过 {_ill_result.get('skipped', 0)} 张，"
+                                    f"失败 {_ill_result.get('failed', 0)} 张（正文已保留）"
+                                ),
+                            })
+                    except Exception as _ill_e:
+                        logger.warning("[配图阶段] 执行异常（不影响正文）: %s", _ill_e)
 
 
 
@@ -2851,6 +2962,88 @@ async def generate_content_impl(
                     except Exception as e:
 
                         logger.warning("一致性审计失败: %s", e)
+
+
+                # 已有方案扩写 · 原方案内容覆盖率审计（2026-10-20 易标机制引入，
+                # 对齐 runOriginalPlanCoverageAuditIfEnabled）：扩写模式下检查
+                # 原方案段落要点是否被新正文保留，有缺口时补写修复（≤2 轮）。
+                # 门禁：TEMPLATE_COVERAGE_AUDIT_ENABLED（默认关）+ 项目有就绪
+                # 模板；未走扩写流程的项目零开销跳过。
+                try:
+
+                    from ...services.template_coverage_audit import (
+                        run_template_coverage_audit_if_enabled as _run_tpl_coverage,
+                    )
+
+                    # 落库口径快照：补写修复会就地改写 results 的 content，
+                    # 必须事前快照原文才能算出「修订了几节」并只写变化项
+                    # （与一致性审计 _audit_original_by_id 同一模式）。
+                    _tpl_original_by_id = {
+                        r["id"]: r.get("content", "") for r in results
+                    }
+
+                    _tpl_coverage = await _run_tpl_coverage(
+                        project_id,
+                        provider,
+                        results,
+                        cancel_event=cancel_event,
+                    )
+
+                    if _tpl_coverage is not None:
+
+                        # 修复可能改写了 results 的 content：落库口径与一致性
+                        # 审计同构（只写变化项），否则补写结果不落库。
+                        _tpl_changed = 0
+
+                        for _r in results:
+
+                            if not isinstance(_r, dict) or _r.get("id") is None:
+                                continue
+
+                            _new_c = _r.get("content") or ""
+
+                            if _new_c and _new_c != _tpl_original_by_id.get(_r["id"], ""):
+
+                                _tpl_changed += 1
+
+                                await asyncio.to_thread(
+
+                                    update_section, _r["id"], SectionUpdate(content=_new_c)
+
+                                )
+
+                        # 三层缓存失效（与 condense/兜底扩写同构）：补写后的
+                        # 新正文必须立刻可见，旧正文缓存不得回灌。
+                        if _tpl_changed:
+                            try:
+                                from ...services.sections import invalidate_content_caches
+                                await asyncio.to_thread(
+                                    invalidate_content_caches, project_id
+                                )
+                            except Exception as _inv_e:
+                                logger.warning("[覆盖审计] 缓存失效失败（忽略）: %s", _inv_e)
+
+                        await queue.put(
+
+                            {
+                                "status": "template_coverage",
+                                "message": "原方案覆盖率审计完成：覆盖率 {:.1f}%，修订 {} 节".format(
+                                    _tpl_coverage.get("coverage_rate", 0.0), _tpl_changed
+                                ),
+                                "coverage_rate": _tpl_coverage.get("coverage_rate", 0.0),
+                                "covered": _tpl_coverage.get("covered", 0),
+                                "partial": _tpl_coverage.get("partial", 0),
+                                "missing": _tpl_coverage.get("missing", 0),
+                                "conflict": _tpl_coverage.get("conflict", 0),
+                                "unmapped": len(_tpl_coverage.get("unmapped") or []),
+                                "revised_count": _tpl_changed,
+                            }
+
+                        )
+
+                except Exception as e:
+
+                    logger.warning("原方案覆盖率审计失败: %s", e)
 
 
 

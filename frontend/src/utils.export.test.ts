@@ -95,4 +95,29 @@ describe("classifyExportFailure（导出失败三分支判定）", () => {
   it("优先级：取消判定先于 409（取消时即便服务端报 409 也不再弹冲突）", () => {
     expect(classifyExportFailure({ status: 409 }, true)).toBe("cancelled");
   });
+
+  // BUG-FIX 2026-10-27（P2·误降级同步导出）：已收到 stream_id 说明构建已在
+  // 后端启动并持有导出组锁 —— 降级同步 exportDocx 必然撞 409 或重复构建，
+  // 必须归为独立 background 分支（转「后台继续」提示，不降级不报错）。
+  it("构建已启动后流中断 → background（不降级，提示查导出历史）", () => {
+    expect(
+      classifyExportFailure(Object.assign(new Error("流中断"), { __stream_started: true }), false),
+    ).toBe("background");
+  });
+
+  it("优先级：409 冲突判定先于 background（锁冲突仍单独提示）", () => {
+    expect(
+      classifyExportFailure(
+        Object.assign({ status: 409 }, { __stream_started: true }),
+        false,
+      ),
+    ).toBe("conflict");
+    // 取消优先级同样高于 background
+    expect(
+      classifyExportFailure(
+        Object.assign(new Error("x"), { __stream_started: true, __cancelled: true }),
+        false,
+      ),
+    ).toBe("cancelled");
+  });
 });

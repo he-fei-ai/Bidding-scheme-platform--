@@ -42,6 +42,42 @@ export interface FileInfo {
   created_at: string;
 }
 
+/** 专项方案解析五类结果（后端 `run_all_scheme_extractions` 的返回结构）。
+ *
+ * BUG-FIX 2026-10-26（R9，前后端接口不一致）：后端 2026-10-23 已提供
+ * `POST /ai/scheme-extraction` 与 `GET /ai/analysis.scheme_extraction`，但前端类型
+ * 与页面完全未接入，导致该功能对用户不可达（死链路）。此处补齐契约。
+ * 单项任务失败时该项为 `{ error: string }` 而非数组，故类型放宽为联合。
+ */
+export interface SchemeExtractionTaskError {
+  error: string;
+}
+
+export interface SchemeExtractionResult {
+  project_overview?: any[] | SchemeExtractionTaskError;
+  scheme_type?: any[] | SchemeExtractionTaskError;
+  dangerous_work_params?: any[] | SchemeExtractionTaskError;
+  basis_list?: any[] | SchemeExtractionTaskError;
+  construction_condition?: any[] | SchemeExtractionTaskError;
+  [k: string]: any;
+}
+
+/** GET /ai/scheme-outline-template 的单章结构（与后端 recommend_outline_reference 同源） */
+export interface SchemeOutlineChapter {
+  id: string;
+  title: string;
+  level?: number;
+  source?: string;
+  [k: string]: any;
+}
+
+export interface SchemeOutlineTemplateResult {
+  scheme_type: string;
+  /** true = 未识别方案类型且无危大参数，返回通用 23 章模板 */
+  is_default: boolean;
+  outline_template: SchemeOutlineChapter[];
+}
+
 export interface AnalysisResult {
   summary_json: string;
   scoring_points_json: string;
@@ -56,6 +92,9 @@ export interface AnalysisResult {
   global_facts_json?: string;
   confirmed_facts?: boolean;
   scope: string;
+  /** 专项方案解析结果（未解析时为 `{}`）。可选，保证旧响应零破坏。 */
+  scheme_extraction?: SchemeExtractionResult;
+  scheme_extraction_json?: string;
 }
 
 export interface UploadResult {
@@ -101,6 +140,13 @@ export interface SectionTreeNode {
   sort_order: number;
   section_type: string;
   scoring_point_id: string | null;
+  /**
+   * 2026-10-20 遗留 3/5（Aligned 锁定）：由程序构造的一级目录落库时置 true。
+   * 前端据此禁用标题编辑/移动/删除（正文仍可编辑）；content_mode 为目录
+   * 生成写入的正文模式（默认 ai-generate），正文生成侧消费。
+   */
+  locked?: boolean;
+  content_mode?: string | null;
   target_words?: number | null;
   // 2026-10-08 新增：字数档位（三级目录控制）
   word_count_tier?: string | null;
@@ -205,6 +251,11 @@ export interface ExportConfig {
   image_dpi?: number;
   gantt_max_columns?: number;
   strict_mode?: boolean;
+  // ENHANCE（本轮跨模块深度探索·审核×导出打通）：一致性校核×导出闸门。
+  // 开启后，若存在未解决的高严重度一致性冲突（consistency_conflicts
+  // resolved=0 且 severity=high），导出返回 400 并引导去校核页处理。
+  // 默认 false，与后端 ExportConfig.block_on_high_conflicts 对齐。
+  block_on_high_conflicts?: boolean;
   // D5 加固（2026-10-07）：图表标题兜底补图开关（此前前端发送但类型缺失）
   auto_fallback_charts?: boolean;
   // L-6（2026-10-17）：图题编号分隔符（" " 空格=默认历史口径 / "：" 冒号），

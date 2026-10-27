@@ -9,6 +9,7 @@ import time
 from typing import Any
 from fastapi import HTTPException, Query
 from starlette.responses import StreamingResponse
+from ...config import CONTENT_DEEP_HEADING_RENUMBER_ENABLED
 from ...db import get_db
 from ...services.ai.outline_common import child_number
 from ...services.ai.provider_factory import get_ai_config
@@ -119,7 +120,37 @@ def _save_section_to_db(
                         "SELECT title FROM sections WHERE id = ?", (section_id,)
                     ).fetchone()
                     _section_title = _title_row["title"] if _title_row else ""
-                    from ...services.content_cleaning import ContentCleaner
+                    from ...services.content_cleaning import (
+                        ContentCleaner,
+                        has_deep_heading_numbering,
+                        normalize_deep_heading_numbering,
+                    )
+
+                    # 2026-10-26（遗留问题 1）：落库前正文标题净化开关。
+                    # 导出端只对 L1~L4 重编号，L5+（≥3 段小数）保留 AI 原文编号，
+                    # 编号漂移会与相邻 DB 子章节冲突。开启后改写为「章节路径 +
+                    # 相对序号」，段数不变 → parse_content 层级不变，导出识别不受影响。
+                    # 2026-10-27 修复：编号锚定之后，标题**文本**里的占位泛化名
+                    # （「专项6」）与「（2）」式冲突后缀仍会原样落库，故同一开关
+                    # 下再净化标题文本（见 content_cleaning._sanitize_heading_body）。
+                    # 先用正则快速预判：无深层编号的章节不触发 get_section_path
+                    # （该函数会读整个项目章节表，避免每次落库都付这份开销）。
+                    if CONTENT_DEEP_HEADING_RENUMBER_ENABLED:
+                        try:
+                            from ...services.sections import get_section_path
+
+                            _section_path = (
+                                get_section_path(section_id)
+                                if has_deep_heading_numbering(content)
+                                else ""
+                            )
+                            content = normalize_deep_heading_numbering(
+                                content, _section_path or "", context_title=_section_title
+                            )
+                        except Exception as _path_exc:
+                            logger.debug(
+                                "[SSE] 深层标题编号净化跳过（不阻塞落库）: %s", _path_exc
+                            )
 
                     content = ContentCleaner().clean(_section_title, content)
                 except Exception as _e:
@@ -664,6 +695,79 @@ def _count_title_changes(before: list[str], after: list[str]) -> int:
     return changed + abs(len(before) - len(after))
 
 
+def _fill_or_fix_outline_titles(
+    outline: list, *, fix_dirty: bool, project_id: int = 0
+) -> int:
+    """落库前确定性标题兜底：补空标题（level>=3），可选改写脏标题。
+
+    单一实现供两处复用（2026-10-26）：
+      1. `normalize_outline_items` **之前**，`fix_dirty=False` —— 只补三级空标题。
+         因为归一化会直接**删除**空标题节点（AI 漏填 → 目录缺节），补名后
+         节点才能正常落库。
+      2. 全部安全网**之后**，`fix_dirty=True` —— 空标题 + 脏标题（「专项6」
+         「总体实施策划（2）」等）强制改写，作为零脏标题落库的硬保证。
+
+    纯本地确定性规则（`_semantic_fallback_title` 工程实体 × 专业维度），
+    不调用 AI、不抛异常（异常由调用方 try/except 记录）。
+
+    Returns:
+        被改写/补名的节点数。
+    """
+    from ...services.ai.outline_common import (
+        _is_dirty_l3_title_deep,
+        _semantic_fallback_title,
+    )
+
+    _used: set[str] = set()
+
+    def _collect(nodes: list) -> None:
+        for _n in nodes:
+            if not isinstance(_n, dict):
+                continue
+            _t = (_n.get("title") or "").strip()
+            if _t:
+                _used.add(_t)
+            _sub = _n.get("children")
+            if isinstance(_sub, list):
+                _collect(_sub)
+
+    def _walk(nodes: list, grand: str = "", parent: str = "", level: int = 1) -> int:
+        _fixed = 0
+        if not isinstance(nodes, list):
+            return _fixed
+        for _i, _n in enumerate(nodes):
+            if not isinstance(_n, dict):
+                continue
+            _t = (_n.get("title") or "").strip()
+            _bad = (not _t) or (fix_dirty and _is_dirty_l3_title_deep(_t))
+            if level >= 3 and _bad:
+                _cand = _semantic_fallback_title(
+                    parent or grand or "工程实施", _i, _used, context_title=grand
+                )
+                if not _cand:
+                    _cand = f"{(parent or grand or '工程实施')[:10]}控制要点"
+                _n["title"] = _cand
+                _used.add(_cand)
+                _fixed += 1
+                if fix_dirty:
+                    logger.error(
+                        "_clear_and_save_outline: 落库前终态校验发现脏/空标题「%s」，"
+                        "已强制改写为「%s」（project=%d，level=%d）"
+                        "—— 上游质量收口链漏掉了该节点，请据此日志追查 error_layer=service",
+                        _t or "(空)", _cand, project_id, level,
+                    )
+            _cur = (_n.get("title") or "").strip()
+            _sub = _n.get("children")
+            if isinstance(_sub, list):
+                _fixed += _walk(_sub, grand=parent, parent=_cur, level=level + 1)
+        return _fixed
+
+    if not isinstance(outline, list):
+        return 0
+    _collect(outline)
+    return _walk(outline)
+
+
 def _clear_and_save_outline(project_id: int, outline: list) -> list:
 
     """清除现有目录并保存新目录，返回带数据库整数 ID 的 outline"""
@@ -679,6 +783,24 @@ def _clear_and_save_outline(project_id: int, outline: list) -> list:
         normalize_outline_items,
         _dedupe_outline_titles,
     )
+
+    # BUG-FIX 2026-10-26（空标题导致章节消失）：`normalize_outline_items` 会把
+    # 空标题节点**整条删除**。三级空标题通常是 AI 漏填（或 L3 修复配额耗尽后的
+    # 残留），直接丢等于目录缺节。归一化前先按父级语义确定性补名（零 AI 成本），
+    # 使其能正常落库；一级/二级空标题不补（无法从上下文推断，保留删除行为）。
+    try:
+        _empty_filled = _fill_or_fix_outline_titles(
+            outline or [], fix_dirty=False, project_id=project_id
+        )
+        if _empty_filled:
+            logger.warning(
+                "_clear_and_save_outline: 归一化前补全 %d 个空标题三级节点 project=%d",
+                _empty_filled, project_id,
+            )
+    except Exception as _empty_exc:
+        logger.warning(
+            "_clear_and_save_outline: 空标题预补全跳过（不阻塞落库）: %s", _empty_exc
+        )
 
     outline = normalize_outline_items(outline or [])
     # BUG-FIX 目录生成：normalize_outline_items 仅做「同父去重」，无法消除不同父节点
@@ -764,6 +886,34 @@ def _clear_and_save_outline(project_id: int, outline: list) -> list:
     except Exception as _cap_exc:
         logger.warning(
             "_clear_and_save_outline: 跨章复用护栏跳过（不阻塞落库）: %s", _cap_exc
+        )
+
+    # 2026-10-26 新增（落库前零脏标题硬保证）：上面四道安全网全部是
+    # try/except「失败即跳过」，任一环抛异常（树里混入非 dict 节点、清洗器
+    # 内部异常等）时脏标题会原样落库；人工编辑与审核回灌路径也完全绕开
+    # V5.1 生成链。此处做一次**不依赖前序成功**的终态校验：
+    # level>=3 的空标题与脏标题（「专项6」「总体实施策划（2）」等）一律用
+    # 确定性语义兜底改名，并打 ERROR 日志暴露上游漏点（日志准确性要求）。
+    _residual_hard_fixed = 0
+    try:
+        _residual_hard_fixed = _fill_or_fix_outline_titles(
+            outline, fix_dirty=True, project_id=project_id
+        )
+        if _residual_hard_fixed:
+            # 强制改写可能与同级既有标题撞名，补一次同级消歧（不与清洗顺序冲突：
+            # 此处只改标题不剥编号，故去重产物不会是「X（2）」形态）。
+            from ...services.ai.outline_common import _uniquify_outline_titles
+
+            outline = _uniquify_outline_titles(outline)
+            logger.error(
+                "_clear_and_save_outline: 落库前终态校验强制改写 %d 个脏/空标题 project=%d",
+                _residual_hard_fixed, project_id,
+            )
+    except Exception as _res_exc:
+        # 终态校验自身异常必须暴露（ERROR），但不阻断落库（目录生成优先交付）
+        logger.error(
+            "_clear_and_save_outline: 落库前终态校验异常，脏标题可能落库（project=%d）: %s",
+            project_id, _res_exc,
         )
 
     # 2026-10-12 收尾闭环：cleanup 内部已用 global_used 防跨父撞名，
@@ -946,9 +1096,9 @@ def _clear_and_save_outline(project_id: int, outline: list) -> list:
 
                 cursor = conn.execute(
 
-                    """INSERT INTO sections (project_id, parent_id, title, level, sort_order, section_type, scoring_point_id, target_words, status, graph_suitable, suggested_chart)
+                    """INSERT INTO sections (project_id, parent_id, title, level, sort_order, section_type, scoring_point_id, target_words, status, graph_suitable, suggested_chart, locked, content_mode)
 
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)""",
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)""",
 
                     (
 
@@ -981,6 +1131,16 @@ def _clear_and_save_outline(project_id: int, outline: list) -> list:
                         1 if node.get("graph_suitable") else 0,
 
                         str(node.get("suggested_chart") or ""),
+
+                        # 2026-10-20 遗留 3/5（Aligned 锁定与正文模式落库）：
+                        # 程序构造 L1 的 locked/content_mode 此前仅随 saved_node
+                        # 返回内存，刷新/跨请求即丢失。落库后 build_tree 与正文
+                        # 生成（_build_leaf_dicts）均可读取；locked 保护由
+                        # services.sections.update_section / move_section 执行。
+                        1 if node.get("locked") else 0,
+
+                        (str(node.get("content_mode")).strip() or None)
+                        if node.get("content_mode") else None,
 
                     ),
 
@@ -1104,8 +1264,8 @@ def _clear_and_save_outline(project_id: int, outline: list) -> list:
 
                 # 2026-10-20 易标机制引入 P0-2：易标 OutlineItem 扩展字段随节点
                 # 透出到目录 JSON（前端/导出/正文消费方可见）；仅在有值时写入，
-                # 旧数据不新增字段，完全向后兼容。DB 表结构不变（避免 SQLite
-                # ADD COLUMN 迁移面扩大），重进目录时由生成链路重新回填。
+                # 旧数据不新增字段，完全向后兼容。locked/content_mode 自遗留 3/5
+                # 起同时落库 section 列（此前仅内存透出，刷新即丢失）。
                 if node.get("source_requirement_id"):
                     saved_node["source_requirement_id"] = node["source_requirement_id"]
                 if node.get("content_mode"):

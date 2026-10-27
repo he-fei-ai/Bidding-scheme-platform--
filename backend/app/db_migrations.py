@@ -23,6 +23,38 @@ from .db import get_db
 
 logger = logging.getLogger(__name__)
 
+# ── 同因 DEBUG 日志去重（FIX 2026-10-23，P2，日志实证）─────────────────────
+# 迁移是幂等的：每次 `ensure_*_tables()` 都会对每一个已存在的列打一条
+# 「列已存在」DEBUG。生产日志实测 2026-10-20 15:19 ~ 2026-10-22 22:13
+# （34.1 万行）中：
+#     db_migrations.py:382  77,641 行
+#     db_migrations.py:958   9,279 行
+#     db_migrations.py:633   9,219 行
+#     db_migrations.py:935   6,146 行
+# 合计约 10.2 万行 ≈ 全量日志的 30%，全部是同一句话的重复，把真正的
+# WARNING/ERROR 完全淹没（这也是 traceId 覆盖率等指标难以阅读的直接原因）。
+# 按 (日志点标识, 上下文键) 去重：进程内同一个键只记一次。
+_DEDUPED_DEBUG_KEYS: set[tuple[str, str]] = set()
+
+
+def _debug_once(site: str, key: str, message: str, *args) -> None:
+    """同一 site+key 的 DEBUG 只打一次（首次命中后静默）。
+
+    仅用于**幂等重复路径**的日志（迁移"列已存在"等），不得用于首次发生
+    才有意义的信息——那些仍应逐次打印。
+    """
+    token = (str(site), str(key))
+    if token in _DEDUPED_DEBUG_KEYS:
+        return
+    _DEDUPED_DEBUG_KEYS.add(token)
+    logger.debug(message, *args)
+
+
+def reset_debug_once_cache() -> None:
+    """清空去重缓存（测试用）。"""
+    _DEDUPED_DEBUG_KEYS.clear()
+
+
 # S-1 加密收口覆盖的表与列（表名, 密钥列名）
 _API_KEY_STORAGE_COLUMNS: tuple[tuple[str, str], ...] = (
     ("ai_config", "api_key"),
@@ -379,7 +411,9 @@ def ensure_enhancement_tables():
                     return
                 if "already exists" not in err_msg and "duplicate column" not in err_msg:
                     raise  # 如果不是已存在错误，抛出
-                logger.debug("%s.%s 列已存在", table, column)
+                # FIX 2026-10-23：幂等重复路径，同 (表,列) 只记一次
+                _debug_once("col_exists_table", f"{table}.{column}",
+                            "%s.%s 列已存在", table, column)
 
         _add_column_if_not_exists("model_configs", "image_base_url", "TEXT")
         _add_column_if_not_exists("model_configs", "image_api_key_enc", "TEXT")
@@ -630,7 +664,9 @@ def ensure_enhancement_tables():
                 conn.execute(_ddl)
             except Exception as _e:
                 # 列已存在（重复迁移）属正常路径，不打 warning 以免刷屏
-                logger.debug("[silent-except] db_migrations.py: 列已存在 - %s", _e)
+                # FIX 2026-10-23：同因去重（生产实测该行 9,219 行 / 2.3 天）
+                _debug_once("col_exists_ddl", _ddl,
+                            "[silent-except] db_migrations.py: 列已存在 - %s", _e)
 
         # 12. 提交事务
         conn.commit()
@@ -678,6 +714,24 @@ def ensure_enhancement_tables():
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_usage_stats_date_tasktype ON ai_usage_stats(created_at, task_type)"
         )
+
+        # 13.1 标书智能体（4）（2026-10-23）：ai_usage_stats 补充 cached_tokens
+        # 列——Prompt Cache 命中量（OpenAI 兼容链路 prompt_tokens_details.
+        # cached_tokens / Anthropic 链路 cache_read_input_tokens）。缓存优化
+        # 是否生效必须可量化：命中率 = cached/prompt，与 cache_metrics 的进程内
+        # 计数器互补（落库可跨进程/重启观测）。旧库无该列时静默跳过；
+        # usage_stats.record_call 对该列缺失亦有兼容回退。
+        try:
+            conn.execute(
+                "ALTER TABLE ai_usage_stats ADD COLUMN cached_tokens INTEGER NOT NULL DEFAULT 0"
+            )
+            conn.commit()
+            logger.info("[OK] ai_usage_stats.cached_tokens 列已添加")
+        except Exception as _e:
+            _debug_once(
+                "usage_stats_cached_tokens", "cached_tokens",
+                "[silent-except] db_migrations.py: ai_usage_stats.cached_tokens - %s", _e,
+            )
 
         # 14. AI Profile 多配置表
         conn.execute("""
@@ -942,7 +996,9 @@ def ensure_enhancement_tables():
             conn.commit()
             logger.info("[OK] sections.word_count 列已添加")
         except Exception as _e:
-            logger.debug("[silent-except] db_migrations.py: line 547 - %s", _e)
+            # FIX 2026-10-23：同因去重（生产实测该行 6,146 行 / 2.3 天）
+            _debug_once("gen_tasks_col", _col,
+                        "[silent-except] db_migrations.py: line 547 - %s", _e)
 
         # 26. sections 表补充 level/section_type/scoring_point_id 列（兼容旧数据库）
         for col_name, col_def in [
@@ -955,7 +1011,9 @@ def ensure_enhancement_tables():
                 conn.commit()
                 logger.info("[OK] sections.%s 列已添加", col_name)
             except Exception as _e:
-                logger.debug("[silent-except] db_migrations.py: line 560 - %s", _e)
+                # FIX 2026-10-23：同因去重（生产实测该行 9,279 行 / 2.3 天）
+                _debug_once("sections_col", col_name,
+                            "[silent-except] db_migrations.py: line 560 - %s", _e)
 
         # 27. generation_tasks 表重建（若检测到旧版结构）
         # 旧版结构包含 strategy/progress_json/completed_sections 旧列以及指向
@@ -1375,6 +1433,24 @@ def ensure_enhancement_tables():
             # 而校验页 / 生成提示词 / 压缩阈值都要读 sections.target_words，
             # 老库上会直接抛 no such column。补进迁移链，幂等零破坏。
             ("target_words", "INTEGER DEFAULT NULL"),
+            # ENHANCE（本轮跨模块深度探索·DDL 双写加固）：以下 7 列此前**只**在
+            # db.py::init_db 用 _ensure_column 声明（db.py:1497-1503）。虽然
+            # init_db 末尾必定调用本迁移、并集生效，但「只跑迁移不跑 init_db」
+            # 的部署/工具路径（如老库升级脚本、init_full_db 建的库）会缺列：
+            #   · word_count_tier —— build_tree / _insert_section /
+            #     update_section_word_count_tier / check_document 的 L3 区间
+            #     判定都要读，缺列即 no such column；
+            #   · 6 个图表 *_json 列 —— 导出 _batch_load_section_details /
+            #     _render_section_charts 直接 SELECT，缺列同样抛错。
+            # 一并补入迁移链，与 init_db 侧同构，幂等（存在即静默跳过）。
+            ("word_count_tier", "TEXT DEFAULT NULL"),
+            ("gantt_json", "TEXT DEFAULT NULL"),
+            ("architecture_json", "TEXT DEFAULT NULL"),
+            ("labor_json", "TEXT DEFAULT NULL"),
+            ("inlined_chart_json", "TEXT DEFAULT NULL"),
+            ("comparison_json", "TEXT DEFAULT NULL"),
+            ("layout_json", "TEXT DEFAULT NULL"),
+            ("timeline_json", "TEXT DEFAULT NULL"),
         ]:
             _add_column_if_not_exists("sections", _wc_col, _wc_def)
 
@@ -1416,6 +1492,38 @@ def ensure_enhancement_tables():
                 )
         except Exception as e:
             logger.warning("image_provider_configs 唯一激活索引跳过: %s", e)
+
+        # 39. project_templates 表补充 content_coverage_json 列（2026-10-20）
+        #
+        # 已有方案扩写的内容级覆盖率审计（template_coverage_audit.py）报告落库。
+        # 与目录级 coverage_audit_json 分列：前者是「原方案段落要点是否被新正文
+        # 保留」的四态判定报告，后者是「模板目录标题是否被当前目录覆盖」的清
+        # 单——两套数据同一列会互相覆盖。旧库缺列时补列，默认 '[]'。
+        try:
+            conn.execute(
+                "ALTER TABLE project_templates ADD COLUMN content_coverage_json TEXT NOT NULL DEFAULT '[]'"
+            )
+            conn.commit()
+            logger.info("[OK] project_templates.content_coverage_json 列已添加")
+        except Exception as _e:
+            logger.debug(
+                "[silent-except] db_migrations.py project_templates.content_coverage_json - %s", _e
+            )
+
+        # 40. sections 表补充 Aligned 锁定字段（2026-10-20 遗留 3/5）
+        #
+        # 背景：aligned 模式的一级目录由程序构造（评分项 R{n} / 九大章节 S{n}），
+        # 节点携带 locked/content_mode 扩展字段。此前这两个字段只存在于内存树
+        # （_save_nodes 随 saved_node 透出），目录落库后即丢失 —— 页面刷新、
+        # 跨请求正文生成都拿不到「哪些章节被锁定」「每章用什么正文模式」。
+        # 补列后：_save_nodes 落库 → build_tree / 正文生成 _build_leaf_dicts 可读，
+        # 锁定章节的标题/父级/顺序由服务层拒绝修改（正文/状态仍可更新）。
+        # 老库缺列时补齐，默认值保证旧数据行为零变化。
+        for _aligned_col, _aligned_def in [
+            ("locked", "INTEGER NOT NULL DEFAULT 0"),
+            ("content_mode", "TEXT DEFAULT NULL"),
+        ]:
+            _add_column_if_not_exists("sections", _aligned_col, _aligned_def)
 
         conn.commit()
 

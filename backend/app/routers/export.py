@@ -34,6 +34,9 @@ _BUILD_TASKS: set = set()
 #: 流终态后 journal 保留时长（10 分钟）与总量上限（50 条流），防内存无界增长
 _STREAM_JOURNAL_TTL_SECONDS = 600
 _STREAM_JOURNAL_MAX = 50
+# drain 线程空闲超时：超过此时长队列无任何事件即视为生产者已死（封存 journal）。
+# 抽成模块常量便于测试注入短超时（BUG-FIX 2026-10-27 合成终态事件的回归测试）。
+_DRAIN_IDLE_TIMEOUT_SECONDS = 3600
 
 
 class _StreamJournal:
@@ -133,8 +136,16 @@ def _drain_queue_to_journal(journal: _StreamJournal) -> None:
     def _loop() -> None:
         while True:
             try:
-                item = journal.progress_queue.get(timeout=3600)
-            except queue.Empty:  # 1 小时无事件：视为生产者已死，封存 journal
+                item = journal.progress_queue.get(timeout=_DRAIN_IDLE_TIMEOUT_SECONDS)
+            except queue.Empty:
+                # BUG-FIX 2026-10-27（P3·无终态封存）：1 小时无事件视为生产者已死，
+                # 原实现只 mark_terminal 不落任何事件 —— resume 重放完进度后静默
+                # 结束，前端落入「流异常结束」降级链。现补一条合成 error 事件，
+                # resume/尾随生成器都能拿到显式终态。
+                journal.append({
+                    'event': 'error',
+                    'detail': f'导出流等待超时（{_DRAIN_IDLE_TIMEOUT_SECONDS // 60} 分钟无事件），请在导出历史中查看结果',
+                })
                 journal.mark_terminal()
                 break
             if item is None:  # 哨兵：_run_build 已结束
@@ -353,7 +364,10 @@ async def export_docx(project_id: int, config: ExportConfig=Body(default_factory
     # strict_mode，而 SSE 分支（下方 /docx-stream）传的是 `config.strict_mode`。
     # 后果：用户在同步导出接口勾选的「严格模式」完全不生效 —— 严格模式下才
     # 会判定的空章节/评分点覆盖缺口被静默放行，导出结果与用户预期不符。
-    check = await asyncio.to_thread(check_document, project_id, strict_mode=config.strict_mode)
+    check = await asyncio.to_thread(
+        check_document, project_id, strict_mode=config.strict_mode,
+        block_on_high_conflicts=config.block_on_high_conflicts,
+    )
     if check.total_sections == 0:
         raise HTTPException(status_code=400, detail='文档为空，无法导出')
     # BUG-FIX 2026-09-18（P0）：判据不得用 `len(empty_sections) == total_sections`。
@@ -362,6 +376,14 @@ async def export_docx(project_id: int, config: ExportConfig=Body(default_factory
     # 0 字的 DOCX。改用与「正文挂在哪类节点」解耦的判据：总字数为 0 即为空。
     if check.total_sections > 0 and not (check.total_chars or 0):
         raise HTTPException(status_code=400, detail='所有章节内容均为空，请先生成章节内容后再导出')
+    # ENHANCE（本轮跨模块深度探索·审核×导出打通）：用户显式开启一致性闸门且
+    # 存在未解决 high 冲突时阻断导出，引导先去校核页处理（默认关闭，历史行为不变）。
+    if config.block_on_high_conflicts and check.high_conflicts_open > 0:
+        raise HTTPException(
+            status_code=400,
+            detail=f'存在 {check.high_conflicts_open} 个未解决的高严重度一致性冲突，'
+                   f'请先在「一致性校核」页处理后再导出',
+        )
     lock_key, owner_id = await _acquire_export_lock(project_id)
     # ENHANCE 2026-10-04（T4）：后台心跳续约，消除「构建超 30 分钟 → 组锁 TTL
     # 到期被 reclaim_stale 回收 → 同项目第二个导出携新锁并发 build」窗口。
@@ -423,9 +445,27 @@ async def export_html(project_id: int, config: ExportConfig=Body(default_factory
     await enforce_project_access(project_id, identity)
     # BUG-FIX 2026-10-13（P1·空文档口径不一致）：DOCX 与 SSE 分支都对空文档
     # 返回 400，唯独 HTML 分支直接放行 → 产出只有封面没有正文的空壳文件。
-    check = await asyncio.to_thread(check_document, project_id, strict_mode=config.strict_mode)
+    check = await asyncio.to_thread(
+        check_document, project_id, strict_mode=config.strict_mode,
+        block_on_high_conflicts=config.block_on_high_conflicts,
+    )
     if check.total_sections == 0:
         raise HTTPException(status_code=400, detail='文档为空，无法导出')
+    # BUG-FIX（本轮深度探索·HTML 空壳文件遗漏路径）：2026-10-13 那次收口只补了
+    # 「total_sections == 0」与「产物 0 字节」两道，漏了与 DOCX 分支
+    # （export_docx）完全对齐的第二道判据——「有章节但所有章节正文均为空」。
+    # build_html 只输出标题/封面，产物非 0 字节，0 字节检查拦不住，用户会下载到
+    # 一份没有正文的空壳 HTML。此处补齐同口径判据。
+    if check.total_sections > 0 and not (check.total_chars or 0):
+        raise HTTPException(status_code=400, detail='所有章节内容均为空，请先生成章节内容后再导出')
+    # ENHANCE（本轮跨模块深度探索·审核×导出打通）：与 DOCX/SSE 分支同口径的
+    # 一致性闸门——开启且存在未解决 high 冲突时阻断导出。
+    if config.block_on_high_conflicts and check.high_conflicts_open > 0:
+        raise HTTPException(
+            status_code=400,
+            detail=f'存在 {check.high_conflicts_open} 个未解决的高严重度一致性冲突，'
+                   f'请先在「一致性校核」页处理后再导出',
+        )
     # BUG-FIX 2026-10-13（P1·无互斥双写）：HTML 产物与 DOCX 同落 exports/ 目录，
     # 但未抢导出组锁 → 两个 HTML 请求（或 HTML 与 DOCX 并发）各自生成产物，
     # 同名时互相截断。抢同一把组锁后，冲突方得到 409 而不是半截文件。
@@ -478,7 +518,10 @@ async def export_docx_stream(request: Request, project_id: int, config: ExportCo
     # ENHANCE 2026-09-29（P1 IDOR 收口）：SSE 流式导出同样先验项目属权
     await enforce_project_access(project_id, identity)
     t0 = time.time()
-    check = await asyncio.to_thread(check_document, project_id, strict_mode=config.strict_mode)
+    check = await asyncio.to_thread(
+        check_document, project_id, strict_mode=config.strict_mode,
+        block_on_high_conflicts=config.block_on_high_conflicts,
+    )
     t1 = time.time()
     logger.info('SSE 导出 check_document 耗时: %.3f 秒 (project_id=%d, strict_mode=%s)', t1 - t0, project_id, config.strict_mode)
     if check.total_sections == 0:
@@ -489,6 +532,14 @@ async def export_docx_stream(request: Request, project_id: int, config: ExportCo
     # 0 字的 DOCX。改用与「正文挂在哪类节点」解耦的判据：总字数为 0 即为空。
     if check.total_sections > 0 and not (check.total_chars or 0):
         raise HTTPException(status_code=400, detail='所有章节内容均为空，请先生成章节内容后再导出')
+    # ENHANCE（本轮跨模块深度探索·审核×导出打通）：与 DOCX/HTML 分支同口径的
+    # 一致性闸门——开启且存在未解决 high 冲突时阻断导出。
+    if config.block_on_high_conflicts and check.high_conflicts_open > 0:
+        raise HTTPException(
+            status_code=400,
+            detail=f'存在 {check.high_conflicts_open} 个未解决的高严重度一致性冲突，'
+                   f'请先在「一致性校核」页处理后再导出',
+        )
     # BUG-FIX 2026-09-15（高）：锁必须在构建启动**之前**抢到。
     # 原实现先 `create_task(_run_build)` 再在 SSE 生成器里拿锁，而
     # `asyncio.to_thread` 会立即把 `_run_build` 提交到线程池 —— build_docx
@@ -608,37 +659,67 @@ async def export_docx_stream(request: Request, project_id: int, config: ExportCo
     stream_id = uuid.uuid4().hex
     journal = _StreamJournal(stream_id, project_id, progress_queue)
     _register_stream_journal(journal)
-
-    async def event_stream():
-        # 组锁已在路由层抢到（跨进程 sqlite 行级锁），构建必须在这里才启动 ——
-        # 早于此处启动就会跑在锁外面（原实现就是这么坏的）。
-        # 锁由 `_run_build` 的 finally 释放。
-        _build_task = asyncio.create_task(asyncio.to_thread(_run_build))
+    # —— BUG-FIX 2026-10-27（P1·启动前取消导致导出组锁永久泄漏）——
+    # 原实现把 `asyncio.create_task(... _run_build)` 放在 event_stream() 生成器的
+    # 第一次迭代里：若客户端在 check_document / 响应头返回期间断开（用户取消、
+    # 代理超时），Starlette 可能在首次拉取生成器**之前**就取消 StreamingResponse
+    # → _run_build 永不启动 → `_stop_keepalive` / `_task_lock.release` 永不执行
+    # → 该项目导出锁被永久持有，之后所有导出 409 直至进程重启。
+    # 现改为：connected 事件、构建任务、drain 线程全部在路由体内启动——
+    # ① 构建仍严格晚于 `_acquire_export_lock`（守住 2026-09-15 P0「锁先于构建」
+    #    不变量，源码契约测试 test_export_acquires_lock_before_build_starts 钉住）；
+    # ② 生成器是否被迭代不再影响构建启动与放锁；
+    # ③ drain 线程从注册时起即是 progress_queue 的**唯一**消费者（生成器改为
+    #    尾随 journal），从结构上消灭「生成器与 drain 双消费者拆散事件流」竞态。
+    connected_payload = {'event': 'connected', 'project_id': project_id, 'stream_id': stream_id}
+    journal.append(connected_payload)
+    try:
+        # BUG-FIX 2026-10-27（补充·任务未调度漏洞）：构建经 run_in_executor 直接
+        # 提交默认线程池 —— 工作项入队即由线程池接手，**不依赖事件循环调度**。
+        # 若用 `create_task(to_thread(...))`，任务在首次调度前被取消（测试中以
+        # asyncio.run 关闭事件循环、生产中 loop 关闭/阻塞）时协程体一步都不执行，
+        # 构建永不启动 → keepalive 线程无限续约把组锁焊死（与启动前取消同症状）。
+        # 事件循环关闭时 shutdown_default_executor 会等待本线程收尾，放锁语义完整。
+        _build_task = asyncio.get_running_loop().run_in_executor(None, _run_build)
         _BUILD_TASKS.add(_build_task)
         _build_task.add_done_callback(_BUILD_TASKS.discard)
+        # 单一队列消费者：无论生成器是否被迭代，事件都会持续落入 journal
+        # （含哨兵后的终态封存）；断线不再需要「接管」动作。
+        journal.drain_started = True
+        _drain_queue_to_journal(journal)
+    except Exception:
+        # 兜底：启动失败也不允许漏锁 —— 立即停续约、放锁、封存 journal 后上抛。
+        logger.exception('SSE 导出构建任务启动失败，回滚锁与 journal: project_id=%d', project_id)
+        _stop_keepalive()
+        try:
+            if lock_key and owner_id:
+                _task_lock.release(lock_key, owner_id)
+        except Exception as _rel_e:
+            logger.warning('[文档导出] 启动失败回滚放锁异常 key=%s: %s', lock_key, _rel_e)
+        journal.mark_terminal()
+        raise
+
+    async def event_stream():
+        # 组锁已在路由层抢到，构建任务 / drain 线程已在路由体启动
+        # （BUG-FIX 2026-10-27：不再依赖本生成器被迭代才启动构建）。
+        # 本生成器不消费 progress_queue（drain 线程是唯一消费者），改为尾随
+        # journal：事件经 队列→drain→journal 到达这里，顺序与直读队列一致。
         t_start = time.time()
-        connected_payload = {'event': 'connected', 'project_id': project_id, 'stream_id': stream_id}
-        yield _sse_frame(journal.append(connected_payload), 'connected', connected_payload)
+        yield _sse_frame(1, 'connected', connected_payload)
         logger.info('SSE 导出第一个事件发送耗时: %.3f 秒 (project_id=%d)', time.time() - t_start, project_id)
         last_heartbeat = time.time()
         ping_interval = 15
         first_data_sent = False
+        last_sent = 0
         try:
             while True:
                 if await request.is_disconnected():
                     logger.info('SSE 导出流客户端已断开 (project_id=%d)', project_id)
-                    # ENHANCE 2026-10-04（T3）：断线不再吞事件 —— 后台线程接管
-                    # 排队列进 journal，客户端可通过续传端点接回剩余事件。
-                    if not journal.drain_started:
-                        journal.drain_started = True
-                        _drain_queue_to_journal(journal)
+                    # ENHANCE 2026-10-04（T3）：断线不中断构建；drain 线程已在
+                    # 路由体启动并持续把事件落入 journal，客户端可通过续传端点
+                    # 接回剩余事件（此处无需再「接管」）。
                     return
-                batch: list = []
-                try:
-                    while len(batch) < 100:
-                        batch.append(progress_queue.get_nowait())
-                except queue.Empty:
-                    pass
+                batch: list = [(seq, item) for seq, item in journal.events if seq > last_sent]
                 if not batch:
                     elapsed_since_start = time.time() - last_heartbeat
                     if elapsed_since_start >= ping_interval:
@@ -647,18 +728,20 @@ async def export_docx_stream(request: Request, project_id: int, config: ExportCo
                         last_heartbeat = time.time()
                     await asyncio.sleep(0.05)
                     continue
-                for item in batch:
-                    if item is None:
-                        journal.mark_terminal()
-                        return
+                for seq, item in batch:
                     event_type = item.get('event')
                     if event_type in ('start', 'progress', 'log', 'completed', 'error') and (not first_data_sent):
                         first_data_sent = True
                         last_heartbeat = time.time()
-                    yield _sse_frame(journal.append(item), event_type, item)
+                    yield _sse_frame(seq, event_type, item)
+                    last_sent = seq
                     if event_type in ('completed', 'error'):
                         journal.mark_terminal()
                         return
+                # 终态兜底：drain 可能已封存 journal（合成 error 已在上方批内
+                # 消费并 return；此处防「terminal 但批内无终态」的极端时序）。
+                if journal.terminal:
+                    return
         except Exception as e:
             logger.exception('SSE 导出流异常: %s', e)
             # BUG-FIX 2026-09-18（P2）：原仅记日志不产出任何事件，流直接终止 ——

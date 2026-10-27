@@ -377,6 +377,17 @@ def update_section(section_id: int, data: SectionUpdate) -> Section | None:
         existing_row = conn.execute("SELECT * FROM sections WHERE id = ?", (section_id,)).fetchone()
         if not existing_row:
             return None
+        # 2026-10-20 遗留 3（Aligned 锁定章节的结构保护）：
+        # locked 由目录生成写入（程序构造的评分项 R{n} / 九大章节 S{n}）。
+        # 只拦截标题/父级/排序三类结构字段；正文、状态、字数预算等编辑
+        # 不受影响（正文生成链路本身会写 content/status）。
+        if "locked" in existing_row.keys() and bool(existing_row["locked"]):
+            _locked_fields = sorted({"title", "parent_id", "sort_order"} & set(updates))
+            if _locked_fields:
+                raise ValueError(
+                    "该章节由系统锁定（Aligned 程序构造的一级目录），不可修改："
+                    + "/".join(_locked_fields)
+                )
         # BUG-FIX 2026-09-18（P1）：PATCH 可直接改 parent_id 且无任何环检测，
         # 把章节移动到自身子孙下即构造 parent 环 → 正文生成的
         # _get_path_and_ancestors 沿链 while 循环永不死出，整任务卡死/内存膨胀。
@@ -612,8 +623,12 @@ def delete_section_tree(section_id: int) -> dict:
         # 先获取父项目ID与父章节ID（parent_id 用于定位删除后需要净化正文编号的
         # 同父剩余兄弟——整棵子树删掉后它们按位置索引整体前移）。
         sec = conn.execute(
-            "SELECT project_id, parent_id FROM sections WHERE id = ?", (section_id,)
+            "SELECT project_id, parent_id, locked FROM sections WHERE id = ?", (section_id,)
         ).fetchone()
+        # 2026-10-20 遗留 3：系统锁定的一级目录不可删除（清空目录仍可用，
+        # 那属于显式全量重建意图，不走本函数）。
+        if sec is not None and bool(sec["locked"]):
+            raise ValueError("该章节由系统锁定（Aligned 程序构造的一级目录），不可删除")
         project_id = sec["project_id"] if sec else None
         parent_id = sec["parent_id"] if sec else None
         # BUG-FIX 2026-10-13（B2 · 删除子树不净化正文编号）：与 delete_section
@@ -692,6 +707,7 @@ def _delete_tree(conn, section_id: int) -> int:
 _TREE_LIGHT_COLUMNS = """
     id, project_id, parent_id, title, level, sort_order, section_type,
     scoring_point_id, target_words, status, created_at,
+    COALESCE(locked, 0) AS locked, content_mode,
     COALESCE(word_count, 0) AS word_count,
     COALESCE(readable_word_count, 0) AS readable_word_count,
     CASE WHEN length(content) > 0 THEN 1 ELSE 0 END AS has_content,
@@ -828,6 +844,9 @@ def build_tree(project_id: int) -> list[SectionTreeNode]:
             sort_order=r["sort_order"],
             section_type=r["section_type"],
             scoring_point_id=r["scoring_point_id"],
+            # 2026-10-20 遗留 3/5：锁定与正文模式随树透出（落库后刷新不丢）
+            locked=bool(r["locked"]),
+            content_mode=r["content_mode"],
             target_words=r["target_words"],
             status=r["status"],
             created_at=r["created_at"],
@@ -970,6 +989,9 @@ def move_section(section_id: int, direction: str) -> bool:
     section = get_section(section_id)
     if not section:
         return False
+    # 2026-10-20 遗留 3：系统锁定的一级目录不允许上移/下移，顺序由程序构造。
+    if getattr(section, "locked", False):
+        raise ValueError("该章节由系统锁定（Aligned 程序构造的一级目录），不可移动")
 
     with get_db() as conn:
         # 修复：parent_id IS ? 对非 NULL 参数在 SQLite 中不兼容

@@ -75,20 +75,17 @@ def test_flatten_nested():
 
 
 def test_validate_outline_business_valid():
-    # V4.0 规则：标题必须为纯文本（编号由系统自动生成，严禁数字前缀）
+    # 业务契约（2026-10-23 收紧）：一级下 3~5 二级、每二级下 ≥5 三级、深度达标、标题纯文本。
     items = [
         {"title": "项目概述", "level": 1, "children": [
             {"title": "编制依据", "level": 2, "children": [
-                {"title": "相关标准", "level": 3, "children": []},
-                {"title": "项目资料", "level": 3, "children": []},
+                {"title": f"标准{k}", "level": 3, "children": []} for k in range(5)
             ]},
             {"title": "工程概况", "level": 2, "children": [
-                {"title": "建设规模", "level": 3, "children": []},
-                {"title": "建设条件", "level": 3, "children": []},
+                {"title": f"规模{k}", "level": 3, "children": []} for k in range(5)
             ]},
             {"title": "目标承诺", "level": 2, "children": [
-                {"title": "质量目标", "level": 3, "children": []},
-                {"title": "工期目标", "level": 3, "children": []},
+                {"title": f"目标{k}", "level": 3, "children": []} for k in range(5)
             ]},
         ]},
     ]
@@ -97,12 +94,18 @@ def test_validate_outline_business_valid():
 
 
 def test_validate_outline_business_no_level3():
-    """V4.0：每个二级下至少 2 个三级节点（无三级则校验失败）"""
+    """V4.0：每个二级下至少 5 个三级节点（2026-10-23 起三级 <5 校验失败）"""
     items = [
         {"title": "施工部署", "level": 1, "children": [
-            {"title": "总体流程", "level": 2, "children": []},
-            {"title": "场地布置", "level": 2, "children": []},
-            {"title": "资源计划", "level": 2, "children": []},
+            {"title": "总体流程", "level": 2, "children": [
+                {"title": "a", "level": 3, "children": []},
+            ]},
+            {"title": "场地布置", "level": 2, "children": [
+                {"title": "b", "level": 3, "children": []},
+            ]},
+            {"title": "资源计划", "level": 2, "children": [
+                {"title": "c", "level": 3, "children": []},
+            ]},
         ]},
     ]
     ok, msg = validate_outline_business(items)
@@ -113,8 +116,9 @@ def test_validate_outline_business_no_level3():
 def test_validate_outline_business_number_prefix():
     """V4.0：标题严禁出现数字前缀（编号由系统自动生成）"""
     items = [{"title": "1、项目概述", "level": 1, "children": [
-        {"title": "编制依据", "level": 2, "children": []},
-        {"title": "工程概况", "level": 2, "children": []},
+        {"title": f"编制依据{k}", "level": 2, "children": [
+            {"title": f"标准{k}-{m}", "level": 3, "children": []} for m in range(5)
+        ]} for k in range(3)
     ]}]
     ok, msg = validate_outline_business(items)
     assert ok is False
@@ -122,27 +126,17 @@ def test_validate_outline_business_number_prefix():
 
 
 def test_validate_outline_business_duplicate_title():
-    """V4.0：全局重复标题检测"""
+    """同级重复标题检测（2026-10-11 起重复判定收窄为同级，此处为一级章同级重复）"""
     items = [
         {"title": "质量管理", "level": 1, "children": [
-            {"title": "体系建立", "level": 2, "children": [
-                {"title": "组织架构", "level": 3, "children": []},
-                {"title": "制度文件", "level": 3, "children": []},
-            ]},
-            {"title": "过程控制", "level": 2, "children": [
-                {"title": "检查流程", "level": 3, "children": []},
-                {"title": "整改闭环", "level": 3, "children": []},
-            ]},
+            {"title": f"体系{k}", "level": 2, "children": [
+                {"title": f"项{k}-{m}", "level": 3, "children": []} for m in range(5)
+            ]} for k in range(3)
         ]},
         {"title": "质量管理", "level": 1, "children": [
-            {"title": "验收标准", "level": 2, "children": [
-                {"title": "检验批划分", "level": 3, "children": []},
-                {"title": "合格标准", "level": 3, "children": []},
-            ]},
-            {"title": "资料归档", "level": 2, "children": [
-                {"title": "归档范围", "level": 3, "children": []},
-                {"title": "移交要求", "level": 3, "children": []},
-            ]},
+            {"title": f"验收{k}", "level": 2, "children": [
+                {"title": f"验{k}-{m}", "level": 3, "children": []} for m in range(5)
+            ]} for k in range(3)
         ]},
     ]
     ok, msg = validate_outline_business(items)
@@ -151,9 +145,11 @@ def test_validate_outline_business_duplicate_title():
 
 
 def test_validate_outline_business_min_children():
-    """V4.0：每个一级下至少 2 个二级节点"""
+    """V4.0：每个一级下至少 3 个二级节点（2026-10-23 起 3~5）"""
     items = [{"title": "安全文明施工", "level": 1, "children": [
-        {"title": "安全制度", "level": 2, "children": []},
+        {"title": "安全制度", "level": 2, "children": [
+            {"title": f"条{k}", "level": 3, "children": []} for k in range(5)
+        ]},
     ]}]
     ok, msg = validate_outline_business(items)
     assert ok is False

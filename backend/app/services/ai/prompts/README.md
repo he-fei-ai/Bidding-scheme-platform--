@@ -17,22 +17,29 @@ backend/app/services/ai/prompts/
 ├── _shared.py         # 共享规则库（SHARED_HEADING_RULES / SHARED_FORBIDDEN_WORDS / SHARED_OUTPUT_SPEC）
 ├── json_repair.py     # 1 个：JSON_REPAIR_PROMPT
 ├── analysis.py        # 14 个：文件解析阶段（项目概述/评分/BOQ/工接口/施工方法）
-├── outline.py         # 6 个：目录审核 / 技术方案 V5.1（L1/L2/自检）/ 三级标题修复
-├── content.py         # 3 个：正文编排（系统/用户）/ 正文续写
+├── outline.py         # 8 个：目录审核 / 直出（SYSTEM+USER）/ 技术方案 V5.1（L1/L2/自检）/ 三级标题修复
+├── content.py         # 6 个：正文编排（系统/用户）/ 正文续写
 ├── mermaid.py         # 6 个：Mermaid 图（修复/排版/流程图/甘特图）
 ├── charts.py          # 11 个：图表（架构/劳动力/对比/布局/时间线 × 编排+生成 + 通用修复兜底 CHART_DATA_FIX）
 ├── illustration.py    # 2 个：ILLUSTRATION_ARRANGE_SYSTEM / ILLUSTRATION_PLAN_SYSTEM
-├── checks.py          # 9 个：废标提取/对照/三轮流程(分析/初稿/定稿)/错别字/逻辑/合并/一致性补丁
+├── checks.py          # 10 个：废标提取/对照/三轮流程(分析/初稿/定稿)/错别字/逻辑/合并/一致性补丁
 ├── knowledge.py       # 3 个：知识库（提取/匹配/目录增强）
-└── industry.py        # 1 个：行业树（INDUSTRY_GENERATE_CHILDREN_SYSTEM）
+├── scheme_extraction.py # 10 个：方案抽取（模板/章节/技术参数/工艺…）
+├── industry.py        # 1 个：行业树（INDUSTRY_GENERATE_CHILDREN_SYSTEM）
+├── _integrate.py      # 12 个：历史收编批次一
+├── _integrate_batch2.py # 21 个：历史收编批次二
+└── _integrate_batch3.py # 13 个：历史收编批次三
 ```
 
-合计 **77 个**提示词常量（62 子模块 + 12 收编 `_integrate.py` + 3 个 SHARED_* 共享规则；
+合计 **108 个**提示词常量（子模块 + 收编 `_integrate*.py` + 3 个 SHARED_* 共享规则；
 注册到管理界面只读展示，可经 `{shared:NAME}` 注入其他提示词）。
 
-> **数量以代码为准**：本节曾长期写「57 个」而实际已增至 77 个（2026-10-17 修正）。
-> 如需核对，运行 `python -c "from app.services.ai.prompts import _ALL_PROMPTS; print(len(_ALL_PROMPTS))"`，
-> 或调用 `GET /prompts/overview` 读取 `total` 与 `shared_usage`。
+> **数量以代码为准**：本节分项树曾长期落后于实际（2026-10-23 复核时
+> `_ALL_PROMPTS` 实为 108 个，且漏列 scheme_extraction.py / `_integrate_batch2.py`
+> / `_integrate_batch3.py`）。下方分项树已按实际注册数修订；若仍有出入，
+> 权威值以 `from app.services.ai.prompts import _ALL_PROMPTS; print(len(_ALL_PROMPTS))`
+> 或 `GET /prompts/overview` 的 `total` 为准（个别 key 在收编文件中被覆盖合并，
+> 故分项之和可能略高于注册表总数）。
 >
 > **复用现状（重要）**：`{shared:NAME}` 机制可用，但注册表中**尚无模板引用**它
 > （`audit_shared_usage()["adoption_rate"] == 0`）。三条共享规则目前只作为「管理页

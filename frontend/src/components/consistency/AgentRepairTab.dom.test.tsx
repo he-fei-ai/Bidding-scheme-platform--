@@ -182,6 +182,71 @@ describe.skipIf(!hasDom)("AgentRepairTab", () => {
 
   // ── BUG-FIX 2026-10-13（P0 回归防护）─────────────────────────────
 
+  // BUG-FIX 2026-10-27（P2·被拒补丁契约）：后端 run_agent_repair 现按
+  // {section_id, title, error} 归一化被拒条目并携带宿主真实拒绝原因 ——
+  // 前端必须把真实原因渲染出来，而不是永远显示兜底文案「匹配失败」。
+  it("被拒补丁渲染宿主真实拒绝原因（title + error）", async () => {
+    repairMock.mockResolvedValue({
+      status: "ok",
+      success: true,
+      dry_run: true,
+      project_id: 1,
+      turns: 1,
+      max_turns: 8,
+      conflict_states: null,
+      changed_sections: [],
+      applied: [],
+      rejected: [
+        {
+          section_id: "3",
+          title: "施工方案",
+          error: "old_text 未找到（建议先 read 该章节核对原文）",
+        },
+      ],
+      unresolved: [],
+      errors: [],
+      message: "预览完成（1 条被拒）",
+    });
+    render(<AgentRepairTab projectId={1} />);
+    screen.getByRole("button", { name: /预览/ }).click();
+    await waitFor(() => {
+      expect(screen.getAllByText(/施工方案/).length).toBeGreaterThan(0);
+      expect(
+        screen.getAllByText(/old_text 未找到/).length,
+      ).toBeGreaterThan(0);
+    });
+  });
+
+  // BUG-FIX 2026-10-27（P3·硬失败被当「无需修复」）：success=false 且带 errors
+  // 时必须走 error 反馈，而非蓝色 info「没有需要修复的一致性冲突」。
+  it("success=false 且 errors 非空时展示错误反馈", async () => {
+    repairMock.mockImplementation(async () => ({
+      status: "ok",
+      success: false,
+      dry_run: false,
+      project_id: 1,
+      turns: 0,
+      max_turns: 8,
+      applied: [],
+      rejected: [],
+      unresolved: [],
+      changed_sections: [],
+      conflict_states: null,
+      errors: ["工作区准备失败：项目正文为空"],
+      message: "工作区准备失败：项目正文为空",
+    }));
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    render(<AgentRepairTab projectId={1} />);
+    screen.getByRole("button", { name: /执行修复/ }).click();
+    await waitFor(() => {
+      // message.error 的文案会渲染进 DOM（antd message 挂载在 body）
+      expect(screen.getAllByText(/工作区准备失败/).length).toBeGreaterThan(0);
+    });
+    // 组件树未卸载
+    expect(screen.getByRole("button", { name: /执行修复/ })).toBeTruthy();
+    errSpy.mockRestore();
+  });
+
   it("桩数据与后端报告 dict 的真实键集一致", async () => {
     const res = (await DEFAULT_REPAIR(1)) as unknown as Record<string, unknown>;
     // 路由层 `{'status': ..., **report}` 额外加一个 status

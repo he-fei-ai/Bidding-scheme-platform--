@@ -266,8 +266,15 @@ class TestB2TenderContextNotDeadParam:
             )
         )
 
-        assert "盾构法施工" in captured["user"], "招标文件内容必须出现在 L1 提示词中"
-        assert "市政工程" in captured["user"]
+        # 标书智能体（4）：user_prompt 现为「稳定上下文块 + 任务差异」列表，
+        # 合并后断言内容不变（tender_context 仍是稳定上下文消息之一）。
+        user_text = (
+            "\n".join(captured["user"])
+            if isinstance(captured["user"], list)
+            else captured["user"]
+        )
+        assert "盾构法施工" in user_text, "招标文件内容必须出现在 L1 提示词中"
+        assert "市政工程" in user_text
 
     def test_generate_outline_v51_passes_context_to_l1(self, monkeypatch):
         from app.services.ai import workflows_outline_v51 as v51
@@ -709,7 +716,14 @@ class TestF2ScoringPlaceholderNotInOutline:
             )
         )
 
-        assert "评分项总数: 1" in captured["user"], (
+        # 标书智能体（4）：user_prompt 现为列表（稳定上下文块 + 任务差异），
+        # 合并后断言「伪项不计入评分项总数」的口径不变。
+        user_text = (
+            "\n".join(captured["user"])
+            if isinstance(captured["user"], list)
+            else captured["user"]
+        )
+        assert "评分项总数: 1" in user_text, (
             "伪项不得计入评分项总数，否则 AI 会按错误总数多生成一个凑数章节"
         )
 

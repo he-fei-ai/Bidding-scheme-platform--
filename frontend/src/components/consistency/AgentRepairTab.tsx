@@ -59,8 +59,16 @@ export default function AgentRepairTab({ projectId }: AgentRepairTabProps) {
       if (result.status === "ok" && result.success) {
         message.success(result.message || "Agent 修复完成");
       } else if (result.success === false) {
-        // 短路返回（空项目 / 无冲突）—— 不算失败，只是无需修复
-        message.info(result.message || "没有需要修复的一致性冲突");
+        // BUG-FIX 2026-10-27（P3·硬失败被当「无需修复」）：success=false 有两类
+        // 截然不同的语义 —— ①短路返回（空项目/无冲突，无需修复）；②真实执行
+        // 失败（工作区准备失败 / Provider 失败 / 章节被清空拒绝落库 / 落库异常，
+        // 后端同时填充 errors 数组）。原实现一律弹蓝色 info「没有需要修复的
+        // 一致性冲突」，把真失败包装成了正常情况。现按 errors 是否非空分支。
+        if (result.errors?.length) {
+          message.error(result.errors[0] || result.message || "Agent 修复执行失败");
+        } else {
+          message.info(result.message || "没有需要修复的一致性冲突");
+        }
       } else {
         message.warning(result.message || "Agent 未完成全部修复");
       }

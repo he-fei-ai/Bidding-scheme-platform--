@@ -273,7 +273,13 @@ def classify_chapter(chapter_title: str, industry: str | None = None) -> dict:
         if score > best_score:
             best_score = score
             best = ch
-    return best or NINE_CHAPTERS[0]
+    # ENHANCE 2026-10-21（正文 #2）：附加 `matched` 置信度标志——是否真正命中
+    # 关键词（False = 纯兜底，落到默认第 1 章）。调用方（事实校验）据此把
+    # 「自定义/行业章节按兜底章节注入事实」从静默变为可观测告警。返回值仍含
+    # `idx/theme/keywords`，对既有 `ch["idx"]` 消费者向后兼容。
+    if best is None:
+        return {**NINE_CHAPTERS[0], "matched": False}
+    return {**best, "matched": best_score > 0}
 
 
 # ============================================================

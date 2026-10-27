@@ -67,11 +67,16 @@ def _file_row(file_id: int) -> dict:
 
 
 def _raise_on_txt_write(monkeypatch, error: OSError):
-    """让 ``Path.write_text`` 仅在目标为 .txt 时抛错（原始文件走 write_bytes，不受影响）"""
+    """让 ``Path.write_text`` 仅在目标为提取文本时抛错（原始文件走 write_bytes，不受影响）。
+
+    F-G FIX 2026-10-26：``re_extract_text`` 改为「先写 .txt.tmp 再原子替换」，
+    因此失败注入必须同时覆盖临时文件（否则模拟不到落盘失败）。
+    """
     real = files_mod.Path.write_text
 
     def raiser(self, data, *args, **kwargs):
-        if str(self).endswith(".txt"):
+        name = str(self)
+        if name.endswith(".txt") or name.endswith(".txt.tmp"):
             raise error
         return real(self, data, *args, **kwargs)
 

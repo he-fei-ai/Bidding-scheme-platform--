@@ -291,13 +291,11 @@ def _generate_local_mermaid_chart(chart_type: str, title: str = "", description:
         _base_year = 2025
         _base_month = 1
         for i, task in enumerate(tasks):
-            # 每个 section 跨 2 个月（起始月 / 结束月），月份溢出到 13+ 时按 12 个月循环
+            # FIX 2026-10-27：删除未使用的 end/end_month/end_year 死变量
+            # （兜底模板任务统一用 30d 时长表达，无需显式结束日期）
             start_month = ((_base_month + i * 2 - 1) % 12) + 1
-            end_month = ((start_month) % 12) + 1  # 下一个月（12月→1月时年份 +1）
             start_year = _base_year + ((_base_month + i * 2 - 1) // 12)
-            end_year = start_year + (1 if start_month == 12 else 0)
             start = f"{start_year}-{start_month:02d}-01"
-            end = f"{end_year}-{end_month:02d}-01"
             mermaid += f"    section {task}\n    {task} :a{i}, {start}, 30d\n"
         return {"type": "gantt", "code": mermaid, "title": title}
 
@@ -348,6 +346,41 @@ def _infer_chart_type_from_text(text: str) -> str:
         return "flowchart"
     scores = {ct: sum(1 for kw in kws if kw.lower() in text.lower()) for ct, kws in _CHART_FALLBACK_KEYWORDS.items()}
     return max(scores, key=scores.get) if max(scores.values()) > 0 else "flowchart"
+
+
+# ============================================================
+# 引导语 → 图名清理（ENHANCE 2026-10-27，需求 8·图题质量）
+# ============================================================
+# 引导语（图题第 3 优先级）在正文里是自然句子（"下图为施工进度计划："），
+# 直接当图名会把「下图为」「：」等框架词带进成品图题（如「图3-1 下图为施工
+# 进度计划：」）。此处仅剥离**引导框架词**，不碰载荷 title / Mermaid title
+# （第 1/2 优先级，本就是干净图名）。剥离后为空（如整句就是"如下图所示："）
+# 则回退原文，绝不产出空图名。
+_LEADIN_FRAME_PREFIX_RE = re.compile(
+    r"^(?:如|请|详|见){0,2}下[面一]?图(?:所示)?[为是：:]?"
+)
+_LEADIN_TAIL_PUNCT_RE = re.compile(r"[：:。,，、；;\s]+$")
+
+#: 本地模板披露括注（A3 建议 1）——与 chart_auto_orchestration
+#: ._LOCAL_TEMPLATE_DISCLAIMER 同口径；两侧服务层互引有循环 import 风险，
+#: 清理端用宽松正则正本（覆盖常量及手写变体），生成端以常量为规范。
+_LEADIN_DISCLAIMER_RE = re.compile(r"（模板示例数据[^）]*）")
+
+
+def _clean_lead_in_title(text: str) -> str:
+    """把引导语句子清理为可作图名的短语（剥框架词 + 尾标点；空结果回退原文）。
+
+    A3 建议 1（显式披露）：source="local" 载荷的 Mermaid 引导语带
+    「（模板示例数据，请按项目实际核定）」括注，本函数先行剥离，
+    保证导出图题干净（「下图为施工流程（模板示例数据…）：」→「施工流程」）。
+    """
+    if not text:
+        return ""
+    raw = str(text).strip()
+    cleaned = _LEADIN_DISCLAIMER_RE.sub("", raw)
+    cleaned = _LEADIN_FRAME_PREFIX_RE.sub("", cleaned)
+    cleaned = _LEADIN_TAIL_PUNCT_RE.sub("", cleaned).strip()
+    return cleaned or raw
 
 
 # ============================================================
@@ -496,37 +529,34 @@ def _get_cached_inline_chart_markers(section_detail) -> tuple[set[str], set[str]
 
     V2.0 增强：TTL 淘汰 + 最大容量限制。
     V3.0 增强：命中率统计。
+    BUG-FIX 2026-10-27（P3·计数器重绑定）：原实现 `from .export_cache import
+    _inline_marker_cache_misses` 把 int 计数器绑定为**局部名**，`+=` 只重绑局部、
+    模块级计数器永不增长，`/export` 统计端点的命中率恒为 0.0%。现改为模块属性
+    访问（`export_cache._inline_marker_cache_misses += 1`），写回真正的模块全局。
     """
-    from .export_cache import (
-        _inline_marker_cache,
-        _inline_marker_cache_hits,
-        _inline_marker_cache_lock,
-        _inline_marker_cache_max,
-        _inline_marker_cache_misses,
-        _inline_marker_cache_ttl,
-    )
+    from . import export_cache as _ec
 
     section_id = getattr(section_detail, "id", None)
     if section_id is None:
-        _inline_marker_cache_misses += 1
+        _ec._inline_marker_cache_misses += 1
         return set(), set()
     now = time.time()
-    with _inline_marker_cache_lock:
-        if section_id in _inline_marker_cache:
-            cached_all, cached_hints, cached_ts = _inline_marker_cache[section_id]
-            if now - cached_ts < _inline_marker_cache_ttl:
-                _inline_marker_cache_hits += 1
+    with _ec._inline_marker_cache_lock:
+        if section_id in _ec._inline_marker_cache:
+            cached_all, cached_hints, cached_ts = _ec._inline_marker_cache[section_id]
+            if now - cached_ts < _ec._inline_marker_cache_ttl:
+                _ec._inline_marker_cache_hits += 1
                 return cached_all, cached_hints
-            del _inline_marker_cache[section_id]
-    _inline_marker_cache_misses += 1
+            del _ec._inline_marker_cache[section_id]
+    _ec._inline_marker_cache_misses += 1
     content = getattr(section_detail, "content", "") or ""
     all_types, hint_types = _detect_inline_chart_markers(content)
-    with _inline_marker_cache_lock:
-        if len(_inline_marker_cache) >= _inline_marker_cache_max:
-            sorted_items = sorted(_inline_marker_cache.items(), key=lambda x: x[1][-1])
+    with _ec._inline_marker_cache_lock:
+        if len(_ec._inline_marker_cache) >= _ec._inline_marker_cache_max:
+            sorted_items = sorted(_ec._inline_marker_cache.items(), key=lambda x: x[1][-1])
             for key, _ in sorted_items[: len(sorted_items) // 2]:
-                del _inline_marker_cache[key]
-        _inline_marker_cache[section_id] = (all_types, hint_types, time.time())
+                del _ec._inline_marker_cache[key]
+        _ec._inline_marker_cache[section_id] = (all_types, hint_types, time.time())
     return all_types, hint_types
 
 
@@ -544,6 +574,8 @@ __all__ = [
     "_afc_enabled",
     "_generate_local_mermaid_chart",
     "_infer_chart_type_from_text",
+    "_clean_lead_in_title",
+    "_adaptive_batch_size",
     # Block 3: 通用格式化工具
     "_heading_font_for",
     "_heading_size_for",

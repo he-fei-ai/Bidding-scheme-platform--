@@ -77,6 +77,71 @@ def normalize_priority(value: Any, needed: bool = True) -> int:
 # Step 1: orchestrate_content — 完整实现（替换空壳）
 # ============================================================
 
+#: 编排输出契约（程序强制，最高优先级）。
+#:
+#: 为什么必须有它：编排 system 提示词**允许管理员自定义**（DB 注册表优先），
+#: 历史版本 / 管理员改写的提示词只输出 {section_id, recommended_type, confidence,
+#: reason, type_sub}，**根本没有 plan 字段** → `_normalize_plan` 拿到空 plan →
+#: table/mermaid/image 判定全部为空 → 预编排机制静默失效（外部文档所称
+#: 「配图不是正文写完后再加，而是正文生成前先规划好」完全落空）。
+#:
+#: 外部引用软件的标准是「AI 负责提名、程序负责拍板」，提名结构必须由**程序**
+#: 兜底保证，不能指望提示词自觉。因此这里把契约作为**常量块**追加到 system
+#: 提示词末尾：常量 → 同项目所有叶子共享同一 system 前缀 → 不破坏 prompt cache。
+_ORCH_OUTPUT_CONTRACT = """
+
+【输出契约（程序强制，最高优先级）】
+无论上文要求何种输出格式，最终**只能返回一个 JSON 对象**，且必须包含 plan 字段：
+{
+  "section_id": "与输入一致的章节ID",
+  "title": "章节标题",
+  "recommended_type": "text|table|flowchart|gantt|architecture|labor|comparison",
+  "confidence": 0.0~1.0,
+  "reason": "判断理由（不超过40字）",
+  "plan": {
+    "table":   {"needed": true或false, "purpose": "表格在本节要表达什么"},
+    "mermaid": {"needed": true或false, "title": "图标题", "code": "合法 Mermaid 代码（不含代码围栏）", "priority": 3或4或5, "reason": "理由"},
+    "chart":   {"needed": true或false, "type": "gantt|architecture|labor|comparison|layout|timeline", "title": "图标题", "data": {"结构化数据": "含真实字段与数值"}, "priority": 3或4或5, "reason": "理由"},
+    "image":   {"needed": true或false, "style": "engineering_diagram或realistic_photo", "title": "图标题", "prompt": "中文生图提示词", "priority": 3或4或5, "reason": "理由"},
+    "knowledge": {"item_ids": ["只能来自『可用知识素材清单』的ID"]},
+    "facts": {"titles": ["只能来自『全局事实标题清单』的标题"]}
+  }
+}
+契约规则：
+1. 只输出 JSON，不要输出解释、总结或 Markdown 代码围栏；
+2. priority 含义：3=有价值候选、4=推荐、5=强推荐；**只有 priority≥3 时才允许把 needed 设为 true**；不需要时 needed=false 且 priority=0；
+3. 克制：能文字表达的不配图，不要为了形式硬插；同一章节 mermaid/chart/image 最多提名两类，最终由程序拍板只保留一种；
+4. mermaid 只适合简单抽象的文本节点关系图（少量节点的流程/层级/时间线/职责关系）；code 必须是可直接渲染的合法 Mermaid：优先 flowchart TD、节点 ID 只用 ASCII 字母数字下划线、中文标签写成 A["中文标签"]、不用分号、不用多节点连接简写、不加代码围栏；
+5. chart 只用于有明确数据支撑的结构化图表（进度任务依赖→gantt、组织管理层级→architecture、工种人数→labor、量化对比→comparison、平面布置→layout、时间节点→timeline）；data 必须给出真实字段与数值，不得编造；
+6. image 只在有具象对象（设备、现场、空间关系、实物示意）时提名，prompt 用中文描述画面；
+7. knowledge.item_ids 与 facts.titles 只能从给定清单中选择，不得编造；没有相关条目给空数组；
+8. 不要要求用满任何数量上限，没有合适对象时不要硬插。
+"""
+
+
+def _build_orch_system_prompt(base_prompt: str) -> str:
+    """给编排 system 提示词追加**输出契约**（程序强制提名结构）。
+
+    契约为常量块 → 同项目所有叶子共享同一 system 前缀 → prompt cache 不受影响。
+    """
+    contract = _ORCH_OUTPUT_CONTRACT
+    try:
+        from app.config import ORCHESTRATION_CHART_ENABLED as _CHART_ON
+    except Exception:  # pragma: no cover - 配置读取兜底
+        _CHART_ON = True
+    if not _CHART_ON:
+        # 关闭数据型图表提名时，契约里同步去掉 chart 项（避免模型提名后被程序丢弃）
+        contract = contract.replace(
+            '    "chart":   {"needed": true或false, "type": "gantt|architecture|labor|comparison|layout|timeline", '
+            '"title": "图标题", "data": {"结构化数据": "含真实字段与数值"}, "priority": 3或4或5, "reason": "理由"},\n',
+            "",
+        )
+    base = base_prompt or ""
+    if "【输出契约（程序强制，最高优先级）】" in base:
+        return base
+    return base.rstrip() + contract
+
+
 # 编排提示词（扩展版，同时输出 section_type + table/mermaid/image 计划）
 _ORCH_SYSTEM = """你是投标技术方案正文编排专家。请根据章节上下文判断：
 1. 本章节内容类型（section_type）
@@ -126,7 +191,8 @@ _ORCH_USER_TEMPLATE = """### 项目概述
 
 def _render_orch_user(template: str, proj_overview: str, leaf_json: str, scoring: str,
                       knowledge_catalog: str = "",
-                      fact_titles_text: str = "") -> str:
+                      fact_titles_text: str = "",
+                      leaf_marker: str = "") -> str:
     """渲染编排用户提示词，兼容两种占位符风格。
 
     BUG-FIX 2026-09-14（高）：编排只认硬编码的 _ORCH_USER_TEMPLATE（{} 风格），
@@ -147,15 +213,18 @@ def _render_orch_user(template: str, proj_overview: str, leaf_json: str, scoring
     if not template:
         template = _ORCH_USER_TEMPLATE
     overview = (proj_overview or "")[:1200]
+    # 标书智能体（4）：leaf_marker 非空时叶子列表渲染为哨兵串（供缓存友好拆分），
+    # 拆分后哨兵即被真实数据替换，不会发给模型。
+    _leaf_value = leaf_marker or leaf_json
     rendered = render_prompt(
         template,
         # v2.0（__OUTLINE__ 风格）所需
-        OUTLINE=leaf_json,
+        OUTLINE=_leaf_value,
         SCORING_STANDARDS=(scoring or "")[:1000],
         PROJECT_OVERVIEW=overview,
         SUMMARY=overview,
         # 历史回落模板（{leaf_list_json}/{scoring_summary}/{project_overview} 风格）所需
-        LEAF_LIST_JSON=leaf_json,
+        LEAF_LIST_JSON=_leaf_value,
         SCORING_SUMMARY=(scoring or "")[:1000],
         # E-2：知识素材清单（两种占位符风格统一供给）
         KNOWLEDGE_CATALOG=knowledge_catalog or "（无可用知识素材）",
@@ -191,6 +260,47 @@ def _render_orch_user(template: str, proj_overview: str, leaf_json: str, scoring
             "通常 0~8 条；无需要给空数组）"
         )
     return rendered
+
+
+#: 编排模板拆分的易变占位符哨兵（标书智能体（4）缓存友好拆分用）。
+#: 只在渲染-拆分过程中存在，拆分后即被真实叶子列表替换，不会发给模型。
+_LEAF_LIST_MARKER = "@@LEAF_LIST_MARKER@@"
+
+
+def _build_orch_user_messages(template: str, proj_overview: str, leaf_json: str,
+                              scoring: str, knowledge_catalog: str = "",
+                              fact_titles_text: str = "") -> list[str]:
+    """把编排用户提示词拆成「稳定上下文前置、任务差异后置」的多条 user 消息。
+
+    标书智能体（4）——提示词顺序优化（缓存命中，冲突时以外部引用标准为准）：
+    ``_orch_one_section`` 每个叶子调用一次（几十次/项目），旧实现把项目概述 /
+    评分标准 / 素材清单 / 判断规则全部拼进单条 user，且 v2.0 模板里**易变的
+    叶子列表排在模板最前面**（「输入数据」段在「判断规则/输出格式」之前）
+    → 每次调用前缀在消息起始处就漂移，稳定规则完全无法命中缓存。
+
+    改法：以哨兵占位符渲染模板（复用 _render_orch_user 的全部补段逻辑），
+    再按哨兵切分为：
+      [稳定前段]（叶子列表之前的模板文本，如无则为空）
+      [稳定后段]（判断规则/输出格式/自检/项目概述补段/素材清单/事实标题）
+      [任务差异]（当前叶子的 JSON + 待编排说明，放最后）
+    同一项目下所有叶子共享前两条（逐字节一致），只有最后一条变化。
+    """
+    from .prompt_order import split_rendered_template
+
+    rendered = _render_orch_user(
+        template, proj_overview, "", scoring,
+        knowledge_catalog=knowledge_catalog,
+        fact_titles_text=fact_titles_text,
+        leaf_marker=_LEAF_LIST_MARKER,
+    )
+    before, after = split_rendered_template(rendered, _LEAF_LIST_MARKER)
+    blocks = [b for b in (before.strip(), after.strip()) if b]
+    blocks.append(
+        "### 待编排章节（JSON）\n"
+        f"{leaf_json}\n\n"
+        "请针对该章节输出编排决策 JSON（判断规则与输出格式同上文）。"
+    )
+    return blocks
 
 
 def _build_knowledge_catalog_text(catalog: list | None) -> str:
@@ -308,16 +418,57 @@ async def _orch_one_section(provider: Any, leaf: dict, sys_prompt: str,
                              knowledge_catalog: str = "",
                              fact_titles_text: str = "") -> dict | None:
     """单章节编排调用（失败降级为 text + 空 plan，不阻塞整体）"""
-    leaf_json = json.dumps([leaf], ensure_ascii=False)
-    user_prompt = _render_orch_user(user_template, proj_overview, leaf_json, scoring,
-                                    knowledge_catalog=knowledge_catalog,
-                                    fact_titles_text=fact_titles_text)
     try:
-        messages = [
-            AIMessage(role="system", content=sys_prompt),
-            AIMessage(role="user", content=user_prompt),
-        ]
-        raw = await provider.chat(messages, max_tokens=800, temperature=0.2)
+        # 标书智能体（4）——提示词顺序优化（缓存命中）：编排是每叶子一次的
+        # 高频调用，项目概述/评分标准/素材清单/判断规则对所有叶子一致，
+        # 拆成独立 user 消息前置，只有「当前叶子 JSON」放最后一条 →
+        # 同项目所有叶子共享稳定前缀，命中服务商 Prompt Cache。
+        # 开关 ORCHESTRATION_PROMPT_LAYERS_ENABLED（默认 true）；false 时
+        # 保持旧的单条 user 行为（内容一致，仅消息条数不同）。
+        try:
+            from app.config import ORCHESTRATION_PROMPT_LAYERS_ENABLED as _LAYERS_ON
+        except Exception:  # pragma: no cover - 配置读取兜底
+            _LAYERS_ON = True
+        # 标书智能体（6）：system 提示词追加**输出契约**（程序强制 plan 结构），
+        # 并按开关放开 token 预算（要 mermaid.code / chart.data 时 800 不够用）。
+        sys_prompt = _build_orch_system_prompt(sys_prompt)
+        try:
+            from app.config import ORCHESTRATION_PLAN_PAYLOAD_ENABLED as _PAYLOAD_ON
+        except Exception:  # pragma: no cover - 配置读取兜底
+            _PAYLOAD_ON = True
+        _max_tokens = 1600 if _PAYLOAD_ON else 800
+        if _LAYERS_ON:
+            from .prompt_order import build_cache_friendly_messages
+
+            user_blocks = _build_orch_user_messages(
+                user_template, proj_overview, json.dumps([leaf], ensure_ascii=False),
+                scoring,
+                knowledge_catalog=knowledge_catalog,
+                fact_titles_text=fact_titles_text,
+            )
+            messages = build_cache_friendly_messages(sys_prompt, user_blocks, "")
+        else:
+            user_prompt = _render_orch_user(
+                user_template, proj_overview, json.dumps([leaf], ensure_ascii=False),
+                scoring,
+                knowledge_catalog=knowledge_catalog,
+                fact_titles_text=fact_titles_text,
+            )
+            messages = [
+                AIMessage(role="system", content=sys_prompt),
+                AIMessage(role="user", content=user_prompt),
+            ]
+        raw = await provider.chat(messages, max_tokens=_max_tokens, temperature=0.2)
+        # 标书智能体（4）缓存可观测性：按任务类型记账（fail-soft）。
+        try:
+            from .cache_metrics import record_provider_cache_usage
+
+            record_provider_cache_usage(
+                provider, task_type="orchestration",
+                section_id=str(leaf.get("id", "")),
+            )
+        except Exception:  # pragma: no cover - 防御性
+            pass
         text = raw if isinstance(raw, str) else raw.get("content", str(raw))
         # 提取 JSON
         m = re.search(r'\[.*\]', text, re.DOTALL) or re.search(r'\{.*\}', text, re.DOTALL)
@@ -508,8 +659,10 @@ def _fallback_plan(leaf: dict) -> dict:
         "reason": "AI 编排失败，降级为纯文字",
         "plan": {
             "table": {"needed": False, "purpose": ""},
-            "mermaid": {"needed": False, "priority": 0, "reason": ""},
-            "image": {"needed": False, "priority": 0, "reason": ""},
+            "mermaid": {"needed": False, "priority": 0, "reason": "", "title": "", "code": ""},
+            "image": {"needed": False, "priority": 0, "reason": "", "style": "", "title": "", "prompt": ""},
+            # 标书智能体（6）：数据型图表提名块（外部文档 chart.needed/type/title/data）
+            "chart": {"needed": False, "priority": 0, "reason": "", "type": "", "title": "", "data": {}},
             # E-2：降级路径 knowledge 置空（不阻塞，正文生成按无素材处理）
             "knowledge": {"item_ids": []},
             # P0（facts-ns）：降级路径 facts 同样置空，正文生成回退确定性打分筛选
@@ -519,25 +672,138 @@ def _fallback_plan(leaf: dict) -> dict:
     }
 
 
+#: 编排允许提名的数据型图表类型白名单（与导出渲染链路 _CHART_TYPE_MAP 同源）。
+#: 取不到时回落为内置集合（避免因导入失败导致 chart 提名全丢）。
+CHART_TYPE_WHITELIST: tuple[str, ...] = (
+    "flowchart", "gantt", "architecture", "labor",
+    "comparison", "layout", "timeline",
+)
+
+
+def _chart_type_whitelist() -> tuple[str, ...]:
+    """返回可消费的数据型图表类型白名单。"""
+    try:
+        from ..export_chart_pipeline import _CHART_TYPE_MAP  # 服务层同包导入
+
+        types = tuple(str(k).lower() for k in (_CHART_TYPE_MAP or {}).keys())
+        if types:
+            return types
+    except Exception:  # pragma: no cover - 导入兜底
+        pass
+    return CHART_TYPE_WHITELIST
+
+
+def _strip_code_fence(text: Any) -> str:
+    """去掉 AI 可能带回来的 Markdown 代码围栏（```mermaid ... ```）。
+
+    外部文档明确要求「Mermaid 代码不含代码围栏」；模型偶尔仍会带上围栏，
+    这里做**幂等**清洗，避免围栏进入正文围栏块后被二次包裹。
+    """
+    s = str(text or "").strip()
+    if not s:
+        return ""
+    if "```" not in s:
+        return s
+    lines = s.split("\n")
+    # 去掉首尾围栏行（允许 ```mermaid / ``` 两种形态）
+    while lines and lines[0].strip().startswith("```"):
+        lines.pop(0)
+    while lines and lines[-1].strip().startswith("```"):
+        lines.pop()
+    return "\n".join(lines).strip()
+
+
+def _sanitize_title(value: Any, limit: int = 60) -> str:
+    """图标题清洗：单行化 + 限长。"""
+    s = " ".join(str(value or "").split())
+    return s[:limit]
+
+
+def _sanitize_mermaid_code(value: Any, limit: int = 4000) -> str:
+    """Mermaid 代码清洗：去围栏 + 限长 + 去空行尾空格。"""
+    s = _strip_code_fence(value)
+    if not s:
+        return ""
+    lines = [ln.rstrip() for ln in s.split("\n")]
+    return "\n".join(lines).strip()[:limit]
+
+
+def _sanitize_chart_data(value: Any, limit: int = 4000) -> dict:
+    """数据型图表载荷清洗：只接受 dict，限长（防止模型塞超长文本）。"""
+    if not isinstance(value, dict):
+        return {}
+    try:
+        blob = json.dumps(value, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return {}
+    if len(blob) > limit:
+        return {}
+    return value
+
+
 def _normalize_plan(orch: dict, leaf: dict,
                     allowed_knowledge_ids: set | None = None) -> dict:
-    """把 AI 返回的编排 JSON 规整成统一 schema"""
+    """把 AI 返回的编排 JSON 规整成统一 schema
+
+    标书智能体（6）对齐：plan 结构与外部文档一致——
+      plan.table   {needed, purpose}
+      plan.mermaid {needed, title, code, priority, reason}
+      plan.chart   {needed, type, title, data, priority, reason}
+      plan.image   {needed, style, title, prompt, priority, reason}
+      plan.knowledge {item_ids}
+      plan.facts     {titles}
+    并由**程序侧**强制「priority ≥ 3 才允许 needed=true」。
+    """
     sid = str(orch.get("section_id") or leaf.get("id") or "")
     plan_raw = orch.get("plan") or {}
+    if not isinstance(plan_raw, dict):
+        plan_raw = {}
     tbl_raw = plan_raw.get("table") or {"needed": False, "purpose": ""}
     mm_raw = plan_raw.get("mermaid") or {"needed": False, "priority": 0, "reason": ""}
     img_raw = plan_raw.get("image") or {"needed": False, "priority": 0, "reason": ""}
+    chart_raw = plan_raw.get("chart") or {"needed": False, "priority": 0, "reason": ""}
 
     # ENHANCE 2026-10-05：priority 统一归一化到 3-5 制（见 normalize_priority）。
     # 必须在**这里**归一，而不是各调用点自行处理——否则裁定函数比较的
     # 仍是混着 0-3 / 3-5 两套语义的原始值。
     def _nblock(raw: dict) -> dict:
-        out = dict(raw)
+        out = dict(raw) if isinstance(raw, dict) else {}
         needed = bool(out.get("needed"))
+        # 标书智能体（6）程序侧强制外部规则：
+        # 「只有 priority 达到 3 才将 needed 设为 true」——AI 若给出
+        # needed=true 但 priority 低于 3（甚至 0），提名视为不达标，丢弃。
+        raw_pr = out.get("priority")
+        try:
+            raw_pr_int = int(raw_pr)
+        except (TypeError, ValueError):
+            raw_pr_int = None
+        if needed and raw_pr_int is not None and raw_pr_int < PRIORITY_MIN:
+            needed = False
+            out["reason"] = str(out.get("reason") or "")
         out["needed"] = needed
         out["priority"] = normalize_priority(out.get("priority"), needed=needed)
         out.setdefault("reason", "")
         return out
+
+    mm_block = _nblock(mm_raw)
+    mm_block["title"] = _sanitize_title(mm_raw.get("title") if isinstance(mm_raw, dict) else "")
+    mm_block["code"] = _sanitize_mermaid_code(mm_raw.get("code") if isinstance(mm_raw, dict) else "")
+
+    img_block = _nblock(img_raw)
+    _style = str((img_raw.get("style") if isinstance(img_raw, dict) else "") or "").strip().lower()
+    img_block["style"] = _style if _style in ("engineering_diagram", "realistic_photo") else ""
+    img_block["title"] = _sanitize_title(img_raw.get("title") if isinstance(img_raw, dict) else "")
+    img_block["prompt"] = str((img_raw.get("prompt") if isinstance(img_raw, dict) else "") or "").strip()[:600]
+
+    chart_block = _nblock(chart_raw)
+    _ctype = str((chart_raw.get("type") if isinstance(chart_raw, dict) else "") or "").strip().lower()
+    chart_block["type"] = _ctype if _ctype in _chart_type_whitelist() else ""
+    chart_block["title"] = _sanitize_title(chart_raw.get("title") if isinstance(chart_raw, dict) else "")
+    chart_block["data"] = _sanitize_chart_data(chart_raw.get("data") if isinstance(chart_raw, dict) else None)
+    # 类型非法或数据缺失 → 提名不成立（数据型图表没有真实数据一律不画）
+    if chart_block.get("needed") and (not chart_block["type"] or not chart_block["data"]):
+        chart_block["needed"] = False
+        chart_block["priority"] = PRIORITY_NONE
 
     return {
         "section_id": sid,
@@ -547,8 +813,9 @@ def _normalize_plan(orch: dict, leaf: dict,
         "reason": orch.get("reason", ""),
         "plan": {
             "table": tbl_raw,           # table 无 priority 字段（易标规格同此）
-            "mermaid": _nblock(mm_raw),
-            "image": _nblock(img_raw),
+            "mermaid": mm_block,
+            "chart": chart_block,
+            "image": img_block,
             # E-2：knowledge.item_ids 白名单过滤后写回；无通道时为空列表
             "knowledge": {"item_ids": _extract_knowledge_ids(plan_raw, allowed_knowledge_ids)},
             # P0（facts-ns 2026-10-14）：facts.titles 去重限长后写回；标题存在性由
@@ -604,8 +871,10 @@ def _adjudicate_illustrations(plans: list[dict],
     # 一个，避免同一张「施工流程图」类意图在不同小节重复裁定落图。
     mermaid_candidates = []  # [(idx, priority)]
     image_candidates = []    # [(idx, priority)]
+    chart_candidates = []    # [(idx, priority)] —— 标书智能体（6）：数据型图表
     _mm_seen: dict[str, tuple[int, int]] = {}  # key -> (priority, idx)
     _im_seen: dict[str, tuple[int, int]] = {}
+    _ct_seen: dict[str, tuple[int, int]] = {}
 
     def _dedup_key(obj: dict) -> str:
         raw = str(obj.get("reason") or obj.get("purpose") or "").strip()
@@ -629,12 +898,16 @@ def _adjudicate_illustrations(plans: list[dict],
         plan = p.get("plan", {})
         mm = plan.get("mermaid") or {}
         im = plan.get("image") or {}
+        ct = plan.get("chart") or {}
         if mm.get("needed"):
             pr = normalize_priority(mm.get("priority"), needed=True)
             _collect(mermaid_candidates, _mm_seen, idx, pr, _dedup_key(mm))
         if im.get("needed"):
             pr = normalize_priority(im.get("priority"), needed=True)
             _collect(image_candidates, _im_seen, idx, pr, _dedup_key(im))
+        if ct.get("needed"):
+            pr = normalize_priority(ct.get("priority"), needed=True)
+            _collect(chart_candidates, _ct_seen, idx, pr, _dedup_key(ct))
 
     # === 第二阶段：分段择优（避免图片集中在前面）===
     segments = max(1, n // section_per_segment + (1 if n % section_per_segment else 0))
@@ -652,6 +925,21 @@ def _adjudicate_illustrations(plans: list[dict],
                 best_idx = seg_mm[0][0]
                 if plans[best_idx]["plan"]["mermaid"].get("needed"):
                     plans[best_idx]["illustration_type"] = "mermaid"
+
+    # 标书智能体（6）：数据型图表（chart）裁定 —— 每段最多 1 张，不占 AI 图配额
+    # （外部文档：图表类型最终只能一个 mermaid/chart/image/none）。
+    # 已占位（mermaid 抢占）的章节跳过 → 同一章节只会落一种图。
+    if prefer_mermaid:
+        for seg in range(segments):
+            seg_ct = [(i, pr) for i, pr in chart_candidates
+                      if _segment_of(i) == seg
+                      and plans[i].get("illustration_type") is None]
+            if not seg_ct:
+                continue
+            seg_ct.sort(key=lambda x: -x[1])
+            best_idx = seg_ct[0][0]
+            if plans[best_idx]["plan"].get("chart", {}).get("needed"):
+                plans[best_idx]["illustration_type"] = "chart"
 
     # AI 图裁定（硬上限 max_ai_images，分段均匀分配）
     # 仅在 prefer_mermaid=True 时走这条路径：mermaid 先占位，image 在
@@ -674,10 +962,11 @@ def _adjudicate_illustrations(plans: list[dict],
                 plans[pick_idx]["illustration_type"] = "ai"
                 remaining_quota -= 1
 
-    # 关闭 prefer_mermaid 时，两类候选合并按 priority 竞争同一配额
+    # 关闭 prefer_mermaid 时，各类候选合并按 priority 竞争同一配额
     if not prefer_mermaid and max_ai_images > 0:
-        merged = [(i, pr, "mermaid") for i, pr in mermaid_candidates] + \
-                 [(i, pr, "image") for i, pr in image_candidates]
+        merged = ([(i, pr, "mermaid") for i, pr in mermaid_candidates]
+                  + [(i, pr, "image") for i, pr in image_candidates]
+                  + [(i, pr, "chart") for i, pr in chart_candidates])
         merged.sort(key=lambda x: (-x[1], 0 if x[2] == "image" else 1))
         remaining = max_ai_images
         for idx, _pr, kind in merged:
@@ -685,7 +974,9 @@ def _adjudicate_illustrations(plans: list[dict],
                 continue
             if remaining <= 0:
                 break
-            plans[idx]["illustration_type"] = "ai" if kind == "image" else "mermaid"
+            plans[idx]["illustration_type"] = {
+                "image": "ai", "mermaid": "mermaid", "chart": "chart",
+            }.get(kind, kind)
             remaining -= 1
 
     # === 第三阶段：table 裁定 — 按 table_ratio 控制 ===
@@ -703,13 +994,16 @@ def _adjudicate_illustrations(plans: list[dict],
                                        needed=bool((p.get("plan", {}).get("mermaid") or {}).get("needed")))
             im_pr = normalize_priority((p.get("plan", {}).get("image") or {}).get("priority"),
                                        needed=bool((p.get("plan", {}).get("image") or {}).get("needed")))
+            # 标书智能体（6）：数据型图表提名同样参与「有配图则表格降权」
+            ct_pr = normalize_priority((p.get("plan", {}).get("chart") or {}).get("priority"),
+                                       needed=bool((p.get("plan", {}).get("chart") or {}).get("needed")))
             # BUG-FIX 2026-10-05（D-2）：旧实现读 tbl.get("priority")，但 table 的
             # plan 结构只有 {needed, purpose}，**从来没有 priority 字段**——该分支
             # 恒为 1，排序退化成稳定排序（原序），「有配图则表格降权」实际只靠
             # mm_pr/im_pr 生效。现改为固定的基础权重 1.0，只保留图竞争带来的降权。
             # max_pr 归一化后取值 3-5，除以 5 得到 0.6-1.0 的降权幅度：
             # 强配图章节的表格会被最先砍掉，纯文字章节的表格最先保留。
-            effective = 1.0 - max(mm_pr, im_pr) * 0.2
+            effective = 1.0 - max(mm_pr, im_pr, ct_pr) * 0.2
             table_candidates.append((idx, effective))
 
     table_candidates.sort(key=lambda x: -x[1])
@@ -841,14 +1135,34 @@ async def generate_full_skeleton(provider: Any, outline: list,
     # ENHANCE 2026-10-18（审计遗留 D2 批次 2 收编）：user 侧收编为
     # CONTENT_SKELETON_USER（system 侧早已于 BUG-FIX-PROMPT-E3 收编）。
     # 项目概述来自解析链路（外部内容），注入前做元标记中和。
-    user_prompt = get_prompt(
+    # 标书智能体（4）——提示词顺序优化（缓存命中）：node_listing 是唯一随
+    # 目录变化的部分，用哨兵占位符渲染模板后按哨兵拆分——稳定段（角色/
+    # 规则/输出格式/项目概述）前置为独立 user 消息，章节清单与任务说明放
+    # 最后一条；目录重建后再次生成骨架时稳定前缀可命中缓存。
+    _NODE_MARKER = "@@NODE_LISTING_MARKER@@"
+    from .prompt_order import (
+        build_cache_friendly_messages,
+        split_rendered_template,
+    )
+
+    _skel_template = get_prompt(
         "CONTENT_SKELETON_USER",
         project_overview=(project_overview or "")[:800],
-        node_listing=listing,
+        node_listing=_NODE_MARKER,
         sanitize=True,
-    ) or (
-        f"### 项目概述\n{(project_overview or '')[:800]}\n\n"
-        f"### 需要写骨架的章节（section_id<TAB>标题）\n{listing}\n\n"
+    )
+    if not _skel_template:
+        _skel_template = (
+            "### 项目概述\n@@PROJECT_OVERVIEW@@\n\n"
+            "### 需要写骨架的章节（section_id<TAB>标题）\n"
+            f"{_NODE_MARKER}\n\n"
+            "请为以上每个 section_id 输出一篇 1~2 句的篇章骨架，返回严格 JSON。"
+        ).replace("@@PROJECT_OVERVIEW@@", (project_overview or "")[:800])
+    _before, _after = split_rendered_template(_skel_template, _NODE_MARKER)
+    _skel_blocks = [b.strip() for b in (_before, _after) if b.strip()]
+    _skel_blocks.append(
+        "### 需要写骨架的章节（section_id<TAB>标题）\n"
+        f"{listing}\n\n"
         "请为以上每个 section_id 输出一篇 1~2 句的篇章骨架，返回严格 JSON。"
     )
     try:
@@ -857,14 +1171,28 @@ async def generate_full_skeleton(provider: Any, outline: list,
         # get_prompt()（DB 优先 → 注册表 → 硬编码回退），保留 _SKELETON_SYSTEM
         # 作为最小 fallback，行为向后兼容。
         _skel_sys = get_prompt("CONTENT_SKELETON_SYSTEM") or _SKELETON_SYSTEM
-        messages = [
-            AIMessage(role="system", content=_skel_sys),
-            AIMessage(role="user", content=user_prompt),
-        ]
+        try:
+            from app.config import ORCHESTRATION_PROMPT_LAYERS_ENABLED as _LAYERS_ON
+        except Exception:  # pragma: no cover - 配置读取兜底
+            _LAYERS_ON = True
+        if _LAYERS_ON:
+            messages = build_cache_friendly_messages(_skel_sys, _skel_blocks, "")
+        else:
+            messages = [
+                AIMessage(role="system", content=_skel_sys),
+                AIMessage(role="user", content="\n\n".join(_skel_blocks)),
+            ]
         chat_kwargs: dict[str, Any] = {"max_tokens": max_tokens, "temperature": 0.2}
         if cancel_event is not None:
             chat_kwargs["cancel_event"] = cancel_event
         raw = await provider.chat(messages, **chat_kwargs)
+        # 标书智能体（4）缓存可观测性：按任务类型记账（fail-soft）。
+        try:
+            from .cache_metrics import record_provider_cache_usage
+
+            record_provider_cache_usage(provider, task_type="full_skeleton")
+        except Exception:  # pragma: no cover - 防御性
+            pass
         text = raw if isinstance(raw, str) else (raw or {}).get("content", str(raw))
         m = re.search(r"\{.*\}", text, re.DOTALL)
         if not m:

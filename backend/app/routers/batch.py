@@ -6,6 +6,7 @@ import logging
 from fastapi import APIRouter, Depends, HTTPException
 from ..security.auth import get_current_user
 from ..services.batch_query import batch_optimizer
+from .project_access import enforce_project_access
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix='/batch', tags=['batch_operations'], dependencies=[Depends(get_current_user)])
 
@@ -63,7 +64,7 @@ async def batch_update_section_status(project_id: int, section_updates: list[tup
         raise HTTPException(status_code=500, detail=f'批量更新失败: {e!s}') from e
 
 @router.get('/files')
-async def batch_get_files(project_ids: str):
+async def batch_get_files(project_ids: str, identity=Depends(get_current_user)):
     """批量获取多个项目的文件列表
 
     Args:
@@ -72,10 +73,17 @@ async def batch_get_files(project_ids: str):
     Returns:
         {project_id: [file_list], ...}
     """
+    # ENHANCE（本轮跨模块深度探索·IDOR 口径收口）：本端点此前只验登录、不验
+    # 项目归属——任意登录用户可传他人 project_id 读取其文件列表，与 files.py
+    # 2026-09-29 的属权收口不同口径。现按 ids 逐个 enforce_project_access
+    # （无权 403 / 不存在 404），与全仓库同一口径。注：前端无任何调用方
+    # （全仓 grep 0 命中），属内部/管理端点，收口无兼容影响。
     try:
         ids = [int(pid.strip()) for pid in project_ids.split(',') if pid.strip()]
         if not ids:
             raise HTTPException(status_code=400, detail='请提供有效的项目ID列表')
+        for _pid in ids:
+            await enforce_project_access(_pid, identity)
         files_map = batch_optimizer.batch_get_project_files(ids)
         return {'status': 'ok', 'files': files_map}
     except HTTPException:

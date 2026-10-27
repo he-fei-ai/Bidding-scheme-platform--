@@ -651,6 +651,32 @@ def reconcile_stale(*, stale_seconds: int | None = None, now: datetime | None = 
     return rows
 
 
+def delete_for_project(
+    project_id: int, task_type: str | None = None, *, now: datetime | None = None
+) -> int:
+    """删除某项目的任务快照行。
+
+    用于「未完成的任务不再保留、直接重新开始」场景：开始新一轮目录生成前，
+    把本项目旧的 `outline_v51` 快照行（含上次未正常结束 / 中断的行）真正删掉，
+    而不是仅标 superseded 留在表里。返回删除行数。
+
+    Args:
+        project_id: 项目 ID。
+        task_type: 不传则删除该项目所有类型；传则只删指定类型（如 'outline_v51'）。
+    """
+    with get_db() as conn:
+        if task_type is None:
+            cur = conn.execute(
+                "DELETE FROM background_tasks WHERE project_id = ?", (project_id,)
+            )
+        else:
+            cur = conn.execute(
+                "DELETE FROM background_tasks WHERE project_id = ? AND task_type = ?",
+                (project_id, task_type),
+            )
+        return cur.rowcount or 0
+
+
 def acknowledge(
     project_id: int, *, task_type: str | None = None, now: datetime | None = None
 ) -> int:

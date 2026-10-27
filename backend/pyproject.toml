@@ -56,6 +56,9 @@ testpaths = ["tests"]
 python_files = ["test_*.py"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
+markers = [
+    "smoke: 目录生成落库冒烟门禁（零脏零空 + 节点守恒 + 编号完整），pytest -m smoke 运行",
+]
 # backend/.pytest_cache 在中文路径下偶发 WinError 5 写入崩溃（间歇性 Killing 进程），
 # 将缓存移到 tests/ 子目录规避
 cache_dir = "tests/.pytest_cache"

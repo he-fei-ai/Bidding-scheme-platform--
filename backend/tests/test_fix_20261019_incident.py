@@ -358,21 +358,23 @@ class TestTocStaticEntries:
 
     def test_collect_entries_level_order(self):
         entries = _collect_toc_entries(self._tree())
+        # FIX 2026-10-26（报告 G-5/I-5）：目录条目与正文标题同口径——
+        # 程序编号 + 去旧编号标题；L2 计数随父级（各章）复位。
         assert entries == [
-            (1, "第一章 施工总体部署"),
-            (2, "1.1 编制依据"),
-            (2, "1.2 工程概况"),
-            (3, "1.2.1 现场调查与既有设施排查"),
-            (1, "第二章 主要施工方法"),
-            (2, "2.1 基层处理工艺"),
-            (3, "2.1.1 施工准备"),
-            (3, "2.1.2 面层铺贴"),
+            (1, "第一节、施工总体部署"),
+            (2, "一、编制依据"),
+            (2, "二、工程概况"),
+            (3, "1、现场调查与既有设施排查"),
+            (1, "第二节、主要施工方法"),
+            (2, "一、基层处理工艺"),
+            (3, "1、施工准备"),
+            (3, "2、面层铺贴"),
         ]
 
     def test_collect_entries_respects_max_level(self):
         entries = _collect_toc_entries(self._tree(), max_level=2)
         assert all(lv <= 2 for lv, _ in entries)
-        assert (3, "2.1.1 施工准备") not in entries
+        assert not any(lv == 3 for lv, _ in entries)
 
     def test_collect_entries_empty_tree(self):
         assert _collect_toc_entries([]) == []

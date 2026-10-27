@@ -45,6 +45,7 @@ from . import (
     knowledge,
     mermaid,
     outline,
+    scheme_extraction,  # 标书智能体（一）引入：五段式专项方案解析提取提示词
 )
 from ._cache import (
     build_prompt_with_context,

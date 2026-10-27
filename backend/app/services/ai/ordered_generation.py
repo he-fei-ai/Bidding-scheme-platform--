@@ -722,6 +722,7 @@ def verify_fact_invocation(
     field_contract: dict | None = None,
     field_trace: list[dict] | None = None,
     facts: list | None = None,
+    industry: str | None = None,
 ) -> dict:
     """生成后校验全局事实调用（二.3 调用完整性 / 二.4 调用一致性）。
 
@@ -729,6 +730,13 @@ def verify_fact_invocation(
       1. 每章按 CHAPTER_FIELD_MAP 应注入的事实字段是否**完整注入**（不遗漏）；
       2. 注入字段是否有值（不截断/不错映射到空值）；
       3. 正文与全局数据字典是否冲突（调用一致性）。
+
+    Args:
+        industry: 行业名，须与生成侧 ``select_facts_by_chapter_map`` 传入的
+            ``industry`` **保持一致**——``classify_chapter`` 会按行业专项词表
+            二次匹配章节归属（``content_field_contract.classify_chapter``
+            L257/L267-269），不传 industry 会让校验侧落到默认 9 章分类，导致
+            「生成侧注入、校验侧漏查」的误报/漏检（发现 #1，2026-10-21 修复）。
 
     Args:
         results: generate_sections 返回的结果列表（含 title/content）。
@@ -754,8 +762,10 @@ def verify_fact_invocation(
         return {"ok": True, "issues": [], "warnings": [], "chapters": {}}
 
     trace = field_trace or []
-    # chapter title -> {(source, field_key)}
+    # 章节追溯双索引（2026-10-21 修复 #4）：section_id 优先（消除同名章碰撞
+    # 与标题被 sanitize 后不匹配导致的误报），title 作为无 id 时的兼容回退。
     traced: dict[str, set] = {}
+    traced_by_id: dict[int, set] = {}
     for t in trace:
         if not isinstance(t, dict):
             continue
@@ -763,6 +773,9 @@ def verify_fact_invocation(
         src = t.get("source", "")
         fld = t.get("field", "")
         traced.setdefault(ch, set()).add((src, fld))
+        sid = t.get("section_id")
+        if sid is not None:
+            traced_by_id.setdefault(sid, set()).add((src, fld))
 
     for r in results or []:
         if not isinstance(r, dict):
@@ -771,12 +784,31 @@ def verify_fact_invocation(
         content = r.get("content") or ""
         if not title:
             continue
-        ch = classify_chapter(title)
+        ch = classify_chapter(title, industry=industry)
         idx = ch["idx"]
         mapping = CHAPTER_FIELD_MAP.get(idx, {})
         required_fact_keys = mapping.get("facts", [])
-        called = traced.get(title, set())
+        # 追溯匹配（#4）：一旦追溯已按 id 索引，就**严格按 id 匹配**（不做
+        # title 回退，杜绝同名章碰撞/标题 sanitize 误报）；仅当追溯无 section_id
+        # （旧追溯）或结果本身无 id 时，才回退 title 索引。
+        _sid = r.get("id")
+        if traced_by_id and _sid is not None:
+            called = traced_by_id.get(_sid, set())
+        else:
+            called = traced.get(title, set())
         called_keys = {fld for _, fld in called}
+
+        # ENHANCE 2026-10-21（正文 #2）：自定义/行业章节未命中任何标准九大章节
+        # 关键词时，classify_chapter 纯兜底到第 1 章并注入其事实。将其从「静默」
+        # 变为可观测 warn（非阻断），便于发现行业专项章节的事实映射缺口。
+        if not ch.get("matched", True):
+            warnings.append({
+                "type": "fact_chapter_unmatched",
+                "level": "warn",
+                "chapter": title,
+                "detail": f"章节「{title}」未匹配到标准九大章节关键词，"
+                          f"按第 {idx} 章兜底注入事实，可能非最相关",
+            })
 
         detail = {
             "chapter_idx": idx,
@@ -925,6 +957,7 @@ def verify_generation_completeness(
     field_trace: list[dict] | None = None,
     facts: list | None = None,
     order_tracker: Any = None,
+    industry: str | None = None,
 ) -> dict:
     """Comprehensive post-generation verification.
 
@@ -1053,7 +1086,9 @@ def verify_generation_completeness(
                 pass
 
     # 5. 全局事实调用完整性（章节 → 所需事实 映射表）
-    fact_report = verify_fact_invocation(results, field_contract, field_trace, facts)
+    fact_report = verify_fact_invocation(
+        results, field_contract, field_trace, facts, industry=industry
+    )
     issues.extend(fact_report["issues"])
     warnings.extend(fact_report["warnings"])
 

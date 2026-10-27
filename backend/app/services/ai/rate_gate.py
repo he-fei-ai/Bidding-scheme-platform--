@@ -72,6 +72,42 @@ _CONCURRENCY_POLL = 0.25
 #: 冷却/令牌等待的单次上限（秒），保证取消与配置变更能及时生效。
 _MAX_SLEEP = 30.0
 
+#: 同因日志节流窗口（秒）。
+#: 生产实证（logs/backend.log，2026-10-22 21:47~21:56，project=1871130）：
+#: 一次 429 风暴会在**同一秒内**打出数十条「触发限流 / 冷却 Xs」WARNING
+#: （全窗口 265 + 27 条），占该时段 WARNING 的绝大多数，把真正的异常信号
+#: （如 L2 章节超时失败）完全淹没。设为 0 可关闭节流、保持历史行为。
+_LOG_THROTTLE_WINDOW = float(
+    os.environ.get("AI_RATE_GATE_LOG_THROTTLE_WINDOW", "60") or 0
+)
+#: key -> [上次打日志的 monotonic 时刻, 窗口内被抑制条数]
+_LOG_THROTTLE_STATE: dict[str, list] = {}
+
+
+def _should_log_throttled(key: str) -> tuple[bool, int]:
+    """同因窗口节流。
+
+    Returns:
+        (是否应当打日志, 本窗口内此前被抑制的条数)。被抑制条数在窗口
+        重新打开时随下一条真实日志一并输出，保证「抑制了什么」可追溯，
+        而不是静默丢日志。
+    """
+    if _LOG_THROTTLE_WINDOW <= 0:
+        return True, 0
+    now = time.monotonic()
+    slot = _LOG_THROTTLE_STATE.get(key)
+    if slot is None or now - slot[0] >= _LOG_THROTTLE_WINDOW:
+        suppressed = int(slot[1]) if slot else 0
+        _LOG_THROTTLE_STATE[key] = [now, 0]
+        return True, suppressed
+    slot[1] = int(slot[1]) + 1
+    return False, 0
+
+
+def reset_log_throttle() -> None:
+    """清空日志节流状态（测试用）。"""
+    _LOG_THROTTLE_STATE.clear()
+
 
 def _env_flag(name: str, default: bool = False) -> bool:
     raw = os.environ.get(name)
@@ -341,19 +377,27 @@ class _RateGate:
         if current > MIN_CONCURRENCY:
             target = max(MIN_CONCURRENCY, int(current * DECREASE_FACTOR))
             st.limiter.set_limit(target)
-            logger.warning(
-                "[限流闸门] 触发限流 base_url=%s 第 %d 次 → 并发 %d -> %d",
-                self._normalize(base_url) or "(default)", st.throttled, current, target,
-            )
+            _ok, _suppressed = _should_log_throttled("on_rate_limited")
+            if _ok:
+                _extra = f"（窗口内已抑制 {_suppressed} 条同类日志）" if _suppressed else ""
+                logger.warning(
+                    "[限流闸门] 触发限流 base_url=%s 第 %d 次 → 并发 %d -> %d%s",
+                    self._normalize(base_url) or "(default)", st.throttled, current, target,
+                    _extra,
+                )
 
         # 冷却：优先采信服务端 Retry-After，否则给一个与收缩幅度相称的窗口。
         suggested = float(retry_after or 0.0)
         if suggested <= 0:
             suggested = min(60.0, max(5.0, 2.0 * (st.max_concurrency - st.limiter.limit + 1)))
         st.cooldown_until = max(st.cooldown_until, time.monotonic() + suggested)
-        logger.warning(
-            "[限流闸门] 冷却 %.1fs（并发上限现为 %d）", suggested, st.limiter.limit,
-        )
+        _ok, _suppressed = _should_log_throttled("cooldown")
+        if _ok:
+            _extra = f"（窗口内已抑制 {_suppressed} 条同类日志）" if _suppressed else ""
+            logger.warning(
+                "[限流闸门] 冷却 %.1fs（并发上限现为 %d）%s",
+                suggested, st.limiter.limit, _extra,
+            )
         return suggested
 
     # ── 运维/测试可观测接口 ─────────────────────────────────────────────

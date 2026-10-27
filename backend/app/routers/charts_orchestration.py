@@ -82,14 +82,19 @@ async def orchestrate_charts(request: OrchestrateRequest):
         for s in request.sections
     ]
 
-    # 获取 AI 客户端（可选）
+    # 获取 AI provider（可选）。
+    # BUG-FIX 2026-10-23（标书智能体（4））：原实现传 get_ai_config() 返回的
+    # **配置 dict**，chart_orchestrator 按 OpenAI SDK 形态调用
+    # chat_completion → AttributeError 被静默吞掉，AI 增强从未生效。
+    # 现改为创建平台 provider（provider.chat 形态），由
+    # _resolve_chart_provider 兼容 dict/provider 两种入参。
     ai_client = None
     if request.use_ai:
         try:
-            from ..services.ai.provider_factory import get_ai_config
-            ai_client = get_ai_config()
+            from ..services.ai.provider_factory import create_provider_with_fallback
+            ai_client, _provider_name = create_provider_with_fallback()
         except Exception as e:
-            logger.warning("AI 客户端不可用，回退本地推断: %s", e)
+            logger.warning("AI provider 不可用，回退本地推断: %s", e)
 
     # 执行智能编排
     results = batch_analyze_sections(
@@ -116,14 +121,15 @@ async def generate_chart_payloads_api(request: PayloadRequest):
     if not request.sections:
         raise HTTPException(status_code=400, detail="sections 不能为空")
 
-    # 获取 AI 客户端（可选）
+    # 获取 AI provider（可选）。BUG-FIX 2026-10-23：原传配置 dict，
+    # AI 增强链路实际从未生效（详见 /orchestrate 同款说明）。
     ai_client = None
     if request.use_ai:
         try:
-            from ..services.ai.provider_factory import get_ai_config
-            ai_client = get_ai_config()
+            from ..services.ai.provider_factory import create_provider_with_fallback
+            ai_client, _provider_name = create_provider_with_fallback()
         except Exception as e:
-            logger.warning("AI 客户端不可用，回退本地生成: %s", e)
+            logger.warning("AI provider 不可用，回退本地生成: %s", e)
 
     # 执行批量生成
     payloads = generate_all_chart_payloads(

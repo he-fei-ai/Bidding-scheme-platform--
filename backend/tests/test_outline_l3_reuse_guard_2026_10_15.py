@@ -359,9 +359,9 @@ class TestEnsureMinChildrenWiring:
 # C1：新配置项默认值与向后兼容
 # ===========================================================================
 class TestNewConfig:
-    def test_default_cap_is_three(self):
-        """默认 3：合法的小范围复用不受影响，成套复制被收口。"""
-        assert OUTLINE_L3_MAX_PARENT_REUSE == 3
+    def test_default_cap_is_two(self):
+        """默认 2：docx 实测 65 个 L3 标题重复 2-3 次，收紧上限至 2。"""
+        assert OUTLINE_L3_MAX_PARENT_REUSE == 2
 
     def test_end_to_end_chain_leaves_no_dirty_or_suffixed_titles(self):
         """清洗 → 去重 → 护栏 → 再清洗：终态既无脏标题也无跨章成套复制。"""

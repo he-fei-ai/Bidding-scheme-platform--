@@ -388,6 +388,221 @@ class TestCheckDocumentIntegration:
         assert not any(w.startswith("[内容质量]") for w in r.warnings), r.warnings
 
 
+# ============================================================================
+# 修复 25：标题-正文错位 / 正文截断 / 项目类型禁止章节扩充（2026-10-26 报告）
+# ============================================================================
+
+
+class TestTitleContentMismatch:
+    _GENERIC = (
+        "本工程位于岳阳路园区科研南楼，建筑面积7974.70平方米，工期180日历天，"
+        "质量目标为合格。编制依据包括招标文件、施工图纸及现行国家规范。"
+    ) * 3
+
+    def test_mismatched_section_flags_cmp09(self):
+        sections = [
+            _sec("消防管线支吊架固定", self._GENERIC, id=1),
+            _sec("给排水管道耐压耐腐蚀指标", self._GENERIC, id=2),
+        ]
+        issues = qr.detect_title_content_mismatch(sections)
+        assert {i["section_id"] for i in issues} == {1, 2}, issues
+        assert all(i["rule_id"] == "CMP-09" for i in issues)
+        assert all(i["severity"] == "high" for i in issues)
+
+    def test_matched_section_not_flagged(self):
+        sections = [
+            _sec(
+                "劳动力考核评价",
+                "项目部建立劳动力考核评价机制，每月对班组进行考核评价，"
+                "考核结果与工资挂钩。具体做法包括考勤记录、工序质量评分、"
+                "安全行为评分，考核评价结果纳入月度评比。" * 2,
+                id=3,
+            ),
+        ]
+        assert qr.detect_title_content_mismatch(sections) == []
+
+    def test_short_title_or_content_skipped(self):
+        sections = [_sec("要点", self._GENERIC), _sec("消防管线支吊架固定", "内容过短")]
+        assert qr.detect_title_content_mismatch(sections) == []
+
+
+class TestTruncatedSections:
+    def test_trailing_comma_flags_dlv02(self):
+        content = (
+            "本工程设置废料暂存点位于场地北侧，采用封闭式围挡并设置喷淋降尘设施，"
+            "清运路线沿北侧临时通道经东门出场，避开办公区与教学区。"
+            "清运车辆加盖篷布，出场前冲洗轮胎，"
+        )
+        issues = qr.detect_truncated_sections([_sec("废料暂存点与清运路线", content)])
+        assert [i["rule_id"] for i in issues] == ["DLV-02"]
+
+    def test_complete_sentence_not_flagged(self):
+        content = (
+            "本工程设置废料暂存点位于场地北侧，采用封闭式围挡并设置喷淋降尘设施，"
+            "清运路线沿北侧临时通道经东门出场，避开办公区与教学区。"
+        )
+        assert qr.detect_truncated_sections([_sec("废料暂存点", content)]) == []
+
+
+class TestDecorationForbiddenSections:
+    def test_structural_sections_flagged_for_decoration(self):
+        sections = [
+            _sec("基坑排水系统设置"),
+            _sec("脚手架连墙件加固"),
+            _sec("塔吊防风锚固措施"),
+            _sec("地下室施工工艺"),
+            _sec("主体结构质量控制"),
+            _sec("外墙技术交底"),
+            _sec("混凝土养护保湿措施"),
+        ]
+        issues = qr.validate_scheme_sections(
+            sections, project_name="岳阳路园区科研南楼室内装修工程"
+        )
+        cmp02 = [i for i in issues if i["rule_id"] == "CMP-02"]
+        flagged = {i["section_title"] for i in cmp02}
+        assert flagged == {s.title for s in sections}, cmp02
+
+
+class TestDuplicateTitles:
+    def test_same_level_duplicate_title_flagged(self):
+        sections = [
+            _sec("施工工艺流程与要点", "", id=1),
+            _sec("1、施工工艺流程与要点", "", id=2),
+            _sec("施工工艺流程与要点", "", id=3),
+        ]
+        sections[0].level = sections[1].level = sections[2].level = 3
+        issues = qr.detect_duplicate_titles(sections)
+        assert len(issues) == 1, issues
+        assert issues[0]["rule_id"] == "CMP-10"
+        assert issues[0]["severity"] == "medium"
+
+    def test_same_title_different_level_not_flagged(self):
+        a = _sec("工程概况", "", id=1)
+        b = _sec("工程概况", "", id=2)
+        a.level, b.level = 2, 3
+        assert qr.detect_duplicate_titles([a, b]) == []
+
+
+# ============================================================================
+# 修复 26：图表一致性 / 编号残留 / 必需交付物（2026-10-26 报告 F/G/H）
+# ============================================================================
+
+
+class TestFigureWithoutPayload:
+    def test_caption_without_chart_flags_cht01(self):
+        """报告 F-5/E-6：正文只有「图X-Y」图题，没有图对象。"""
+        content = (
+            "图1-1 装饰装修独立区段\n"
+            "本节按施工区段组织流水作业，配置独立班组与独立材料堆放区。\n\n"
+        ) * 3
+        issues = qr.detect_figure_without_payload([_sec("装饰装修独立区段", content, id=7)])
+        assert [i["rule_id"] for i in issues] == ["CHT-01"], issues
+        assert issues[0]["severity"] == "high"
+
+    def test_caption_with_mermaid_fence_not_flagged(self):
+        content = "图1-1 施工流程\n\n```mermaid\nflowchart LR\n A-->B\n```\n"
+        assert qr.detect_figure_without_payload([_sec("施工流程", content)]) == []
+
+    def test_caption_with_payload_not_flagged(self):
+        s = _sec("区段划分", "图1-1 区段划分\n说明文字。", id=1)
+        s.layout_json = '{"title": "区段划分", "nodes": []}'
+        assert qr.detect_figure_without_payload([s]) == []
+
+
+class TestDuplicateFigureTitles:
+    def _mk(self, sid: int, title: str, fig_title: str, parent_id: int = 1):
+        s = _sec(title, "", id=sid, parent_id=parent_id)
+        s.layout_json = '{"title": "%s", "nodes": []}' % fig_title
+        return s
+
+    def test_same_chapter_duplicate_caption_flags_cht02(self):
+        """报告 F-2/B-4：图7-2/7-3/7-4 共用同一图题。"""
+        sections = [
+            _sec("第七章", "", id=1),
+            self._mk(2, "环保材料 A", "环保与速干材料交叉施工协调"),
+            self._mk(3, "环保材料 B", "图7-2 环保与速干材料交叉施工协调"),
+            self._mk(4, "环保材料 C", "环保与速干材料交叉施工协调"),
+        ]
+        issues = qr.detect_duplicate_figure_titles(sections)
+        assert len(issues) == 1, issues
+        assert issues[0]["rule_id"] == "CHT-02"
+        assert issues[0]["severity"] == "medium"
+
+    def test_different_chapter_same_title_not_flagged(self):
+        """跨章同名图是合理的（每章都可能有一张进度横道图）。"""
+        sections = [
+            _sec("第一章", "", id=1),
+            _sec("第七章", "", id=2),
+            self._mk(3, "进度 A", "施工进度横道图", parent_id=1),
+            self._mk(4, "进度 B", "施工进度横道图", parent_id=2),
+        ]
+        assert qr.detect_duplicate_figure_titles(sections) == []
+
+
+class TestContentNumberingStyle:
+    def test_dotted_numbering_flags_cmp11(self):
+        """报告 G-1/G-4：正文残留「1.2.1.1 围挡设置标准」。"""
+        content = "1.2.1.1 围挡设置标准\n围挡采用2.2m高彩钢板，底部砌筑300mm高砖基础。"
+        issues = qr.detect_content_numbering_style([_sec("施工隔离围挡设置", content)])
+        assert [i["rule_id"] for i in issues] == ["CMP-11"], issues
+        assert issues[0]["severity"] == "medium"
+
+    def test_single_level_number_not_flagged(self):
+        content = "5.1米的净高满足要求，厚度5~7mm，验收合格率100%。"
+        assert qr.detect_content_numbering_style([_sec("净高控制", content)]) == []
+
+
+class TestRequiredDeliverables:
+    def _decoration_sections(self, content: str = ""):
+        return [
+            _sec("装饰装修工程概况", "本项目为既有科研楼室内装修，工期180日历天。"),
+            _sec("编制依据", "依据现行国家标准与招标文件。"),
+            _sec("施工进度计划", "总工期180日历天，按区段流水组织。"),
+            _sec("装饰装修施工工艺", content),
+            _sec("安全保证措施", "建立安全生产责任制。"),
+            _sec("验收要求", "按 GB50210 验收。"),
+            _sec("应急处置", "建立应急组织。"),
+        ]
+
+    def test_missing_tables_flags_dlv03(self):
+        """报告 H-9：材料进场检验/隐蔽验收/消防联动调试记录表缺失。"""
+        issues = qr.detect_missing_required_tables(
+            self._decoration_sections(), "装饰装修专项施工方案"
+        )
+        assert len([i for i in issues if i["rule_id"] == "DLV-03"]) == 3, issues
+
+    def test_present_tables_not_flagged(self):
+        content = "材料进场检验记录表、隐蔽工程验收记录表、消防联动调试记录表均已建立。"
+        issues = qr.detect_missing_required_tables(
+            self._decoration_sections(content), "装饰装修专项施工方案"
+        )
+        assert issues == []
+
+    def test_missing_key_charts_flags_dlv04(self):
+        """报告 H-10：总平面布置图/进度横道图/劳动力曲线图缺失。"""
+        issues = qr.detect_missing_key_charts(
+            self._decoration_sections(), "装饰装修专项施工方案"
+        )
+        assert len([i for i in issues if i["rule_id"] == "DLV-04"]) == 3, issues
+        assert all(i["severity"] == "high" for i in issues)
+
+    def test_text_only_mention_still_flags(self):
+        """报告 F-4：只有「施工总平面布置图」文字描述、无图，不算覆盖。"""
+        content = "施工总平面布置图如下：北侧为物料主入口，南侧为加工区。"
+        issues = qr.detect_missing_key_charts(
+            self._decoration_sections(content), "装饰装修专项施工方案"
+        )
+        names = " ".join(i["message"] for i in issues)
+        assert "施工总平面布置图" in names, issues
+
+    def test_chart_payloads_cover(self):
+        sections = self._decoration_sections()
+        sections[3].layout_json = '{"title": "总平面布置", "nodes": []}'
+        sections[3].gantt_json = '{"title": "进度横道图", "tasks": []}'
+        sections[3].labor_json = '{"title": "劳动力曲线", "points": []}'
+        assert qr.detect_missing_key_charts(sections, "装饰装修专项施工方案") == []
+
+
 if __name__ == "__main__":
     import pytest
 

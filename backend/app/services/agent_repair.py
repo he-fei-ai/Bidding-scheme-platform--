@@ -26,6 +26,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime
 import json
 import logging
@@ -118,8 +119,13 @@ def build_agent_workspace(project_id: int, base: Path | None = None) -> dict:
 
     Returns dict：{dir, facts, conflicts, sections, global_facts_md, technical_plan_md}
     只读操作，不落库。
+
+    BUG-FIX 2026-10-27（P3·纯读抢写锁）：本函数对 DB 只读（文件写入仅在
+    AGENT_REPAIR_PERSIST_WORKSPACE 门禁下发生，且不碰库），此前用无参
+    `get_db()` 抢全局写锁 —— 与 backflow / auditor 已修的「纯读却抢写锁」
+    同类问题，会把并发导出/生成事务无谓拖慢。现改 `get_db(readonly=True)`。
     """
-    with get_db() as conn:
+    with get_db(readonly=True) as conn:
         facts_row = conn.execute(
             "SELECT global_facts_json FROM analysis WHERE project_id = ?", (project_id,)
         ).fetchone()
@@ -417,7 +423,11 @@ async def run_agent_repair(
         "message": "",
     }
     try:
-        ctx = build_agent_workspace(project_id, base)
+        # BUG-FIX 2026-10-27（P1·事件循环阻塞）：本函数是 async，但工作区准备
+        # （只读连接 + 全量正文读取 + 可选落盘写文件）是同步重操作，此前直接
+        # 跑在事件循环里 —— 正是 audit 路由 asyncio.to_thread 修复注释里的
+        # 同一病灶（prompts.py 铁律：async 端点的同步 DB 调用必须进线程池）。
+        ctx = await asyncio.to_thread(build_agent_workspace, project_id, base)
     except Exception as e:
         report["message"] = f"工作区准备失败：{e!s}"
         # 与 repair_with_ai 报告同构：异常既进 message（给人读）也进 errors（给 UI 计数）
@@ -447,9 +457,18 @@ async def run_agent_repair(
     for turn in range(max_turns):
         result = await _agent_turn(provider, ctx, _format_feedback(events), turn)
         if result is None:
-            events.append({"action": "turn", "ok": False, "detail": "模型返回不可解析，终止"})
-            report["errors"].append(f"第 {turn + 1} 轮模型返回不可解析，已提前终止")
-            break
+            # BUG-FIX 2026-10-27（P3·单次解析失败终结全会话）：原实现 break，
+            # 一次非法 JSON（max_tokens 截断 / 模型夹带说明文字）就烧掉剩余轮数。
+            # 现把「上轮返回不可解析」作为反馈喂回下一轮（_format_feedback 取
+            # 最近 8 条事件），要求模型严格只输出 JSON 后继续；轮数仍由
+            # max_turns 硬性封顶，不会失控。
+            events.append({
+                "action": "turn",
+                "ok": None,
+                "detail": "上一轮返回不可解析（非合法 JSON）。请严格只输出一个 JSON 对象：不要附加解释文字、不要 markdown 围栏、不要截断。",
+            })
+            report["errors"].append(f"第 {turn + 1} 轮模型返回不可解析，已反馈并重试")
+            continue
         if result.get("unresolved"):
             for item in result["unresolved"]:
                 if isinstance(item, dict) and (item.get("section_id") or item.get("reason")):
@@ -466,7 +485,25 @@ async def run_agent_repair(
                 if ev.get("ok"):
                     report["applied"].append(action)
                 else:
-                    report["rejected"].append(action)
+                    # BUG-FIX 2026-10-27（P2·被拒补丁契约错位）：本报告的
+                    # `rejected` 消费方是前端 AgentRepairTab（渲染
+                    # {section_id, title, error}）与姊妹链路 repair_with_ai
+                    # 的同名字段（rejected[i]["error"]，见
+                    # test_enhancement_2026_09_14 的契约用例）。原实现把 AI 的
+                    # 原始 action dict（{action, section_id, old_text, ...}）
+                    # 直接塞进来，宿主拒绝原因 ev["detail"]（未找到/不唯一/越界）
+                    # 被丢弃 → 前端每条都显示兜底文案「匹配失败」。现按契约
+                    # 归一化，把真实拒绝原因带给 UI。
+                    _sid = str(action.get("section_id") or "")
+                    _title = next(
+                        (s["title"] for s in ctx["sections"] if str(s["id"]) == _sid),
+                        "",
+                    )
+                    report["rejected"].append({
+                        "section_id": _sid,
+                        "title": _title,
+                        "error": str(ev.get("detail") or "匹配失败"),
+                    })
         if result.get("done"):
             break
 
@@ -501,7 +538,11 @@ async def run_agent_repair(
         return report
 
     # —— 落文 + 收敛冲突状态（复用 AI 补丁路径同一判据）——
-    try:
+    # BUG-FIX 2026-10-27（P1·事件循环阻塞）：写锁内的「全量正文扫描 +
+    # 冲突状态收敛」是同步重操作，此前直接跑在事件循环里（写锁争用时事件
+    # 循环最长冻结 _db_write_lock_timeout=8s）。现整段移入线程池，事件循环
+    # 不再被阻塞；异常语义与原实现一致。
+    def _persist_changed_sections() -> dict:
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         with get_db() as conn:
             for s in changed:
@@ -517,12 +558,15 @@ async def run_agent_repair(
             verify_scope = _load_all_project_content(conn, project_id)
             for s in changed:
                 verify_scope[int(s["id"])] = s["content"]
-            report["conflict_states"] = refresh_conflict_states(
+            return refresh_conflict_states(
                 conn,
                 project_id,
                 verify_scope,
                 extra_texts=_load_project_summary_and_baseline(conn, project_id),
             )
+
+    try:
+        report["conflict_states"] = await asyncio.to_thread(_persist_changed_sections)
     except Exception as e:
         report["message"] = f"落库失败：{e!s}"
         report["errors"].append(f"落库失败：{e!s}")
@@ -532,7 +576,9 @@ async def run_agent_repair(
     # 旁路直写正文 → 失效三层缓存
     try:
         from .sections import invalidate_content_caches
-        invalidate_content_caches(project_id, [s["id"] for s in changed])
+        await asyncio.to_thread(
+            invalidate_content_caches, project_id, [s["id"] for s in changed]
+        )
     except Exception as e:
         logger.warning("[Agent修复] 缓存失效失败（忽略）: %s", e)
 

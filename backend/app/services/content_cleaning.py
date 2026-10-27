@@ -666,6 +666,13 @@ def find_unclosed_chart_fence(lines: Sequence[str] | None) -> dict | None:
 # Mermaid 内部 title 行（图题提取优先级第二级：载荷 title > Mermaid title > 引导语 > 类型通用名）
 _MERMAID_TITLE_PATTERN = re.compile(r"^[ \t]*title[ \t]+(.+?)[ \t]*$", re.MULTILINE | re.IGNORECASE)
 
+# 图引导框架词（ENHANCE 2026-10-27）：用于 _extract_fence_caption_hint 跨空行
+# 回看时的候选识别——只有像「图引导语」的隔行文本才采信（下图/如下图/见下图/
+# 如图 X 所示等），普通隔行段落不采信。
+_LEADIN_HINT_FRAME_RE = re.compile(
+    r"(?:下[面一]?图|如[下]?图(?:所示)?|见[下]?图|图[所示]|所示)"
+)
+
 
 def extract_mermaid_title(code: str) -> str:
     """从 Mermaid 代码中提取 title 行（无 title 返回空串）。"""
@@ -689,7 +696,11 @@ def _extract_fence_caption_hint(lines: Sequence[str], fence_open_idx: int) -> st
     通用名（如「施工流程图」），丢失 AI 在正文中写好的具体引语。
 
     采信条件（全部满足才返回，否则空串）：
-      1. 围栏开行前**紧邻**的非空行（不跨越空行，避免抓到无关段落）；
+      1. 围栏开行前紧邻的非空行；或（ENHANCE 2026-10-27）隔一个空行的
+         上一行——但该候选必须含**图引导框架词**（下图/如下图/见下图/如图
+         所示等），Markdown 惯例在引导语与围栏之间留空行，旧实现仅看紧邻行
+         导致该高频场景引导语不可达；普通隔行段落（无框架词）仍不采信，
+         维持「不抓无关段落」契约（test_hint_absent_after_blank_line）；
       2. 非标题 / 围栏 / 表格行 / 列表项 / 图表标记等结构化行；
       3. 以句尾标点（。！？!?:：…）收束，长度 ≤ 50 字符；
       4. 截断到 30 字符作图题（图题宜短）。
@@ -697,6 +708,11 @@ def _extract_fence_caption_hint(lines: Sequence[str], fence_open_idx: int) -> st
     if fence_open_idx <= 0 or fence_open_idx >= len(lines):
         return ""
     raw = (lines[fence_open_idx - 1] or "").strip()
+    if not raw and fence_open_idx >= 2:
+        # 引导语与围栏之间隔了一个空行 → 回看一行，但仅当候选像图引导语
+        _lookback = (lines[fence_open_idx - 2] or "").strip()
+        if _LEADIN_HINT_FRAME_RE.search(_lookback):
+            raw = _lookback
     if not raw:
         return ""
     # 结构化行/其它围栏/代码行不作引导语
@@ -1475,6 +1491,191 @@ def _strip_zero_width_chars(text: str) -> str:
     return _ZERO_WIDTH_RE.sub("", text)
 
 
+# ===========================================================================
+# 系统残留清洗（《招投标软件导出文档 — 分类问题报告》A-3 / A-4 / E-1~E-5）
+# ===========================================================================
+#
+# 报告 A/B/E 类的共同根因：AI 产物或历史落库正文把「非正文」内容直接写进
+# 标书，导出端此前只做 LaTeX/Markdown/围栏清洗，未识别以下几类系统残留：
+#   A-3  HTML 标签（`<br>` / `<p>` …）直接进入正文或表格单元格；
+#   A-4  松散 Mermaid 源码（`graph LR`、`A[..] --> B[..]`）未成围栏却漏为正文；
+#   E-1  「请确认是否生成正式投标文本。」等 Agent 系统提示；
+#   E-2  「【本章背景补充（供审阅溯源，非正文）】」及其后整段审阅稿；
+#   E-3  「注：图中数据为资金分配逻辑示例…」等示意性说明；
+#   E-4  Git 版本冲突标记（`<<<<<<< HEAD … >>>>>>> dev`，保留 HEAD 侧）；
+#   E-5  内部引用标记「【章节L3】…」。
+# 全部清洗都在图表围栏之外执行（`_apply_outside_chart_fences`），不会破坏
+# mermaid / chart-json 载荷。
+
+#: 行内/块级 HTML 标签白名单（避免把 `<<CHART:...>>` 这类图表标记误删）
+_HTML_TAG_RE = re.compile(
+    r"</?(?:br|p|div|span|strong|b|i|em|u|s|li|ul|ol|dl|dt|dd|"
+    r"td|th|tr|table|thead|tbody|h[1-6])\b[^>]*>",
+    re.IGNORECASE,
+)
+_HTML_BREAK_RE = re.compile(r"<br\s*/?>", re.IGNORECASE)
+_HTML_BLOCK_RE = re.compile(
+    r"</?(?:p|div|li|ul|ol|tr|table|thead|tbody|h[1-6])\b[^>]*>",
+    re.IGNORECASE,
+)
+_HTML_ENTITY_MAP = {
+    "&nbsp;": " ",
+    "&lt;": "<",
+    "&gt;": ">",
+    "&amp;": "&",
+    "&quot;": '"',
+    "&#39;": "'",
+}
+
+#: 系统提示行（整行删除，不做部分替换，避免误伤正文中的同义表述）
+_SYSTEM_RESIDUE_RES: tuple[re.Pattern[str], ...] = (
+    re.compile(r"^[ \t]*请确认是否(?:生成|输出|导出|继续)[^\n]*$", re.MULTILINE),
+    re.compile(r"^[ \t]*是否生成正式投标文本[^\n]*$", re.MULTILINE),
+    re.compile(r"^[ \t]*【章节L\d+】[^\n]*$", re.MULTILINE),
+    re.compile(r"^[ \t]*注[:：][^\n]*(?:示例|示意|演示)[^\n]*$", re.MULTILINE),
+)
+
+#: 完整 Git 冲突块：默认保留 HEAD 侧（`<<<<<<<` 与 `=======` 之间），
+#: 删除分隔行、dev 侧与结束标记（报告 E-4 的修复口径）。
+_GIT_CONFLICT_BLOCK_RE = re.compile(
+    r"^[ \t]*<<<<<<<[^\n]*\n([\s\S]*?)^[ \t]*=======[ \t]*\n[\s\S]*?^[ \t]*>>>>>>>[^\n]*\n?",
+    re.MULTILINE,
+)
+#: 不完整冲突块的孤立标记行（没有配对时直接删，避免标记泄漏进正文）
+_GIT_CONFLICT_MARKER_LINE_RE = re.compile(
+    r"^[ \t]*(?:<<<<<<<|=======|>>>>>>>)[^\n]*$",
+    re.MULTILINE,
+)
+
+#: 「非正文」审阅稿标记：连同其后整段（直到空行）一起删除
+_NON_BODY_MARKER_RE = re.compile(r"【[^】\n]*非正文[^】\n]*】")
+
+#: 松散 Mermaid 源码行：仅匹配「纯关键字行」与「节点连线行」，不碰正文
+_MERMAID_KEYWORD_LINE_RE = re.compile(
+    r"^[ \t]*(?:graph|flowchart)\s+(?:LR|RL|TD|TB|BT)[ \t]*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+_MERMAID_DECORATION_LINE_RE = re.compile(
+    r"^[ \t]*(?:subgraph\b[^\n]*|end[ \t]*|"
+    r"style\s+\S+[^\n]*|classDef\s+\S+[^\n]*|class\s+\S+[^\n]*|"
+    r"linkStyle\b[^\n]*|click\s+\S+[^\n]*)$",
+    re.IGNORECASE | re.MULTILINE,
+)
+_MERMAID_EDGE_LINE_RE = re.compile(
+    r"^[ \t]*[^\s\[\]]+\s*\[[^\]]*\]\s*"
+    r"(?:-->|---|==>|-\.[^.]+\.->|→|-->)\s*"
+    r"[^\s\[\]]+\s*\[[^\]]*\]\s*$",
+    re.MULTILINE,
+)
+
+#: 连续重复段落去重的最小归一化长度（短句/列表项不参与，防止误删）
+_DEDUPE_MIN_CHARS = 20
+
+#: 成对的 `<table>...</table>` 整块（HTML 清洗时原样保留，交由 parse_content 解析）
+_HTML_TABLE_BLOCK_RE = re.compile(r"<table\b[\s\S]*?</table\s*>", re.IGNORECASE)
+
+
+def _strip_html_tags(segment: str) -> str:
+    """剥标签本体（`<br>`/块级标签折行，其余标签删除，实体还原）。"""
+    segment = _HTML_BREAK_RE.sub("\n", segment)
+    segment = _HTML_BLOCK_RE.sub("\n", segment)
+    segment = _HTML_TAG_RE.sub("", segment)
+    for entity, replacement in _HTML_ENTITY_MAP.items():
+        segment = segment.replace(entity, replacement)
+    return segment
+
+
+def _strip_html_markup(segment: str) -> str:
+    """剥离正文中的 HTML 标签（`<br>`/`<p>` 折行，其余标签删除）。
+
+    FIX 2026-10-26（回归修复）：`<table>...</table>` 必须**原样保留**——
+    `parse_content` 依赖这段原始标记解析行列网格并转 GFM 管道表；此前统一
+    剥标签会把表格单元格连成一片纯文本，表格块彻底丢失。
+    """
+    if "<" not in segment and "&" not in segment:
+        return segment
+    out: list[str] = []
+    pos = 0
+    for match in _HTML_TABLE_BLOCK_RE.finditer(segment):
+        out.append(_strip_html_tags(segment[pos : match.start()]))
+        out.append(match.group(0))
+        pos = match.end()
+    out.append(_strip_html_tags(segment[pos:]))
+    return "".join(out)
+
+
+def _strip_non_body_markers(segment: str) -> str:
+    """删除「【…非正文…】」标记及其后整段审阅稿（直到空行）。"""
+    if "非正文" not in segment:
+        return segment
+    lines = segment.split("\n")
+    out: list[str] = []
+    skipping = False
+    for line in lines:
+        if _NON_BODY_MARKER_RE.search(line):
+            skipping = True
+            continue
+        if skipping:
+            if not line.strip():
+                skipping = False
+                out.append(line)
+            continue
+        out.append(line)
+    return "\n".join(out)
+
+
+def _strip_system_residue(segment: str) -> str:
+    """删除系统提示、内部章节标记、示意性注释与 Git 冲突标记。
+
+    Git 冲突块按报告 E-4 的建议「默认保留 HEAD 一侧」处理：冲突起始行、
+    分隔行与 dev 行删除，保留下来的只有 HEAD 侧正文。
+    """
+    if "<<<<<<<" in segment:
+        segment = _GIT_CONFLICT_BLOCK_RE.sub(lambda m: m.group(1), segment)
+        segment = _GIT_CONFLICT_MARKER_LINE_RE.sub("", segment)
+    for pattern in _SYSTEM_RESIDUE_RES:
+        segment = pattern.sub("", segment)
+    return segment
+
+
+def _strip_stray_mermaid(segment: str) -> str:
+    """删除漏在围栏之外的松散 Mermaid 关键字/装饰/连线行。"""
+    if "-->" not in segment and "→" not in segment and "graph" not in segment.lower() \
+            and "flowchart" not in segment.lower():
+        return segment
+    segment = _MERMAID_KEYWORD_LINE_RE.sub("", segment)
+    segment = _MERMAID_DECORATION_LINE_RE.sub("", segment)
+    return _MERMAID_EDGE_LINE_RE.sub("", segment)
+
+
+def _normalize_for_dedupe(paragraph: str) -> str:
+    """段落归一化：剥编号、去空白、去尾部标点，用于连续重复判定。"""
+    text = _LEADING_NUMBERING_RE.sub("", paragraph.strip())
+    text = re.sub(r"[\s\u3000]+", "", text)
+    return text.strip("，。；：、,.;:!?！？")
+
+
+def _dedupe_consecutive_paragraphs(text: str) -> str:
+    """删除连续重复段落（报告 A-1 / B-1）。
+
+    只折叠**相邻**且归一化后完全一致的段落，且归一化长度 ≥ 20 字：
+    - 首段带编号、次段无编号的重复形态（报告实例）可被识别；
+    - 短句/列表项不参与，避免把合法的重复强调误删。
+    """
+    if "\n\n" not in text:
+        return text
+    paragraphs = re.split(r"\n{2,}", text)
+    kept: list[str] = []
+    prev_norm = ""
+    for paragraph in paragraphs:
+        norm = _normalize_for_dedupe(paragraph)
+        if norm and len(norm) >= _DEDUPE_MIN_CHARS and norm == prev_norm:
+            continue
+        kept.append(paragraph)
+        prev_norm = norm
+    return "\n\n".join(kept)
+
+
 def clean_generated_content(raw: str) -> str:
     if not raw:
         return ""
@@ -1525,6 +1726,14 @@ def clean_generated_content(raw: str) -> str:
     # 若未闭合，原全局正则只删围栏行、块内代码残留为正文段落。
     raw = _strip_unclosed_plain_fences(raw)
 
+    # FIX 2026-10-26（《招投标软件导出文档 — 分类问题报告》A-3/A-4/E-1~E-5）：
+    # 系统残留清洗。全部在图表围栏占位符之外执行，不会破坏图表载荷；
+    # 「非正文」标记先删（含其后整段），再删 HTML / Mermaid / 系统提示行。
+    raw = _apply_outside_chart_fences(raw, _strip_non_body_markers)
+    raw = _apply_outside_chart_fences(raw, _strip_html_markup)
+    raw = _apply_outside_chart_fences(raw, _strip_stray_mermaid)
+    raw = _apply_outside_chart_fences(raw, _strip_system_residue)
+
     # ↓↓↓ 以下步骤必须发生在 _restore_chart_fences **之前** ↓↓↓
     # FIX 2026-10-10（《文档质量分析报告》格式问题 5/13，修复 5/11）：
     # ① LaTeX 公式先于其它清洗转换为可读 Unicode 文本 —— 必须排在
@@ -1533,6 +1742,9 @@ def clean_generated_content(raw: str) -> str:
     # ② Markdown 转义字符（\~ 等）在标题/粗体清理之后还原，避免还原出的
     #    # 又被剥标题正则吃掉。
     raw = _apply_outside_chart_fences(raw, convert_latex_in_text)
+    # FIX 2026-10-26（报告 A-4）：LaTeX 转换后 `\(\rightarrow\)` 才变成 `→`，
+    # 松散 Mermaid 连线行需在此再扫一次（首次扫描只能命中 graph/flowchart 行）。
+    raw = _apply_outside_chart_fences(raw, _strip_stray_mermaid)
     raw = _apply_outside_chart_fences(raw, _strip_markdown_markup)
     raw = _apply_outside_chart_fences(raw, _unescape_markdown_escapes)
     raw = _apply_outside_chart_fences(raw, _strip_literal_newline_escapes)
@@ -1542,6 +1754,11 @@ def clean_generated_content(raw: str) -> str:
     # 成正文行。改为匹配整个 info-string（同时支持 ``` 与 ~~~）。
     raw = re.sub(r"(?:`{3,}|~{3,})[^\n`~]*\n?", "", raw)
     raw = re.sub(r"\n?(?:`{3,}|~{3,})", "", raw)
+
+    # FIX 2026-10-26（报告 A-1 / B-1）：连续重复段落去重。必须在图表占位符
+    # 仍存在时执行——占位符是单行不透明 token，不会被误判成重复正文；
+    # 若放到 _restore 之后，图表载荷里的多行 JSON 会参与分段比对。
+    raw = _dedupe_consecutive_paragraphs(raw)
 
     raw = _restore_chart_fences(raw)
     _fence_cache.blocks.clear()
@@ -1559,6 +1776,64 @@ def clean_generated_content(raw: str) -> str:
     raw = re.sub(r"\n{3,}", "\n\n", raw)
 
     return raw.strip()
+
+
+def _strip_residue_outside_chart_fences(content: str) -> str:
+    """系统残留清洗（``_strip_non_body_markers`` + ``_strip_system_residue``），
+    闭合图表围栏整块保护 —— **线程安全本地令牌版**。
+
+    与导出端 ``clean_generated_content`` 的区别：不使用 ``_fence_cache``
+    全局缓存。该缓存是模块级可变状态（其 L1706 注释已警示多线程互踩），
+    而导出构建在 ``asyncio.to_thread`` 工作线程执行 ``clean_generated_content``
+    （同一缓存使用者）——ContentCleaner 若在事件循环线程并发 clear()，
+    会吞掉构建线程未还原的占位符，导致导出流挂死。
+
+    实现：``scan_chart_fence_blocks``（围栏区间唯一权威扫描器）圈出闭合块
+    行区间 → 逆序整块折叠为单行不透明令牌（``\\x00`` 包裹，不命中任何
+    残留删除模式）→ 清洗 → 按令牌内容还原（令牌行被「标记+后续段」规则
+    连带删除时块随段消失，与导出端占位符行为一致）。
+
+    审计7（2026-10-27）：落库链路残留清洗前置的围栏保护基座。
+    """
+    if not content or not isinstance(content, str):
+        return content
+    spans = scan_chart_fence_blocks(content.split("\n"))
+    if not spans:
+        return _strip_system_residue(_strip_non_body_markers(content))
+    lines = content.split("\n")
+    tokens: dict[str, str] = {}
+    # 逆序替换：区间 0-based 且互不重叠，先处理靠后的区间避免行号漂移
+    for n in range(len(spans) - 1, -1, -1):
+        s, e = spans[n]
+        tok = f"\x00CHART_FENCE_TOKEN_{n}\x00"
+        tokens[tok] = "\n".join(lines[s : e + 1])
+        lines[s : e + 1] = [tok]
+    masked = "\n".join(lines)
+    masked = _strip_non_body_markers(masked)
+    masked = _strip_system_residue(masked)
+    for tok, block in tokens.items():
+        masked = masked.replace(tok, block)
+    return masked
+
+
+def clean_inline_text(text: str) -> str:
+    """清洗「行内文本」（表格单元格 / 表头 / 表题）中的格式与系统残留。
+
+    导出链路中正文段落统一经 :func:`clean_generated_content`，但表格单元格
+    直接由 ``_add_table_from_markup`` 写入，此前只做 XML 控制字符清洗 ——
+    报告 A-2/A-3 的 `\\(100\\%\\)`、`<br>` 正是从表格里漏进 DOCX 的。
+    本函数只做**行内**可逆清理（无分段/围栏逻辑），可安全用于单元格。
+    """
+    if not text or not isinstance(text, str):
+        return text
+    text = _strip_html_markup(text)
+    text = _strip_system_residue(text)
+    text = convert_latex_in_text(text)
+    text = _strip_markdown_markup(text)
+    text = _unescape_markdown_escapes(text)
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
 
 
 def _strip_leading_spaces(text: str) -> tuple[str, int]:
@@ -1743,6 +2018,240 @@ def strip_heading_numbering_from_content(content: str) -> str:
                 continue
         result_lines.append(line)
     return "\n".join(result_lines)
+
+
+# =====================================================================
+# 2026-10-26：正文深层编号净化（遗留问题 1 · 开关见
+# config.CONTENT_DEEP_HEADING_RENUMBER_ENABLED）
+# -----------------------------------------------------------------------------
+# 与上面 strip_heading_numbering_from_content 的区别：
+#   - strip 是「删编号」（依赖 # 标记，落库后的 content 已无 #，故对 L5+ 无效）；
+#   - 本函数是「改写编号」：把 ≥3 段小数（3.1.2.1 / 4.2.3.1 等）的深层标题前缀
+#     换成「章节自身路径 + 相对序号」，**段数与原编号一致**，因此
+#     parse_content 的层级判定（HEADING_PATTERNS：2+ 个小数点 → L5）不变，
+#     导出端标题识别不受影响，而编号冲突被消除。
+#   - 只处理深层编号：L4（1.1）及更浅标题由导出端按目录树统一重编号。
+# =====================================================================
+# 快速预判：正文是否存在 ≥3 段小数编号（避免每次落库都做一次全项目章节查询）
+_DEEP_HEADING_QUICK_RE = re.compile(
+    r"^[ \t]*(?:#{1,6}[ \t]*)?\d{1,4}(?:\.\d+){2,}", re.MULTILINE
+)
+
+
+def has_deep_heading_numbering(content: str) -> bool:
+    """正文是否含有 ≥3 段小数的深层编号（``normalize_deep_heading_numbering``
+    的轻量前置判断，用于跳过无深层编号章节的路径查询开销）。"""
+    return bool(content and isinstance(content, str) and _DEEP_HEADING_QUICK_RE.search(content))
+
+
+# 任意段数的「编号 + 标题」行（含 ATX 与纯文本两种形态）。
+# 段数不限：编号改写只取 ≥3 段，标题文本净化对所有编号标题行生效。
+_NUMBERED_HEADING_RE = re.compile(
+    r"^(?P<hashes>#{1,6})?[ \t]*(?P<num>\d{1,4}(?:\.\d+)*)(?![.\d])"
+    r"[ \t]*[、．.]?[ \t]*(?P<body>.+?)[ \t]*$"
+)
+
+# 无编号的 ATX 三级及以下标题（`### 专项6`）：AI 偶发漏写编号。
+# 编号无从锚定，只净化标题文本；一二级（#/##）不在标题净化范围。
+_ATX_THIRD_HEADING_RE = re.compile(r"^(?P<hashes>#{3,6})[ \t]*(?P<body>\S.*?)[ \t]*$")
+
+
+def _sanitize_heading_body(
+    body: str, used: set[str], context_title: str, seq: int
+) -> tuple[str, bool]:
+    """净化正文标题**文本**（占位泛化名 + 编号冲突后缀）。
+
+    与 ``outline_common._cleanup_placeholder_titles`` 同口径：
+      1. 先剥编号前缀/后缀保主体 —— 「钢筋绑扎验收（2）」→「钢筋绑扎验收」，
+         保留 AI 生成的项目针对性（整体替换会把具体标题洗成泛化标题）；
+      2. 主体仍是占位/碎片（「专项6」「内容」「总体实施策划（2）」）→ 用
+         ``_semantic_fallback_title`` 依所在章节语义确定性改写，零 AI 成本。
+
+    Args:
+        body: 标题文本（已剥离行首编号）。
+        used: 同篇正文内已出现的标题集合（保证改写后互不重名）。
+        context_title: 所在章节标题（兜底标题的语义来源）。
+        seq: 已改写计数（兜底候选轮转用，避免同章多个脏标题拿到同一名称）。
+
+    Returns:
+        (净化后的标题, 是否发生改写)
+    """
+    _t = (body or "").strip()
+    if not _t:
+        return _t, False
+    from .ai.outline_common import (
+        _L3_TITLE_FRAGMENTS,
+        _MIN_CLEAN_BODY_LEN,
+        _is_dirty_l3_title_deep,
+        _semantic_fallback_title,
+        _strip_legacy_redundant_suffix,
+        _strip_ordinal_prefix,
+        _strip_ordinal_suffix,
+    )
+
+    if not _is_dirty_l3_title_deep(_t):
+        return _t, False
+    _core = _strip_legacy_redundant_suffix(_strip_ordinal_suffix(_t))
+    _core = _strip_ordinal_prefix(_core).strip()
+    if (
+        _core
+        and _core != _t
+        and len(_core) >= _MIN_CLEAN_BODY_LEN
+        and _core not in _L3_TITLE_FRAGMENTS
+        and _core not in used
+        and not _is_dirty_l3_title_deep(_core)
+    ):
+        used.add(_core)
+        return _core, True
+    _cand = _semantic_fallback_title(
+        context_title or "", seq, used, context_title=context_title or ""
+    )
+    used.add(_cand)
+    return _cand, True
+
+
+def normalize_deep_heading_numbering(
+    content: str, section_path: str = "", context_title: str = ""
+) -> str:
+    """把正文中深层标题改写为「章节路径 + 相对序号」，并净化标题文本。
+
+    Args:
+        content: 正文（ATX `### 3.1.2.1 标题` 或纯文本 `3.1.2.1 标题` 两种形态）。
+        section_path: 章节在目录树中的路径号（如 ``3.1.2``，来自
+            ``services.sections.get_section_path``）。缺省/非法时只净化标题文本，
+            不重编号（深层编号改写必须锚定章节路径才有意义）。
+        context_title: 所在章节标题，作为占位标题语义兜底的上下文。
+
+    Returns:
+        改写后的正文；无需改动时原样返回（幂等）。
+
+    示例（section_path="3.1.2"）：
+        ``### 3.2.1 施工准备``    → ``### 3.1.2.1 施工准备``
+        ``### 4.5.6.7 验收``      → ``### 3.1.2.2 验收``（同层第 2 个）
+        ``### 4.5.6.7.8 复检``    → ``### 3.1.2.2.1 复检``（更深一层）
+        ``### 2.9.4 专项6``       → ``### 3.1.2.3 施工准备技术交底``（占位改写）
+        ``### 2.9.5 钢筋绑扎验收（2）`` → ``### 3.1.2.4 钢筋绑扎验收``（剥后缀）
+        ``## 1.1 一般规定``       → 不变（L4 由导出端重编号、文本非脏）
+        ``3 天内完成移交``        → 不变（非编号标题/数量短语）
+    """
+    if not content or not isinstance(content, str):
+        return content
+    _base_parts = [p for p in str(section_path or "").split(".") if p.strip().isdigit()]
+    _depth = len(_base_parts)
+    _counters: dict[int, int] = {}
+
+    _lines = content.split("\n")
+
+    # 第一遍：登记既有标题文本（净化改写必须避免与同篇其它标题重名）
+    _used: set[str] = set()
+    _in_code = False
+    _open_marker: tuple[str, int] = ("", 0)
+    for _line in _lines:
+        _stripped = _line.strip()
+        _marker = fence_marker(_stripped)
+        if _marker[0]:
+            if not _in_code:
+                _in_code = True
+                _open_marker = _marker
+            elif _marker[0] == _open_marker[0] and _marker[1] >= _open_marker[1]:
+                _in_code = False
+                _open_marker = ("", 0)
+            continue
+        if _in_code:
+            continue
+        # 两正则都带 body 组：无编号的 `### 专项6` 同样要登记，净化改写时才会避重。
+        _m = _NUMBERED_HEADING_RE.match(_stripped) or _ATX_THIRD_HEADING_RE.match(
+            _stripped
+        )
+        if _m:
+            _used.add(_m.group("body").strip())
+    if context_title:
+        _used.add(str(context_title).strip())
+
+    _result: list[str] = []
+    _in_code = False
+    _open_marker = ("", 0)
+    _seq = 0
+    for _line in _lines:
+        _stripped = _line.strip()
+        # 围栏代码块内不做改写（与 strip_heading_numbering_from_content 同口径）
+        _marker = fence_marker(_stripped)
+        if _marker[0]:
+            if not _in_code:
+                _in_code = True
+                _open_marker = _marker
+            elif _marker[0] == _open_marker[0] and _marker[1] >= _open_marker[1]:
+                _in_code = False
+                _open_marker = ("", 0)
+            _result.append(_line)
+            continue
+        if _in_code:
+            _result.append(_line)
+            continue
+
+        _m = _NUMBERED_HEADING_RE.match(_stripped)
+        if not _m:
+            # AI 偶发漏写编号的 ATX 三级及以下标题（`### 专项6`）：编号无从锚定，
+            # 只净化标题文本，`#` 数量与层级保持不变。
+            _atx = _ATX_THIRD_HEADING_RE.match(_stripped)
+            if not _atx:
+                _result.append(_line)
+                continue
+            _new_body, _changed = _sanitize_heading_body(
+                _atx.group("body").strip(), _used, context_title or "", _seq
+            )
+            if not _changed:
+                _result.append(_line)
+                continue
+            _seq += 1
+            _result.append(f"{_atx.group('hashes')} {_new_body}")
+            continue
+
+        _hashes = _m.group("hashes") or ""
+        _num = _m.group("num")
+        _body = _m.group("body").strip()
+        # BUG-1 FIX 2026-10-27：纯文本伪标题保护（审计7）。
+        # parse_content 对 ≥2 段小数行一律按 L5 标题解析，改写编号与解析语义一致；
+        # 但两类「长得像编号标题」的正文必须排除，否则落库即破坏正文：
+        #   ① 日期行——首段 4 位数字（如 "2026.10.27 为计划开工日期"），
+        #     重编号会把日期本体洗掉，且占用编号槽位令后续真实标题跳号；
+        #   ② 句式行——真实标题不以句末标点（。！？；…）结尾，句号行是句子不是标题。
+        # ATX（# 前缀）行是 AI 显式标题标记，不做此判断。
+        if not _hashes and (
+            len(_num.split(".", 1)[0]) >= 4 or (_body and _body[-1] in "。！？；…")
+        ):
+            _result.append(_line)
+            continue
+
+        _canon = _num
+        # 编号改写只针对 ≥3 段小数（深层标题）；浅层编号交给导出端统一重编号。
+        if _base_parts and len(_num.split(".")) >= 3:
+            # 相对深度：AI 可能把深层标题写成与章节同段数（章节 3.1.2 正文写 3.2.1），
+            # 此时按「章节内第 1 层」处理；段数变化不影响层级判定（3/4 段均判 L5）。
+            _rel = max(1, len(_num.split(".")) - _depth)
+            # 首个标题可能直接出现在更深层（如 3.1.2 下直接 3.1.2.1.1），
+            # 需为缺失的浅层计数器补 1，否则取 counters[d] 会 KeyError。
+            for _d in range(1, _rel):
+                _counters.setdefault(_d, 1)
+            _counters[_rel] = _counters.get(_rel, 0) + 1
+            for _k in [k for k in _counters if k > _rel]:
+                _counters.pop(_k, None)
+            _canon = ".".join(
+                _base_parts + [str(_counters[d]) for d in range(1, _rel + 1)]
+            )
+
+        _new_body, _changed = _sanitize_heading_body(
+            _body, _used, context_title or "", _seq
+        )
+        if _changed:
+            _seq += 1
+        if not _changed and _canon == _num:
+            # 完全无需改动：保留原行（含缩进与原有分隔符）
+            _result.append(_line)
+            continue
+        _prefix = f"{_hashes} " if _hashes else ""
+        _result.append(f"{_prefix}{_canon} {_new_body}")
+    return "\n".join(_result)
 
 
 def _is_list_item(text: str) -> tuple[bool, str, str]:
@@ -2414,9 +2923,21 @@ class ContentCleaner:
             return content
 
         original = content
+        # 残留清洗前置（审计7遗留建议2，2026-10-27）：落库即清系统残留，
+        # 前端预览与导出文档所见一致。
+        # 复用导出端同一对清洗器（_strip_non_body_markers / _strip_system_residue），
+        # 但**不走 _protect_chart_fences/_fence_cache 全局缓存**（该缓存为模块级
+        # 可变状态，导出构建线程同样在用，并发 clear() 会吞占位符致导出流挂死
+        # ——全量回归 test_disconnect_drains_journal_and_resume_replays 420s 超时
+        # 根因），改用 scan_chart_fence_blocks + 本地令牌掩码，多线程安全：
+        #   → _strip_residue_outside_chart_fences（纯删除、幂等、无全局状态）
+        content = _strip_residue_outside_chart_fences(content)
         content = self._remove_duplicate_title(title, content)
         content = self._remove_markdown_headings(content)
         content = self._remove_leading_numbering(content)
+        # 空行归一（与导出端 clean_generated_content 同口径）：残留/重复标题删除
+        # 会留下连续空行簇，落库折叠后预览与导出分段一致。
+        content = re.sub(r"\n{3,}", "\n\n", content)
         cleaned = content.strip()
 
         if cleaned != original.strip():
