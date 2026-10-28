@@ -1169,3 +1169,29 @@ class ConsistencyAuditor:
 
 # 全局实例
 consistency_auditor = ConsistencyAuditor()
+
+
+def cleanup_old_consistency_audit(retention_days: int = 90) -> int:
+    """清理超过 retention_days 的一致性审计日志（consistency_audit_log）。
+
+    G3（2026-10-28 遗留加固）：consistency_audit_log 每行存全量 conflicts_json，
+    此前无任何 retention 策略，历史表持续膨胀。按 audit_time 早于截止时间删除，
+    与配置审计表 ai_config_audit 的清理口径一致（main.py 已注册 CONFIG_AUDIT_
+    RETENTION_DAYS=90 模式）。返回删除条数；失败返回 0（调用方记告警）。
+    """
+    from datetime import datetime, timedelta
+
+    try:
+        cutoff = datetime.now() - timedelta(days=max(1, int(retention_days)))
+        cutoff_str = cutoff.strftime("%Y-%m-%d %H:%M:%S")
+        with get_db() as conn:
+            cur = conn.execute(
+                "DELETE FROM consistency_audit_log "
+                "WHERE audit_time < ? ",
+                (cutoff_str,),
+            )
+            conn.commit()
+            return max(0, cur.rowcount or 0)
+    except Exception:
+        return 0
+

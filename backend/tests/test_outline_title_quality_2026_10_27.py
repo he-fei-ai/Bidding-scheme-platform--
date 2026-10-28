@@ -27,6 +27,7 @@ from __future__ import annotations
 from app.services.ai.outline_common import (
     _is_dirty_l3_title,
     _is_dirty_l3_title_deep,
+    _is_dirty_l2_title_deep,
     _cleanup_placeholder_titles,
     _uniquify_outline_titles,
     _is_placeholder_numbered_title,
@@ -121,3 +122,68 @@ class TestLegitFormsNotOverFiltered:
     def test_generic_only_still_flagged(self):
         # 「总体实施策划」无后缀本身是泛化词表成员，必须仍判脏
         assert _is_dirty_l3_title_deep("总体实施策划")
+
+
+class TestNoBracketItemSuffixLeak:
+    """「泛化词干 × 第N项/条」无括号编号冲突（第七轮新发现，用户复报漏网）。
+
+    用户复报「编号冲突后缀（3）（2）」家族里，以下**无括号**「第N项/条」结尾
+    形态此前穿透全部脏判定（`_ORDINAL_SUFFIX_RE` 要求 `[（(]` 包裹，
+    `_ORDINAL_ITEM_ONLY_RE` 只认整标题即「第N项」）：
+      - 「总体实施策划第2项」「总体实施策划第6条」
+      - 「专项第6项」「专项方案第2项」
+      - 「专项施工方案第6项」「专项施工技术措施第3项」（长度≥7，被
+        `_is_l3_title_project_specific` 误判为「具体」而整体漏出）
+      - 「总体实施策划之6」（「之N」阿拉伯数字，合法消歧是「之六」）
+    """
+
+    def test_generic_stem_item_suffix_flagged(self):
+        for t in [
+            "总体实施策划第2项", "总体实施策划第6条", "实施要点第3项",
+            "专项第6项", "专项方案第2项",
+            "专项施工方案第6项", "专项施工技术措施第3项",
+        ]:
+            assert _is_dirty_l3_title_deep(t), f"{t!r} 应判脏（无括号第N项/条）"
+            assert _is_placeholder_numbered_title(t), f"{t!r} 应被编号占位识别"
+
+    def test_zhi_arabic_num_flagged(self):
+        # 「之N」合法消歧是中文「之六」；阿拉伯「之6」是编号冲突后缀
+        assert _is_dirty_l3_title_deep("总体实施策划之6")
+        assert _is_dirty_l3_title_deep("总体实施策划之20")
+
+    def test_specific_base_item_suffix_not_flagged(self):
+        # 具体主体 + 第N项/条 是合法条目标题，不得误伤
+        assert not _is_dirty_l3_title_deep("混凝土第3项")
+        assert not _is_dirty_l3_title_deep("安全技术交底第3项")
+        assert not _is_dirty_l3_title_deep("钢筋绑扎验收第2项")
+        assert not _is_dirty_l3_title_deep("基坑监测方案第2项")
+
+    def test_l2_detection_same_scope(self):
+        # L2 同样适用结构性脏（编号冲突与层级无关）
+        assert _is_dirty_l2_title_deep("总体实施策划第2项")
+
+    def test_cleanup_rewrites_leaks(self):
+        tree = [{"title": "第一章", "children": [
+            {"title": "总体方案与实施策划", "children": [
+                {"title": "总体实施策划第2项", "children": []},
+                {"title": "专项方案第2项", "children": []},
+                {"title": "专项施工方案第6项", "children": []},
+                {"title": "总体实施策划之6", "children": []},
+                {"title": "混凝土第3项", "children": []},
+            ]},
+        ]}]
+        _cleanup_placeholder_titles(tree)
+        t2 = _uniquify_outline_titles(tree)
+        final = [l3["title"] for l1 in t2 for l2 in l1["children"] for l3 in l2["children"]]
+        residual = [t for t in final if _is_dirty_l3_title_deep(t)]
+        assert residual == [], f"仍有脏标题: {residual}"
+        # 具体主体「混凝土第3项」剥后缀保留主体
+        assert any("混凝土" in t for t in final), f"具体主体丢失: {final}"
+
+    def test_normalization_collapses_item_suffix(self):
+        # 去重口径：无括号第N项/条 与 括号式/无后缀 归一化后同 core
+        from app.services.ai.outline_common import _title_core
+        core_set = {_title_core(t) for t in [
+            "总体实施策划", "总体实施策划（2）", "总体实施策划第2项", "总体实施策划第6条",
+        ]}
+        assert len(core_set) == 1, f"应归一化为同一 core: {core_set}"

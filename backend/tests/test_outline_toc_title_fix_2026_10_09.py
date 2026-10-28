@@ -138,12 +138,18 @@ class TestCleanupPlaceholderTitles:
             }
         ]
         fixed = _cleanup_placeholder_titles(tree)
-        assert fixed == 4
+        # 2026-10-27（L2 清洗升级）：L2 标题「一、…」「二、…」带编号前缀（DB title
+        # 不携带编号），现在也会被清洗（剥前缀保主体）。因此：
+        #   L2×2（剥前缀）+ L3×4（3 个专项 + 1 个实施要点）= 6 处
+        assert fixed == 6, f"应清洗 6 个（L2×2 剥前缀 + L3×4 占位），实际 {fixed}"
         titles = _collect_titles(tree)
         assert not _has_placeholder(titles), f"仍有占位: {titles}"
         # 同父下的占位改写为带域 token 的语义标题，且相互唯一
         node1 = tree[0]["children"][0]["children"]
         assert node1[0]["title"] != node1[1]["title"]
+        # 2026-10-27 新增断言：L2 前缀被剥掉，保留主体
+        assert tree[0]["children"][0]["title"] == "脚手架总体施工部署"
+        assert tree[0]["children"][1]["title"] == "脚手架分项工程"
 
     def test_keeps_normal_titles(self):
         tree = [{"title": "正常章节", "children": [{"title": "施工工艺与操作要点"}]}]

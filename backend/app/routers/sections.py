@@ -137,12 +137,20 @@ def _reject_if_generation_running(project_id: int, *, allow_content_edit: bool=F
 @router.get('')
 async def list_sections_route(project_id: int, current_user: Annotated[Any, Depends(get_current_user)]=None):
     """获取章节树"""
+    # BUG-FIX（2026-10-28 跨模块深度探索 F7）：GET 类路由此前不调用
+    # require_project_permission（同文件写端点均校验），任何登录用户可读取任意
+    # 项目章节树（IDOR 读泄露）。与写端点同口径补上属权校验。
+    if current_user:
+        await require_project_permission(project_id, current_user)
     # PERF（2026-10-06）：build_tree 走 DB + 60s 缓存，直调会阻塞事件循环
     return await asyncio.to_thread(build_tree, project_id)
 
 @router.get('/flat')
 async def list_sections_flat_route(project_id: int, current_user: Annotated[Any, Depends(get_current_user)]=None):
     """获取章节列表（扁平结构）"""
+    # BUG-FIX（2026-10-28 F7）：同上，补属权校验。
+    if current_user:
+        await require_project_permission(project_id, current_user)
     # PERF（2026-10-06）：list_sections 对每章完整正文跑 _count_words，
     # 大项目单次数十 MB 级扫描，必须移出事件循环并走只读连接。
     return await asyncio.to_thread(list_sections, project_id, readonly=True)
@@ -150,6 +158,9 @@ async def list_sections_flat_route(project_id: int, current_user: Annotated[Any,
 @router.get('/content-persistence-snapshot', dependencies=[limit_per_endpoint])
 async def content_persistence_snapshot_route(project_id: int, current_user: Annotated[Any, Depends(get_current_user)]=None):
     """获取内容持久化快照（仅返回摘要信息，不含完整章节内容）"""
+    # BUG-FIX（2026-10-28 F7）：同上，补属权校验。
+    if current_user:
+        await require_project_permission(project_id, current_user)
     sections = await asyncio.to_thread(list_sections, project_id, readonly=True)
     total_sections = len(sections)
     count = sum((1 for s in sections if s.content))
@@ -163,6 +174,9 @@ async def word_budget_route(project_id: int, level2_default: int=Query(3500, ge=
     BUG O5 修复：原缺失该路由，前端调用此端点时被 FastAPI 错误匹配到
     `/{section_id}` 动态路由，导致 Pydantic 422 错误。
     """
+    # BUG-FIX（2026-10-28 F7）：补属权校验（IDOR 读泄露收口）。
+    if current_user:
+        await require_project_permission(project_id, current_user)
     return get_section_word_budget(project_id, level2_default)
 
 @router.get('/generation-status')
@@ -174,6 +188,9 @@ async def generation_status_route(project_id: int, current_user: Annotated[Any, 
     "path.section_id: Input should be a valid integer"。
     修复：在 /{section_id} 之前定义此静态路由。
     """
+    # BUG-FIX（2026-10-28 F7）：补属权校验（IDOR 读泄露收口）。
+    if current_user:
+        await require_project_permission(project_id, current_user)
     progress = await generation_manager.get_project_progress(project_id)
     return progress
 
@@ -248,8 +265,15 @@ async def generate_content(request: Request, project_id: int, writing_length: st
     try:
         if current_user:
             await require_project_permission(project_id, current_user)
-        valid_lengths = ('short', 'standard', 'detailed', 'extra_long')
-        if writing_length not in valid_lengths:
+        # BUG-FIX 2026-10-28（P1 前后端不同步）：前端档位 key 为
+        # brief/standard/detailed/long（utils.ts WORD_COUNT_TIERS），而本白名单
+        # 用的是旧 key short/standard/detailed/extra_long → 用户选「简短/超长」
+        # 被 422 拒绝。权威 key 见 writing_length_config.WRITING_LENGTH_TIER_CONFIG；
+        # 旧别名（short/extra_long）仍接受并交由 normalize_writing_length 归一化
+        # （向后兼容旧调用方），故白名单 = 权威 key + 旧别名全集。
+        from ..services.ai.writing_length_config import normalize_writing_length as _norm_wl
+        valid_lengths = ('brief', 'standard', 'detailed', 'long')
+        if _norm_wl(writing_length) not in valid_lengths:
             raise HTTPException(status_code=422, detail=f'writing_length 必须是 {valid_lengths} 之一')
     except HTTPException as _e:
         _error_detail = _e.detail
@@ -263,7 +287,29 @@ async def generate_content(request: Request, project_id: int, writing_length: st
         async def error_generator():
             yield f"data: {json.dumps({'status': 'error', 'message': _error_msg}, ensure_ascii=False)}\n\n"
         return StreamingResponse(error_generator(), media_type='text/event-stream; charset=utf-8', headers={'Cache-Control': 'no-cache, no-transform', 'Connection': 'keep-alive', 'X-Accel-Buffering': 'no', 'Content-Encoding': 'none'})
-    return await generate_content_impl(project_id, writing_length, regenerate_ids, root_section_id, regenerate_missing, use_orchestration, level2_default, use_word_sampling, use_fallback_expand, use_consistency_audit, concurrency, orch_max_ai_images, orch_table_ratio, orch_prefer_mermaid, orch_section_per_segment, use_word_adjust, generation_mode)
+    # G5（2026-10-28 遗留加固）：此前 17 个实参按**位置**传入 generate_content_impl，
+    # 历史上有 3 次因参数追加导致位置错位（BUG-FIX 2026-10-05/10-12/10-18 均为此
+    # 在签名加注释），属脆弱接口。改关键字传参消除「实参顺序必须与签名逐字同序」
+    # 的隐式契约；generate_content_impl 签名不动，行为逐字不变。
+    return await generate_content_impl(
+        project_id=project_id,
+        writing_length=writing_length,
+        regenerate_ids=regenerate_ids,
+        root_section_id=root_section_id,
+        regenerate_missing=regenerate_missing,
+        use_orchestration=use_orchestration,
+        level2_default=level2_default,
+        use_word_sampling=use_word_sampling,
+        use_fallback_expand=use_fallback_expand,
+        use_consistency_audit=use_consistency_audit,
+        concurrency=concurrency,
+        orch_max_ai_images=orch_max_ai_images,
+        orch_table_ratio=orch_table_ratio,
+        orch_prefer_mermaid=orch_prefer_mermaid,
+        orch_section_per_segment=orch_section_per_segment,
+        use_word_adjust=use_word_adjust,
+        generation_mode=generation_mode,
+    )
 
 @router.get('/v51-pending-task')
 async def v51_pending_task_route(project_id: int, current_user: Annotated[Any, Depends(get_current_user)]=None):
@@ -299,6 +345,10 @@ async def v51_clear_pending_route(project_id: int, current_user: Annotated[Any, 
 @router.get('/{section_id}')
 async def get_section_route(project_id: int, section_id: int, current_user: Annotated[Any, Depends(get_current_user)]=None):
     """获取单个章节"""
+    # BUG-FIX（2026-10-28 F7）：此前仅 _ensure_section_in_project（只查归属，
+    # 不校验用户权限），任何登录用户可读任意项目章节。补属权校验。
+    if current_user:
+        await require_project_permission(project_id, current_user)
     _ensure_section_in_project(project_id, section_id)
     return get_section(section_id)
 
@@ -727,8 +777,11 @@ async def expand_content(request: Request, project_id: int, writing_length: str=
     if current_user:
         await require_project_permission(project_id, current_user)
     _reject_if_generation_running(project_id)
-    valid_lengths = ('short', 'standard', 'detailed', 'extra_long')
-    if writing_length not in valid_lengths:
+    # BUG-FIX 2026-10-28（P1 前后端不同步）：同 generate-content，权威 key
+    # brief/standard/detailed/long，旧别名交 normalize 归一化（向后兼容）。
+    from ..services.ai.writing_length_config import normalize_writing_length as _norm_wl
+    valid_lengths = ('brief', 'standard', 'detailed', 'long')
+    if _norm_wl(writing_length) not in valid_lengths:
         raise HTTPException(status_code=422, detail=f'writing_length 必须是 {valid_lengths} 之一')
     return await expand_content_impl(project_id, writing_length, level2_default, concurrency)
 

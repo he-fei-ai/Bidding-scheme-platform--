@@ -1384,13 +1384,22 @@ def get_section_path(section_id: int) -> str:
     后端三出口不再有漂移面；剩余漂移面仅前端独立实现（O-12 原文）。
     一致性由 tests/test_outline_l3_hardening_2026_10_13.py::TestPathNumberNamespace 锁定。
     """
-    section = get_section(section_id)
-    if not section:
+    # 审计8修复（PERF-C4）：本函数是**纯读**，且被 SSE 落库热路径逐章节调用
+    # （sse_db_ops._save_section_to_db → get_section_path），旧实现用非只读
+    # `get_db()` 在写锁内做「get_section 单节读 + 全项目章节表读 + 排序」，
+    # 把整表读+排序的锁持有时间推到每次落库上，推高 DatabaseWriteLockTimeout。
+    # 改 `get_db(readonly=True)` 走共享读连接；不再调用 `get_section`（其非只读
+    # 且可能被 create_section 的「写后读」路径依赖），改为直查 project_id。
+    with get_db(readonly=True) as conn:
+        _sec_row = conn.execute(
+            "SELECT project_id FROM sections WHERE id = ?", (section_id,)
+        ).fetchone()
+    if not _sec_row:
         return ""
+    project_id = _sec_row["project_id"]
 
     # 一次性获取项目下所有章节（按层级组织）
-    project_id = section.project_id
-    with get_db() as conn:
+    with get_db(readonly=True) as conn:
         rows = conn.execute(
             "SELECT id, parent_id, title, sort_order, created_at FROM sections "
             "WHERE project_id = ? ORDER BY sort_order, created_at",

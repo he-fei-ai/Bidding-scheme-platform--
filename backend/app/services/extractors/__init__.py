@@ -1064,13 +1064,25 @@ def _extract_image_ocr(file_path: str) -> str:
             # 并发护栏：PaddleOCR / tesseract 单次推理内存占用高，限制同时在跑的
             # OCR 数量（_late("OCR_MAX_CONCURRENT")）。取不到信号量时记录告警后放行，
             # 避免极端情况下把上传请求永久挂住。
+            # BUG-FIX（2026-10-28 跨模块深度探索 F4）：原实现 `acquired=False` 时
+            # **照常执行** OCR（无限流），且与注释「记录告警后放行」相反——没有
+            # 记录任何告警日志。后果：高峰期超出 OCR_MAX_CONCURRENT 的并发解析
+            # 仍同时拉起 PaddleOCR/tesseract，单次推理高内存放大 OOM 风险。
+            # 修复：取不到信号量时打 warning 并跳过本段 OCR（回退到「无 OCR 文本」
+            # 的既有优雅降级路径，由上游 save_upload 判空文本提示，不中断上传）。
             acquired = _ocr_semaphore.acquire(timeout=_late("OCR_TIMEOUT") + 60)
-            try:
-                text = _late("_ocr_with_paddle")(file_path)
-                if not text:
-                    text = _late("_ocr_with_tesseract")(file_path)
-            finally:
-                if acquired:
+            if not acquired:
+                logger.warning(
+                    "[图片OCR] OCR 并发信号量超时（上限 %d），跳过 OCR 以保护内存: %s | error_code=OCR_CONCURRENCY_SATURATED error_layer=service retryable=False",
+                    _late("OCR_MAX_CONCURRENT"),
+                    name,
+                )
+            else:
+                try:
+                    text = _late("_ocr_with_paddle")(file_path)
+                    if not text:
+                        text = _late("_ocr_with_tesseract")(file_path)
+                finally:
                     _ocr_semaphore.release()
     finally:
         logger.info("[图片OCR] 完成: %s 耗时 %.2fs，提取 %d 字符", name, time.monotonic() - _t0, len(text))

@@ -105,6 +105,23 @@ def _positional_call_arg_count(module_path: Path, func_name: str) -> int | None:
     return None
 
 
+def _call_arg_counts(module_path: Path, func_name: str) -> tuple[int | None, set[str]]:
+    """AST 找 `func_name(...)` 调用点，返回 (位置实参个数, 关键字实参名集合)。
+
+    G5（2026-10-28）：调用点改关键字传参后，位置计数恒 0；关键字名集合用于
+    校验是否覆盖 impl 全部形参（无遗漏）。找不到返回 (None, set())。
+    """
+    tree = ast.parse(module_path.read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            f = node.func
+            name = f.attr if isinstance(f, ast.Attribute) else getattr(f, "id", None)
+            if name == func_name:
+                kw_names = {k.arg for k in node.keywords if k.arg}
+                return len(node.args), kw_names
+    return None, set()
+
+
 class TestGenerateContentImplParamGate:
     def test_router_and_impl_query_params_match(self):
         """门禁本体：router 暴露的 Query 参数必须与 impl 的形参逐一同序。
@@ -142,23 +159,28 @@ class TestGenerateContentImplParamGate:
 
         少传一个不会立刻报错，只会让尾部参数静默退化成 Query 对象 ——
         这类「不报错但行为错」的漂移比直接 TypeError 更难查。
+
+        BUG-FIX 2026-10-28（G5 遗留加固）：sections.py 调用点已从**位置传参**
+        改为**关键字传参**（17 个 param=param，消除历史 3 次参数追加导致位置
+        错位的隐式契约）。因此本门禁口径同步更新：断言位置实参为 0（全部改
+        关键字），且关键字实参集合必须覆盖 impl 全部形参（无遗漏）。
         """
         from app.routers.sse import sse_content
 
-        # ENHANCE 2026-10-18（门禁口径修正）：原公式 `1 + len(Query 参数)` 假设
-        # project_id 之后**每个**形参都带 Query 默认值。但 `generation_mode`
-        # 按 BUG-FIX 2026-10-18（第二轮）必须用**普通字符串**默认值（本函数
-        # 被 sections.py 以位置参数内部调用，不经过 FastAPI 解析时 Query 默认值
-        # 会是 Query 对象而非 str，透传到 SSE json.dumps 抛 TypeError）。
-        # 因此改为直接比对 impl 的**形参总数**，既覆盖新增的普通默认值参数，
-        # 又保留「调用点必须按位置传全」这一真正的漂移检测意图。
         expected = len(inspect.signature(sse_content.generate_content_impl).parameters)
-        actual = _positional_call_arg_count(
+        pos_count, kw_names = _call_arg_counts(
             BACKEND_DIR / "app" / "routers" / "sections.py", "generate_content_impl"
         )
-        assert actual is not None, "未找到 generate_content_impl 的调用点"
-        assert actual == expected, (
-            f"调用点位置参数个数 {actual} != 期望 {expected}（project_id + {expected - 1} 个 Query 参数）"
+        assert pos_count is not None, "未找到 generate_content_impl 的调用点"
+        # G5：调用点必须全部关键字传参（位置实参恒 0）
+        assert pos_count == 0, (
+            f"调用点仍有 {pos_count} 个位置实参；G5 后应全部改为关键字传参（param=param）"
+        )
+        impl_params = set(inspect.signature(sse_content.generate_content_impl).parameters)
+        missing = impl_params - kw_names
+        assert not missing, f"关键字传参遗漏形参：{missing}"
+        assert kw_names == impl_params, (
+            f"关键字实参与 impl 形参不一致：call={kw_names} impl={impl_params}"
         )
 
     def test_gate_actually_detects_drift(self):

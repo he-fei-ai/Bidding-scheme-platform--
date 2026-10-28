@@ -358,6 +358,9 @@ export default function FileUploadPage() {
       batchRef.current = accumulateBatchTotals(batchRef.current, outcome);
       if (outcome === "parse_failed") {
         message.error(formatUploadFailureText(fileName, "parse_failed", result?.message));
+      } else if (outcome === "duplicate") {
+        // G8（2026-10-28 后续建议#4）：内容哈希去重命中，未新增文件行。
+        message.warning(result?.message || `${fileName} 文件内容已存在，未重复上传`, 5);
       } else if (shouldNotifySingle(pendingRef.current, batchRef.current)) {
         // HARDENING 2026-10-16：单张图片等异步解析文件如实提示「后台解析中」，
         // 与批尾汇总的 pending 口径一致（此前一律「上传成功」，OCR 失败时误导）

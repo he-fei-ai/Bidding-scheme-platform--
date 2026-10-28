@@ -10,6 +10,9 @@ from fastapi import HTTPException, Query
 from starlette.responses import StreamingResponse
 from ...config import (
     CONTENT_GENERATION_MODE,
+    CONTENT_USE_CONSISTENCY_AUDIT_DEFAULT,
+    CONTENT_USE_ORCHESTRATION_DEFAULT,
+    CONTENT_USE_WORD_SAMPLING_DEFAULT,
     SSE_HEARTBEAT_INTERVAL_SECS,
     SSE_QUEUE_POLL_INTERVAL_SECS,
 )
@@ -186,15 +189,15 @@ async def generate_content_impl(
 
     regenerate_missing: bool = Query(False),
 
-    use_orchestration: bool = Query(False),
+    use_orchestration: bool = Query(CONTENT_USE_ORCHESTRATION_DEFAULT),
 
     level2_default: int = Query(3500, ge=1000, le=10000),
 
-    use_word_sampling: bool = Query(False),
+    use_word_sampling: bool = Query(CONTENT_USE_WORD_SAMPLING_DEFAULT),
 
     use_fallback_expand: bool = Query(False),
 
-    use_consistency_audit: bool = Query(False),
+    use_consistency_audit: bool = Query(CONTENT_USE_CONSISTENCY_AUDIT_DEFAULT),
 
     concurrency: int | None = Query(None),
 

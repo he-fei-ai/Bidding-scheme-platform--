@@ -631,6 +631,52 @@ export const WORD_COUNT_TIERS: WordCountTier[] = [
   { key: 'long', label: '超长', targetWords: 2500, toleranceRatio: 0.10, isDefault: false },
 ];
 
+/**
+ * G7（2026-10-28 遗留加固）：把 WORD_COUNT_TIERS 从后端 `/word-count/tiers`
+ * 单一事实来源（word_count_tiers 表，DB 优先）同步到本数组。
+ *
+ * 此前前端硬编码 800/1200/2000/2500 ±10%，后端已支持运维改 DB 档位，但前端
+ * 从未消费（api/index.ts 的 getWordCountTiers 定义后无调用方）——管理员改档位
+ * 后前端仍按静态值展示/判定，与后端校验页口径漂移。
+ *
+ * 策略：**原地 splice 替换**（保持数组引用不变，所有 import 方无需改引用即见
+ * 新值）；拉取失败/结构非法则静默保留静态默认（fail-soft，向后兼容）。
+ * 静态默认与后端默认逐字一致（800/1200/2000/2500，±10%），零行为变更。
+ */
+export async function syncWordCountTiers(): Promise<boolean> {
+  try {
+    // 动态 import 避免 utils <-> api 循环依赖（api/index.ts 依赖 utils 类型）。
+    const { getWordCountTiers } = await import("./api");
+    const res = await getWordCountTiers();
+    const tiers = Array.isArray(res?.tiers) ? res.tiers : null;
+    if (!tiers || tiers.length === 0) return false;
+    const mapped: WordCountTier[] = [];
+    for (const t of tiers) {
+      const target = Number(t?.target_words);
+      const ratio = Number(t?.tolerance_ratio);
+      if (!t?.key || !Number.isFinite(target) || target <= 0 || !Number.isFinite(ratio)) {
+        continue; // 结构非法条目跳过，不整体回退
+      }
+      mapped.push({
+        key: t.key as WordCountTier['key'],
+        label: String(t?.label ?? t.key),
+        targetWords: target,
+        toleranceRatio: ratio,
+        isDefault: Boolean(t?.is_default),
+      });
+    }
+    if (mapped.length === 0) return false;
+    // 原地替换：保持数组引用不变，让所有既有 import 方（SectionEditorPage 等）
+    // 无需任何改动即消费新值。
+    WORD_COUNT_TIERS.splice(0, WORD_COUNT_TIERS.length, ...mapped);
+    return true;
+  } catch (err) {
+    // fail-soft：网络/后端异常时保留静态默认，绝不因同步失败影响页面。
+    console.warn("[WordCountTiers] 同步后端档位失败，使用静态默认:", err);
+    return false;
+  }
+}
+
 export const DEFAULT_WORD_COUNT_TIER = 'standard';
 
 /** 方案三：L3 自身正文 300 字 ±20%（240~360 字） */
@@ -1314,12 +1360,28 @@ export function parseProjectId(raw: string | null | undefined): number | null {
  * 现把「没有可用文本」这一事实提前到入口说清，并区分「还在解析」与「已失败」。
  */
 export function checkReadyForExtraction(
-  files: { status: string }[],
+  files: { status: string; file_role?: string }[],
 ): { ready: true } | { ready: false; reason: string } {
   const extracted = files.filter(
     (f) => f.status === "success" || f.status === "extracted",
   ).length;
-  if (extracted > 0) return { ready: true };
+  // BUG-FIX 2026-10-28（P2 数据链断点）：只要有任意 success 文件，原实现
+  // 直接放行，即使**主文件仍在异步 OCR（processing）**。此时后端
+  // latest_extracted_text 因主文件 extracted_text_path 为空，会把辅助文件
+  // 200 行摘要顶替为「正文」喂给 AI，全文事实提取质量静默劣化。现拦截
+  // processing/pending 的主文件（file_role==='main'），提示等待主文件解析。
+  const mainInFlight = files.filter(
+    (f) =>
+      f.file_role === "main" &&
+      (f.status === "processing" || f.status === "pending" || f.status === "parsing"),
+  ).length;
+  if (extracted > 0 && mainInFlight === 0) return { ready: true };
+  if (mainInFlight > 0) {
+    return {
+      ready: false,
+      reason: "主文件正在解析中，请等主文件解析完成后再进入要点提取",
+    };
+  }
   const inFlight = files.filter((f) => isInFlightFileStatus(f.status)).length;
   if (inFlight > 0) {
     return { ready: false, reason: "有文件正在解析中，请等解析完成后再进入要点提取" };
@@ -1347,13 +1409,15 @@ export const NEEDS_REANALYSIS_MESSAGE =
 // ============================================================
 
 /** 单份文件的上传结果分类 */
-export type UploadOutcome = "ok" | "pending" | "parse_failed" | "error";
+export type UploadOutcome = "ok" | "pending" | "parse_failed" | "duplicate" | "error";
 
 /** 本批次聚合计数：ok=上传并解析成功；pending=已入库、后台异步解析中；parseFailed=HTTP 成功但解析失败；failed=请求失败 */
 export interface UploadBatchTotals {
   ok: number;
   pending: number;
   parseFailed: number;
+  /** G8（2026-10-28）：内容哈希去重命中数（未新增文件行） */
+  duplicate: number;
   failed: number;
 }
 
@@ -1361,6 +1425,7 @@ export const EMPTY_BATCH_TOTALS: UploadBatchTotals = {
   ok: 0,
   pending: 0,
   parseFailed: 0,
+  duplicate: 0,
   failed: 0,
 };
 
@@ -1384,6 +1449,10 @@ export function classifyUploadResult(
   // 汇总与终态不一致 —— 用户以为这批文件都解析成功了。单列 "pending" 口径，
   // 让汇总如实区分「解析已完成」与「后台解析中」。
   if (res.status === "processing") return "pending";
+  // G8（2026-10-28 后续建议#4）：后端 save_upload 内容哈希去重命中返回
+  // status='duplicate'（HTTP 200）。此前落入 "ok" 被谎报「上传成功」，实际未新增
+  // 文件行——用户困惑。单独归类为 "duplicate"，批尾汇总与单文件提示如实反馈。
+  if (res.status === "duplicate") return "duplicate";
   return "ok";
 }
 
@@ -1403,12 +1472,16 @@ export function accumulateBatchTotals(
   if (outcome === "pending") {
     return { ...totals, pending: totals.pending + 1 };
   }
+  // G8：去重命中单独计数，不混入 ok（批尾汇总才不谎报「全部成功」）
+  if (outcome === "duplicate") {
+    return { ...totals, duplicate: totals.duplicate + 1 };
+  }
   return { ...totals, ok: totals.ok + 1 };
 }
 
 /** 本批次已处理文件总数 */
 export function totalBatchCount(totals: UploadBatchTotals): number {
-  return totals.ok + totals.pending + totals.parseFailed + totals.failed;
+  return totals.ok + totals.pending + totals.parseFailed + totals.duplicate + totals.failed;
 }
 
 /**
@@ -1432,21 +1505,25 @@ export function formatBatchSummary(
 ): { type: "success" | "warning" | "error"; text: string } | null {
   const total = totalBatchCount(totals);
   if (total <= 1) return null;
-  const { ok, pending, parseFailed, failed } = totals;
+  const { ok, pending, parseFailed, duplicate, failed } = totals;
   if (parseFailed === 0 && failed === 0) {
     // HARDENING 2026-10-16：含后台解析中的文件时如实说明，不再一律宣称
     // 「成功 N 个」（OCR 终态尚未落库，见 classifyUploadResult 注释）
     if (pending > 0) {
       return {
         type: "success",
-        text: `批量上传完成，成功 ${ok} 个文件，${pending} 个正在后台解析`,
+        text: `批量上传完成，成功 ${ok} 个文件，${pending} 个正在后台解析${duplicate > 0 ? `，${duplicate} 个重复未上传` : ""}`,
       };
     }
-    return { type: "success", text: `批量上传完成，成功 ${ok} 个文件` };
+    return {
+      type: "success",
+      text: `批量上传完成，成功 ${ok} 个文件${duplicate > 0 ? `，${duplicate} 个重复未上传` : ""}`,
+    };
   }
   const parts: string[] = [`成功 ${ok} 个`];
   if (pending > 0) parts.push(`后台解析中 ${pending} 个`);
   if (parseFailed > 0) parts.push(`解析失败 ${parseFailed} 个`);
+  if (duplicate > 0) parts.push(`重复 ${duplicate} 个`);
   if (failed > 0) parts.push(`上传失败 ${failed} 个`);
   return { type: "warning", text: `批量上传完成：${parts.join("，")}` };
 }

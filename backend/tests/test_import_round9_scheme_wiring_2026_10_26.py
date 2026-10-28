@@ -186,9 +186,14 @@ def test_two_reader_functions_share_same_parsing_result():
 
     import unittest.mock as mock
 
-    with mock.patch.object(ai_module, "get_db", new=lambda: _Conn()):
+    # BUG-FIX 2026-10-28：sse_outline._read_scheme_extraction_for_outline 已按 F5
+    # 改用 get_db(readonly=True)（纯读不抢写锁）。mock 须接受 readonly 关键字参数，
+    # 否则 get_db(readonly=True) 抛 TypeError 被 except 吞掉返回 ("", [])，
+    # 断言失败。ai._read_scheme_extraction 仍用 get_db()（无参），两者共用同一
+    # 伪造连接验证解析口径一致。
+    with mock.patch.object(ai_module, "get_db", new=lambda *a, **k: _Conn()):
         ai_result = ai_module._read_scheme_extraction(1)
-    with mock.patch.object(sse_outline, "get_db", new=lambda: _Conn()):
+    with mock.patch.object(sse_outline, "get_db", new=lambda *a, **k: _Conn()):
         outline_result = sse_outline._read_scheme_extraction_for_outline(1)
     assert ai_result == outline_result == (
         "起重吊装及安装拆卸工程",

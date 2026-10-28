@@ -123,6 +123,35 @@ describe("checkReadyForExtraction（进入要点提取的流程门禁）", () =>
     expect(r.ready).toBe(false);
     expect((r as { reason: string }).reason).not.toContain("正在解析中");
   });
+
+  it("主文件 processing 且有 success 辅助文件 → 拦截（防辅助摘要顶替）", () => {
+    // BUG-FIX 2026-10-28（P2 数据链断点）：主文件仍在异步 OCR 时，后端会把
+    // 辅助文件 200 行摘要顶替为正文喂 AI。前端须拦截，提示等待主文件解析。
+    const r = checkReadyForExtraction([
+      { status: "processing", file_role: "main" },
+      { status: "success", file_role: "supporting" },
+    ]);
+    expect(r.ready).toBe(false);
+    expect((r as { reason: string }).reason).toContain("主文件正在解析中");
+  });
+
+  it("主文件 processing 且无其他 success → 拦截（优先主文件提示）", () => {
+    const r = checkReadyForExtraction([
+      { status: "processing", file_role: "main" },
+      { status: "failed", file_role: "supporting" },
+    ]);
+    expect(r.ready).toBe(false);
+    expect((r as { reason: string }).reason).toContain("主文件正在解析中");
+  });
+
+  it("主文件 success 且有 processing 辅助文件 → 放行（主文件文本就绪）", () => {
+    // 主文件文本就绪时不应被辅助文件的 processing 阻塞（提取可用）。
+    const r = checkReadyForExtraction([
+      { status: "success", file_role: "main" },
+      { status: "processing", file_role: "supporting" },
+    ]);
+    expect(r.ready).toBe(true);
+  });
 });
 
 // ─── resolveUploadLimitMb ──────────────────────────────────────

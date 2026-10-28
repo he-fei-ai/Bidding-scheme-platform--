@@ -57,8 +57,24 @@ export default defineConfig({
     // 消除争抢；retry 升到 2 给偶发一次额外重试。纯函数用例不受影响（毫秒级）。
     // ENHANCE 2026-10-17（Vitest 5 迁移）：`test.poolOptions.threads.maxThreads`
     // 已被 Vitest 4+ 移除（运行时告警 DEPRECATED），迁移为等价的顶层 `maxWorkers`。
-    // 语义不变：限制并发 worker 到 2，消除 antd+jsdom 全量并发下的 CPU/内存争抢。
-    maxWorkers: 2,
+    //
+    // BUG-FIX 2026-10-27（遗留·全量并发假失败根治）：vitest 5 forks 池的 worker
+    // 启动超时 START_TIMEOUT=60000ms 是硬编码常量（dist 源码 line 10760，非 config
+    // 可配）。此前 maxWorkers=2 时两个重型 antd+jsdom 页面测试同时 fork，各自
+    // bootstrap（transform antd + 加载 jsdom + setupTests）均超 60s →
+    // "[vitest-pool-runner]: Timeout waiting for worker to respond" → 文件级全灭
+    // （实测 ConsistencyPage + ExportConfigPage 并发即 2 errors / no tests；
+    // 单文件跑均通过，确认非代码缺陷）。
+    //
+    // 最优解：singleFork=true —— 所有测试文件在同一个 fork 内顺序执行。
+    // antd/jsdom 仅首个文件冷启动加载一次，后续文件复用热缓存。彻底消除并发
+    // bootstrap 争抢，不再触发 60s 启动超时。isolate=true（默认）保证每个文件
+    // 的模块实例与 mock 状态在文件间重置，无泄漏。maxWorkers=1 与 singleFork
+    // 配合，确保不派生第二个 fork。
+    // 注意：Vitest 4+ 已移除 `test.poolOptions`（运行时 DEPRECATED 告警），
+    // singleFork 现为 `test` 顶层选项。
+    singleFork: true,
+    maxWorkers: 1,
     // 三保险：retry=2（最多重试 2 次），确定性回归重试后仍失败、照常红灯。
     retry: 2,
   },

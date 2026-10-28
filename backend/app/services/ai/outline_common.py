@@ -1097,6 +1097,76 @@ _SINGLE_ORDINAL_TITLE_RE = re.compile(
     r"^(?:第[一二三四五六七八九十百ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩ]|[一二三四五六七八九十百ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩ]+|[0-9]+)$"
 )
 
+# BUG-FIX 2026-10-27（第七轮 · 「X第N项/条」无括号编号后缀漏判）：
+# 用户复报「编号冲突后缀（3）（2）」家族里，「总体实施策划第2项」「专项方案第2项」
+# 「专项施工方案第6项」「专项施工技术措施第3项」这类**无括号**「第N项/条」结尾
+# 完全穿透全部脏判定（`_ORDINAL_SUFFIX_RE` 要求 `[（(]` 包裹，`_ORDINAL_ITEM_ONLY_RE`
+# 只认整标题即「第N项」）。这些标题是 AI 编号漂移「（第N项）」的去括号镜像，语义
+# 上与「总体实施策划（2）」「专项6」同类（零语义占位 + 编号冲突后缀）。
+# 且 `_is_l3_title_project_specific` 对「专项施工方案第6项」这类长度 ≥7 且不含
+# 通用词表的标题判为「具体」，`validate_l3_specificity` 不再告警 → 整条防线漏出。
+# 现纳入任意位置的「第N项/条」（含末尾与中间），剥后主体属泛化词干即判脏。
+_GENERIC_ITEM_ANYWHERE_RE = re.compile(
+    r"第[0-9一二三四五六七八九十百ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩ]+\s*[项条]"
+)
+
+# 「专项 + 通用维度」泛化短语：这些是 AI/规则兜底可能产出的专项类**类别名**，
+# 落到 L3 条目且带「第N项/条」编号后缀即占位（与「专项6」同家族）。
+_SPECIAL_GENERIC_PHRASES: frozenset[str] = frozenset({
+    "专项", "专项方案", "专项措施", "专项施工", "专项工程", "专项技术",
+    "专项管理", "专项实施", "专项施工方案", "专项施工技术", "专项施工工艺",
+    "专项技术措施", "专项施工技术措施", "专项施工方案与技术措施",
+    "专项施工方案与工艺", "专项方案与工艺", "专项工程方案", "专项管理措施",
+})
+
+# 「之N」阿拉伯数字消歧后缀（「总体实施策划之6」）—— 合法消歧用中文「之六」，
+# 阿拉伯「之6」是编号冲突后缀（AI 常产出），剥后主体泛化即判脏。
+_ZHI_ARABIC_NUM_RE = re.compile(r"之[0-9]+\s*$")
+
+
+def _base_is_generic_stem(base: str) -> bool:
+    """判断剥除编号后缀后的**主体**是否为泛化词干（决定是否判脏）。
+
+    只认「泛化词表成员 / 专项类类别名 / 泛化词干×维度词组合」，刻意不放开到
+    任意 CJK —— 避免把「混凝土」「安全技术交底」「钢筋绑扎验收」这类具体主体
+    误判为泛化（否则「混凝土第3项」这类**合法**的条目标题会被误伤）。
+    """
+    _b = (base or "").strip()
+    if not _b:
+        return True
+    if _b in (_GENERIC_STEM_WORDS | _GENERIC_ONLY_TITLES | _L3_L2LIKE_TITLES | _L3_TITLE_FRAGMENTS):
+        return True
+    if _b in _SPECIAL_GENERIC_PHRASES:
+        return True
+    if _is_generic_stem_only_title(_b):
+        return True
+    return False
+
+
+def _is_generic_stem_item_suffix(title: str) -> bool:
+    """检测「泛化词干 × 第N项/条」编号冲突（无括号，含末尾与中间两形态）。
+
+    与 `_is_generic_stem_ordinal_suffix` 同口径但针对「第N项/条」：
+      「总体实施策划第2项」→ 剥「第2项」得「总体实施策划」∈ 泛化词表 → 判脏；
+      「专项施工方案第6项」→ 剥「第6项」得「专项施工方案」→ 专项家族 → 判脏；
+      「混凝土第3项」→ 剥「第3项」得「混凝土」∉ 泛化词表 → 合法（不判脏）。
+    """
+    t = (title or "").strip()
+    if not t:
+        return False
+    for _m in _GENERIC_ITEM_ANYWHERE_RE.finditer(t):
+        if _base_is_generic_stem(t[: _m.start()].strip()):
+            return True
+    # 「之N」阿拉伯数字消歧后缀（「总体实施策划之6」）
+    _z = _ZHI_ARABIC_NUM_RE.search(t)
+    if _z:
+        _base = t[: _z.start()].strip()
+        if _base.endswith("之"):
+            _base = _base[:-1].strip()
+        if _base_is_generic_stem(_base):
+            return True
+    return False
+
 
 def _is_generic_stem_ordinal_suffix(title: str) -> bool:
     """检测标题是否以「泛化词干 × 裸序号」形态结尾（无括号、无「之」消歧）。
@@ -1241,6 +1311,9 @@ def _is_placeholder_numbered_title(title: str) -> bool:
     # 整段就是序号的标题（「1」「一」「Ⅱ」）
     if _SINGLE_ORDINAL_TITLE_RE.match(t):
         return True
+    # 泛化词干 × 第N项/条 无括号编号冲突（「总体实施策划第2项」「专项方案第2项」）
+    if _is_generic_stem_item_suffix(t):
+        return True
     return False
 
 
@@ -1320,10 +1393,20 @@ def _strip_ordinal_suffix(title: str) -> str:
     判定语义）；也不含裸数字结尾（「总体实施策划2」），否则会导致
     `_uniquify_outline_titles` 的裸数字回退死循环。裸数字结尾由
     `_is_dirty_l3_title` 单独判定。
+
+    BUG-FIX 2026-10-27（第七轮 · 归一化口径补漏）：无括号「第N项/条」后缀
+    （「总体实施策划第2项」「专项方案第2项」）与「之N」阿拉伯数字
+    （「总体实施策划之6」）此前不参与剥离，`_title_core` 把「总体实施策划第2项」
+    与「总体实施策划」判为不同标题，去重/消歧无法合并。现与判定口径对称纳入；
+    只剥「第N项/条」与「之+阿拉伯数字」，不剥「之N」中文（那是合法消歧形态，
+    与 `_is_generic_stem_ordinal_suffix` 的豁免口径一致）。
     """
     if not title:
         return title
-    return _ORDINAL_SUFFIX_RE.sub("", title).strip()
+    t = _ORDINAL_SUFFIX_RE.sub("", title).strip()
+    t = _GENERIC_ITEM_ANYWHERE_RE.sub("", t, count=1).strip()
+    t = _ZHI_ARABIC_NUM_RE.sub("", t).strip()
+    return t
 
 
 # 「（其N）」/「（其 2）」/半角「(其2)」—— 旧版去重兜底产出的**无意义序数后缀**。
@@ -1562,6 +1645,13 @@ def _is_dirty_l3_title(title: str) -> bool:
     #     是第三种形态，旧判定完全放行。
     if _SINGLE_ORDINAL_TITLE_RE.match(t):
         return True
+    # 14. 「泛化词干 × 第N项/条」无括号编号冲突（2026-10-27 · 第七轮）：
+    #     「总体实施策划第2项」「专项方案第2项」「专项施工方案第6项」
+    #     「专项施工技术措施第3项」「总体实施策划之6」—— 与「（第N项）」
+    #     括号式同族，去括号后穿透 `_ORDINAL_SUFFIX_RE` 且 `_ORDINAL_ITEM_ONLY_RE`
+    #     只认整标题即「第N项」，带主体的无括号形态完全漏判。
+    if _is_generic_stem_item_suffix(t):
+        return True
     return False
 
 
@@ -1587,6 +1677,79 @@ def _is_dirty_l3_title_deep(title: str) -> bool:
         return False
     _stripped = _strip_legacy_redundant_suffix(_t)
     if _stripped != _t and _is_dirty_l3_title(_stripped):
+        return True
+    return False
+
+
+def _is_dirty_l2_title(title: str) -> bool:
+    """L2 层级脏标题判定：只查**结构性脏**（污染/占位），放过所有泛化词表判定。
+
+    与 `_is_dirty_l3_title` 的差异：
+      - L2 是章名级粒度，天然就是"泛化"的（「总体实施策划」「其他」「说明」
+        都是合法 L2 标题）。任何基于"泛化程度"的脏判定（规则 6/7/8）对 L2
+        都会误伤，必须全部放过。
+      - L2 仍会出现的脏态都是**污染类**的：编号前后缀（「总体实施策划（2）」
+        「（2）总体实施策划」）、完全占位（「专项6」「内容3」）、裸序数后缀
+        （「总体实施策划二」）、纯序号单段（「1」「一」）。这些与具体泛化程度
+        无关，纯粹是 AI 编号漂移/漏写造成的结构性缺陷，无论哪一级都该清。
+
+    保留规则（结构性脏）：1-5（空/占位/编号前后缀/裸数字+泛化主体）、
+    9（编号前缀）、12（泛化词干+裸序数）、13（单字符序号）。
+    放过规则（泛化程度）：6（t ∈ _GENERIC_ONLY_TITLES）、7（t ∈ _L3_L2LIKE_TITLES）、
+    8（_is_generic_stem_only_title —— 「其他说明」这类合法 L2 会误命中）。
+    """
+    t = (title or "").strip()
+    if not t:
+        return True
+    # --- 结构性脏规则（任何层级都该清洗）---
+    if _PLACEHOLDER_TITLE_RE.match(t):
+        return True
+    if _PLACEHOLDER_ANYWHERE_RE.search(t):
+        return True
+    if _PLACEHOLDER_PREFIXED_RE.search(t):
+        return True
+    if _PLACEHOLDER_TAIL_NUM_RE.search(t):
+        return True
+    if _PLACEHOLDER_ORDINAL_ONLY_RE.match(t):
+        return True
+    if _ORDINAL_ITEM_ONLY_RE.match(t):
+        return True
+    if _ORDINAL_SUFFIX_RE.search(t):
+        return True
+    if _BARE_NUM_TAIL_RE.search(t):
+        _rest = _BARE_NUM_TAIL_RE.sub("", t).strip()
+        if _rest and _rest in (_GENERIC_ONLY_TITLES | _L3_L2LIKE_TITLES):
+            return True
+    # 规则 8（_is_generic_stem_only_title）对 L2 放过 —— 「其他说明」这类合法 L2
+    # 会因命中泛化词干×泛化维度词组合而被误改写。L2 的泛化程度判定全部交由
+    # L3+ 的判定函数处理。
+    #   if _is_generic_stem_only_title(t):  return True  ← 放过
+    # 规则 9（编号前缀）
+    if _strip_ordinal_prefix(t) != t:
+        return True
+    # 规则 12（泛化词干 + 裸序数）
+    if _is_generic_stem_ordinal_suffix(t):
+        return True
+    # 规则 13（单字符/纯序号）
+    if _SINGLE_ORDINAL_TITLE_RE.match(t):
+        return True
+    # 规则 14（泛化词干 × 第N项/条 无括号编号冲突）—— L2 同样适用（结构性脏）
+    if _is_generic_stem_item_suffix(t):
+        return True
+    # --- 规则 6/7/8 对 L2 放过 ---
+    return False
+
+
+def _is_dirty_l2_title_deep(title: str) -> bool:
+    """L2 深度脏判定：与 `_is_dirty_l3_title_deep` 同口径（原文 + 剥离冗余后缀后都过一遍），
+    但用 L2 专用的 `_is_dirty_l2_title` 而非 L3 的。"""
+    if _is_dirty_l2_title(title):
+        return True
+    _t = (title or "").strip()
+    if not _t:
+        return False
+    _stripped = _strip_legacy_redundant_suffix(_t)
+    if _stripped != _t and _is_dirty_l2_title(_stripped):
         return True
     return False
 
@@ -2357,13 +2520,15 @@ def _cleanup_placeholder_titles(
             if not isinstance(_node, dict):
                 continue
             _title = (_node.get("title") or "").strip()
-            # 2026-10-10 修复：脏标题清洗只作用于三级及以下。
-            # 旧实现无条件套用占位判定，但「其他」「概述」「说明」这类词
-            # 同为 28 章模板的合法一级/二级标题（FIXED_28_CHAPTERS[27]="其他"），
-            # 若一并清洗会误伤合法章节标题。
-            # 2026-10-13 修复（G2）：判定升级为深度判定（含「（其N）」剥离后
-            # 仍为泛化词的形态），见 `_is_dirty_l3_title_deep`。
-            _is_placeholder = level >= 3 and _is_dirty_l3_title_deep(_title)
+            # 2026-10-27（BUG-OUTLINE-2026-10-27-L2POOL）：L2 脏标题也纳入清洗。
+            # 旧实现只对 level>=3 启用，但目录侧 L2 同样会漏出带编号污染的脏标题
+            # （如「总体实施策划（2）」）—— 这些不是合法 L2 章名，是 AI 编号漂移
+            # 的副产物，应当清洗。
+            #
+            # 注意：判定函数必须按 level 分层选择。L2 放过「恰好等于泛化词表」的
+            # 合法章名（「总体实施策划」「其他」「说明」等），L3+ 则一律判脏。
+            _level_dirty = _is_dirty_l2_title_deep if level == 2 else _is_dirty_l3_title_deep
+            _is_placeholder = level >= 2 and _level_dirty(_title)
             if _is_placeholder:
                 # 2026-10-15 修复（B1 · 清洗器过度剥离）：
                 # 「悬挑架安装（2）」这类标题的主体**完全具体**，只是带了个
@@ -2379,28 +2544,45 @@ def _cleanup_placeholder_titles(
                 # 得「专项」、「内容（3）」剥后得「内容」—— bare fragment
                 # 不是可读标题，旧实现直接保留等于把一种占位垃圾换成另一种，
                 # 现改走整体语义化重写。
+                #
+                # 2026-10-27（L2 清洗）：剥后缀后的主体干净判定也用分层函数 ——
+                # 对 L2 而言，「总体实施策划（2）」剥后缀得到的「总体实施策划」
+                # 是**合法 L2 章名**，应保留主体不走整体重写；若误判为脏则会被
+                # 语义化改写丢掉原始语义。
                 _body = _strip_legacy_redundant_suffix(_strip_ordinal_suffix(_title)).strip()
                 _body = _strip_ordinal_prefix(_body).strip()
+                _new = ""
                 if (
                     _body
                     and _body != _title
                     and len(_body) >= _MIN_CLEAN_BODY_LEN
                     and _body not in _L3_TITLE_FRAGMENTS
-                    and not _is_dirty_l3_title_deep(_body)
-                    and _body not in _used
+                    and not _level_dirty(_body)
                 ):
-                    _node["title"] = _body
-                    _used.add(_body)
-                    _clean_seq += 1
-                    _fixed += 1
-                else:
+                    # 主体干净可用：先尝试直接保留（同父/全局首次出现）；
+                    # 撞名时追加中文序数消歧后缀（与 `_uniquify_outline_titles`
+                    # 口径一致：`X之二 / X之三`，纯中文序数 + 「之」连接），
+                    # 不再整体重写。避免把「总体实施策划」（合法 L2 主体）
+                    # 语义化成 L3 粒度条目式标题（如「项目管理部组织架构」）
+                    # 造成层级语义错配。
+                    if _body not in _used:
+                        _new = _body
+                    else:
+                        for _n in range(2, 10000):
+                            _cand = f"{_body}之{_cn_ordinal(_n)}"
+                            if _cand not in _used and not _level_dirty(_cand):
+                                _new = _cand
+                                break
+                if not _new:
+                    # 主体本身脏（如「专项6」剥后缀得碎片）或消歧用尽：
+                    # 走整体语义化重写兜底。
                     _new = _semantic_fallback_title(
                         parent_title or "", _clean_seq, _used, context_title=grandparent_title
                     )
-                    _node["title"] = _new
-                    _used.add(_new)
-                    _clean_seq += 1
-                    _fixed += 1
+                _node["title"] = _new
+                _used.add(_new)
+                _clean_seq += 1
+                _fixed += 1
             _sub = _node.get("children")
             if isinstance(_sub, list):
                 _walk(_sub, _title, parent_title, level + 1)

@@ -4360,10 +4360,11 @@ def test_export_acquires_lock_before_build_starts():
     """
     src = _read_backend_source("app/routers/export.py")
     lock_line = _line_of(src, "lock_key, owner_id = await _acquire_export_lock(project_id)")
-    build_line = _line_of(src, "_build_task = asyncio.get_running_loop().run_in_executor(None, _run_build)")
+    # BUG-FIX 2026-10-28（G6）：提交目标从默认线程池改为专用 `_EXPORT_BUILD_EXECUTOR`。
+    build_line = _line_of(src, "_build_task = asyncio.get_running_loop().run_in_executor(_EXPORT_BUILD_EXECUTOR, _run_build)")
     assert lock_line < build_line, "抢锁(L%d) 必须早于构建启动(L%d)" % (lock_line, build_line)
     # 构建只能启动一次（曾经因为补丁失误留了两处）
-    assert src.count("run_in_executor(None, _run_build)") == 1
+    assert src.count("run_in_executor(_EXPORT_BUILD_EXECUTOR, _run_build)") == 1
 
 
 def test_export_dropped_the_in_process_lock():

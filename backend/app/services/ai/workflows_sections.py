@@ -3077,7 +3077,19 @@ async def generate_sections(
                         for c in _children
                     ][: max(max(1, _SIBLING_CAP), _SIBLING_TITLES_CAP)]
                 _sibling_list_by_parent[_pid] = _children
-            _siblings_map[_sid] = _sibling_list_by_parent[_pid]
+            _shared = _sibling_list_by_parent[_pid]
+            # 审计8修复（BUG-A）：同级列表截断不变量。设计约定（L3037-3043）要求
+            # 每个章节的同级列表**包含当前章节**（自定位/兄弟感知）。当父节点孩子数
+            # 超过 titles 上限时，共享列表被 `[:cap]` 截断，第 cap+1 个及之后的章节
+            # 不在共享列表里 → 违反不变量（第 41 个章节看不到自己，自定位缺失）。
+            # 修复：仅对被截掉的章节单独补一条「自身 + 共享列表」的列表；共享列表
+            # 本身不动，未截断章节仍共用同一对象（前缀缓存命中设计不变）。
+            if not any(_sb.get("id") == _sid for _sb in _shared):
+                _siblings_map[_sid] = [
+                    {"id": _sid, "title": _s.get("title", ""), "description": ""},
+                ] + _shared
+            else:
+                _siblings_map[_sid] = _shared
         # 找 parent 链（向上最多 3 层）
         _parents_list = []
         _cur_pid = _pid

@@ -1,4 +1,5 @@
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import functools
 import json
 import logging
@@ -17,10 +18,29 @@ from ..db import get_db
 from ..logging_context import make_context_bound
 from ..models import ExportConfig
 from ..services import task_lock as _task_lock
-from ..services.export import build_docx, check_document, get_latest_export, list_exports, record_failed_export
+from ..services.export import (
+    build_docx,
+    check_document,
+    get_latest_export,
+    list_exports,
+    record_failed_export,
+)
+from ..services.export import EXPORT_FORMAT_MEDIA_TYPES
+
+# 单一事实来源（TECH-DEBT 2026-10-27）：routers/export.py 的下载端点
+# 与 services/export.py 的孤儿清理白名单此前是两份平行清单（靠
+# test_export_media_types_constant_consistency 守门防漂移）。现收敛为
+# 同一对象：EXPORT_MEDIA_TYPES 直接引用 services.EXPORT_FORMAT_MEDIA_TYPES，
+# 新增格式只需改 services 一处，两处自动同步。
+EXPORT_MEDIA_TYPES = EXPORT_FORMAT_MEDIA_TYPES
 from ..services.projects import update_step
 from .project_access import enforce_project_access
 from .rate_limiter import limit_per_endpoint
+# G6（2026-10-28 遗留加固）：导出 SSE 构建此前用 run_in_executor(None) 提交
+# **默认线程池**，长时 DOCX 打包会占用共享工作线程、饿死同池的轻量任务（文件解析/
+# DB 写）。改独立模块级专用线程池（max_workers=2），只服务导出构建，隔离资源争用。
+_EXPORT_BUILD_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="export-build")
+
 logger = logging.getLogger(__name__)
 api_key_header = APIKeyHeader(name='X-API-Key', auto_error=False)
 #: 导出任务类型（登记在 task_lock.TASK_GROUPS 的 `export` 组）
@@ -338,7 +358,7 @@ async def get_docx_stream_hint(project_id: int):
     raise HTTPException(status_code=405, detail='请使用 POST 请求调用此接口')
 
 @router.get('/check', dependencies=[limit_per_endpoint])
-async def export_check(project_id: int, strict: bool=False, identity=Depends(verify_auth)):
+async def export_check(project_id: int, strict: bool=False, block_on_high_conflicts: bool=False, identity=Depends(verify_auth)):
     """文档完整性检查（V1.0 增强：支持 strict 参数控制严格模式）
 
     BUG-FIX-01 修复：添加 verify_auth 认证依赖。
@@ -348,9 +368,18 @@ async def export_check(project_id: int, strict: bool=False, identity=Depends(ver
     ENHANCE 2026-09-29（P1 IDOR 收口）：verify_auth 只验「是否登录」，
     不验「项目归属」；任意登录用户可传他人 project_id 获取其文档结构。
     现接入与 sections 同口径的 enforce_project_access。
+
+    BUG-FIX 2026-10-28（P2 前后端不同步）：此前本端点只透传 strict_mode，
+    不透传 block_on_high_conflicts —— 用户勾选「一致性闸门」后，预检显示
+    「通过」，但点导出 DOCX 时后端（/docx 传 config.block_on_high_conflicts）
+    返回 400「存在 N 个未解决高冲突」。预检无法预警，导出被拦。现补查询
+    参数并透传，使预检与导出闸门口径一致。
     """
     await enforce_project_access(project_id, identity)
-    result = await asyncio.to_thread(check_document, project_id, strict_mode=strict)
+    result = await asyncio.to_thread(
+        check_document, project_id, strict_mode=strict,
+        block_on_high_conflicts=block_on_high_conflicts,
+    )
     return result
 
 @router.post('/docx', dependencies=[limit_per_endpoint])
@@ -387,8 +416,14 @@ async def export_docx(project_id: int, config: ExportConfig=Body(default_factory
     lock_key, owner_id = await _acquire_export_lock(project_id)
     # ENHANCE 2026-10-04（T4）：后台心跳续约，消除「构建超 30 分钟 → 组锁 TTL
     # 到期被 reclaim_stale 回收 → 同项目第二个导出携新锁并发 build」窗口。
-    _stop_keepalive = _task_lock.start_keepalive(lock_key, owner_id)
+    # BUG-FIX（2026-10-28 跨模块深度探索 F2）：`start_keepalive` 此前在 try/finally
+    # **之外**执行——若它自身抛异常（如 sqlite 写失败），finally 永不进入，
+    # `_release_export_lock` 永不执行 → 该项目导出组锁被永久持有（TTL 30min 内
+    # 同项目第二个导出恒 409）。现移入 try，并预置 `None` 守卫，保证任何路径
+    # 都走 finally 释放锁。
+    _stop_keepalive = None
     try:
+        _stop_keepalive = _task_lock.start_keepalive(lock_key, owner_id)
         output_path, export_id = await asyncio.to_thread(build_docx, project_id, config=config)
         filename = Path(output_path).name
         file_size = Path(output_path).stat().st_size
@@ -427,7 +462,8 @@ async def export_docx(project_id: int, config: ExportConfig=Body(default_factory
         await _rollback_export_step(project_id)
         raise HTTPException(status_code=500, detail=f'导出失败: {type(e).__name__}: {str(e)[:200]}') from e
     finally:
-        _stop_keepalive()
+        if _stop_keepalive:
+            _stop_keepalive()
         await _release_export_lock(lock_key, owner_id, why=f'同步导出 project={project_id}')
 
 @router.post('/html', dependencies=[limit_per_endpoint])
@@ -470,8 +506,10 @@ async def export_html(project_id: int, config: ExportConfig=Body(default_factory
     # 但未抢导出组锁 → 两个 HTML 请求（或 HTML 与 DOCX 并发）各自生成产物，
     # 同名时互相截断。抢同一把组锁后，冲突方得到 409 而不是半截文件。
     lock_key, owner_id = await _acquire_export_lock(project_id)
-    _stop_keepalive = _task_lock.start_keepalive(lock_key, owner_id)
+    # BUG-FIX（2026-10-28 F2）：start_keepalive 移入 try/finally 防锁泄漏。
+    _stop_keepalive = None
     try:
+        _stop_keepalive = _task_lock.start_keepalive(lock_key, owner_id)
         from ..services.html_export import build_html
 
         path, _fingerprint = await asyncio.to_thread(build_html, project_id, config)
@@ -501,7 +539,8 @@ async def export_html(project_id: int, config: ExportConfig=Body(default_factory
         _record_export_failure(project_id, config, f'{type(e).__name__}: {str(e)[:200]}')
         raise HTTPException(status_code=500, detail=f'导出失败: {type(e).__name__}: {str(e)[:200]}') from e
     finally:
-        _stop_keepalive()
+        if _stop_keepalive:
+            _stop_keepalive()
         await _release_export_lock(lock_key, owner_id, why=f'HTML 导出 project={project_id}')
 
 @router.post('/docx-stream', dependencies=[limit_per_endpoint])
@@ -547,7 +586,15 @@ async def export_docx_stream(request: Request, project_id: int, config: ExportCo
     lock_key, owner_id = await _acquire_export_lock(project_id)
     # ENHANCE 2026-10-04（T4）：SSE 路径同样心跳续约（stop 在 _run_build finally
     # 释放锁前调用）；客户端断线不中断构建，续约亦不中断，语义一致。
-    _stop_keepalive = _task_lock.start_keepalive(lock_key, owner_id)
+    # BUG-FIX（2026-10-28 F2）：start_keepalive 抛异常时此前直接上抛，`_run_build`
+    # 的 finally（释放锁）永不执行 → 该项目导出组锁被永久持有。现加守卫：
+    # 启动续约失败立即释放已抢的锁并重抛，语义明确。
+    try:
+        _stop_keepalive = _task_lock.start_keepalive(lock_key, owner_id)
+    except Exception as _ka_e:
+        logger.error('SSE 导出 start_keepalive 失败，立即释放组锁: %s', _ka_e)
+        await _release_export_lock(lock_key, owner_id, why='SSE 导出 start_keepalive 失败')
+        raise
     # T6 闭环说明（2026-10-04）：队列故意保持无界 —— 有界化后 put_nowait 在
     # 高压下会真实丢事件（包括 completed/error 终态），比囤积内存更坏；
     # 事件量有天然上界（章节数×进度点），断线场景由 T3 的 journal drain
@@ -680,7 +727,7 @@ async def export_docx_stream(request: Request, project_id: int, config: ExportCo
         # asyncio.run 关闭事件循环、生产中 loop 关闭/阻塞）时协程体一步都不执行，
         # 构建永不启动 → keepalive 线程无限续约把组锁焊死（与启动前取消同症状）。
         # 事件循环关闭时 shutdown_default_executor 会等待本线程收尾，放锁语义完整。
-        _build_task = asyncio.get_running_loop().run_in_executor(None, _run_build)
+        _build_task = asyncio.get_running_loop().run_in_executor(_EXPORT_BUILD_EXECUTOR, _run_build)
         _BUILD_TASKS.add(_build_task)
         _build_task.add_done_callback(_BUILD_TASKS.discard)
         # 单一队列消费者：无论生成器是否被迭代，事件都会持续落入 journal
@@ -820,14 +867,6 @@ async def download_export(project_id: int, export_id: int, identity=Depends(veri
 
     # PERF（2026-10-05）：纯读 readonly + to_thread（含 resolve/exists 文件 I/O），
     # 不再在事件循环内抢全局写锁
-    _MEDIA_TYPES = {
-        '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-        '.dotx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.template',
-        '.doc':  'application/msword',
-        '.html': 'text/html; charset=utf-8',
-        '.pdf':  'application/pdf',
-    }
-
     def _locate_file():
         with get_db(readonly=True) as conn:
             row = conn.execute('SELECT file_path, filename, status FROM exports WHERE id = ? AND project_id = ?', (export_id, project_id)).fetchone()
@@ -844,9 +883,9 @@ async def download_export(project_id: int, export_id: int, identity=Depends(veri
         if not actual_path.exists():
             return ('not_found', '文件已被删除')
         suffix = actual_path.suffix.lower()
-        if suffix not in _MEDIA_TYPES:
+        if suffix not in EXPORT_MEDIA_TYPES:
             return ('bad_type', '文件类型不支持')
-        return ('ok', str(actual_path), row['filename'], _MEDIA_TYPES[suffix])
+        return ('ok', str(actual_path), row['filename'], EXPORT_MEDIA_TYPES[suffix])
 
     result = await asyncio.to_thread(_locate_file)
     if result[0] == 'not_found':
@@ -884,17 +923,10 @@ async def download_latest(project_id: int, identity=Depends(verify_auth)):
         #
         # O-4（2026-10-16，跨模块契约调整）：与 download_export 同步扩展到
         # {'.docx', '.dotx', '.doc', '.html', '.pdf'}，media_type 按扩展名动态判定。
-        _MEDIA_TYPES = {
-            '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-            '.dotx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.template',
-            '.doc':  'application/msword',
-            '.html': 'text/html; charset=utf-8',
-            '.pdf':  'application/pdf',
-        }
         suffix = path_obj.suffix.lower()
-        if suffix not in _MEDIA_TYPES:
+        if suffix not in EXPORT_MEDIA_TYPES:
             return ('bad_type', None, None)
-        return ('ok', str(path_obj), _MEDIA_TYPES[suffix])
+        return ('ok', str(path_obj), EXPORT_MEDIA_TYPES[suffix])
 
     kind, located, media_type = await asyncio.to_thread(_locate_latest)
     if kind == 'not_found':

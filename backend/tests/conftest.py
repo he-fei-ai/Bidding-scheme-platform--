@@ -150,3 +150,41 @@ def pytest_collection_modifyitems(session, config, items):
     """收集完成后、测试执行前：清除功能开关环境变量污染。"""
     for _key in _FUNCTIONAL_SWITCH_PREFIXES:
         os.environ.pop(_key, None)
+
+
+# =====================================================================
+# 认证开关隔离加固（2026-10-28）：消除 test_prompts_hardening_2026_09_29 的
+# patch("app.services.auth_service.AUTH_ENABLED", True) 在特定收集顺序下残留。
+# ---------------------------------------------------------------------
+# 背景：test_prompts_hardening_2026_09_29::test_list_prompts_requires_auth_when_enabled
+# 用 `with patch("app.config.AUTH_ENABLED", True), patch(
+# "app.services.auth_service.AUTH_ENABLED", True)` 包裹两个 401 断言。mock.patch
+# 退出时按「进入时刻」保存的原值还原；但 auth_service.AUTH_ENABLED 是模块导入时
+# `from ..config import AUTH_ENABLED` 绑定的**独立副本**，与 config.AUTH_ENABLED
+# 不共享——在特定测试收集顺序（同一会话先加载 auth_service 再被 prompts 注册链
+# 重新触发）下，还原目标与真实读取路径错位，导致 auth_service.AUTH_ENABLED 残留
+# True，后续 test_prompts_bugfix_2026_10_09/10/14 的 /prompts 请求全部 401。
+# 修复：每用例前后快照并强制还原两模块的 AUTH_ENABLED，使依赖该全局开关的测试
+# 与收集顺序彻底解耦（与既有 _FUNCTIONAL_SWITCH_PREFIXES 清理同一思路）。
+# =====================================================================
+import pytest as _pytest  # noqa: E402
+
+
+@_pytest.fixture(autouse=True)
+def _restore_auth_enabled():
+    """每个测试用例前后还原认证开关，消除跨测试 AUTH_ENABLED 状态泄漏。
+
+    autouse + function 作用域：覆盖所有测试文件（含不显式依赖认证的用例），
+    开销可忽略（一次属性读 + 一次条件写）。
+    """
+    import app.config as _cfg
+    import app.services.auth_service as _auth_svc
+
+    saved_cfg = getattr(_cfg, "AUTH_ENABLED", False)
+    saved_svc = getattr(_auth_svc, "AUTH_ENABLED", False)
+    yield
+    # 仅在实际偏离时回写，避免每用例两条无谓赋值
+    if getattr(_cfg, "AUTH_ENABLED", False) != saved_cfg:
+        _cfg.AUTH_ENABLED = saved_cfg
+    if getattr(_auth_svc, "AUTH_ENABLED", False) != saved_svc:
+        _auth_svc.AUTH_ENABLED = saved_svc

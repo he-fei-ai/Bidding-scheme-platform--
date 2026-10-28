@@ -42,6 +42,9 @@ except ImportError:
     )
 
 from ..utils.scoring_points import strip_scoring_placeholders
+# BUG-FIX 2026-10-28（P2）：L3 自身字数达标判定改用 R1 可读口径
+# （count_readable_words），与字数校验页 word_count.py 同源，消除预检/校验页矛盾。
+from ..utils import count_readable_words
 from ..config import (
     CHART_FAIL_PLACEHOLDER,
     PROJECTS_DATA_DIR,
@@ -725,7 +728,13 @@ def check_document(
             and s.word_count > 0
         ):
             _l3_lo, _l3_hi = get_l3_own_range()
-            if not (_l3_lo <= s.word_count <= _l3_hi):
+            # BUG-FIX 2026-10-28（P2 口径不一致）：L3 达标判定原用 raw
+            # ``s.word_count``，而字数校验页（word_count.py::_section_actual_words）
+            # 用 ``count_readable_words``（R1 可读口径）。含表格/图片/URL 的 L3
+            # 正文两口径差约 40% → 同一章节在「导出预检」与「字数校验页」对
+            # 240~360 达标区间给出矛盾结论。现统一为 R1 可读口径（与 D2/F8 同源）。
+            _l3_actual = count_readable_words(content)
+            if not (_l3_lo <= _l3_actual <= _l3_hi):
                 l3_range_sections.append(
                     EmptySection(id=s.id, title=title, level=s.level),
                 )
@@ -3532,15 +3541,20 @@ _EXPORT_CACHE_INDEX_CORRUPTED = False
 # 孤儿文件只清理「最后修改超过 7 天」的，保护正在写入/刚导出的产物。
 _EXPORT_ORPHAN_MIN_AGE_SECONDS = 7 * 24 * 3600
 
-# X-1（2026-10-16，T-1 遗留）：孤儿清理白名单从仅 .docx/.doc 扩展到 .html/.pdf。
-# 背景：HTML（2026-10-12 新增）与 PDF（2026-10-04 新增）产物同样落在
-# `<数据目录>/<pid>/exports/`，但此前 `_is_safe_export_artifact` 只认 .docx/.doc、
-# `_iter_export_artifacts` 只 glob *.docx → HTML/PDF 孤儿文件永不清理，长期运行
-# 磁盘只增不减。此处统一为后缀白名单常量，两处判据保持同源。
-# X-B（2026-10-17）：白名单补齐 `.dotx`，与 routers/export.py:694 的下载白名单
-# {'.docx','.dotx','.doc','.html','.pdf'} 收敛一致；避免 PDF 转换源 .dotx 或模板类
-# 产物成为永不清理的孤儿（旧白名单缺 .dotx）。
-_EXPORT_ARTIFACT_SUFFIXES = (".docx", ".doc", ".dotx", ".html", ".pdf")
+# 单一事实来源：支持的导出格式（扩展名→MIME）。
+# 新增格式只需在此处加一行 —— routers/export.py 的下载端点与本模块的孤儿清理
+# 自动同步。此前 routers/export.py:EXPORT_MEDIA_TYPES 与本文件
+# _EXPORT_ARTIFACT_SUFFIXES 是两份平行清单（靠 test_export.py 守门防漂移），
+# 现收敛为同一对象，从根因消除不同步风险（X-1/X-B 历史补齐 .html/.pdf/.dotx
+# 即是平行清单漏改的产物）。
+EXPORT_FORMAT_MEDIA_TYPES: dict[str, str] = {
+    '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    '.dotx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.template',
+    '.doc': 'application/msword',
+    '.html': 'text/html; charset=utf-8',
+    '.pdf': 'application/pdf',
+}
+_EXPORT_ARTIFACT_SUFFIXES = tuple(EXPORT_FORMAT_MEDIA_TYPES)
 
 
 def _is_safe_export_artifact(p: Path) -> bool:

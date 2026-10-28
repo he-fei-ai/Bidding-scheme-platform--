@@ -183,13 +183,18 @@ async def overview(project_id: int, user=Depends(get_current_user)):
     readable_map, override = await asyncio.to_thread(_prepare_wc_context, project_id, sections)
     _kw = {"writing_length": writing_length, "children_ids": children_ids, "override": override}
 
-    total_words = sum((s.word_count for s in sections))
+    # BUG-FIX（2026-10-28 跨模块深度探索 F8）：total_words / per_level / per_status
+    # 此前用 raw 口径（count_words），而 on_target 判定用 R1 可读口径——同一节在
+    # 统计卡片（raw）与明细表/达标判定（readable）会互相矛盾（含表格/图片/URL 的
+    # 正文两口径差约 40%）。D2 修复（2026-10-20）已让「面板/校验/SSE」共用可读
+    # 口径，此处补齐统计口径，消除展示矛盾。
+    total_words = sum((readable_map.get(s.id, s.word_count or 0) for s in sections))
     total_target = sum((_resolve_target_for_section(s, writing_length, children_ids=children_ids, override=override) or 0 for s in sections))
-    completed = [s for s in sections if s.word_count > 0]
+    completed = [s for s in sections if (readable_map.get(s.id, 0) or 0) > 0]
     on_target = [s for s in sections if _is_within_tolerance(s, actual=readable_map.get(s.id), **_kw)]
     below_target = [s for s in sections if _is_below_target(s, actual=readable_map.get(s.id), **_kw)]
     exceeded_target = [s for s in sections if _is_above_target(s, actual=readable_map.get(s.id), **_kw)]
-    empty = [s for s in sections if s.word_count == 0]
+    empty = [s for s in sections if (readable_map.get(s.id, 0) or 0) == 0]
 
     level3_sections = [s for s in sections if (s.level or 3) == 3]
     level3_on_target = [s for s in level3_sections if _is_within_tolerance(s, actual=readable_map.get(s.id), **_kw)]
@@ -197,7 +202,7 @@ async def overview(project_id: int, user=Depends(get_current_user)):
     level3_exceeded = [s for s in level3_sections if _is_above_target(s, actual=readable_map.get(s.id), **_kw)]
     per_tier_stats = _compute_tier_stats(sections, writing_length, children_ids, override, readable_map)
 
-    return {'status': 'ok', 'project_id': project_id, 'total_sections': len(sections), 'total_words': total_words, 'total_target': total_target, 'target_coverage': round(total_words / total_target * 100, 1) if total_target else 0, 'completed_sections': len(completed), 'on_target_sections': len(on_target), 'below_target_sections': len(below_target), 'exceeded_target_sections': len(exceeded_target), 'empty_sections': len(empty), 'stats': {'per_level': _group_by_level(sections), 'per_status': _group_by_status(sections), 'level3_stats': {'count': len(level3_sections), 'on_target': len(level3_on_target), 'below_target': len(level3_below), 'exceeded_target': len(level3_exceeded), 'rate': round(len(level3_on_target) / len(level3_sections) * 100, 1) if level3_sections else 0}, 'per_tier_stats': per_tier_stats}}
+    return {'status': 'ok', 'project_id': project_id, 'total_sections': len(sections), 'total_words': total_words, 'total_target': total_target, 'target_coverage': round(total_words / total_target * 100, 1) if total_target else 0, 'completed_sections': len(completed), 'on_target_sections': len(on_target), 'below_target_sections': len(below_target), 'exceeded_target_sections': len(exceeded_target), 'empty_sections': len(empty), 'stats': {'per_level': _group_by_level(sections, readable_map), 'per_status': _group_by_status(sections, readable_map), 'level3_stats': {'count': len(level3_sections), 'on_target': len(level3_on_target), 'below_target': len(level3_below), 'exceeded_target': len(level3_exceeded), 'rate': round(len(level3_on_target) / len(level3_sections) * 100, 1) if level3_sections else 0}, 'per_tier_stats': per_tier_stats}}
 
 @router.get('/sections/{project_id}')
 async def section_stats(project_id: int, user=Depends(get_current_user)):
@@ -423,20 +428,30 @@ def _section_sort_key(item: dict):
         return (1, level, 0)
     return (2, level, 0)
 
-def _group_by_level(sections) -> dict[str, int]:
-    """按章节层级分组统计字数"""
+def _group_by_level(sections, readable_map: dict | None = None) -> dict[str, int]:
+    """按章节层级分组统计字数。
+
+    BUG-FIX（2026-10-28 跨模块深度探索 F8）：默认 raw 口径此前与 on_target 的
+    readable 判定矛盾（含表格/图片/URL 的正文两口径差约 40%）。传入 readable_map
+    时改用 R1 可读口径，与校验页/SSE 逐值相等，消除统计卡片展示矛盾。
+    """
     groups: dict[str, int] = {}
     for s in sections:
         key = f'level_{s.level}'
-        groups[key] = groups.get(key, 0) + s.word_count
+        val = readable_map.get(s.id, s.word_count) if readable_map is not None else s.word_count
+        groups[key] = groups.get(key, 0) + (val or 0)
     return groups
 
-def _group_by_status(sections) -> dict[str, int]:
-    """按生成状态分组统计字数"""
+def _group_by_status(sections, readable_map: dict | None = None) -> dict[str, int]:
+    """按生成状态分组统计字数。
+
+    BUG-FIX（2026-10-28 F8）：同上，readable_map 可用时改用 R1 可读口径。
+    """
     groups: dict[str, int] = {}
     for s in sections:
         key = s.status or 'unknown'
-        groups[key] = groups.get(key, 0) + s.word_count
+        val = readable_map.get(s.id, s.word_count) if readable_map is not None else s.word_count
+        groups[key] = groups.get(key, 0) + (val or 0)
     return groups
 
 def _human_words(n: int) -> str:
@@ -489,6 +504,17 @@ async def word_count_audit(project_id: int, user=Depends(get_current_user)):
         logger.error('字数审计加载失败: %s', e, exc_info=True)
         raise HTTPException(status_code=500, detail=f'加载章节失败: {str(e)[:200]}') from e
 
+    # BUG-FIX（2026-10-28 跨模块深度探索 F3）：audit 端点此前与 overview/sections
+    # 口径不一致——它调用 `_resolve_target_for_section(s, writing_length)` 与
+    # `_target_bounds(s)` 时**不传** `children_ids` 与 `override`（D1/D3 修复 2026-10-20
+    # 之后 overview/sections 已传），导致「含下级的 L3」仍按 L3 自身 300±20% 判定、
+    # 「强控项目」仍按档位口径判定——同一章节在 audit 与校验页得到矛盾结论。
+    # 修复：与 overview 端点同源预取 `children_ids` + `override`（强控覆盖表），
+    # 一并透传，使审核/预检与校验页结论一致。
+    children_ids = _build_children_ids(sections)
+    _readable_map, _override = await asyncio.to_thread(_prepare_wc_context, project_id, sections)
+    _wc_kw = {"writing_length": writing_length, "children_ids": children_ids, "override": _override}
+
     items = []
     total_target = 0
     total_actual = 0
@@ -503,7 +529,7 @@ async def word_count_audit(project_id: int, user=Depends(get_current_user)):
         if level < 3:
             # L1/L2 不参与字数控制
             continue
-        target = _resolve_target_for_section(s, writing_length)
+        target = _resolve_target_for_section(s, **_wc_kw)
         if not target:
             continue
         actual = s.word_count or 0
@@ -514,7 +540,7 @@ async def word_count_audit(project_id: int, user=Depends(get_current_user)):
         readable = await asyncio.to_thread(count_readable_words, s.content or '')
         deviation = readable - target
         deviation_rate = round(deviation / target, 4) if target else 0
-        lo, hi = _target_bounds(s)
+        lo, hi = _target_bounds(s, **_wc_kw)
         if readable == 0:
             category = 'empty'
         elif lo <= readable <= hi:

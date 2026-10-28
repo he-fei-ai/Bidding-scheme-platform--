@@ -187,7 +187,7 @@ export default function ExportConfigPage() {
   const handleCheck = async () => {
     setChecking(true);
     try {
-      const result = await checkDocument(projectId, strictMode);
+      const result = await checkDocument(projectId, strictMode, blockOnHighConflicts);
       setCheckResult(result);
       if (result.passed) {
         message.success("文档完整性检查通过");
@@ -221,7 +221,12 @@ export default function ExportConfigPage() {
     bidder_name: bidderName,
     // BUG-FIX-53 修复：原未传递这些字段，用户无法配置图表参数和严格模式
     image_max_width_cm: 18.0,
-    image_dpi: 300,
+    // BUG-FIX 2026-10-28（P2）：原硬编码 image_dpi: 300 覆盖后端 F9 修复
+    // （ExportConfig.image_dpi 默认值 = config.EXPORT_IMAGE_DPI）。运维设
+    // EXPORT_IMAGE_DPI 环境变量经前端主路径导出恒被中和为 300。
+    // 现省略该字段（可选），由后端 default_factory 懒读 config 默认值，
+    // 不设环境变量时行为与历史一致（300），设了即生效（向后兼容）。
+    // image_dpi: 300,
     gantt_max_columns: 18,
     strict_mode: strictMode,
     // ENHANCE（本轮跨模块深度探索·审核×导出打通）：一致性闸门透传后端
@@ -300,7 +305,7 @@ export default function ExportConfigPage() {
         }
         // SSE 仅发送摘要，需要单独获取完整检查结果
         try {
-          const fullCheck = await checkDocument(projectId, strictMode);
+          const fullCheck = await checkDocument(projectId, strictMode, blockOnHighConflicts);
           setCheckResult(fullCheck);
         } catch {
           // 摘要数据已通过 SSE 返回，不影响主流程

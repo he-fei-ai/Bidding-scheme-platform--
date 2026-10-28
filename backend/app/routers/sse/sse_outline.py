@@ -48,8 +48,13 @@ def _read_scheme_extraction_for_outline(project_id: int) -> "tuple[str, list]":
     解析口径统一走 :func:`parse_scheme_extraction_raw`（与 ``GET /ai/scheme-outline-template``
     预览侧共用同一真相，避免「预览模板」与「实际生成模板」漂移）。
     """
+    # BUG-FIX（2026-10-28 跨模块深度探索 F5）：此函数是纯读，此前用
+    # `get_db()`（非 readonly）——抢全局写锁做纯读，且调用方 `_run_outline_task`
+    # 是 async 协程，直接同步调用会阻塞事件循环（与 sections.py 2026-09-16
+    # B-W4 同类缺陷，生成高峰期整个 loop 被冻结）。改用 readonly 连接 + 调用方
+    # `asyncio.to_thread` 派发工作线程。
     try:
-        with get_db() as conn:
+        with get_db(readonly=True) as conn:
             row = conn.execute(
                 "SELECT scheme_extraction_json FROM analysis WHERE project_id = ?",
                 (project_id,),
@@ -870,7 +875,12 @@ async def generate_outline_sse_impl(
                     # 自动选用对应目录模板（仅追加类型特有重点章节，不影响通用骨架；
                     # 未识别/读取失败则保持原行为 —— 回退 REFERENCE_TEMPLATE_V51）。
                     if not (reference_outline or "").strip():
-                        _st, _dp = _read_scheme_extraction_for_outline(project_id)
+                        # BUG-FIX（2026-10-28 F5）：同步 DB 读派发线程池，避免
+                        # 阻塞事件循环（_read_scheme_extraction_for_outline 现走
+                        # readonly 连接）。
+                        _st, _dp = await asyncio.to_thread(
+                            _read_scheme_extraction_for_outline, project_id
+                        )
                         if _st or _dp:
                             try:
                                 _ref = recommend_outline_reference(_st, _dp)

@@ -262,3 +262,46 @@ def test_claim_chart_title_dedupes_within_chapter():
     assert _claim_chart_title("7", "环保与速干材料交叉施工协调") is True
     assert _claim_chart_title("7", "环保与速干材料交叉施工协调") is True
 
+
+def test_export_media_types_constant_consistency():
+    """TECH-DEBT 2026-10-27（单一事实来源）：download_export / download_latest 曾各自
+    内联同一份 _MEDIA_TYPES dict，后收敛为 routers/export.py:EXPORT_MEDIA_TYPES，
+    现进一步与 services/export.py:_EXPORT_ARTIFACT_SUFFIXES 合并为同一对象
+    EXPORT_FORMAT_MEDIA_TYPES。本测试验证：
+
+      1. routers/export.EXPORT_MEDIA_TYPES 与 services/export.EXPORT_FORMAT_MEDIA_TYPES
+         是**同一对象**（identity）—— 新增格式只改 services 一处，两处自动同步，
+         从根因消除平行清单漂移风险；
+      2. _EXPORT_ARTIFACT_SUFFIXES 由 EXPORT_FORMAT_MEDIA_TYPES 派生（键集合一致）；
+      3. 两个下载端点引用模块常量，不残留函数内局部字典赋值。
+    """
+    import inspect as _inspect
+
+    from app.routers import export as export_router
+    from app.services import export as export_service
+
+    # 1) 单一事实来源：router 的常量 IS service 的常量（同一 dict 对象）
+    media = export_router.EXPORT_MEDIA_TYPES
+    canonical = export_service.EXPORT_FORMAT_MEDIA_TYPES
+    assert media is canonical, (
+        "routers/export.EXPORT_MEDIA_TYPES 应直接引用 services/export."
+        "EXPORT_FORMAT_MEDIA_TYPES（同一对象），而非另写一份 dict"
+    )
+    assert isinstance(media, dict) and len(media) >= 4
+    assert media[".docx"].startswith("application/")
+    assert media[".pdf"].startswith("application/")
+
+    # 2) 孤儿清理白名单由同一 dict 派生
+    suffixes = export_service._EXPORT_ARTIFACT_SUFFIXES
+    assert set(suffixes) == set(media.keys()), (
+        f"_EXPORT_ARTIFACT_SUFFIXES {sorted(suffixes)} 与 "
+        f"EXPORT_FORMAT_MEDIA_TYPES 键 {sorted(media)} 不一致"
+    )
+
+    # 3) 下载端点引用模块常量，不残留函数内局部字典
+    src = _inspect.getsource(export_router.download_export) + _inspect.getsource(
+        export_router.download_latest
+    )
+    assert "EXPORT_MEDIA_TYPES" in src, "下载端点应引用 EXPORT_MEDIA_TYPES"
+    assert "_MEDIA_TYPES = {" not in src, "下载端点不得残留内联 _MEDIA_TYPES 局部字典"
+

@@ -458,6 +458,14 @@ async def _fetch_project_data_async(project_id: int) -> dict | None:
 
         logger.info("使用 Redis 缓存获取章节数据，项目 %d", project_id)
 
+        # BUG-FIX 2026-10-28（P2 数据链断点）：缓存可能由修复前 SQL（未选
+        # word_count_tier 列）填充，命中行缺该 key → 消费端恒 None → 单节档位
+        # 覆盖在生成侧被静默丢弃。此处对缓存行做列补齐防御（缺列补 None，
+        # 与 SELECT 列口径一致），使旧缓存不丢字段、新缓存直接命中。
+        for _r in all_rows:
+            if "word_count_tier" not in _r:
+                _r["word_count_tier"] = None
+
 
 
         # 缓存命中时仍需从数据库查询元数据
@@ -539,7 +547,7 @@ async def _fetch_project_data_async(project_id: int) -> dict | None:
 
                 all_rows = conn.execute(
 
-                    "SELECT id, parent_id, title, level, sort_order, section_type, scoring_point_id, status, content, target_words, locked, content_mode FROM sections WHERE project_id = ? ORDER BY sort_order, id",
+                    "SELECT id, parent_id, title, level, sort_order, section_type, scoring_point_id, status, content, target_words, locked, content_mode, word_count_tier FROM sections WHERE project_id = ? ORDER BY sort_order, id",
 
                     (project_id,),
 

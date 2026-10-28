@@ -480,7 +480,12 @@ class TestCleanupPlaceholderLevelScope:
         assert tree[0]["children"][0]["children"][0]["title"] != "专项6"
 
     def test_prefix_placeholder_variant_is_cleaned(self):
-        """「分阶段推进专项13」这类带前缀变体旧正则完全漏掉。"""
+        """「分阶段推进专项13」这类带前缀变体旧正则完全漏掉。
+
+        2026-10-27（L2 清洗升级）：L2 标题「二、分阶段推进」带编号前缀（DB title
+        命名空间不携带编号），现在也会被清洗（剥前缀保主体）。因此清洗数从 2
+        变为 3（L2×1 + L3×2），且 L2 前缀被正确剥掉。
+        """
         tree = [
             {"title": "一、总体施工部署", "children": [
                 {"title": "二、分阶段推进", "children": [
@@ -490,7 +495,10 @@ class TestCleanupPlaceholderLevelScope:
             ]}
         ]
         fixed = _cleanup_placeholder_titles(tree)
-        assert fixed == 2, f"应清洗 2 个，实际 {fixed}"
+        # L2「二、分阶段推进」剥前缀得「分阶段推进」+ L3 两个占位 → 共 3 处
+        assert fixed == 3, f"应清洗 3 个（L2×1 + L3×2），实际 {fixed}"
+        # L2 前缀被剥掉，保留合法主体「分阶段推进」
+        assert tree[0]["children"][0]["title"] == "分阶段推进"
         titles = [c["title"] for c in tree[0]["children"][0]["children"]]
         assert len(set(titles)) == 2, f"清洗后仍重复: {titles}"
 

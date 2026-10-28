@@ -4,6 +4,7 @@ import { BrowserRouter } from "react-router-dom";
 import { ConfigProvider } from "antd";
 import zhCN from "antd/locale/zh_CN";
 import App from "./App";
+import { syncWordCountTiers } from "./utils";
 import { brandTheme } from "./styles/theme";
 import "./styles/global.css";
 
@@ -30,6 +31,10 @@ window.addEventListener("error", (event) => {
 // 禁用 StrictMode：开发模式下 React 18 会对组件执行 mount → unmount → mount 三连，
 // 导致 SSE 的 AbortController 被 cleanup 提前触发，浏览器报 net::ERR_ABORTED。
 // 生产环境 StrictMode 仅一次渲染，无此问题。
+// G7（2026-10-28 遗留加固）：启动即从后端 /word-count/tiers 同步字数档位
+// （DB 优先，运维可改）。fail-soft：失败保留静态默认，不阻塞页面渲染。
+syncWordCountTiers().catch(() => undefined);
+
 ReactDOM.createRoot(document.getElementById("root")!).render(
   // <React.StrictMode>
     <ConfigProvider locale={zhCN} theme={brandTheme}>

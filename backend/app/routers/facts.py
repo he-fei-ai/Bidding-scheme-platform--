@@ -16,7 +16,10 @@ from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException
 
+from pathlib import Path
+
 from ..db import get_db
+from ..config import PROJECTS_DATA_DIR
 from ..models import FactsGenerateRequest, GlobalFactList
 from ..security.auth import get_current_user
 from ..services.facts_service import (
@@ -703,7 +706,9 @@ async def generate_facts(project_id: int, body: FactsGenerateRequest | None = No
     outline_block = ""
     if outline_input_enabled():
         def _read_outline_titles():
-            with get_db() as conn:
+            # BUG-FIX 2026-10-28（P3 性能）：纯 SELECT 用只读连接，不抢全局写锁
+            # （批量上传/保存高峰期不再与 save_upload 排队）。
+            with get_db(readonly=True) as conn:
                 return conn.execute(
                     "SELECT title, level FROM sections WHERE project_id = ? "
                     "ORDER BY sort_order, id",
@@ -764,8 +769,16 @@ async def generate_facts(project_id: int, body: FactsGenerateRequest | None = No
 请提取所有可确定的事实变量，输出 JSON 对象（dict）。"""
     # 尾部补充来源（Step02/摘要/评分点+输出指令）单独抽出：分段提取时
     # 每个分段复用同一段尾部，与单段路径的提示词尾部完全一致。
-    _tail_start = extract_user.index("\n\n以下是 Step02") if step02_parts else extract_user.index(
-        "\n\n请提取所有可确定的事实变量")
+    # BUG-FIX（2026-10-28 跨模块深度探索 F10）：`str.index` 在标记未命中时抛
+    # ValueError → 直接 500。改用 `find` 带回退（标记恒在用户提示词末尾，未命中
+    # 属异常态，回退到「取整个用户提示词」仍可安全降级，绝不中断提取）。
+    _tail_marker = "\n\n以下是 Step02" if step02_parts else "\n\n请提取所有可确定的事实变量"
+    _tail_start = extract_user.find(_tail_marker)
+    if _tail_start < 0:
+        _tail_start = extract_user.find("\n\n请提取所有可确定的事实变量")
+    if _tail_start < 0:
+        logger.warning("[AI事实] 提示词尾部标记未找到，回退整串作为尾部（提取继续）")
+        _tail_start = 0
     extract_tail = extract_user[_tail_start:]
 
     # BUG-FIX 2026-09-14（中·可信度）：原先无论 AI 成功还是异常降级为正则启发式，
@@ -960,7 +973,8 @@ async def generate_facts(project_id: int, body: FactsGenerateRequest | None = No
             from ..services.files import extract_text_from_path as _extract_tpl_text
 
             def _read_ready_templates():
-                with get_db() as conn:
+                # BUG-FIX 2026-10-28（P3 性能）：纯 SELECT 用只读连接，不抢全局写锁。
+                with get_db(readonly=True) as conn:
                     return conn.execute(
                         "SELECT id, filename, file_path FROM project_templates "
                         "WHERE project_id = ? AND status = 'ready' AND file_path != '' "
@@ -973,9 +987,30 @@ async def generate_facts(project_id: int, body: FactsGenerateRequest | None = No
             def _render_template_material(rows):
                 _lines: list[str] = []
                 _budget = 6000
+                _tpl_root = PROJECTS_DATA_DIR / str(project_id) / "templates"
                 for _i, _tr in enumerate(rows or [], 1):
                     _fp = str(_tr["file_path"] or "").strip()
                     if not _fp:
+                        continue
+                    # G1（2026-10-28 遗留加固）：模板补丁读取的 file_path 虽由
+                    # template_expansion 写入（受控位置），但 DB 可能被手工改写或
+                    # 历史数据可能存任意路径（用户绝对路径/UNC）。读取前做
+                    # resolve + 包含校验，必须落在本项目 templates 目录内，
+                    # 否则跳过并告警（fail-closed），杜绝项目间越权/任意文件读取。
+                    try:
+                        _fp_resolved = Path(_fp).resolve()
+                        _root_resolved = _tpl_root.resolve()
+                        if not _fp_resolved.is_relative_to(_root_resolved):
+                            logger.warning(
+                                "[AI事实] 模板 %s 路径不在本项目模板目录 %s 内，跳过（SSRF 路径守卫）",
+                                _fp, _root_resolved,
+                            )
+                            continue
+                    except Exception as _pe:
+                        logger.warning(
+                            "[AI事实] 模板 %s 路径解析失败，跳过（SSRF 路径守卫）: %s",
+                            _fp, _pe,
+                        )
                         continue
                     try:
                         _text = _extract_tpl_text(_fp)

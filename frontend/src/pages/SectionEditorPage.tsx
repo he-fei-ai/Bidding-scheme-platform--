@@ -1150,6 +1150,22 @@ if (d.status === "failed") {
             key: "chartDraining",
             duration: 2,
           });
+        } else if (d.status === "illustration_phase") {
+          // BUG-FIX 2026-10-28（P3 前端无消费）：配图阶段（CONTENT_ILLUSTRATION_PHASE_ENABLED
+          // 默认 true 且编排开启时）可能耗时较长，此前用户看不到任何进度，界面"卡住"黑盒。
+          // 补消费：展示候选图总数提示（复用 chart_draining 的常驻 loading 模式）。
+          message.loading({
+            content: d.message || `配图阶段开始（${d.total ?? 0} 张候选图）...`,
+            key: "illustrationPhase",
+            duration: 0,
+          });
+        } else if (d.status === "illustration_phase_done") {
+          // BUG-FIX 2026-10-28（P3）：配图完成，销毁常驻 loading 并提示结果。
+          message.destroy("illustrationPhase");
+          message.success(
+            `配图完成：成功 ${d.inserted ?? 0} 张，跳过 ${d.skipped ?? 0} 张，失败 ${d.failed ?? 0} 张`,
+            4,
+          );
         } else if (d.status === "slow_warning") {
           // ENHANCE 2026-09-16：软告警（超过估算 1.5x）只提醒不熔断，让用户知道"慢但没死"。
           message.warning(d.message || "AI 响应较慢，生成仍在继续", 4);
@@ -1162,7 +1178,11 @@ if (d.status === "failed") {
           flushTreeUpdates();
           setIsGenerating(false);
           globalCompletedReceivedRef.current = true;
-          setProgressSuccess(d.success);
+          // 审计8修复（FE-BUG-1）：与同分支 L1191/L1192/L1193 的 stopped 处理
+          // 口径对齐——`d.success` 缺省时（后端异常/未来字段改名）`progressSuccess`
+          // 变 undefined，derivedProgress 与 ProgressPanel 的 done 产生 NaN% 进度。
+          // 显式 `|| 0` 消除 NaN 通道（正常后端事件恒带 success，此为防御性缺口）。
+          setProgressSuccess(d.success || 0);
           setProgressFailed(d.failed || 0);
           setProgressCancelled(d.cancelled || 0);
           if (d.stopped) {

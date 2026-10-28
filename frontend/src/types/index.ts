@@ -98,7 +98,12 @@ export interface AnalysisResult {
 }
 
 export interface UploadResult {
-  id: number;
+  // BUG-FIX 2026-10-28（P3 类型契约）：duplicate 分支（files.py 去重命中）返回
+  // {status, message, filename, file_id, duplicate_of}，不含 id → id 必填是类型
+  // 谎言（读 result.id 在 duplicate 时得到 undefined）。改可选；补 duplicate_of。
+  id?: number;
+  file_id?: number;
+  duplicate_of?: number;
   filename: string;
   file_type: string;
   file_role: string;
@@ -326,6 +331,10 @@ export interface DocumentCheckResult {
   // 内容质量规则（《文档质量分析报告》修复 15~24，2026-10-10）：
   // 结构化问题清单，同类问题已聚合成 warnings 中的「[内容质量] …」条目
   quality_issues?: QualityIssue[];
+  // 一致性校核×导出闸门（2026-10-26 跨模块打通）：后端 check_document 在
+  // block_on_high_conflicts=True 时统计本项目未解决的高严重度一致性冲突并
+  // 追加 error；前端类型此前未同步该字段，消费者无法类型安全读取。
+  high_conflicts_open?: number;
 }
 
 /** 内容质量规则 Issue（后端 quality_rules / chart_validators CMP-07 同形） */

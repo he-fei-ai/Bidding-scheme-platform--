@@ -782,13 +782,27 @@ class TestNoShadowSanitizePath:
         BUG-FIX 2026-10-13（G2）：判定升级为 `_is_dirty_l3_title_deep`
         （额外覆盖「（其N）」剥离后仍为泛化词的残渣形态），level>=3 的
         作用域约束保持不变。
+
+        2026-10-27（L2 清洗升级）：L2 脏标题也纳入清洗，但**必须用**
+        `_is_dirty_l2_title_deep`（放过泛化词表判定，只查结构性脏），
+        而非 `_is_dirty_l3_title_deep`（会把合法 L2 章名「总体实施策划」
+        「其他」「说明」误判为脏）。源码审计点改为分层判定结构存在：
+          - L2: `_level_dirty = _is_dirty_l2_title_deep if level == 2`
+          - L3+: 回退 `_is_dirty_l3_title_deep`
+          - 入口守卫 `level >= 2`（此前是 `level >= 3`）。
         """
         src = (Path(__file__).resolve().parents[1] / "app" / "services" / "ai"
                / "outline_common.py").read_text(encoding="utf-8")
         i = src.index("def _cleanup_placeholder_titles(")
-        seg = src[i:i + 2000]
-        assert "level >= 3 and _is_dirty_l3_title_deep(_title)" in seg, (
-            "占位清洗必须限定 level>=3，否则会误伤 28 章模板的合法 L1/L2 标题"
+        seg = src[i:i + 2500]
+        # 分层判定入口守卫：level>=2（不是旧的 level>=3）
+        assert "level >= 2" in seg, (
+            "占位清洗入口守卫现在覆盖 L2+（结构性脏），不得回退到 level>=3"
+        )
+        # L2 专用判定函数存在
+        assert "_is_dirty_l2_title_deep" in seg, (
+            "L2 清洗必须用 _is_dirty_l2_title_deep（放过泛化词表判定），"
+            "不得直接用 _is_dirty_l3_title_deep 会误伤合法 L2 章名"
         )
 
 

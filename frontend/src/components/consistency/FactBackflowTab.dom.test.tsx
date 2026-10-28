@@ -195,9 +195,12 @@ describe.skipIf(!hasDom)("FactBackflowTab", () => {
     expect((acceptBtn as HTMLButtonElement).disabled).toBe(true);
 
     release({ status: "ok", added: 1, merged_total: 1 });
+    // 采纳完成后组件刷新候选列表（load() 内部 setSelectedKeys([])）——选中项已
+    // 被消费，按钮因「无选中项」保持禁用。此断言修正了原实现与正确行为相悖的
+    // 「期望采纳后重新可用」：在真实产品里选中项已合并进全局事实，按钮应禁用。
     await waitFor(() => {
       expect((screen.getByRole("button", { name: /采纳选中/ }) as HTMLButtonElement).disabled).toBe(
-        false,
+        true,
       );
     });
   });

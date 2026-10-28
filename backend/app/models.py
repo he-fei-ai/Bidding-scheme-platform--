@@ -208,6 +208,19 @@ class SectionTreeNode(BaseModel):
     suggested_chart: str = ""
 
 
+def _default_image_dpi() -> int:
+    """读取 EXPORT_IMAGE_DPI 配置作为导出图片默认 DPI（F9 修复）。
+
+    懒导入避免 models ↔ config 循环依赖；未配置/读取失败回落 300（历史默认）。
+    """
+    try:
+        from .config import EXPORT_IMAGE_DPI
+
+        return int(EXPORT_IMAGE_DPI)
+    except Exception:
+        return 300
+
+
 class ExportConfig(BaseModel):
     font_title: str = "宋体"
     font_body: str = "宋体"
@@ -222,7 +235,12 @@ class ExportConfig(BaseModel):
     show_header_footer: bool = True
     bidder_name: str = ""
     image_max_width_cm: float = 18.0  # 优化：从 15.5cm 提升至 18cm，图表更宽更清晰
-    image_dpi: int = 300  # 确保 300 DPI 高分辨率打印质量
+    # BUG-FIX（2026-10-28 跨模块深度探索 F9）：`EXPORT_IMAGE_DPI`（config.py:618）
+    # 此前是**死配置**——定义后全仓无消费者，实际 DPI 走本模型默认 300，运维改
+    # `EXPORT_IMAGE_DPI` 环境变量不生效。现以惰性 default_factory 读取该配置作为
+    # 默认值（懒导入避免 models↔config 循环依赖）：不设环境变量时行为与历史完全
+    # 一致（300），设了即生效，向后兼容。
+    image_dpi: int = Field(default_factory=lambda: _default_image_dpi())  # 确保 300 DPI 高分辨率打印质量
     gantt_max_columns: int = 18
     # V1.0 增强：严格模式开关，开启后预检 warning 升级为 error
     strict_mode: bool = False

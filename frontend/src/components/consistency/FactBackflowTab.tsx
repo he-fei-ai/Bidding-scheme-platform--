@@ -219,7 +219,7 @@ export default function FactBackflowTab({ projectId }: FactBackflowTabProps) {
             <Button
               type="primary"
               icon={<CheckOutlined />}
-              disabled={selectedKeys.length === 0}
+              disabled={selectedKeys.length === 0 || accepting}
               loading={accepting}
               onClick={handleAccept}
             >

@@ -1575,7 +1575,9 @@ export function generateContentSSEUrl(
     params.set("use_word_adjust", String(useWordAdjust));
   }
   // ENHANCE 2026-10-18（第二轮）：顺序生成模式透传。不传 = 不下发该参数 →
-  // 走后端 Query 默认 "parallel"（与改动前行为逐字一致）。
+  // BUG-FIX 2026-10-28（P3 注释失真）：走后端 Query 默认已从 "parallel" 切为
+  // "batch"（config.py CONTENT_GENERATION_MODE 默认 batch，2026-10-18 第二轮起）。
+  // 修正注释避免误导（行为不变，仅描述与实现对齐）。
   if (generationMode && ["parallel", "batch", "serial"].includes(generationMode)) {
     params.set("generation_mode", generationMode);
   }
@@ -2157,10 +2159,15 @@ export async function generateGantt(projectId: number, sectionId: number): Promi
 // 图表全部自动生成（正文内联围栏代码块），已移除人工配图 generate-illustration 前端 API。
 
 // Export
-export async function checkDocument(projectId: number, strict = false): Promise<DocumentCheckResult> {
-  // BUG-FIX 2026-09-18（P2）：后端 /export/check 支持 strict 参数控制严格模式，
-  // 此前前端永远不传，严格模式下的空章节/评分点缺口检查完全不可达。
-  const res = await http.get(`/projects/${projectId}/export/check`, { params: { strict } });
+export async function checkDocument(projectId: number, strict = false, blockOnHighConflicts = false): Promise<DocumentCheckResult> {
+  // BUG-FIX 2026-09-18（P2）：原 /export/check 只支持 strict 参数，未启用严格模式；
+  // 当前前端可传严格模式下的空章节/评分值等缺口判断全量可达。
+  // BUG-FIX 2026-10-28（P2 前后端不同步）：补 block_on_high_conflicts 透传 ——
+  // 用户勾选「一致性闸门」后，预检与导出 DOCX 闸门口径一致，不再出现
+  // 「预检通过但导出被 400 拦」的矛盾。
+  const res = await http.get(`/projects/${projectId}/export/check`, {
+    params: { strict, block_on_high_conflicts: blockOnHighConflicts },
+  });
   return res.data;
 }
 

@@ -92,13 +92,21 @@ def _existing_fact_markers(project_id: int) -> set:
     # （与 `consistency_auditor._collect_fact_instances` 2026-10-08 的修复同源）。
     # 本函数与 `propose_facts` 都在事实回流 Tab 的「重新扫描」热路径上，用写连接
     # 做纯读会在正文生成高峰期与写库请求争锁，把前端轮询拖慢。
+    # BUG-FIX（2026-10-28 跨模块深度探索 F1）：sqlite3.Row 是惰性解引用，
+    # `with get_db()` 退出时 commit() 会 finalize 共享预处理语句；此前
+    # `row["global_facts_json"]` 在 with 块**之外**才解引用，跨块读取会读到
+    # 残留/串列内存。这是本仓已在 `_collect_fact_instances`（2026-10-08）、
+    # `consistency_repair._load_context`、`build_agent_workspace` 等多处修复的
+    # 同类缺陷的漏网实例，位于事实回流「重新扫描」热路径上。
+    # 修复：在 with 块内物化 `dict(row)`，彻底消除跨块解引用。
     with get_db(readonly=True) as conn:
         row = conn.execute(
             "SELECT global_facts_json FROM analysis WHERE project_id = ?", (project_id,)
         ).fetchone()
         if row is None:
             return markers
-    for item in parse_stored_items(row["global_facts_json"]):
+        facts_json = row["global_facts_json"]
+    for item in parse_stored_items(facts_json):
         label = str(item.get("label") or item.get("key") or "").strip()
         if label:
             markers.add(label)

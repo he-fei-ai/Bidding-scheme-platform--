@@ -829,11 +829,13 @@ class TestSSEExportLockComplete:
 
         source = inspect.getsource(export_docx_stream)
         lock_at = source.index("_acquire_export_lock(project_id)")
+        # BUG-FIX 2026-10-28（G6）：提交目标已从默认线程池改为专用
+        # `_EXPORT_BUILD_EXECUTOR`（不占用 asyncio.to_thread 的默认池）。
         build_at = source.index(
-            "asyncio.get_running_loop().run_in_executor(None, _run_build)"
+            "asyncio.get_running_loop().run_in_executor(_EXPORT_BUILD_EXECUTOR, _run_build)"
         )
         assert lock_at < build_at, "抢锁必须早于构建启动"
-        assert source.count("run_in_executor(None, _run_build)") == 1, (
+        assert source.count("run_in_executor(_EXPORT_BUILD_EXECUTOR, _run_build)") == 1, (
             "构建只能启动一次"
         )
 

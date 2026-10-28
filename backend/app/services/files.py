@@ -229,6 +229,54 @@ def _get_file_hash(file_path: str) -> str:
         return ""
 
 
+def _find_duplicate_upload(project_id: int, content: bytes) -> dict | None:
+    """按内容 SHA-256 查找本项目已存在的重复上传（G8 去重）。
+
+    Args:
+        project_id: 项目 ID
+        content: 待上传文件字节
+
+    Returns:
+        命中则返回 {id, filename, path, status}（dict，sqlite3.Row 物化），
+        未命中/异常返回 None。仅比较同项目且同文件大小的历史文件（先按
+        os.stat 大小过滤再做全量哈希，避免每次上传读遍所有旧文件）。
+    """
+    if not content:
+        return None
+    try:
+        digest = hashlib.sha256(content).hexdigest()
+        target_size = len(content)
+        with get_db(readonly=True) as conn:
+            rows = conn.execute(
+                "SELECT id, filename, path, status FROM uploaded_files "
+                "WHERE project_id = ? ORDER BY id",
+                (project_id,),
+            ).fetchall()
+        for row in rows:
+            fp = str(row["path"] or "")
+            if not fp:
+                continue
+            try:
+                st = os.stat(fp)
+                if st.st_size != target_size:
+                    continue
+                with open(fp, "rb") as fh:
+                    if hashlib.sha256(fh.read()).hexdigest() != digest:
+                        continue
+            except (OSError, FileNotFoundError):
+                continue
+            # sqlite3.Row 惰性解引用：在 with 块外取值需物化
+            return {
+                "id": row["id"],
+                "filename": row["filename"],
+                "path": fp,
+                "status": row["status"],
+            }
+        return None
+    except Exception:
+        return None
+
+
 def _clear_parse_cache(file_path: str = "") -> None:
     """清除文件解析缓存"""
     with _parse_cache_lock:
@@ -628,6 +676,46 @@ def save_upload(project_id: int, filename: str, content: bytes, file_role: str =
     # 锁内原子完成，否则并发同名上传会选中同一目标路径互相覆盖（见 _get_upload_write_lock）。
     # 锁只覆盖命名+落盘，文本提取（可能耗时数秒~OCR）在锁外执行，不阻塞同项目其它上传。
     with _get_upload_write_lock(project_id):
+        # G8（2026-10-28 后续建议#4·文件去重）：按内容 SHA-256 查重，命中则
+        # 不落盘/不建任务/不插行，直接返回 duplicate（前端据此提示「文件已存在」）。
+        # 仅同项目同大小文件参与比较（_find_duplicate_upload 内按 os.stat 过滤），
+        # 正常路径零额外行为。查重本身异常降级为「不去重」，不影响上传。
+        _dup = _find_duplicate_upload(project_id, content)
+        if _dup:
+            # BUG-FIX 2026-10-28（P2 重传自愈）：若历史命中文件解析失败
+            # （status='failed'），用户重传同一文件（最自然的修复动作）此前被判
+            # duplicate，无法触发重新解析。现删除旧失败行 + 走正常上传路径，
+            # 让重传真正触发重新解析（自愈）。仅 failed 触发；pending/processing
+            # 保持 duplicate 拦截（任务进行中，无需重复）。
+            if _dup.get("status") == "failed":
+                logger.info(
+                    "上传去重命中解析失败文件，删除旧行后重传自愈 project=%d old_id=%d file=%s",
+                    project_id, _dup.get("id"), filename,
+                )
+                _dup_id = _dup.get("id")
+                if _dup_id is not None:
+                    try:
+                        with get_db() as conn:
+                            conn.execute(
+                                "DELETE FROM uploaded_files WHERE id = ? AND project_id = ?",
+                                (_dup_id, project_id),
+                            )
+                    except Exception as _dup_e:  # noqa: BLE001 —— 删除失败不阻塞上传
+                        logger.warning("删除失败重复文件失败（继续上传）id=%s: %s", _dup_id, _dup_e)
+                # 删除旧行后继续走正常落盘/建任务/插行路径（不 return）
+            else:
+                logger.info(
+                    "上传去重命中 project=%d file=%s -> 已存在 id=%d status=%s",
+                    project_id, filename, _dup.get("id"), _dup.get("status"),
+                )
+                return {
+                    "status": "duplicate",
+                    "message": f"文件内容已存在（{_dup.get('filename', filename)}），未重复上传",
+                    "filename": filename,
+                    "file_id": _dup.get("id"),
+                    "duplicate_of": _dup.get("id"),
+                }
+
         file_path = upload_dir / filename
         # BUG-FIX-65: 同名文件并发覆盖防护 — 若目标路径已存在，追加数字后缀避免覆盖
         if file_path.exists():
@@ -1730,6 +1818,31 @@ async def latest_extracted_text(project_id: int) -> str:
 
     files = [dict(r) for r in rows]
     main = _pick_main_file(files)
+    # BUG-FIX 2026-10-28（P2 数据链断点）：主文件仍在异步解析（processing/pending，
+    # extracted_text_path 为空）时，_pick_main_file 会回退到「首个未成功主文件」，
+    # main_text 为空 → 下方辅助文件 200 行摘要被顶替为「正文」喂给 AI，全文事实
+    # 提取质量静默劣化且无告警。此处显式检测：项目存在未完成解析的主文件且无任何
+    # 成功主文件文本时，返回空（下游视为「提取未完成」，前端门禁同步拦截）。
+    # 仅当确实没有任何 success 主文件文本时才拦截——有成功主文件文本则正常合并。
+    _main_unfinished = [
+        f for f in files
+        if f.get("file_role") == "main"
+        and f.get("status") in ("processing", "pending", "parsing")
+    ]
+    _any_main_text_ready = any(
+        f.get("file_role") == "main"
+        and f.get("status") == "success"
+        and f.get("extracted_text_path")
+        and Path(f["extracted_text_path"]).exists()
+        for f in files
+    )
+    if _main_unfinished and not _any_main_text_ready:
+        logger.warning(
+            "主文件仍在解析（processing/pending）且无成功主文件文本，"
+            "latest_extracted_text 返回空（避免辅助摘要顶替），project=%d unfinished=%d",
+            project_id, len(_main_unfinished),
+        )
+        return ""
     # ENHANCE 2026-10-05（TD4 技术债）：原为 `f != main`（dict 全等比较）——语义
     # 依赖「两个 dict 恰好不完全相等」，一旦 SELECT 字段变化（如去掉 id）就会把
     # 主文件自己也当成辅助文件再拼一遍，造成正文重复。改为按 id 精确排除。
@@ -1966,41 +2079,50 @@ def delete_file(project_id: int, file_id: int) -> dict:
     自动提升最合适的一个（顺序与静默回退一致，下游取到的文本不变）。
     """
     promoted_file_id = None
-    with get_db() as conn:
-        row = conn.execute(
-            "SELECT path, extracted_text_path FROM uploaded_files WHERE id = ? AND project_id = ?",
-            (file_id, project_id),
-        ).fetchone()
-        if not row:
-            raise ValueError("文件不存在")
+    # BUG-FIX（2026-10-28 跨模块深度探索 F6）：delete_file 此前不取项目上传写锁，
+    # 与并发 `save_upload`（已持 `_get_upload_write_lock`）存在竞态：DB 删除后、
+    # 物理 unlink 前，save_upload 可在同一临界区把同名文件落盘到**同一路径**；
+    # 随后 delete_file 的 `_p.unlink()` 会把新上传文件删除，而 DB 里新行指向
+    # 已删除路径（悬空）。现整个「DB 删除 + 物理删除」临界区纳入项目写锁，
+    # 与 save_upload 串行化（clear_project_texts 已同口径，delete_file 是漏网）。
+    with _get_upload_write_lock(project_id):
+        with get_db() as conn:
+            row = conn.execute(
+                "SELECT path, extracted_text_path FROM uploaded_files WHERE id = ? AND project_id = ?",
+                (file_id, project_id),
+            ).fetchone()
+            if not row:
+                raise ValueError("文件不存在")
 
-        file_path = Path(row["path"])
-        text_path = row["extracted_text_path"]
+            file_path = Path(row["path"])
+            text_path = row["extracted_text_path"]
 
-        conn.execute(
-            "DELETE FROM uploaded_files WHERE id = ? AND project_id = ?",
-            (file_id, project_id),
-        )
-
-        # 删除后维持「有文件则至少有一个显式 main」的不变式
-        still_main = conn.execute(
-            "SELECT 1 FROM uploaded_files WHERE project_id = ? AND file_role = 'main' LIMIT 1",
-            (project_id,),
-        ).fetchone()
-        if not still_main:
-            promoted_file_id = _promote_next_main(conn, project_id)
-
-    # BUG-FIX 2026-09-16（低）：DB 记录已删后物理文件 unlink 失败（Windows 上
-    # 文件正被解析进程占用会 PermissionError）原实现直接抛 500，且无兜底。
-    # 记录删除是主操作，物理残留仅告警，不影响接口成功。
-    for _p in [file_path, *( [Path(text_path)] if text_path else [] )]:
-        try:
-            if _p.exists():
-                _p.unlink()
-        except OSError as _unlink_e:
-            logger.warning(
-                "删除物理文件失败（记录已删除，文件将残留）path=%s: %s", _p, _unlink_e
+            conn.execute(
+                "DELETE FROM uploaded_files WHERE id = ? AND project_id = ?",
+                (file_id, project_id),
             )
+
+            # 删除后维持「有文件则至少有一个显式 main」的不变式
+            still_main = conn.execute(
+                "SELECT 1 FROM uploaded_files WHERE project_id = ? AND file_role = 'main' LIMIT 1",
+                (project_id,),
+            ).fetchone()
+            if not still_main:
+                promoted_file_id = _promote_next_main(conn, project_id)
+
+        # BUG-FIX 2026-09-16（低）：DB 记录已删后物理文件 unlink 失败（Windows 上
+        # 文件正被解析进程占用会 PermissionError）原实现直接抛 500，且无兜底。
+        # 记录删除是主操作，物理残留仅告警，不影响接口成功。
+        # BUG-FIX（2026-10-28 F6）：unlink 保留在项目写锁临界区内，与 save_upload
+        # 的落盘互斥，杜绝「unlink 删除新上传同名文件」竞态。
+        for _p in [file_path, *( [Path(text_path)] if text_path else [] )]:
+            try:
+                if _p.exists():
+                    _p.unlink()
+            except OSError as _unlink_e:
+                logger.warning(
+                    "删除物理文件失败（记录已删除，文件将残留）path=%s: %s", _p, _unlink_e
+                )
 
     # 项目文本已变化，使合并文本缓存失效
     _text_cache_clear(project_id)

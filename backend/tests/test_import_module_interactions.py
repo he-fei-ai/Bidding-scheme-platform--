@@ -201,10 +201,19 @@ class TestBatchUploadTaskIntegrity:
         resp = _upload(client, project_id, "终态检查.docx", content)
         assert resp.status_code == 200
 
-        # 同名二次上传（触发重命名分支），同样要求终态
+        # G8（2026-10-28 内容哈希去重）：同内容二次上传返回 duplicate，
+        # 不新增文件行/任务行（不再走重命名分支）。
         resp2 = _upload(client, project_id, "终态检查.docx", content)
         assert resp2.status_code == 200
-        assert resp2.json()["filename"] == "终态检查_1.docx"
+        assert resp2.json().get("status") == "duplicate", resp2.json()
+        assert resp2.json().get("filename") == "终态检查.docx"
+
+        # 同名但**不同内容**上传：仍走防覆盖重命名分支（保留原契约），
+        # 且同样要求终态写回。
+        content_b = _make_docx_bytes("任务表终态检查-不同内容")
+        resp3 = _upload(client, project_id, "终态检查.docx", content_b)
+        assert resp3.status_code == 200
+        assert resp3.json().get("filename") == "终态检查_1.docx", resp3.json()
 
         rows = _parse_task_rows(project_id)
         assert rows, "file_parse_tasks 应有任务行"

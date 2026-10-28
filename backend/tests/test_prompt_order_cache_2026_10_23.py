@@ -362,9 +362,23 @@ class TestSiblingContextCacheIntegration:
 
         asyncio.run(_run())
         sibs = [_sibling_message_of(c) for c in provider.captured]
-        assert len(set(sibs)) == 1
+        # BUG-A 新语义（2026-10-27，审计8）：共享列表截断至 titles 上限后，
+        # 被截掉的章节（工艺4/5）各自补齐「自身 + 共享列表」——每个章节的
+        # 同级列表必含自身（自定位不变量），未截断章节（工艺1/2/3）仍共用
+        # 同一共享列表（前缀缓存命中设计不变）。
+        assert len(provider.captured) == 5
+        # 未截断章节共用同一共享列表 → 共享部分字节级一致（含工艺1/2/3）
+        assert len(set(sibs)) == 3, (
+            "共享列表(工艺1/2/3) + 工艺4自身列表 + 工艺5自身列表，共 3 个不同列表"
+        )
+        # 每个章节的同级列表必含自身（BUG-A 自定位不变量）
+        for i, sib in enumerate(sibs):
+            assert f"工艺{i + 1}" in sib, f"工艺{i + 1} 不在自己的同级列表里"
+        # 共享列表（sibs[0]，工艺1 的同级列表）只含工艺1/2/3，不含被截掉的 4/5
         assert all(f"工艺{i}" in sibs[0] for i in (1, 2, 3))
         assert "工艺4" not in sibs[0] and "工艺5" not in sibs[0]
+        # 被截掉的章节各自补齐「自身 + 共享列表」
+        assert "工艺4" in sibs[3] and "工艺5" in sibs[4]
 
 
 # ══════════════════════════════════════════════════════════════════════

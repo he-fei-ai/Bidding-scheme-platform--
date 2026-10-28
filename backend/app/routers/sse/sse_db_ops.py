@@ -309,7 +309,9 @@ def _rollback_dirty_sections(leaf_ids: list[int]):
 
             # 第二条按 status='generating' 过滤的语句必然空匹配，故删除。
 
-            conn.execute(
+            # 审计8修复（C.7）：日志记录实际被 UPDATE 命中的行数而非请求数。
+            # 若部分章节已非 generating（并发完成/取消），旧日志虚高，可观测性失真。
+            _cur = conn.execute(
 
                 f"UPDATE sections SET status = 'pending', updated_at = datetime('now', 'localtime') "
 
@@ -319,7 +321,7 @@ def _rollback_dirty_sections(leaf_ids: list[int]):
 
             )
 
-            logger.info("[正文生成] 回滚脏状态完成: %d 个章节", len(leaf_ids))
+            logger.info("[正文生成] 回滚脏状态完成: %d 个章节", _cur.rowcount)
 
             # BUG-FIX 缓存失效（P2）：状态回滚也是旁路直写，需失效整包章节缓存。
             _row = conn.execute(
@@ -698,23 +700,39 @@ def _count_title_changes(before: list[str], after: list[str]) -> int:
 def _fill_or_fix_outline_titles(
     outline: list, *, fix_dirty: bool, project_id: int = 0
 ) -> int:
-    """落库前确定性标题兜底：补空标题（level>=3），可选改写脏标题。
+    """落库前确定性标题兜底：补空标题（level>=3），可选改写脏标题（level>=2）。
 
     单一实现供两处复用（2026-10-26）：
       1. `normalize_outline_items` **之前**，`fix_dirty=False` —— 只补三级空标题。
          因为归一化会直接**删除**空标题节点（AI 漏填 → 目录缺节），补名后
          节点才能正常落库。
-      2. 全部安全网**之后**，`fix_dirty=True` —— 空标题 + 脏标题（「专项6」
-         「总体实施策划（2）」等）强制改写，作为零脏标题落库的硬保证。
+      2. 全部安全网**之后**，`fix_dirty=True` —— 空标题（level>=3）+ 脏标题
+         （level>=2，「专项6」「总体实施策划（2）」等）强制改写，作为零脏标题
+         落库的硬保证。
 
-    纯本地确定性规则（`_semantic_fallback_title` 工程实体 × 专业维度），
-    不调用 AI、不抛异常（异常由调用方 try/except 记录）。
+    分层判定：L2 脏标题用 `_is_dirty_l2_title_deep`（放过「恰好等于泛化词表」
+    的合法 L2 章名，如「总体实施策划」「其他」），L3+ 用 `_is_dirty_l3_title_deep`。
+    空标题只在 level>=3 补（L1/L2 空标题无法从上下文可靠推断）。
+
+    清洗策略：先剥编号后缀/前缀保主体（与 `_cleanup_placeholder_titles` 同口径），
+    主体仍脏才走 `_semantic_fallback_title` 整体重写。**消除**安全网与主清洗器
+    的语义粒度错配风险 —— 即使前面的 `_cleanup_placeholder_titles` 因异常被
+    try/except 跳过，安全网也不会把「总体实施策划」（合法 L2）误替换成
+    「脚手架质量管控」（L3 粒度词池标题）。
+
+    纯本地确定性规则，不调用 AI、不抛异常（异常由调用方 try/except 记录）。
 
     Returns:
         被改写/补名的节点数。
     """
     from ...services.ai.outline_common import (
+        _MIN_CLEAN_BODY_LEN,
+        _cn_ordinal,
+        _is_dirty_l2_title_deep,
         _is_dirty_l3_title_deep,
+        _strip_legacy_redundant_suffix,
+        _strip_ordinal_prefix,
+        _strip_ordinal_suffix,
         _semantic_fallback_title,
     )
 
@@ -739,11 +757,37 @@ def _fill_or_fix_outline_titles(
             if not isinstance(_n, dict):
                 continue
             _t = (_n.get("title") or "").strip()
-            _bad = (not _t) or (fix_dirty and _is_dirty_l3_title_deep(_t))
-            if level >= 3 and _bad:
-                _cand = _semantic_fallback_title(
-                    parent or grand or "工程实施", _i, _used, context_title=grand
-                )
+            _level_dirty = _is_dirty_l2_title_deep if level == 2 else _is_dirty_l3_title_deep
+            _bad_empty = (not _t) and level >= 3
+            _bad_dirty = fix_dirty and level >= 2 and _level_dirty(_t)
+            if _bad_empty or _bad_dirty:
+                # 脏标题且非空：先尝试剥编号前后缀保主体
+                _cand = ""
+                if _bad_dirty and _t:
+                    _body = _strip_legacy_redundant_suffix(_strip_ordinal_suffix(_t)).strip()
+                    _body = _strip_ordinal_prefix(_body).strip()
+                    if (
+                        _body
+                        and _body != _t
+                        and len(_body) >= _MIN_CLEAN_BODY_LEN
+                        and not _level_dirty(_body)
+                    ):
+                        if _body not in _used:
+                            _cand = _body
+                        else:
+                            # 同父多脏标题剥后缀撞名：追加中文序数消歧后缀
+                            # （X之二 / X之三），与主清洗器 `_cleanup_placeholder_titles`
+                            # 及 `_uniquify_outline_titles` 口径一致。
+                            for _k in range(2, 10000):
+                                _cand2 = f"{_body}之{_cn_ordinal(_k)}"
+                                if _cand2 not in _used and not _level_dirty(_cand2):
+                                    _cand = _cand2
+                                    break
+                # 空标题或剥后缀后主体仍脏/不可用 → 整体语义化重写
+                if not _cand:
+                    _cand = _semantic_fallback_title(
+                        parent or grand or "工程实施", _i, _used, context_title=grand
+                    )
                 if not _cand:
                     _cand = f"{(parent or grand or '工程实施')[:10]}控制要点"
                 _n["title"] = _cand

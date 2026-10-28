@@ -860,6 +860,44 @@ async def _startup():
     except Exception as e:
         logger.warning("配置审计日志清理任务注册失败（不影响核心功能）: %s", e)
 
+    # G3（2026-10-28 遗留加固）：一致性审计日志 consistency_audit_log 每行存全量
+    # conflicts_json，此前无 retention 策略，历史表持续膨胀。参照上方配置审计清理
+    # 口径注册每日清理（默认保留 90 天，环境变量 CONSISTENCY_AUDIT_RETENTION_DAYS
+    # 可配）。清理失败不阻断主流程。
+    try:
+        _cons_retention_days = int(
+            os.environ.get("CONSISTENCY_AUDIT_RETENTION_DAYS", "90")
+        )
+        _cons_retention_days = max(1, _cons_retention_days)
+
+        async def _consistency_audit_cleanup_loop():
+            while True:
+                try:
+                    from .services.consistency_auditor import (
+                        cleanup_old_consistency_audit,
+                    )
+
+                    # 同步 SQLite DELETE 持全局写锁，派发工作线程避免冻结事件循环
+                    # （与配置审计清理的 BUG-FIX 2026-10-14 口径一致）。
+                    _deleted = await asyncio.to_thread(
+                        cleanup_old_consistency_audit,
+                        retention_days=_cons_retention_days,
+                    )
+                    if _deleted:
+                        logger.info("一致性审计日志清理完成，删除 %d 条过期记录", _deleted)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as _e:
+                    logger.warning("一致性审计日志清理异常（忽略）: %s", _e)
+                await asyncio.sleep(86400)
+
+        _task = asyncio.create_task(_consistency_audit_cleanup_loop())
+        _background_tasks.add(_task)
+        _task.add_done_callback(_background_tasks.discard)
+        logger.info("一致性审计日志清理任务已注册（保留 %d 天）", _cons_retention_days)
+    except Exception as _e:
+        logger.warning("注册一致性审计日志清理任务失败（忽略）: %s", _e)
+
     logger.info("应用启动完成，耗时 %.1fs", time.monotonic() - _start_time)
 
 

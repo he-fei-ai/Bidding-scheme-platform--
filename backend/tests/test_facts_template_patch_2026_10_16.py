@@ -20,6 +20,7 @@ import tempfile
 from pathlib import Path
 
 from app.db import get_db, init_db
+from app.config import PROJECTS_DATA_DIR
 
 
 def _new_project(name: str) -> int:
@@ -30,10 +31,15 @@ def _new_project(name: str) -> int:
 
 
 def _insert_ready_template(project_id: int, text: str) -> str:
-    """插入一条 ready 状态的模板记录并写临时文件，返回 file_path。"""
-    tmp_dir = Path(tempfile.gettempdir()) / "eb_facts_tpl_tests"
-    tmp_dir.mkdir(parents=True, exist_ok=True)
-    file_path = tmp_dir / f"tpl_{project_id}.txt"
+    """插入一条 ready 状态的模板记录并写模板目录文件，返回 file_path。
+
+    G1（2026-10-28 遗留加固）：模板补丁路径守卫要求 file_path 落在
+    PROJECTS_DATA_DIR/<project_id>/templates 内（template_expansion 的写入位置）。
+    原实现写系统临时目录，会被守卫按设计拒绝。现按生产契约写合规路径。
+    """
+    tpl_dir = PROJECTS_DATA_DIR / str(project_id) / "templates"
+    tpl_dir.mkdir(parents=True, exist_ok=True)
+    file_path = tpl_dir / f"tpl_{project_id}.txt"
     file_path.write_text(text, encoding="utf-8")
     with get_db() as conn:
         conn.execute(
@@ -213,7 +219,8 @@ def test_generate_facts_template_missing_file_degrades(monkeypatch):
     monkeypatch.setattr(facts_router, "outline_input_enabled", lambda: False)
 
     pid = _new_project("模板缺失降级测试")
-    missing_path = str(Path(tempfile.gettempdir()) / "eb_facts_tpl_tests" / f"missing_{pid}.txt")
+    # G1：指向模板目录内的不存在文件，保持「提取失败降级」语义（路径在守卫内）
+    missing_path = str(PROJECTS_DATA_DIR / str(pid) / "templates" / f"missing_{pid}.txt")
     with get_db() as conn:
         conn.execute(
             "INSERT INTO project_templates (project_id, filename, file_path, status) "
@@ -236,6 +243,60 @@ def test_generate_facts_template_missing_file_degrades(monkeypatch):
     )
     # 提取失败 → 无素材 → 不发起第二次 AI 调用，基线结果完整
     assert calls["n"] == 1
+    assert result["template_patches_applied"] == 0
+    items = {i["key"]: i for i in result["items"]}
+    assert items["scheduleDuration"]["value"] == "90 日历天"
+
+
+def test_generate_facts_template_path_outside_dir_guard(monkeypatch):
+    """G1（2026-10-28 遗留加固）：模板 file_path 在项目模板目录外 → fail-closed 跳过。
+
+    DB 被手工改写/历史数据存任意路径（用户绝对路径、UNC、系统临时目录）时，
+    路径守卫必须拒绝读取（SSRF/越权防护），不发起模板补丁 AI 调用、不报错，
+    基线提取不受影响。
+    """
+    import tempfile
+
+    from app.models import FactsGenerateRequest
+    from app.routers import facts as facts_router
+    from app.services.ai import provider_factory, workflows
+
+    monkeypatch.setattr(
+        facts_router, "get_facts_file_text", lambda _pid: "招标文件正文：工期要求 90 日历天。"
+    )
+    monkeypatch.setattr(facts_router, "template_patch_enabled", lambda: True)
+    monkeypatch.setattr(facts_router, "kb_patch_enabled", lambda: False)
+    monkeypatch.setattr(facts_router, "segmented_extraction_enabled", lambda: False)
+    monkeypatch.setattr(facts_router, "outline_input_enabled", lambda: False)
+
+    pid = _new_project("模板路径守卫测试")
+    # 把模板写在系统临时目录（目录外、真实存在、内容合法）——守卫应拒绝
+    outside_dir = Path(tempfile.gettempdir()) / "eb_facts_tpl_guard"
+    outside_dir.mkdir(parents=True, exist_ok=True)
+    outside_path = outside_dir / f"evil_{pid}.txt"
+    outside_path.write_text("历史标书模板：质保期 3 年。", encoding="utf-8")
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO project_templates (project_id, filename, file_path, status) "
+            "VALUES (?, ?, ?, 'ready')",
+            (pid, "越权模板.txt", str(outside_path)),
+        )
+
+    calls = {"n": 0}
+
+    async def _fake_collect(_provider, _messages, **_kwargs):
+        calls["n"] += 1
+        return {"projectName": "示范工程", "scheduleDuration": "90 日历天"}
+
+    monkeypatch.setattr(provider_factory, "get_ai_config", lambda: object())
+    monkeypatch.setattr(provider_factory, "create_provider", lambda _cfg: object())
+    monkeypatch.setattr(workflows, "collect_json_response", _fake_collect)
+
+    result = asyncio.run(
+        facts_router.generate_facts(pid, FactsGenerateRequest(missing_value_policy="fabricate"))
+    )
+    # 守卫拒绝目录外路径 → 无模板素材 → 只有基线一次 AI 调用
+    assert calls["n"] == 1, "目录外模板必须被跳过，不发起模板补丁调用"
     assert result["template_patches_applied"] == 0
     items = {i["key"]: i for i in result["items"]}
     assert items["scheduleDuration"]["value"] == "90 日历天"
