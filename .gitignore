@@ -83,8 +83,9 @@ _e2e_aligned_*/*
 frontend/_check_refs.py
 frontend/_find_sse.py
 
-# 单点探测/回归脚本（勿提交）
+# 单点探测/回归脚本（勿提交；!__init__.py 例外：允许包初始化文件入库，避免误伤子目录正式模块）
 _*.py
+!__init__.py
 _*.ps1
 
 # ACL 恢复/备份产物（勿提交）

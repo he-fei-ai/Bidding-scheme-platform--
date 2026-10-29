@@ -73,6 +73,7 @@ from .routers import (
     industry_tree,
     knowledge,
     monitor,
+    observability,
     projects,
     prompts,
     qa,  # 新增：智能问答路由
@@ -287,6 +288,22 @@ class RequestIDMiddleware(BaseHTTPMiddleware):
         rid = request.headers.get("X-Request-ID") or uuid.uuid4().hex[:12]
         request_id_var.set(rid)
         request.state.request_id = rid
+        # ENHANCE 2026-10-29：全链路追踪。trace_id 优先取 X-Trace-ID 头，
+        # 否则复用 request_id（保证同请求可串联）；随后开启根 span 记录请求耗时。
+        from .observability import tracing as _obs_tracing
+
+        trace_id = request.headers.get("X-Trace-ID") or rid
+        root_span = None
+        try:
+            _obs_tracing.bind_trace(trace_id)
+            root_span = _obs_tracing.span(
+                f"http:{request.method} {request.url.path}",
+                module="api", event="api.request",
+                trace_id=trace_id, detail={"method": request.method, "path": request.url.path},
+            )
+            root_span.__enter__()
+        except Exception:
+            root_span = None
         # F-P0-1：在中间件层按 URL 绑定 project/section/task ID 到日志上下文。
         # 放在 call_next 之前，确保本次请求全程日志（含路由处理）都带 ID；
         # 用 try 包住，避免绑定异常影响主流程。
@@ -298,9 +315,14 @@ class RequestIDMiddleware(BaseHTTPMiddleware):
             response = await call_next(request)
         finally:
             # contextvar 随协程任务结束自然失效，无需手动 reset（避免线程复用串号风险）
-            pass
-        # 回显 request_id 到响应头，便于网关/前端/客户端按 ID 串联日志与链路
+            try:
+                if root_span is not None:
+                    root_span.__exit__(None, None, None)
+            except Exception:
+                pass
+        # 回显 request_id / trace_id 到响应头，便于网关/前端/客户端按 ID 串联日志与链路
         response.headers["X-Request-ID"] = rid
+        response.headers["X-Trace-ID"] = trace_id
         return response
 
 
@@ -556,6 +578,8 @@ v1_router.include_router(usage._global_usage_router, prefix="", tags=["usage_glo
 # ENHANCE 2026-09-14：导出格式预设（全局，无 project 前缀）
 v1_router.include_router(export._presets_router, prefix="", tags=["export_presets"])
 v1_router.include_router(monitor.router, prefix="", tags=["monitor"])
+# 可观测性（结构化日志/全链路追踪/运行轨迹/指标/告警）查询接口，ENHANCE 2026-10-29
+v1_router.include_router(observability.router, prefix="", tags=["observability"])
 v1_router.include_router(api_keys.router, prefix="", tags=["api_keys"])
 v1_router.include_router(api_docs.router, prefix="", tags=["api_docs"])
 v1_router.include_router(batch.router, prefix="", tags=["batch_operations"])
@@ -898,6 +922,33 @@ async def _startup():
     except Exception as _e:
         logger.warning("注册一致性审计日志清理任务失败（忽略）: %s", _e)
 
+    # ENHANCE 2026-10-29：可观测性日志每日轮转清理（压缩 + 按级保留清理），
+    # 满足「过期自动清理并记录清理日志」需求；清理失败不阻断主流程。
+    try:
+        async def _obs_log_cleanup_loop():
+            while True:
+                try:
+                    from .observability import storage as _obs_storage
+
+                    _result = await asyncio.to_thread(_obs_storage.cleanup)
+                    if _result.get("deleted") or _result.get("compressed"):
+                        logger.info(
+                            "可观测性日志清理完成: 压缩 %d 个, 删除 %s",
+                            _result.get("compressed", 0), _result.get("deleted", {}),
+                        )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as _e:
+                    logger.warning("可观测性日志清理异常（忽略）: %s", _e)
+                await asyncio.sleep(86400)
+
+        _obs_task = asyncio.create_task(_obs_log_cleanup_loop())
+        _background_tasks.add(_obs_task)
+        _obs_task.add_done_callback(_background_tasks.discard)
+        logger.info("可观测性日志每日清理任务已注册")
+    except Exception as _e:
+        logger.warning("注册可观测性日志清理任务失败（忽略）: %s", _e)
+
     logger.info("应用启动完成，耗时 %.1fs", time.monotonic() - _start_time)
 
 
@@ -910,6 +961,14 @@ async def _shutdown():
         _ai_config_shutdown()
     except Exception as e:
         logger.warning("AI 配置服务关闭失败: %s", e)
+
+    # ENHANCE 2026-10-29：关闭前排空可观测性日志异步缓冲，避免丢失未落盘日志。
+    try:
+        from .observability import storage as _obs_storage
+
+        _obs_storage.flush(timeout=2.0)
+    except Exception as e:
+        logger.warning("可观测性日志 flush 失败（忽略）: %s", e)
 
     # HARDENING 2026-10-11：取消所有注册的后台循环任务（含审计日志每日清理），
     # 避免事件循环关闭时留下未 await 的 while-True 协程。

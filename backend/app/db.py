@@ -2109,6 +2109,13 @@ def _migrate(conn: sqlite3.Connection):
 
     _task_snapshot.ensure_schema(conn)
 
+    # ========== 可观测性数据表（ENHANCE 2026-10-29）==========
+    # obs_structured_log / obs_trajectory / obs_span：结构化日志、任务运行轨迹、span 调用段。
+    # 与 task_lock/task_snapshot 同模式：DDL 集中在 observability.schema，函数内局部导入避免循环。
+    from .observability import schema as _obs_schema
+
+    _obs_schema.ensure_schema(conn)
+
     # ========== 种子数据：默认 AI 厂商（agnes，开箱即用，无需用户手动输入）==========
     _seed_default_agnes_config(conn)
 
