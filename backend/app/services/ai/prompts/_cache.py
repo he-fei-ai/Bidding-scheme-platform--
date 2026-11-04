@@ -43,8 +43,13 @@ def _cfg(name: str, default):
 
 # ENHANCE 2026-10-17：安全默认值开关。默认均为 False —— 即保持「opt-in」的
 # 既有语义，调用方显式传参优先；运维可通过环境变量全局开启（见 config.py 注释）。
-_CFG_PROMPT_SANITIZE_DEFAULT = bool(_cfg("PROMPT_SANITIZE_DEFAULT", False))
-_CFG_PROMPT_DESENSITIZE_DEFAULT = bool(_cfg("PROMPT_DESENSITIZE_DEFAULT", False))
+#
+# 2026-11-04（收尾 P1，治理项热更新）：原为导入时快照的模块级常量
+# （_CFG_PROMPT_SANITIZE_DEFAULT / _CFG_PROMPT_DESENSITIZE_DEFAULT），
+# 运维改环境变量也必须重启才生效，且无法按运行期审计调整。现改为每次
+# get_prompt 调用时读取 `_governance`（DB 优先、环境变量默认、进程缓存 2s、
+# 写后立即失效），默认值不变（false），行为零变化，但支持免重启热更新。
+from ._governance import get_bool as _gov_bool
 
 # render_prompt 的控制参数名（非模板变量）：变量校验时必须排除，否则会
 # 把「渲染开关」误当作已提供的变量，掩盖真实缺失。
@@ -849,6 +854,13 @@ def _check_hardcode_drift() -> None:
     if not _prompt_cache:
         return
 
+    # BUG-FIX-PROMPT-M1（同 get_prompt）：本函数虽在 _cache_lock 内被调用，但
+    # 函数体多处裸读模块全局 `_prompt_cache`；重载线程若在读取间隙置 None
+    # （reload_prompt_cache 持锁写，但本函数历史上也存在锁外调用方）会触发
+    # `key not in _prompt_cache` → TypeError 并被上层 DB 加载 except 吞掉，
+    # 使缓存加载被误判失败进入冷却回退。统一改为函数入口快照。
+    cache = _prompt_cache
+
     # 读取 DB 每行的 default_content，用于判定该行是否被用户编辑过。
     # 查询失败（旧库无该列等）时置 None → 下面按「无法判定=视为未编辑」保守告警。
     default_by_key: dict[str, str] | None = None
@@ -868,9 +880,9 @@ def _check_hardcode_drift() -> None:
 
     drifted_keys = []
     for key, meta in _ALL_PROMPTS.items():
-        if key not in _prompt_cache:
+        if key not in cache:
             continue  # DB中不存在，使用硬编码，无漂移
-        db_content = _prompt_cache[key]
+        db_content = cache[key]
         default_content = meta["content"]
         # 清洗后比对（DB加载时已清洗，这里对硬编码也清洗一次）
         default_cleaned = clean_prompt_text(default_content)
@@ -921,6 +933,14 @@ def _load_prompt_cache():
                 _prompt_cache = {}
                 for row in rows:
                     cleaned = clean_prompt_text(row["content"])
+                    # BUG-FIX-PROMPT-M2（2026-11-04，空内容兜底失效）：管理员以
+                    # force=true 保存空串后，DB 行内容为空，此前会原样进缓存，
+                    # get_prompt 返回 "" —— 硬编码兜底完全失效，AI 调用拿到空
+                    # system 提示词。与 list_prompts / get_prompt_detail 的既有
+                    # 口径（`row["content"] or meta["content"]`）对齐：
+                    # 空内容 = 视同不存在，回退注册表硬编码。
+                    if not cleaned:
+                        continue
                     _prompt_cache[row["key"]] = cleaned
             _load_failed_at = None
             logger.info("Prompt cache loaded: %d templates from DB", len(_prompt_cache))
@@ -956,8 +976,8 @@ def get_prompt(key: str, **kwargs) -> str:
     # （回归：tests/test_prompts_module_2026_10_04.py::test_fetch_raw_template_no_warning）。
     # 语义上也成立：sanitize/desensitize 作用于「变量值」，无变量即无需清洗。
     if kwargs:
-        kwargs.setdefault("sanitize", _CFG_PROMPT_SANITIZE_DEFAULT)
-        kwargs.setdefault("desensitize", _CFG_PROMPT_DESENSITIZE_DEFAULT)
+        kwargs.setdefault("sanitize", _gov_bool("PROMPT_SANITIZE_DEFAULT"))
+        kwargs.setdefault("desensitize", _gov_bool("PROMPT_DESENSITIZE_DEFAULT"))
     # 锁内检查 + 加载，保证并发安全
     with _cache_lock:
         if _prompt_cache is None:
@@ -980,6 +1000,10 @@ def get_prompt(key: str, **kwargs) -> str:
                         local_cache: dict[str, str] = {}
                         for row in rows:
                             cleaned = clean_prompt_text(row["content"])
+                            # BUG-FIX-PROMPT-M2：空内容行不入缓存（口径同上，
+                            # 与 _load_prompt_cache 及 list 端点一致，回退硬编码）
+                            if not cleaned:
+                                continue
                             local_cache[row["key"]] = cleaned
                         _prompt_cache = local_cache
                         _load_failed_at = None
@@ -1001,8 +1025,21 @@ def get_prompt(key: str, **kwargs) -> str:
                     _prompt_cache = None  # 保持 None，冷却期后重试
                     _load_failed_at = time.time()
 
-    if _prompt_cache and key in _prompt_cache:
-        prompt = _prompt_cache[key]
+    # BUG-FIX-PROMPT-M1（2026-11-04，竞态 TypeError）：上方锁块结束后，另一线程的
+    # reload_prompt_cache()（PUT 保存后调用）可能把 _prompt_cache 置回 None。
+    # 原实现在**锁外**连读两次全局：`_prompt_cache and`（真）→ `key in _prompt_cache`
+    # （此时已是 None）→ TypeError: argument of type 'NoneType' is not iterable，
+    # 直接炸掉调用方（章节生成/AI 编排请求失败）。实测复现：读线程高频 get_prompt
+    # × 写线程 200 次 reload，TypeError 稳定出现（落在 _check_hardcode_drift 的
+    # 裸读时还会被 DB 加载 except 吞掉 → 缓存误入 60s 冷却回退）。
+    # 修复：先快照到局部变量再判断，整个读路径基于同一快照，消除 TOCTOU。
+    # BUG-FIX-PROMPT-M2（读路径自愈）：DB 行内容为空/纯空白（如管理员 force 保存
+    # 空串、或历史上被清空）时同样回退硬编码——与加载路径的「空内容不入缓存」
+    # 口径一致，即使空值经由其它途径进入缓存，读取端也不再返回空提示词给 AI。
+    cache_snapshot = _prompt_cache
+    db_prompt = cache_snapshot.get(key) if cache_snapshot else None
+    if db_prompt and db_prompt.strip():
+        prompt = db_prompt
         source = "db"
     else:
         meta = _ALL_PROMPTS.get(key)
@@ -1096,7 +1133,17 @@ def get_prompt_with_validation(key: str, **kwargs) -> tuple[str, list[str]]:
 
     if kwargs:
         required_vars = extract_variables(raw)
-        passed_lower = {k.lower() for k, v in kwargs.items() if v is not None}
+        # BUG-FIX-PROMPT-E9（2026-11-03，与 get_prompt 口径对齐）：原实现未排除
+        # _RENDER_CONTROL_KEYS，与 get_prompt（本文件上方 D3 修复处）口径不一致：
+        # 调用方传 sanitize/desensitize 等渲染开关时，这些「开关参数」被计入
+        # passed_lower，虽不至于误报缺失，但若模板恰好存在同名变量（如
+        # {sanitize}），校验会误判「已提供」，掩盖真实缺失告警。现与 get_prompt
+        # 完全同口径：排除渲染控制键。
+        passed_lower = {
+            k.lower()
+            for k, v in kwargs.items()
+            if v is not None and k.lower() not in _RENDER_CONTROL_KEYS
+        }
         missing = [v for v in required_vars if v.lower() not in passed_lower]
         if missing:
             logger.warning(
@@ -1125,6 +1172,25 @@ def reload_prompt_cache():
         _prompt_cache = None
         _load_failed_at = None  # 主动 reload 应立刻重试，不受冷却期限制
     logger.info("Prompt cache invalidated, will reload on next access")
+
+
+def warm_prompt_cache() -> int:
+    """启动期主动加载提示词缓存（真预热），返回成功加载的模板数。
+
+    BUG-FIX-PROMPT-M3（2026-11-04，启动预热是空操作）：原启动流程调用
+    ``reload_prompt_cache()`` 并打出「提示词缓存预热完成」日志，但该函数
+    **只把缓存置 None（失效），从不加载**——首个 AI 请求仍要付一次全量
+    ``SELECT key, content FROM prompt_templates`` 的冷启动查询（且在
+    _cache_lock 内串行化所有并发 get_prompt）。实测复现：
+        reload_prompt_cache(); _prompt_cache -> None（非预热态）
+    修复：新增本函数在调用现场立即完成 DB 加载（复用 _load_prompt_cache，
+    含失败冷却/清洗/漂移检测的完整既有语义），main.py 启动接线改调本函数。
+
+    Returns:
+        加载的模板数（DB 不可用时为 0，异常沿调用方 try 兜底，不阻塞启动）。
+    """
+    _load_prompt_cache()
+    return len(_prompt_cache or {})
 
 
 def build_prompt_with_context(key, parts, *, max_tokens=None, sanitize=False, desensitize=False):

@@ -267,7 +267,7 @@ def detect_injection_risk(text: str) -> tuple[int, list[str]]:
     return score, hits
 
 
-def sanitize_for_injection(value: str, *, wrap_on_risk: int = 3) -> str:
+def sanitize_for_injection(value: str, *, wrap_on_risk: int | None = None) -> str:
     """「按风险自适应」的注入防御：中和元标记 + 风险达标时自动边界包裹。
 
     相比 ``sanitize_prompt_value(wrap=True)`` 无差别包裹，本函数只对**命中
@@ -276,13 +276,27 @@ def sanitize_for_injection(value: str, *, wrap_on_risk: int = 3) -> str:
 
     Args:
         value: 原始变量值。
-        wrap_on_risk: 风险分达到该值即自动包裹数据边界。
+        wrap_on_risk: 风险分达到该值即自动包裹数据边界。为 None（默认）时读取
+            治理配置 ``PROMPT_INJECTION_WRAP_THRESHOLD``（DB 优先，DB 无记录
+            回落环境变量默认 3）——
+            UNIFY-R5（2026-11-04）：该配置项此前**零引用**（死配置，设置后无任何
+            效果），现接为本参数的默认来源，配置即刻生效；显式传参优先于配置。
+            2026-11-04（收尾 P1）：默认来源从「config 模块常量」改为
+            ``_governance.get_int``，支持免重启热更新与审计/回滚；默认值仍为 3，
+            未写库时行为零变化。
 
     Returns:
         处理后的字符串。
     """
     if not value:
         return value
+    if wrap_on_risk is None:
+        try:
+            from ._governance import get_int as _gov_int
+
+            wrap_on_risk = _gov_int("PROMPT_INJECTION_WRAP_THRESHOLD")
+        except Exception:
+            wrap_on_risk = 3
     out = neutralize_meta_markers(value)
     score, _ = detect_injection_risk(out)
     if score >= wrap_on_risk:

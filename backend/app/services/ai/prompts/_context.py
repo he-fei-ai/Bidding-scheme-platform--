@@ -439,16 +439,6 @@ def _fit_to_token_budget(content: str, budget_tokens: int, head: str, marker: st
             hi = mid - 1
     return content[:lo].rstrip() if lo > 0 else ""
 
-    # 以下分支不可达（上方已 return），仅为静态检查与可读性保留兜底。
-    lo, hi = 0, len(content)
-    while lo < hi:
-        mid = (lo + hi + 1) // 2
-        if _fits(mid):
-            lo = mid
-        else:
-            hi = mid - 1
-    return content[:lo].rstrip() if lo > 0 else ""
-
 
 def truncate_to_tokens(text: str, max_tokens: int) -> str:
     """对单段文本做 Token 软上限截断（超出则截断并附标记，宁缺毋假）。
@@ -562,11 +552,16 @@ __all__ = [
 
 
 def _default_context_max_tokens() -> int | None:
-    """上下文组装的默认 Token 预算（0/None 表示不限，保持既有行为）。"""
-    try:
-        from .... import config
+    """上下文组装的默认 Token 预算（0/None 表示不限，保持既有行为）。
 
-        value = int(getattr(config, "PROMPT_CONTEXT_MAX_TOKENS", 0) or 0)
+    2026-11-04（收尾 P1）：默认值来源从「config 模块常量」改为运行时治理配置
+    ``PROMPT_CONTEXT_MAX_TOKENS``（DB 优先，DB 无记录回落环境变量默认 0），
+    支持免重启热更新与审计/回滚；默认 0 时行为零变化。
+    """
+    try:
+        from ._governance import get_int as _gov_int
+
+        value = _gov_int("PROMPT_CONTEXT_MAX_TOKENS")
     except Exception:
         return None
     return value if value > 0 else None

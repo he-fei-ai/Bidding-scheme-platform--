@@ -819,6 +819,92 @@ async def suggest_budget(
         "suggestion": suggestion,
     }
 
+
+# ══════════════════════════════════════════════════════════════════════════
+# 运行时治理配置（2026-11-04 收尾 P1）
+#
+# 把 PROMPT_DESENSITIZE_DEFAULT / PROMPT_SANITIZE_DEFAULT /
+# PROMPT_INJECTION_WRAP_THRESHOLD / PROMPT_CONTEXT_MAX_TOKENS 从「进程启动时
+# 的环境变量常量」迁到 DB：读/写/审计/回滚，改后免重启立即生效（写路径清空
+# 进程缓存，渲染路径每次读取）。DB 无记录时回落环境变量默认值，因此不调用
+# 这些接口的部署与改造前行为完全一致。
+#
+# 注意：这些是**静态子路由**，必须声明在 `/{key}` 之前（见下方顺序约束）。
+# ══════════════════════════════════════════════════════════════════════════
+
+
+class GovernanceUpdate(BaseModel):
+    value: str | int | bool
+
+
+class GovernanceRollback(BaseModel):
+    audit_id: int
+
+
+def _governance():
+    from ..services.ai.prompts import _governance as gov
+
+    return gov
+
+
+@router.get("/governance")
+async def list_governance_settings(current: User = Depends(get_current_user)):
+    """列出全部治理项：当前值、来源（db/env_default）、环境变量默认、更新人/时间。"""
+    gov = _governance()
+    settings = await asyncio.to_thread(gov.list_settings)
+    return {"items": settings, "total": len(settings)}
+
+
+@router.get("/governance/audit")
+async def list_governance_audit(
+    key: str | None = Query(None, description="仅查看某一配置项的审计"),
+    limit: int = Query(50, ge=1, le=500),
+    current: User = Depends(get_current_user),
+):
+    """治理配置变更审计（最新在前）：旧值/新值/操作人/时间/动作。"""
+    gov = _governance()
+    rows = await asyncio.to_thread(gov.list_audit, key, limit)
+    return {"items": rows, "total": len(rows)}
+
+
+@router.put("/governance/{setting_key}")
+async def update_governance_setting(
+    setting_key: str,
+    payload: GovernanceUpdate,
+    current: User = Depends(get_current_user),
+):
+    """写入治理项（含取值校验），自动记录审计并从进程缓存失效 → 立即生效。"""
+    gov = _governance()
+    try:
+        view = await asyncio.to_thread(
+            gov.set_setting, setting_key, payload.value, changed_by=current.username
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"status": "ok", "item": view}
+
+
+@router.post("/governance/{setting_key}/rollback")
+async def rollback_governance_setting(
+    setting_key: str,
+    payload: GovernanceRollback,
+    current: User = Depends(get_current_user),
+):
+    """按审计行回滚治理项（恢复 old_value；old_value 为空则回到环境变量默认）。"""
+    gov = _governance()
+    try:
+        view = await asyncio.to_thread(
+            gov.rollback, payload.audit_id, changed_by=current.username
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if view["key"] != setting_key:
+        raise HTTPException(
+            status_code=400,
+            detail=f"审计记录属于 {view['key']}，与路径 {setting_key} 不一致",
+        )
+    return {"status": "ok", "item": view}
+
 # ══════════════════════════════════════════════════════════════════════════
 # 带路径参数的路由（必须声明在全部静态子路由之后）
 #
@@ -943,12 +1029,16 @@ async def reset_prompt(key: str, current: User = Depends(get_current_user)):
                     changed_by=changed_by,
                 )
             conn.execute(
-                """INSERT INTO prompt_templates (key, content, default_content, updated_at)
-               VALUES (?, ?, ?, datetime('now', 'localtime'))
+                """INSERT INTO prompt_templates (key, category, label, content, default_content, updated_at)
+               VALUES (?, ?, ?, ?, ?, datetime('now', 'localtime'))
                ON CONFLICT(key) DO UPDATE SET
                 content=excluded.default_content,
                 updated_at=datetime('now', 'localtime')""",
-                (key, default_content, default_content),
+                # BUG-FIX-PROMPT-M5（2026-11-04，R2/R3 同类遗漏）：重置作为某 key
+                # 的**首次写入**时（DB 行此前不存在，如被手工清理过），原 INSERT
+                # 分支缺 category/label，落库为 NULL——与 update_prompt 的 R3 修复
+                # （统一带 meta 值）口径不一致，监控按分类聚合时该行落入「未分类」。
+                (key, meta["category"], meta["label"], default_content, default_content),
             )
 
     await asyncio.to_thread(_write)

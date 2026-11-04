@@ -4,7 +4,7 @@ import logging
 import sqlite3
 import threading
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .config import DATABASE_PATH, PROJECT_ROOT
 
@@ -817,6 +817,7 @@ def init_db():
                 file_role TEXT NOT NULL DEFAULT '',
                 status TEXT NOT NULL,
                 extracted_text_path TEXT,
+                content_hash TEXT,
                 message TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
                 updated_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
@@ -1400,6 +1401,18 @@ def _migrate(conn: sqlite3.Connection):
     _ensure_column(conn, "projects", "created_by", "INTEGER")
     _ensure_column(conn, "uploaded_files", "file_role", "TEXT NOT NULL DEFAULT ''")
     _ensure_column(conn, "uploaded_files", "extracted_text_path", "TEXT")
+    # 2026-11-02（B2 永久修复 R1）：uploaded_files 补 content_hash 列（附加式·可空）。
+    # 并发上传去重据此在 get_db 写锁内做纯 DB 等值判重（无需磁盘 I/O，遵守锁内禁 I/O
+    # 约定）；可空 = 存量老行无哈希 → _find_duplicate_upload 对 NULL 行回退文件扫描，
+    # 向后兼容不回填。配套 (project_id, content_hash) 复合索引提速等值命中。
+    _ensure_column(conn, "uploaded_files", "content_hash", "TEXT")
+    try:
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_uf_project_hash "
+            "ON uploaded_files(project_id, content_hash)"
+        )
+    except sqlite3.OperationalError as e:
+        logger.warning("uploaded_files content_hash 索引创建失败（去重退化全扫，不阻断）: %s", e)
 
     _ensure_column(conn, "knowledge_documents", "industry_tree_id", "TEXT DEFAULT NULL")
     _ensure_column(conn, "knowledge_items", "industry_tree_id", "TEXT DEFAULT NULL")
@@ -1950,6 +1963,10 @@ def _migrate(conn: sqlite3.Connection):
             sources_json TEXT NOT NULL,
             severity TEXT NOT NULL DEFAULT 'medium',
             description TEXT,
+            -- 遗留项 L5(2026-11-03)：G-1 判定依据（severity_rationale 派生的
+            -- 命中分支/实例数/章节 id 等）随冲突行落库，GET /conflicts 回放
+            -- 下发为 fact_evidence。可空：AI 发现行与老数据无依据。
+            evidence_json TEXT,
             resolved INTEGER DEFAULT 0,
             resolved_value TEXT,
             resolved_at TEXT,
@@ -1982,6 +1999,8 @@ def _migrate(conn: sqlite3.Connection):
     )
     # T2 根治（2026-10-16）：老库补列 + 历史行回填（独立函数，可被迁移测试直接调用）。
     _migrate_consistency_audit_log(conn)
+    # 遗留项 L5(2026-11-03)：老库补 evidence_json 列（独立函数，可被迁移测试直接调用）。
+    _migrate_consistency_conflicts_evidence(conn)
 
     # ========== 评分标准达标对齐（ENHANCE 2026-10-06）==========
     # 缺口：导出预检的 uncovered_scoring_points 只判「评分点有没有被章节挂载」，
@@ -2116,6 +2135,16 @@ def _migrate(conn: sqlite3.Connection):
 
     _obs_schema.ensure_schema(conn)
 
+    # ========== 运行时治理配置表（2026-11-04 收尾 P1）==========
+    # ai_runtime_settings / ai_runtime_settings_audit：提示词治理项（脱敏/清洗/
+    # 注入包裹阈值/上下文预算）从「进程启动时的环境变量常量」迁到 DB，支持
+    # 读写接口 + 审计 + 回滚 + 免重启热更新。DB 无记录时回落 config 同名环境
+    # 变量默认值，因此老部署不写库即保持改造前行为。
+    # 同模式：DDL 集中在 _governance.ensure_schema，函数内局部导入避免循环。
+    from .services.ai.prompts import _governance as _prompt_governance
+
+    _prompt_governance.ensure_schema(conn)
+
     # ========== 种子数据：默认 AI 厂商（agnes，开箱即用，无需用户手动输入）==========
     _seed_default_agnes_config(conn)
 
@@ -2237,8 +2266,32 @@ def _migrate_consistency_audit_log(conn: sqlite3.Connection) -> None:
         )
 
 
+def _migrate_consistency_conflicts_evidence(conn: sqlite3.Connection) -> None:
+    """遗留项 L5（2026-11-03）：`consistency_conflicts` 老库补 `evidence_json` 列。
+
+    G-1 判定依据此前只随审计执行响应下发、不落库 —— 用户关闭页面后重新进入
+    （或第二天回看），冲突行严重度旁的「依据」浮层就再也打不开。现在依据随
+    冲突行落库并回放下发。可空列（AI 发现行与历史行无依据），无需回填。
+    幂等：列已存在时跳过，可安全重复调用。
+    """
+    if "evidence_json" not in _get_column_names(conn, "consistency_conflicts"):
+        conn.execute("ALTER TABLE consistency_conflicts ADD COLUMN evidence_json TEXT")
+
+
 def seed_prompt_templates():
     from .services.ai.prompts import _ALL_PROMPTS
+
+    # 2026-11-04（ILLUSTRATION-REMOVAL 遗留项）：人工配图/生图端点已下线，
+    # 对应 4 个提示词模板在代码里已无任何 get_prompt 注入点。旧库中的残留行
+    # 会让「提示词管理」页展示永远不生效的配图提示词，并使变量契约审计
+    # （test_prompts_module_2026_10_06::test_prompt_placeholder_coverage_complete）
+    # 报「占位符从未被注入」——这里按**确定废弃 key** 清理，不动其他用户编辑内容。
+    _deprecated_prompt_keys = (
+        "ILLUSTRATION_ARRANGE_SYSTEM",
+        "ILLUSTRATION_ARRANGE_USER",
+        "ILLUSTRATION_PLAN_SYSTEM",
+        "ILLUSTRATION_PLAN_USER",
+    )
 
     old_placeholders = (
         "{scoring_points}",
@@ -2254,6 +2307,9 @@ def seed_prompt_templates():
     )
 
     with get_db() as conn:
+        for _dk in _deprecated_prompt_keys:
+            conn.execute("DELETE FROM prompt_templates WHERE key = ?", (_dk,))
+            conn.execute("DELETE FROM prompt_versions WHERE key = ?", (_dk,))
         existing = conn.execute(
             "SELECT key, content, default_content FROM prompt_templates",
         ).fetchall()
@@ -2850,6 +2906,13 @@ def __getattr__(name: str):
 
         return ensure_enhancement_tables
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+if TYPE_CHECKING:
+    # F822 修复：该名称由下方 PEP 562 __getattr__ 惰性提供，运行时不存在。
+    # 为静态分析声明一个仅类型检查期可见的符号，既保留 __all__ 导出语义，
+    # 又让 `ruff --select F822` 通过（运行期行为完全不变）。
+    from .db_migrations import ensure_enhancement_tables
 
 
 __all__ = [
