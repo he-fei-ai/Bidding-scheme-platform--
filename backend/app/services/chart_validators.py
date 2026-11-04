@@ -10,6 +10,8 @@ import json
 import re
 from typing import Any
 
+from .degradation import log_degradation
+
 
 def _flatten_with_level(node: dict, level: int = 0) -> list[dict]:
     """递归展平树结构，返回带层级信息的节点列表"""
@@ -156,7 +158,12 @@ def detect_architecture_subtype(data: dict, section_title: str = None) -> str | 
         if isinstance(data, dict):
             extract_labels(data)
     except Exception as _e:
-        pass
+        log_degradation(
+            "chart",
+            trigger="图表数据 JSON 解析/展开失败",
+            action="跳过结构化关键词提取（子类型可能退化为通用类型）",
+            reason=str(_e)[:120],
+        )
 
     # 添加章节标题关键词
     if section_title:

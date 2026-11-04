@@ -8,6 +8,7 @@ from typing import Any
 
 from ...utils import count_words as _count_words
 from ...utils.json_parser import extract_json_from_text
+from ..degradation import log_degradation
 from .prompts import get_prompt
 from .providers.base import AIMessage
 
@@ -700,8 +701,14 @@ def _warn_residual_review_placeholders(template: str) -> None:
                     "目录审核提示词填充后仍有未注入的占位符（DB 定制超出映射名单？）: %s",
                     sorted(set(leftover) | set(dunder)),
                 )
-    except Exception:
-        pass
+    except Exception as exc:
+        log_degradation(
+            "prompt",
+            trigger="提示词占位符残留检查失败",
+            action="跳过本次残留检查（不阻断目录审核）",
+            reason=str(exc)[:120],
+            logger_obj=logger,
+        )
 
 
 def _build_outline_review_texts(

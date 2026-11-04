@@ -150,6 +150,7 @@ from .export_chart_pipeline import (  # noqa: F401
     get_render_profile_summary,
     clear_render_profile,
 )
+from .degradation import log_degradation
 
 #: 导出端防御性清洗器（复用实例；ContentCleaner 无状态，实例开销可忽略）
 _EXPORT_CONTENT_CLEANER = ContentCleaner()
@@ -160,6 +161,7 @@ from .ai.outline_common import _strip_legacy_redundant_suffix
 
 
 logger = logging.getLogger(__name__)
+
 
 
 # 标题编号前缀模式 —— V3.1 七级新标准
@@ -1822,6 +1824,24 @@ def _render_commercial(
     # REFACTOR 2026-10-27：抽成闭包，渲染端语法闸门（上方策略 2 前）与
     # 策略 2 失败尾部共用同一段占位逻辑，避免两处实现漂移。
     def _emit_fail_note() -> None:
+        # ENHANCE 2026-11-04（降级盘点）：默认 CHART_FAIL_PLACEHOLDER=false 时
+        # 图表渲染失败会「静默跳过」——成品缺图但用户无感。此处统一落结构化
+        # 降级事件（含图型/图题/原因），使该降级可查询、可统计；不改交付物内容。
+        log_degradation(
+            "export",
+            trigger="DOCX 图表渲染失败",
+            action=(
+                "插入灰色失败说明（CHART_FAIL_PLACEHOLDER=true）"
+                if CHART_FAIL_PLACEHOLDER
+                else "静默跳过该图表（默认开关 false，图号不占用）"
+            ),
+            reason=str(last_error) if last_error else "",
+            logger_obj=logger,
+            chart_type=typ,
+            caption=(caption or "")[:60],
+            section_title=(section_title or "")[:60],
+            preload_only=preload_only,
+        )
         if preload_only or not CHART_FAIL_PLACEHOLDER:
             return
         try:

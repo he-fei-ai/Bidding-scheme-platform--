@@ -41,6 +41,7 @@ import re
 import time
 from typing import Any
 
+from ..degradation import log_degradation
 
 logger = logging.getLogger(__name__)
 
@@ -1189,7 +1190,15 @@ def select_facts_by_chapter_map(
             _norm_text,
             classify_chapter,
         )
-    except Exception:
+    except Exception as exc:
+        log_degradation(
+            "content",
+            trigger="content_field_contract 导入失败",
+            action="跳过章节事实清单注入",
+            reason=str(exc)[:120],
+            logger_obj=logger,
+            chapter_title=str(chapter_title)[:60],
+        )
         return []
 
     ch = classify_chapter(chapter_title, industry=industry)
@@ -1306,7 +1315,15 @@ def build_nine_chapter_elements(
     """
     try:
         from ...services.content_field_contract import classify_chapter
-    except Exception:
+    except Exception as exc:
+        log_degradation(
+            "content",
+            trigger="content_field_contract 导入失败",
+            action="跳过九章要素提示注入",
+            reason=str(exc)[:120],
+            logger_obj=logger,
+            chapter_title=str(chapter_title)[:60],
+        )
         return ""
 
     ch = classify_chapter(chapter_title, industry=industry)

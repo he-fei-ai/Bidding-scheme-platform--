@@ -36,6 +36,7 @@ from ...config import (
     PPT_COM_ENABLED,
     PPT_COM_TIMEOUT,
 )
+from ..degradation import log_degradation
 from ._notices import (
     EXTRACT_DOC_NOTICE,
     EXTRACT_PPT_NOTICE,
@@ -1052,6 +1053,14 @@ def _extract_image_ocr(file_path: str) -> str:
         logger.info("[图片OCR] OCR_ENGINE=none，按配置跳过: %s", name)
         return ""
     if _late("_ocr_image_size_exceeded")(file_path):
+        log_degradation(
+            "parse",
+            trigger="图片超出 OCR 大小上限",
+            action="跳过 OCR，返回空文本",
+            logger_obj=logger,
+            file_name=name,
+            engine=engine,
+        )
         return ""
 
     text = ""

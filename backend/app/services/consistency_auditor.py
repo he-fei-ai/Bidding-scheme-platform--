@@ -14,6 +14,7 @@ from typing import Any, ClassVar
 from ..db import get_db
 from . import consistency_rules as rules
 from . import text_patch
+from .degradation import log_degradation
 from .facts_service import is_placeholder_value, normalize_fact_value, parse_stored_items
 
 
@@ -1371,6 +1372,14 @@ def cleanup_old_consistency_audit(retention_days: int = 90) -> int:
             )
             conn.commit()
             return max(0, cur.rowcount or 0)
-    except Exception:
+    except Exception as exc:
+        log_degradation(
+            "consistency",
+            trigger="一致性审计日志清理失败",
+            action="放弃本次清理，返回 0 条",
+            reason=str(exc)[:120],
+            logger_obj=logger,
+            retention_days=retention_days,
+        )
         return 0
 

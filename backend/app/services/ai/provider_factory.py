@@ -22,6 +22,7 @@ from ...db import get_db, get_db_with_retry
 from ...logging_format import log_error as _log_error
 from ...utils.proxy_config import build_httpx_proxy_settings
 from ..crypto import decrypt_api_key, is_encrypted
+from ..degradation import log_degradation
 from . import provider_catalog
 
 
@@ -88,7 +89,14 @@ def get_ai_config_version() -> int:
     try:
         v = _read_config_version()
         return v if v > 0 else 0
-    except Exception:
+    except Exception as exc:
+        log_degradation(
+            "ai_config",
+            trigger="AI 配置版本号读取失败",
+            action="返回版本 0（ETag/乐观锁退化为无版本）",
+            reason=str(exc)[:120],
+            logger_obj=logger,
+        )
         return 0
 
 
@@ -104,7 +112,14 @@ def get_key_rotated_at() -> str | None:
                 (_KEY_ROTATED_AT_STATE_KEY,),
             ).fetchone()
         return row[0] if row else None
-    except Exception:
+    except Exception as exc:
+        log_degradation(
+            "ai_config",
+            trigger="API Key 轮转时间读取失败",
+            action="返回 None（轮转时间未知）",
+            reason=str(exc)[:120],
+            logger_obj=logger,
+        )
         return None
 
 

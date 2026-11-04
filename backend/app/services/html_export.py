@@ -30,6 +30,7 @@ from pathlib import Path
 from ..config import PROJECTS_DATA_DIR
 from ..db import get_db
 from ..models import ExportConfig
+from .degradation import log_degradation
 from .ai.heading_standard import HeadingNumberingGeneratorV2
 from .content_cleaning import extract_mermaid_title, parse_content
 from .export_cache import (
@@ -48,6 +49,7 @@ from .sections import build_tree
 
 
 logger = logging.getLogger(__name__)
+
 
 
 # ========== HTML 样式 ==========
@@ -200,8 +202,15 @@ def _render_chart_marker_html(
     marker = None
     try:
         marker = json.loads(text)
-    except (json.JSONDecodeError, TypeError):
-        pass
+    except (json.JSONDecodeError, TypeError) as exc:
+        log_degradation(
+            "export",
+            trigger="chart_marker JSON 解析失败",
+            action="按空 marker 渲染为图表占位符",
+            reason=str(exc)[:120],
+            logger_obj=logger,
+            section_id=str((section or {}).get("id", "")),
+        )
     if not isinstance(marker, dict):
         marker = {}
 
