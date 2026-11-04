@@ -53,6 +53,7 @@ const createSectionMock = vi.fn(async () => ({
 }));
 const moveSectionMock = vi.fn(async () => fetchSectionsMock());
 const v51ConfirmMock = vi.fn(async () => ({ ok: true }));
+const stopGenerationMock = vi.fn(async () => {});
 
 /** 可被测试驱动的 SSE 事件源替身 */
 let sseHandlers: { onmessage: ((e: { data: string }) => void) | null } = {
@@ -72,7 +73,7 @@ vi.mock("../api", () => ({
   reviewOutline: vi.fn(async () => ({ passed: true, issues: [] })),
   reviewOutlineWithAutofix: vi.fn(async () => ({ repaired: false, passed: true, issues: [] })),
   clearSections: vi.fn(async () => {}),
-  stopGeneration: vi.fn(async () => {}),
+  stopGeneration: stopGenerationMock,
   v51Confirm: v51ConfirmMock,
   fetchPendingV51Task: vi.fn(async () => ({ has_pending: false })),
   clearV51PendingTask: vi.fn(async () => {}),
@@ -138,6 +139,10 @@ describe.skipIf(!hasDom)("OutlineEditorPage 组件级交互（2026-10-12 加固�
   // 冷启动本身就慢；全量并行跑时 vitest 默认 10s 的 hook 超时会被击穿，
   // 表现为「Hook timed out in 10000ms」—— 与被测代码无关的假失败。
   // 与既有 dom 测试（如 FactBackflowTab）的处理一致：显式放宽。
+  // HARDEN 2026-11-04（遗留项 4 加固）：冷缓存首次 transform antd+jsdom 依赖
+  // 可超过 60s（配置注释实测冷启动极值 266s）——60_000 的 hook 超时在冷启动
+  // 时仍会误报「Hook timed out」。上调到与全局 testTimeout(300000) 一致，
+  // 覆盖冷启动极值且有余量，消除与被测代码无关的假失败。
   beforeAll(async () => {
     rtl = await loadRtl();
     if (!rtl) return;
@@ -153,7 +158,7 @@ describe.skipIf(!hasDom)("OutlineEditorPage 组件级交互（2026-10-12 加固�
       });
     }
     ({ default: OutlineEditorPage } = await import("./OutlineEditorPage"));
-  }, 60_000);
+  }, 300_000);
 
   beforeEach(() => {
     vi.clearAllMocks();
@@ -473,5 +478,74 @@ describe.skipIf(!hasDom)("OutlineEditorPage 组件级交互（2026-10-12 加固�
     ) as HTMLButtonElement | undefined;
     expect(btn).toBeTruthy();
     expect(btn!.disabled).toBe(false);
+  });
+
+  // ===============================================================
+  // 遗留项 4（2026-11-04）：占位标题 / 降级目录的用户提示
+  // ===============================================================
+
+  it("outline_l1_placeholder 与 outline_degraded 均向用户透出提示，不静默成功", async () => {
+    if (!rtl) return;
+    await renderPage();
+    const genBtn = Array.from(document.querySelectorAll("button")).find((b) =>
+      (b.textContent || "").includes("生成目录"),
+    ) as HTMLElement | undefined;
+    genBtn!.click();
+    await rtl.waitFor(() => expect(sseHandlers.onmessage).toBeTruthy());
+
+    emit({
+      status: "outline_l1_placeholder",
+      message: "有 2 个一级章节标题为占位形态（如「专项6」），建议人工调整",
+      placeholder_count: 2,
+      seq: 1,
+    });
+    await rtl.waitFor(() => {
+      expect(document.body.textContent).toContain("占位形态");
+    });
+    await rtl.waitFor(() => {
+      expect(document.body.textContent).toContain("人工调整");
+    });
+
+    emit({
+      status: "outline_degraded",
+      message: "有 3 个章节回退为模板默认目录",
+      fallback_count: 3,
+      seq: 2,
+    });
+    await rtl.waitFor(() => {
+      expect(document.body.textContent).toContain("模板默认目录");
+    });
+  });
+
+  it("审核弹窗「重新生成」先停旧任务、关断流并重新发起生成", async () => {
+    if (!rtl) return;
+    await renderPage();
+    const genBtn = Array.from(document.querySelectorAll("button")).find((b) =>
+      (b.textContent || "").includes("生成目录"),
+    ) as HTMLElement | undefined;
+    genBtn!.click();
+    await rtl.waitFor(() => expect(sseHandlers.onmessage).toBeTruthy());
+    const firstSource = sseHandlers.onmessage;
+
+    emit({
+      status: "review_needed", phase: "level1", message: "请审核一级目录", seq: 1,
+      outline: [{ id: "1", title: "施工部署", children: [] }],
+    });
+    const regenerate = await rtl.waitFor(() => {
+      const found = Array.from(document.querySelectorAll("button")).find((b) =>
+        (b.textContent || "").includes("重新生成"),
+      ) as HTMLButtonElement | undefined;
+      expect(found).toBeTruthy();
+      return found!;
+    });
+    regenerate.click();
+
+    // 停旧任务 + 关闭旧流，300ms 后重新发起（新事件源 onmessage 会被重新注册）
+    await rtl.waitFor(() => expect(stopGenerationMock).toHaveBeenCalled());
+    await rtl.waitFor(() => expect(closeSpy).toHaveBeenCalled());
+    await rtl.waitFor(() => {
+      expect(sseHandlers.onmessage).toBeTruthy();
+      expect(sseHandlers.onmessage).not.toBe(firstSource);
+    }, { timeout: 2000 });
   });
 });

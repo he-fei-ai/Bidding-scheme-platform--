@@ -924,6 +924,20 @@ class TestExtractBalancedJsonPerformance:
         result = _extract_balanced_json(content)
         assert result == '{"key": "value with { and } brackets"}'
 
+    def test_unbalanced_quote_falls_back_to_second_scan(self):
+        """引号不平衡的流式半成品：第二趟扫描仍能取到后面的完整 JSON。
+
+        锁定 BUG-FIX 2026-11-04 单趟扫描的兜底语义：
+        - 第一趟 respect_quotes=True 时，`{ "未闭合 ...` 的未闭合引号会把
+          后续 `{"a": 1}` 的括号全部视为字符串内容并屏蔽，返回 None；
+        - 第二趟把引号当普通文本（等价旧实现「每个候选起点重置字符串状态」），
+          取到最靠左的完整片段 `{"a": 1}`，而不是整段 None。
+        """
+        from app.utils.json_parser import _extract_balanced_json
+
+        content = '{ "未闭合 ... {"a": 1}'
+        assert _extract_balanced_json(content) == '{"a": 1}'
+
 
 # ----- Bug 7: _try_parse_candidate 惰性修复 -----
 

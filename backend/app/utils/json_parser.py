@@ -329,6 +329,21 @@ def _extract_balanced_json(content: str) -> str | None:
     相比正则 `\\{.*?\\}`，本方法能正确处理嵌套结构、字符串内的括号、
     以及文本中混杂多个 JSON 片段的场景。
 
+    实现（BUG-FIX 2026-11-04）：改为**单趟栈扫描**。
+    旧实现虽然用 `content.find` 跳开非开括号字符，但每个候选起点都要把
+    剩余全文重扫一遍：`"{" * 1000 + '{"a": 1}' + " " * 10000` 这种
+    「大量不匹配开括号 + 长尾」输入实测 5.77s（tests/test_import_fixes_
+    2026_10_08.py::test_many_unmatched_openers_fast 阈值 5s），仍属
+    O(k·n) 退化。单趟扫描把每个字符只看一次，最坏 O(n)。
+
+    语义保持不变：返回**最靠左**的完整配平片段。栈底开括号闭合（栈空）
+    即最左成功起点，可直接返回；若始终未清空（外层不闭合），则回退到
+    「闭合过的最左开括号」（例如 `{ {a}` → 返回 `{a}`，与旧实现一致）。
+
+    引号处理沿用旧实现的「每个候选起点重置字符串状态」：栈为空时引号视为
+    普通文本（允许被引号包裹的 JSON 被提取），栈非空时才按 JSON 字符串
+    规则屏蔽其中的括号。
+
     Returns:
         配平后的 JSON 子串；若找不到则返回 None。
     """
@@ -336,40 +351,22 @@ def _extract_balanced_json(content: str) -> str | None:
     closers = {"}": "{", "]": "["}
 
     # 性能优化：先定位第一个开括号，避免对超长纯文本（无任何 JSON）做逐字符无谓扫描。
-    # 原实现从位置 0 逐个字符检查，当输入为 50 万字符且不含 JSON 时仍会 O(n) 扫描。
-    find_start = -1
     first_open = content.find("{")
     first_bracket = content.find("[")
     if first_open == -1 and first_bracket == -1:
         return None
-    if first_open == -1:
-        find_start = first_bracket
-    elif first_bracket == -1:
-        find_start = first_open
-    else:
-        find_start = min(first_open, first_bracket)
-
-    # BUG-FIX 2026-10-08：原实现 for start in range(find_start, len) 逐字符
-    # 迭代外层循环，每次失败后从 start+1 重启扫描，最坏 O(n²)。
-    # 现改用 content.find() 跳到下一个开括号位置，内层扫描仍单次通过。
-    start = find_start
+    start = min(p for p in (first_open, first_bracket) if p != -1)
     n = len(content)
-    while start < n:
-        ch = content[start]
-        if ch not in openers:
-            # 跳到下一个开括号（避免逐字符遍历非开括号字符）
-            next_open = content.find("{", start + 1)
-            next_bracket = content.find("[", start + 1)
-            candidates = [p for p in (next_open, next_bracket) if p != -1]
-            if not candidates:
-                break
-            start = min(candidates)
-            continue
 
-        stack: list[str] = [ch]
+    def _scan(respect_quotes: bool) -> str | None:
+        """单趟栈扫描；respect_quotes=False 时把引号当普通文本（兼容重试语义）。"""
+        stack: list[int] = []
         in_string = False
         escape = False
-        i = start + 1
+        # 已闭合但外层未闭合时的最佳候选（开括号下标, 闭括号下标）
+        best: tuple[int, int] | None = None
+
+        i = start
         while i < n:
             c = content[i]
             if in_string:
@@ -379,28 +376,48 @@ def _extract_balanced_json(content: str) -> str | None:
                     escape = True
                 elif c == '"':
                     in_string = False
-            else:
-                if c == '"':
-                    in_string = True
-                elif c in openers:
-                    stack.append(c)
-                elif c in closers:
-                    if stack and stack[-1] == closers[c]:
-                        stack.pop()
-                        if not stack:
-                            return content[start : i + 1]
-                    else:
-                        break
+                i += 1
+                continue
+
+            if not stack:
+                # 栈为空：此处要么开启新片段，要么是片段之间的普通文本；
+                # 引号按普通文本处理（等价于旧实现「在新起点重置字符串状态」）。
+                if c in openers:
+                    stack.append(i)
+                i += 1
+                continue
+
+            if respect_quotes and c == '"':
+                in_string = True
+            elif c in openers:
+                stack.append(i)
+            elif c in closers:
+                if content[stack[-1]] != closers[c]:
+                    # 括号类型错配：当前所有未闭合候选都不可能配平（旧实现逐个
+                    # 重试也必然在同一个字符处失败），整体丢弃，从后续文本重新开始。
+                    stack.clear()
+                    in_string = False
+                    escape = False
+                else:
+                    popped = stack.pop()
+                    if not stack:
+                        return content[popped : i + 1]
+                    if best is None or popped < best[0]:
+                        best = (popped, i)
             i += 1
 
-        # 扫描失败 → 跳到下一个开括号位置继续尝试
-        next_open = content.find("{", start + 1)
-        next_bracket = content.find("[", start + 1)
-        candidates = [p for p in (next_open, next_bracket) if p != -1]
-        if not candidates:
-            break
-        start = min(candidates)
-    return None
+        if best is not None:
+            return content[best[0] : best[1] + 1]
+        return None
+
+    found = _scan(respect_quotes=True)
+    if found is not None:
+        return found
+    # 兜底（等价于旧实现「每个候选起点重置字符串状态」的恢复能力）：
+    # 首个片段里出现未闭合引号时，字符串状态会把后续合法 JSON 的括号全部
+    # 屏蔽掉（如 `{ "未闭合 ... {"a": 1}` 的流式半成品）。再跑一趟
+    # 「引号视为普通文本」的扫描，仍是最坏 O(n)，不引入重扫退化。
+    return _scan(respect_quotes=False)
 
 
 def safe_json_parse(text: str, default: Any = None) -> dict | list | None:

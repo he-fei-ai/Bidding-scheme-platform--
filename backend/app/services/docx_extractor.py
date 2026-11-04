@@ -61,14 +61,16 @@ def extract_docx_plain(file_path: str) -> str:
         result = "\n".join(paragraphs)
     except Exception:
         # 引入软件标准（标书智能体（一））：资源释放在 try 与 except 两处，避免异常时句柄泄漏。
-        # 异常路径同样删除文档对象并立即 gc，防止 zip 文件句柄（Document 内部持有）堆积。
-        del doc
+        # 异常路径同样解除文档对象引用并立即 gc，防止 zip 文件句柄（Document 内部持有）堆积。
+        # 注：用置 None 替代 del —— 语义等价（都是解除局部引用触发回收），
+        # 但避免 ruff F821 对「except 分支 del 后再 del」的误报。
+        doc = None
         gc.collect()
         raise
     # 正常路径释放（与 except 分支口径一致；仅此两处覆盖全部路径，不依赖 finally）。
     # BUG-FIX 2026-10-08：此前用 doc.part._element.clear() 依赖 python-docx 内部私有 API，
-    # 版本升级时可能失效，故改为直接删除文档对象让 GC 回收。
-    del doc
+    # 版本升级时可能失效，故改为解除引用让 GC 回收。
+    doc = None
     gc.collect()
     return result
 

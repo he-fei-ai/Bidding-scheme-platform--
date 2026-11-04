@@ -530,6 +530,65 @@ describe.skipIf(!hasDom)("FileUploadPage 组件级交互", () => {
     },
   );
 
+  // ─── 失败重试：失败后再次点击「重新提取」可恢复成功（不卡死） ──────
+
+  it(
+    "重新提取失败后重试成功：按钮恢复可点且显示成功提示",
+    async () => {
+      const rtl = await loadRtl();
+      if (!rtl) return;
+
+      API_MOCKS.fetchFiles.mockResolvedValue(FILES_MIXED);
+      API_MOCKS.reExtractFileText
+        .mockResolvedValueOnce({
+          status: "failed",
+          message: "[提示] 当前系统无法自动提取此 .doc 文件文本",
+          text_length: 0,
+        })
+        .mockResolvedValueOnce({ status: "success", text_length: 10, message: "" });
+
+      const FileUploadPage = (await import("./FileUploadPage")).default;
+      rtl.render(<FileUploadPage />);
+      await rtl.screen.findByText("招标文件.docx");
+
+      // 注意：重提取会 await loadFiles()，antd List 可能重建行节点；
+      // 每次断言/点击都重新定位行，避免对已脱离 DOM 的旧节点读 disabled。
+      const getRow = () =>
+        rtl.screen
+          .getByText("招标文件.docx")
+          .closest("li.ant-list-item") as HTMLElement;
+      const getRetryBtn = () =>
+        rtl.within(getRow()).getAllByRole("button", { name: /重新提取/ })[0] as HTMLButtonElement;
+
+      // 第 1 次：失败 -> error 提示，但在途标记已释放
+      rtl.fireEvent.click(getRetryBtn());
+      await rtl.waitFor(() => {
+        expect(API_MOCKS.reExtractFileText).toHaveBeenCalledTimes(1);
+      });
+      // 等失败结果落地（在途状态释放、提示出现）后再断言按钮可点
+      await rtl.waitFor(() => {
+        expect(document.body.textContent || "").toMatch(/无法自动提取|提取失败/);
+      });
+      await rtl.waitFor(() => {
+        expect(getRetryBtn().disabled).toBe(false);
+      }, { timeout: 5000 });
+
+      // 第 2 次：同一按钮仍可点击 -> 成功提示（失败不是终态，无需刷新页面）
+      const retryBtn = getRetryBtn();
+      expect(retryBtn.disabled).toBe(false);
+      rtl.fireEvent.click(retryBtn);
+      await rtl.waitFor(() => {
+        expect(API_MOCKS.reExtractFileText).toHaveBeenCalledTimes(2);
+      });
+      await rtl.waitFor(() => {
+        const body = document.body.textContent || "";
+        expect(body).toMatch(/提取成功/);
+      });
+
+      rtl.cleanup();
+    },
+  );
+
   // ─── 空态 + 上传后刷新列表 ────────────────────────────────────
 
   it(

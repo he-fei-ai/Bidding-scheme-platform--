@@ -721,7 +721,8 @@ def _ppt_com_extract_sync(file_path: str) -> str:
       - ``PPT_COM_INJECT_RESULT``：直接返回该文本，跳过真实 COM；
       - ``PPT_COM_INJECT_HANG``：睡眠 60s，用于验证超时护栏。
     """
-    import os
+    # `os` 由模块级导入（第 18 行）提供：本函数可能在子进程（spawn）中重新
+    # 导入模块后执行，模块级导入已生效；此处局部 import 属 F811 遮蔽，已移除。
 
     # —— 测试注入钩子（默认不触发）——
     _inject = os.environ.get("PPT_COM_INJECT_RESULT")
@@ -788,8 +789,8 @@ def _ppt_com_child_target(q, file_path):
     子进程，不影响解析主流程（父进程 join 超时 / 收不到结果即返回降级）。
     """
     import faulthandler
-    import os
 
+    # `os` 来自模块级导入（第 18 行）；子进程重新导入模块同样生效，去掉局部遮蔽。
     try:
         faulthandler.disable()
     except Exception:

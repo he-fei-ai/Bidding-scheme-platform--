@@ -41,7 +41,7 @@ const HISTORY_RECORD = {
   created_at: "2026-01-01 00:00:00",
 };
 
-const checkDocumentMock = vi.fn(async (_pid: number, _strict?: boolean) => CHECK_RESULT);
+const checkDocumentMock = vi.fn(async (_pid: number, _strict?: boolean, _block?: boolean) => CHECK_RESULT);
 const exportDocxMock = vi.fn(async (_pid: number, _cfg?: Record<string, unknown>) => ({
   filename: "out.docx",
   file_path: "/x",
@@ -64,21 +64,34 @@ const getExportHistoryMock = vi.fn(async (_pid: number) => [HISTORY_RECORD]);
 const exportPdfMock = vi.fn(async (_pid: number) => undefined);
 // ENHANCE 2026-10-13：HTML 导出（第二交付格式）mock
 const exportHtmlMock = vi.fn(async (_pid: number, _cfg?: Record<string, unknown>) => undefined);
+// B-3/B-4（2026-11-04）：预设目录 mock 提为具名可控行。夹具字段同步修正为
+// 与后端 GET /export/presets（export_presets.list_presets）及前端
+// ExportLayoutPreset 类型一致的 **label** 字段——旧夹具写 `name`，生产代码与
+// 类型读 `label`，测试里下拉选项 label 恒为 undefined（夹具/类型漂移）。
+const PRESET_CATALOG = {
+  layouts: [
+    {
+      id: "formal-binding",
+      label: "正式装订",
+      description: "测试版式：适合打印后装订递交。",
+      config: {},
+    },
+  ],
+  themes: [],
+  defaults: { layout_id: "formal-binding", theme_id: "" },
+};
+const getExportPresetsMock = vi.fn(async () => PRESET_CATALOG);
 
 vi.mock("../api", () => ({
   getProject: vi.fn(async () => ({ id: 1, name: "测试项目", bidder_name: "测试单位" })),
   // spread 用显式元组类型，避免 TS2556（vi.fn 的 Parameters 退化为 unknown[] 不可 spread）
-  checkDocument: (...args: [number, boolean?]) => checkDocumentMock(...args),
+  checkDocument: (...args: [number, boolean?, boolean?]) => checkDocumentMock(...args),
   exportDocx: (...args: [number, Record<string, unknown>?]) => exportDocxMock(...args),
   exportDocxStream: (...args: [number, Record<string, unknown>, ((e: unknown) => void)?]) => exportDocxStreamMock(...args),
   getExportHistory: (...args: [number]) => getExportHistoryMock(...args),
   getExportDownloadUrl: vi.fn((pid: number, eid: number) => `/api/v1/projects/${pid}/export/download/${eid}`),
   getLatestExportUrl: vi.fn((pid: number) => `/api/v1/projects/${pid}/export/latest`),
-  getExportPresets: vi.fn(async () => ({
-    layouts: [{ id: "formal-binding", name: "正式装订", config: {} }],
-    themes: [],
-    defaults: { layout_id: "formal-binding", theme_id: "" },
-  })),
+  getExportPresets: (...args: []) => getExportPresetsMock(...args),
   exportPdf: (...args: [number]) => exportPdfMock(...args),
   exportHtml: (...args: [number, Record<string, unknown>?]) => exportHtmlMock(...args),
 }));
@@ -235,6 +248,61 @@ describe.skipIf(!hasDom)("ExportConfigPage 组件级交互（导出链契约）"
     rtl.cleanup();
   });
 
+  // 2026-11-04（收尾 P4）：缓存指纹命中 —— 后端 SSE progress.step 透传到用户可见
+  // 进度文案，证明「同输入复用渲染结果」不是静默复用，用户能看到当前阶段。
+  it("导出 SSE 的缓存指纹命中阶段透传到界面（非静默复用）", async () => {
+    const rtl = await loadRtl();
+    if (!rtl) return;
+    exportDocxMock.mockClear();
+    exportDocxStreamMock.mockClear();
+
+    // 显式标注返回类型，避免 Promise<unknown> 与 mockImplementationOnce 期望的
+    // Promise<ExportResult> 不兼容（TS2345）。
+    type StreamResult = {
+      filename: string;
+      file_path: string;
+      file_size: number;
+      export_id: number;
+      record_failed: boolean;
+      check: DocumentCheckResult;
+    };
+    let resolveStream!: (v: StreamResult) => void;
+    const pending = new Promise<StreamResult>((resolve) => {
+      resolveStream = resolve;
+    });
+    exportDocxStreamMock.mockImplementationOnce(
+      (_pid: number, _cfg: Record<string, unknown>, onEvt?: (e: unknown) => void) => {
+        onEvt?.({
+          event: "progress",
+          progress: 0.6,
+          step: "命中缓存：12 个章节复用指纹一致的渲染结果",
+        });
+        return { abort: vi.fn(), promise: pending };
+      },
+    );
+
+    const Page = (await import("./ExportConfigPage")).default;
+    rtl.render(<Page />);
+    rtl.fireEvent.click(await rtl.screen.findByText("导出 DOCX"));
+
+    // 进度阶段文案直接出现在界面（缓存命中不是静默跳过）
+    await rtl.waitFor(() => {
+      expect(document.body.textContent).toContain("命中缓存：12 个章节复用指纹一致的渲染结果");
+    });
+    expect(exportDocxMock).not.toHaveBeenCalled();
+
+    resolveStream({
+      filename: "out.docx",
+      file_path: "/x",
+      file_size: 12345,
+      export_id: 201,
+      record_failed: false,
+      check: CHECK_RESULT,
+    });
+    expect(await rtl.screen.findByText("导出成功")).toBeTruthy();
+    rtl.cleanup();
+  });
+
   // BUG-FIX 2026-10-27（P2·误降级同步导出）：已收到 stream_id 说明构建已在
   // 后端启动并持有导出组锁 —— 降级同步 exportDocx 必然撞 409 或重复构建。
   // 页面必须转「后台继续」分支：不调 exportDocx，任务以 completed 收尾并提示
@@ -275,6 +343,33 @@ describe.skipIf(!hasDom)("ExportConfigPage 组件级交互（导出链契约）"
     // 关键契约：不降级 —— 同步接口绝不能被再次调用（409 误报 / 重复构建）
     expect(exportDocxMock).not.toHaveBeenCalled();
     completeSpy.mockRestore();
+    rtl.cleanup();
+  });
+
+  // BUG-FIX 2026-11-02（B-1·前端硬编码覆盖预设）：image_max_width_cm /
+  // gantt_max_columns / image_dpi 属"预设/后端配置管辖"字段，前端显式传值
+  // 会在 resolve_export_config 中以最高优先级覆盖预设值（选「宽表格横版」
+  // 等版式时图片宽度与甘特列数恒被 18 中和）。钉住导出请求体不再携带这
+  // 三个字段，由后端按 preset_id + 模型默认值补全（向后兼容）。
+  it("导出 DOCX 配置不携带 image_max_width_cm/gantt_max_columns/image_dpi（B-1）", async () => {
+    const rtl = await loadRtl();
+    if (!rtl) return;
+    exportDocxStreamMock.mockClear();
+
+    const Page = (await import("./ExportConfigPage")).default;
+    rtl.render(<Page />);
+
+    const btn = await rtl.screen.findByText("导出 DOCX");
+    rtl.fireEvent.click(btn);
+
+    expect(await rtl.screen.findByText("导出成功")).toBeTruthy();
+    expect(exportDocxStreamMock).toHaveBeenCalled();
+    const [, cfg] = exportDocxStreamMock.mock.calls[0] as [number, Record<string, unknown>];
+    expect(cfg).not.toHaveProperty("image_max_width_cm");
+    expect(cfg).not.toHaveProperty("gantt_max_columns");
+    expect(cfg).not.toHaveProperty("image_dpi");
+    // 预设透传链路不受影响
+    expect(cfg).toHaveProperty("preset_id", "formal-binding");
     rtl.cleanup();
   });
 
@@ -413,6 +508,149 @@ describe.skipIf(!hasDom)("ExportConfigPage 组件级交互（导出链契约）"
 
     modalErrorSpy.mockRestore();
     messageErrorSpy.mockRestore();
+    rtl.cleanup();
+  });
+
+  // BUG-FIX 2026-11-06（组件级覆盖补齐）：导出进行中点「取消导出」→ 中止 SSE 流、
+  // 不降级重跑同步接口、任务停止追踪。原 handleCancelExport 的 abort/取消分支此前
+  // 无组件级测试（只有 utils.classifyExportFailure 纯函数覆盖取消判定）。
+  it("导出进行中点「取消导出」中止 SSE 流且不降级同步导出", async () => {
+    const rtl = await loadRtl();
+    if (!rtl) return;
+    exportDocxMock.mockClear();
+    exportDocxStreamMock.mockClear();
+    // 模拟真实 SSE 语义：abort() 使挂起 promise reject（AbortError）——
+    // 否则 promise 永不 settle，handleExport 的 catch/finally 永不执行，
+    // taskStore.stopTracking 也不会被调用，断言无法收敛。
+    let rejectPending: (e: any) => void = () => {};
+    const pendingPromise = new Promise<never>((_res, rej) => { rejectPending = rej; });
+    const abortMock = vi.fn(() => rejectPending(new Error("SSE 导出已被取消")));
+    exportDocxStreamMock.mockReturnValueOnce({
+      abort: abortMock,
+      promise: pendingPromise,
+    });
+    const stopSpy = vi.spyOn(taskStore, "stopTracking");
+
+    const Page = (await import("./ExportConfigPage")).default;
+    rtl.render(<Page />);
+
+    const btn = await rtl.screen.findByText("导出 DOCX");
+    rtl.fireEvent.click(btn);
+    // 等待导出卡出现（挂起中）
+    await rtl.screen.findByText("取消导出");
+
+    const cancelBtn = await rtl.screen.findByText("取消导出");
+    rtl.fireEvent.click(cancelBtn);
+
+    await vi.waitFor(() => expect(abortMock).toHaveBeenCalled());
+    // 关键契约：取消不降级 —— 同步接口绝不能被调用
+    expect(exportDocxMock).not.toHaveBeenCalled();
+    // 取消后任务停止追踪（cancelRequestedRef → catch 的取消分支）
+    await vi.waitFor(() => expect(stopSpy).toHaveBeenCalledWith("export-1"));
+    stopSpy.mockRestore();
+    rtl.cleanup();
+  });
+
+  // 组件级覆盖补齐：勾选「严格模式」「一致性冲突阻断导出」后点「完整性检查」，
+  // 必须把 strict=true / block=true 透传给 checkDocument（此前只测默认 false）。
+  it("勾选严格模式与一致性闸门后点「完整性检查」透传 true", async () => {
+    const rtl = await loadRtl();
+    if (!rtl) return;
+    checkDocumentMock.mockClear();
+
+    const Page = (await import("./ExportConfigPage")).default;
+    rtl.render(<Page />);
+
+    // antd Switch 序列：标题页/目录页/页眉页脚/严格模式/一致性冲突阻断/图表兜底补图
+    const switches = rtl.screen.getAllByRole("switch");
+    rtl.fireEvent.click(switches[3]); // 严格模式
+    rtl.fireEvent.click(switches[4]); // 一致性冲突阻断导出
+
+    const btn = await rtl.screen.findByText("完整性检查");
+    rtl.fireEvent.click(btn);
+
+    await vi.waitFor(() => expect(checkDocumentMock).toHaveBeenCalled());
+    const [, strict, block] = checkDocumentMock.mock.calls[0] as [number, boolean, boolean];
+    expect(strict).toBe(true);
+    expect(block).toBe(true);
+    rtl.cleanup();
+  });
+
+  // 组件级覆盖补齐：图题分隔符选择「：」后点「导出 DOCX」，SSE 请求体携带
+  // figure_no_separator="："（L-6 2026-10-17 图题格式配置链路）。
+  it("选择冒号图题分隔符后导出配置携带 figure_no_separator=：", async () => {
+    const rtl = await loadRtl();
+    if (!rtl) return;
+    exportDocxStreamMock.mockClear();
+
+    const Page = (await import("./ExportConfigPage")).default;
+    rtl.render(<Page />);
+
+    // 点开分隔符 Select（value 显示「空格（图3-1 标题）」；用正则匹配避免
+    // antd 对全角括号/空白节点的精确文本差异导致漏匹配）
+    const sepSelect = await rtl.screen.findByText(/空格（图3-1 标题）/);
+    rtl.fireEvent.mouseDown(sepSelect);
+    // 选中「冒号（图3-1：标题）」选项
+    const colonOption = await rtl.screen.findByText(/冒号（图3-1：标题）/);
+    rtl.fireEvent.click(colonOption);
+
+    const btn = await rtl.screen.findByText("导出 DOCX");
+    rtl.fireEvent.click(btn);
+
+    expect(await rtl.screen.findByText("导出成功")).toBeTruthy();
+    expect(exportDocxStreamMock).toHaveBeenCalled();
+    const [, cfg] = exportDocxStreamMock.mock.calls[0] as [number, Record<string, unknown>];
+    expect(cfg).toHaveProperty("figure_no_separator", "：");
+    rtl.cleanup();
+  });
+
+  // B-3（2026-11-04 导出模块加固轮·夹具/类型漂移钉住）：预设目录的版式条目
+  // 按 ExportLayoutPreset 契约携带 label/description；页面把 label 渲染进
+  // 「版式」Select 的选中项、description 渲染进说明 Alert。旧测试夹具写
+  // `name` 字段，label 恒 undefined → 下拉显示 value（"formal-binding"），
+  // 该契约此前无断言。
+  it("预设目录加载后版式 label/description 正确渲染（B-3）", async () => {
+    const rtl = await loadRtl();
+    if (!rtl) return;
+    getExportPresetsMock.mockClear();
+
+    const Page = (await import("./ExportConfigPage")).default;
+    rtl.render(<Page />);
+
+    // 默认版式被自动套用（defaults.layout_id）→ Select 选中项显示 label 文本
+    expect(await rtl.screen.findByText("正式装订")).toBeTruthy();
+    // 说明 Alert 渲染 description（同一目录的另一契约字段）
+    expect(
+      await rtl.screen.findByText("测试版式：适合打印后装订递交。"),
+    ).toBeTruthy();
+    // 目录计数文案来自同一 catalog
+    expect(await rtl.screen.findByText(/共 1 套版式/)).toBeTruthy();
+    expect(getExportPresetsMock).toHaveBeenCalledTimes(1);
+    rtl.cleanup();
+  });
+
+  // B-4（2026-11-04 导出模块加固轮）：预设加载失败必须可感知、可重试。
+  // 旧实现 catch 里复位 presetsLoadedRef 但挂载 effect 依赖 []，重试是死代码。
+  it("预设加载失败展示重试按钮，点击重试成功后提示消失（B-4）", async () => {
+    const rtl = await loadRtl();
+    if (!rtl) return;
+    getExportPresetsMock.mockClear();
+    // 首次（挂载）调用失败 → 重试入口出现；重试走默认成功实现
+    getExportPresetsMock.mockRejectedValueOnce(new Error("预设服务暂时不可用"));
+
+    const Page = (await import("./ExportConfigPage")).default;
+    rtl.render(<Page />);
+
+    const retryBtn = await rtl.screen.findByText("重试加载预设");
+    expect(await rtl.screen.findByText(/预设目录加载失败/)).toBeTruthy();
+
+    rtl.fireEvent.click(retryBtn);
+    // 重试成功（默认实现）→ 失败提示与按钮消失，目录正常渲染
+    await rtl.screen.findByText("正式装订");
+    await vi.waitFor(() =>
+      expect(rtl.screen.queryByText("重试加载预设")).toBeNull(),
+    );
+    expect(getExportPresetsMock).toHaveBeenCalledTimes(2);
     rtl.cleanup();
   });
 });
