@@ -518,7 +518,10 @@ const [progressTotal, setProgressTotal] = useState(0);
   const silentRefreshTree = useCallback(async (): Promise<SectionTreeNode[]> => {
     try {
       const t = await fetchSections(projectId);
-      const sanitized = sanitizeTreeIfNotGenerating(t);
+      // BUG-FIX 2026-11-04（中）：暂停态下在飞章节仍为 generating，sanitize
+      // 会把它们误标为 completed/failed（loadTree 对 paused 已有同款规避，
+      // 暂停路径 300ms 后的刷新漏掉了 —— 与断点续生现场不符，误导用户）。
+      const sanitized = isPausedRef.current ? t : sanitizeTreeIfNotGenerating(t);
       setTree(sanitized);
       return sanitized;
     } catch {
@@ -797,6 +800,33 @@ const handleSelectSection = (node: SectionTreeNode) => {
     }
   };
 
+  // 图表载荷编辑（前端来源标签方案 P1）：按行区间重写正文中的 chart-json 围栏体并落库。
+  // 保存后 setSectionContent 触发 ContentPreview 重新 parse，围栏行区间天然刷新。
+  const handleEditChartFence = useCallback(
+    async (lineStart: number, lineEnd: number, jsonStr: string) => {
+      if (!selectedSection) return;
+      const lines = sectionContent.split("\n");
+      const next = [...lines];
+      next.splice(lineStart + 1, Math.max(0, lineEnd - lineStart - 1), jsonStr);
+      const newContent = next.join("\n");
+      setSectionContent(newContent);
+      try {
+        await updateSectionApi(projectId, selectedSection.id, { content: newContent });
+        message.success("图表数据已更新");
+      } catch {
+        message.error("保存失败");
+      }
+    },
+    [selectedSection, sectionContent, projectId],
+  );
+  // 用 ref 保持回调身份稳定，避免破坏 ContentPreview 的 React.memo 渲染缓存
+  const editChartFenceRef = useRef(handleEditChartFence);
+  editChartFenceRef.current = handleEditChartFence;
+  const stableEditChartFence = useCallback(
+    (a: number, b: number, c: string) => editChartFenceRef.current(a, b, c),
+    [],
+  );
+
   const startGeneration = async (regenIds?: number[], rootSectionId?: number | null, regenerateMissing?: boolean) => {
     // BUG-F-04 修复：防止并发调用 startGeneration
     // 当一个 startGeneration 正在执行时，拒绝新的请求
@@ -864,12 +894,26 @@ const handleSelectSection = (node: SectionTreeNode) => {
       return;
     }
 
-    const eventSource = createContentStream(projectId, writingLength, regenIds, rootSectionId, regenerateMissing, level2DefaultWords, useOrchestration, useWordSampling, useFallbackExpand, useConsistencyAudit, concurrency, useOrchestration ? {
+    let eventSource: ReturnType<typeof createContentStream>;
+    try {
+      eventSource = createContentStream(projectId, writingLength, regenIds, rootSectionId, regenerateMissing, level2DefaultWords, useOrchestration, useWordSampling, useFallbackExpand, useConsistencyAudit, concurrency, useOrchestration ? {
       maxAiImages: orchMaxAiImages,
       tableRatio: orchTableRatio,
       preferMermaid: orchPreferMermaid,
       sectionPerSegment: orchSectionPerSegment,
     } : undefined, useWordAdjust, generationMode);
+    } catch (streamErr) {
+      // BUG-FIX 2026-11-04（低·启动异常悬挂）：createContentStream 同步抛错
+      // （URL 构造/参数异常等）时旧实现无回滚 —— setIsGenerating(true) 已置位、
+      // 树已标记 generating、按钮永久转圈。回滚全部启动态后呈现错误。
+      setIsGenerating(false);
+      setTree((prev) => resetGeneratingNodes(prev));
+      message.error(
+        `启动生成失败：${streamErr instanceof Error ? streamErr.message : String(streamErr)}`
+      );
+      isStartingRef.current = false;  // BUG-F-04 修复：手动重置锁
+      return;
+    }
 eventSourceRef.current = eventSource;
     let finishedNormally = false;
     let hasConnected = false;
@@ -1198,6 +1242,18 @@ if (d.status === "failed") {
           eventSource.close();
           eventSourceRef.current = null;
         } else if (d.status === "stopped") {
+          // BUG-FIX 2026-11-04（中低·停止后 stopped 帧重复处理）：用户点
+          // 「停止」时 handleStopGeneration 已 markTerminalEvent + close +
+          // message.success + 计数收尾；后端 CancelledError 路径仍会补推一条
+          // stopped 帧（sse_content.py），read 循环 close 后的下一个 chunk
+          // 仍会被处理一次 → 重复 toast + 计数覆盖。用户已主动停止时，
+          // 迟到的 stopped 帧只静默关流。
+          if (userStoppedRef.current) {
+            eventSource.markTerminalEvent();
+            eventSource.close();
+            eventSourceRef.current = null;
+            return;
+          }
           finishedNormally = true;
           message.destroy("wordAdjust");
           clearAllTimeouts();
@@ -1220,6 +1276,25 @@ globalCompletedReceivedRef.current = true;
           eventSource.close();
           eventSourceRef.current = null;
         } else if (d.status === "error") {
+          // BUG-FIX 2026-11-04（高·断线重连误报失败）：重连分支对同一
+          // /generate-content GET 递归重发时，后台续跑任务仍持有任务组锁，
+          // 新连接会收到 {"status":"error","code":"TASK_LOCK_CONFLICT"}。
+          // 旧实现把它当终态失败：全部节点标红 + setIsGenerating(false)，
+          // 而后端任务其实仍在正常跑完 —— 用户看到假失败、树被标红，
+          // 5s 恢复轮询也被关闭（isGenerating=false），UI 冻结在假失败态。
+          // 特判互斥冲突：不标红、不改生成态，仅提示并关流；isGenerating
+          // 保持 true 且 eventSourceRef 置空后，5s 恢复轮询自动接管进度与收尾。
+          if (d.code === "TASK_LOCK_CONFLICT") {
+            message.destroy("wordAdjust");
+            message.destroy("chartDraining");
+            message.info(d.message || "已有生成任务进行中，正在同步进度");
+            clearAllTimeouts();
+            flushTreeUpdates();
+            eventSource.markTerminalEvent();  // 标记终端事件，避免 close() 时 abort
+            eventSource.close();
+            eventSourceRef.current = null;
+            return;
+          }
           finishedNormally = true;
           message.destroy("wordAdjust");
           clearAllTimeouts();
@@ -1269,6 +1344,10 @@ globalCompletedReceivedRef.current = true;
 
       if (_pollRetryCount >= MAX_POLL_RETRIES) {
         // 超时耗尽，最终放弃
+        // BUG-FIX 2026-11-04（低）：同 promise.catch 降级路径，清理常驻 loading toast
+        message.destroy("wordAdjust");
+        message.destroy("chartDraining");
+        message.destroy("illustrationPhase");
         setIsGenerating(false);
         setTree((prev) => resetGeneratingNodes(prev));
         message.error("SSE 连接中断，请刷新页面查看最新结果");
@@ -1287,7 +1366,44 @@ globalCompletedReceivedRef.current = true;
         const tasks = statusResp.data?.tasks || {};
         const contentTask = tasks['content_generation'];
         const taskStatus = contentTask?.task_status || contentTask?.status;
-        
+
+        // BUG-FIX 2026-11-04（中高·可恢复任务误判死亡）：轮询旧只识别
+        // completed/failed/cancelled 三个终态；后端 /tasks/status 对暂停任务
+        // 下发 {'status':'paused'}（无 task_status 字段）、对残留任务自动修正后
+        // 下发 {'status':'corrected'} —— 两者都落入「仍在运行」分支空转 60s，
+        // 最终走放弃分支误报「SSE 连接中断」并把可断点续生的暂停任务标红。
+        if (taskStatus === 'paused') {
+          console.info('[SSE] 任务已暂停，切换到暂停态（可恢复）');
+          isGeneratingRef.current = false;
+          setIsGenerating(false);
+          setIsPaused(true);
+          isPausedRef.current = true;
+          if (eventSourceRef.current) {
+            eventSourceRef.current.markTerminalEvent();
+            eventSourceRef.current.close();
+            eventSourceRef.current = null;
+          }
+          return;
+        }
+        if (taskStatus === 'corrected') {
+          // 后端已把残留任务与章节自动标记为失败，按失败终态收尾（与 5s
+          // 恢复轮询的「任务已结束」分支同口径，以服务端树为准）
+          console.info('[SSE] 任务被后端自动修正为失败，收尾');
+          await silentRefreshTree();
+          if (selectedSectionRef.current) {
+            loadSectionDetail(selectedSectionRef.current.id);
+          }
+          isGeneratingRef.current = false;
+          setIsGenerating(false);
+          message.warning(contentTask?.message || '检测到异常中断的生成任务，请重新生成');
+          if (eventSourceRef.current) {
+            eventSourceRef.current.markTerminalEvent();
+            eventSourceRef.current.close();
+            eventSourceRef.current = null;
+          }
+          return;
+        }
+
         // 任务已完成或已失败
         if (taskStatus === 'completed' || taskStatus === 'failed' || taskStatus === 'cancelled') {
           console.info(`[SSE] 任务已终止 (status=${taskStatus})，刷新结果`);
@@ -1337,6 +1453,11 @@ globalCompletedReceivedRef.current = true;
       // HTTP 错误（401/429/503）：清除所有超时，立即显示真实错误信息
       if ((e as any).isHttpError) {
         clearAllTimeouts();
+        // BUG-FIX 2026-11-04（低）：降级路径同步清理常驻 loading toast，
+        // 否则「正在按字数目标调整正文…」等 duration:0 提示永不消失
+        message.destroy("wordAdjust");
+        message.destroy("chartDraining");
+        message.destroy("illustrationPhase");
         setIsGenerating(false);
         setTree((prev) => resetGeneratingNodes(prev));
         message.error(String(e));
@@ -1490,7 +1611,7 @@ globalCompletedReceivedRef.current = true;
     // BUG-FIX 2026-09-15：兜底扩写的目标集合是「已生成但字数不足」的章节，
     // 旧实现误用 pendingFailedCount（待生成/失败/取消数）做门控与提示，
     // 导致全部生成完成但字数不足时按钮被禁用（核心场景不可用）。
-    const deficient = getWordDeficientStats(tree, getExpandFlatMinimum(writingLength), level2DefaultWords);
+    const deficient = getWordDeficientStats(tree, getExpandFlatMinimum(writingLength), level2DefaultWords, writingLength);
     if (deficient.count === 0) {
       message.info("没有字数不足的已生成章节，无需扩写");
       return;
@@ -1978,7 +2099,11 @@ globalCompletedReceivedRef.current = true;
               </Button>
             </div>
             {previewMode ? (
-              <ContentPreview content={sectionContent} sectionCharts={sectionCharts} />
+              <ContentPreview
+                content={sectionContent}
+                sectionCharts={sectionCharts}
+                onEditChartFence={stableEditChartFence}
+              />
             ) : (
               <RichTextEditor
                 value={sectionContent}
@@ -2086,8 +2211,32 @@ globalCompletedReceivedRef.current = true;
   const leafCount = getLeafCount(tree);
   const pendingFailedCount = getPendingFailedLeafCount(tree);
   // 兜底扩写目标统计：已生成但字数不足的章节（ENHANCE 2026-09-15）
-  const wordDeficient = getWordDeficientStats(tree, getExpandFlatMinimum(writingLength), level2DefaultWords);
+  const wordDeficient = getWordDeficientStats(tree, getExpandFlatMinimum(writingLength), level2DefaultWords, writingLength);
   const annotatedTree = useMemo(() => annotateOutlineWithNumbers(tree), [tree]);
+
+  // BUG-FIX 2026-11-04（中·右栏详情脱同步）：selectedSection 持有的是选中
+  // 那一代的树节点克隆（annotateInto 每次返回全新对象）；树刷新（生成终态/
+  // 改目标字数/silentRefreshTree）后 annotatedTree 全量重建，selectedSection
+  // 仍指旧对象 → 右栏「已保存」Tag、字数、目标字数输入框停留在旧值
+  // （左树新、右栏旧的双真相源）。此处按 id 从最新 annotatedTree 重新取节点，
+  // 仅在展示关键字段实际变化时回写，避免多余渲染与选中闪烁。
+  useEffect(() => {
+    const cur = selectedSectionRef.current;
+    if (!cur || !annotatedTree.length) return;
+    const fresh = findNodeInTree(annotatedTree, cur.id);
+    if (!fresh) return;
+    if (
+      fresh.status !== cur.status ||
+      fresh.word_count !== cur.word_count ||
+      fresh.has_content !== cur.has_content ||
+      fresh.target_words !== cur.target_words ||
+      fresh.title !== cur.title ||
+      fresh.number !== cur.number
+    ) {
+      selectedSectionRef.current = fresh;
+      setSelectedSection(fresh);
+    }
+  }, [annotatedTree]);
 
   // 2026-10-12：字数控制已下沉到三级目录（L3）。当前档位与达标区间从 WORD_COUNT_TIERS 派生，
   // 供「字数预算」卡片展示，避免再写死旧的二级（L2）字数区间。

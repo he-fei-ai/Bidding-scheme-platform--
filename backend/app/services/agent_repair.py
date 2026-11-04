@@ -35,15 +35,18 @@ import re
 from typing import Any
 
 from ..db import get_db
+from . import consistency_rules as rules
 from . import text_patch
 from .ai.prompts import get_prompt
 from .ai.providers.base import AIMessage
 from .consistency_repair import (
     _load_all_project_content,
     _load_project_summary_and_baseline,
+    build_ai_findings_text,
     build_conflicts_text,
     build_facts_text,
     refresh_conflict_states,
+    split_rule_and_ai,
 )
 
 
@@ -95,9 +98,24 @@ MAX_ACTIONS_PER_TURN = 12
 
 
 def _workspace_dir(project_id: int, base: Path | None = None) -> Path:
-    """工作区目录：默认落到 {backend}/data/agent_repair/{project_id}/。"""
-    root = base or Path(__file__).resolve().parents[2] / "data" / "agent_repair"
-    return root / str(project_id)
+    """工作区目录：默认落到 `{DATA_DIR}/{AGENT_REPAIR_WORKSPACE_SUBDIR}/{project_id}/`。
+
+    BUG-FIX 2026-11-04（第 11 轮·P2·死配置 + 路径口径矛盾）：`config.py` 声明了
+    `AGENT_REPAIR_WORKSPACE_SUBDIR`（注释明确写「相对 DATA_DIR」），但本函数
+    此前硬编码 `{backend}/data/agent_repair` —— 既不读配置、也不在 `DATA_DIR`
+    （项目根 `data/`，与实库同源）之下，而是落在 `backend/data/`（陈旧副本
+    目录，见仓库记忆口径）。配置项成为死配置，且持久化快照会写进错误目录。
+    现改为读配置；config 导入失败时回退旧行为（保持向后兼容）。
+    显式传 `base`（测试）优先，行为不变。
+    """
+    if base is not None:
+        return Path(base) / str(project_id)
+    try:
+        from ..config import AGENT_REPAIR_WORKSPACE_SUBDIR, DATA_DIR
+
+        return Path(DATA_DIR) / str(AGENT_REPAIR_WORKSPACE_SUBDIR or "agent_repair") / str(project_id)
+    except Exception:  # pragma: no cover - 配置不可用时回退历史路径
+        return Path(__file__).resolve().parents[2] / "data" / "agent_repair" / str(project_id)
 
 
 def _load_sections(conn, project_id: int) -> list[dict]:
@@ -117,21 +135,39 @@ def _load_sections(conn, project_id: int) -> list[dict]:
 def build_agent_workspace(project_id: int, base: Path | None = None) -> dict:
     """准备 Agent 工作区：读取事实/冲突/正文，写出两个工作区文件。
 
-    Returns dict：{dir, facts, conflicts, sections, global_facts_md, technical_plan_md}
+    Returns dict：{dir, facts, conflicts, ai_findings, sections,
+    global_facts_md, technical_plan_md}
     只读操作，不落库。
 
     BUG-FIX 2026-10-27（P3·纯读抢写锁）：本函数对 DB 只读（文件写入仅在
     AGENT_REPAIR_PERSIST_WORKSPACE 门禁下发生，且不碰库），此前用无参
     `get_db()` 抢全局写锁 —— 与 backflow / auditor 已修的「纯读却抢写锁」
     同类问题，会把并发导出/生成事务无谓拖慢。现改 `get_db(readonly=True)`。
+
+    F-2（2026-11-02）：冲突按来源拆成 `conflicts`（规则冲突，Agent 可用
+    replace 收敛）与 `ai_findings`（AI 语义发现，无结构化取值，只作参考），
+    与 AI 补丁链路同一口径。
     """
     with get_db(readonly=True) as conn:
         facts_row = conn.execute(
             "SELECT global_facts_json FROM analysis WHERE project_id = ?", (project_id,)
         ).fetchone()
+        # BUG-FIX 2026-11-02（sqlite3.Row 惰性解引用·同类已修 3 处）：`facts_row`
+        # 此前在 with 块**之外**才解引用（见下方 `parse_stored_items`），而 Row 读的是
+        # 连接上那个共享、会在块退出 commit() 时被 finalize 的预处理语句的当前行/列。
+        # 后续 `conflict_rows` / `_load_sections` 的 execute 覆盖了同一语句的列布局，
+        # 跨块取值可能读到残留或串列内存 —— Agent 修复因此拿不到全局事实基准，
+        # 只能凭语义猜目标值。现于块内立即物化成普通字符串。
+        # 同口径修复：`consistency_repair._load_context`、`consistency_backflow`
+        # （2026-10-28 F1）、`consistency_auditor._collect_fact_instances`。
+        facts_json = (facts_row["global_facts_json"] if facts_row else "") or ""
         conflict_rows = conn.execute(
+            # TD-1（2026-11-02）：`resolved` 列可空，裸 `resolved = 0` 会因 SQL 三值
+            # 逻辑把 NULL 行判为 false（冲突在列表可见却对 Agent 修复隐形）。
+            # 统一引用 `rules.RESOLVED_SQL_OPEN`。
             "SELECT conflict_id, fact_name, values_json, description "
-            "FROM consistency_conflicts WHERE project_id = ? AND resolved = 0 ORDER BY id",
+            "FROM consistency_conflicts WHERE project_id = ? AND "
+            + rules.RESOLVED_SQL_OPEN + " ORDER BY id",
             (project_id,),
         ).fetchall()
         conflicts: list[dict] = []
@@ -149,7 +185,13 @@ def build_agent_workspace(project_id: int, base: Path | None = None) -> dict:
         sections = _load_sections(conn, project_id)
 
     from .facts_service import parse_stored_items
-    facts = parse_stored_items((facts_row["global_facts_json"] if facts_row else "") or "")
+    facts = parse_stored_items(facts_json)
+
+    # F-2（2026-11-02）：按来源拆分；AI 语义发现单独渲染成"仅参考"文本，
+    # 不再混进 Agent 的 `conflicts_text`（历史行为：混进去后每轮都计入
+    # `still_open`，报告恒显「仍待处理 N 条」，且白占提示词 token）。
+    rule_conflicts, ai_findings = split_rule_and_ai(conflicts)
+    ai_findings_text = build_ai_findings_text(ai_findings) if ai_findings else ""
 
     # ENHANCE 2026-10-11（引入项 #14）：AGENT_REPAIR_PERSIST_WORKSPACE 门禁。
     #   默认 false：Agent 工作区只在内存（facts/conflicts/sections 已足够驱动多轮），
@@ -177,7 +219,12 @@ def build_agent_workspace(project_id: int, base: Path | None = None) -> dict:
         facts_md = workdir / "global-facts.md"
         facts_md.write_text(
             "# 全局事实\n\n" + (build_facts_text(facts) if facts else "（无全局事实）")
-            + "\n\n# 未解决冲突\n\n" + build_conflicts_text(conflicts),
+            + "\n\n# 未解决冲突\n\n" + build_conflicts_text(rule_conflicts)
+            # F-2：AI 语义发现单列"仅参考"区，与 Agent 提示词同口径。
+            + (
+                "\n\n# AI 语义发现（仅参考，不参与自动收敛）\n\n" + ai_findings_text
+                if ai_findings_text else ""
+            ),
             encoding="utf-8",
         )
         facts_md_path = str(facts_md)
@@ -196,7 +243,9 @@ def build_agent_workspace(project_id: int, base: Path | None = None) -> dict:
         "dir": str(workdir) if AGENT_REPAIR_PERSIST_WORKSPACE else None,
         "persisted": bool(AGENT_REPAIR_PERSIST_WORKSPACE),
         "facts": facts,
-        "conflicts": conflicts,
+        "conflicts": rule_conflicts,
+        "ai_findings": ai_findings,
+        "ai_findings_text": ai_findings_text,
         "sections": sections,
         "global_facts_md": facts_md_path,
         "technical_plan_md": plan_md_path,
@@ -259,6 +308,16 @@ async def _agent_turn(
             prev_feedback=prev_feedback,
         )
     )
+    # F-2（2026-11-02）：AI 语义发现以"仅参考"区**追加**在提示词末尾，
+    # 不进 `conflicts_text` 变量 —— 注册表模板（CONSISTENCY_AGENT_USER）
+    # 与历史逐字不变，模板覆盖/重置与提示词缓存命中均不受影响。
+    _ai_text = str(ctx.get("ai_findings_text") or "")
+    if _ai_text:
+        user_prompt += (
+            "\n\n以下为 AI 语义审计发现（**仅供参考**：无结构化取值，不属于上方"
+            "「未解决冲突」，不要为其生成 replace 动作，也不要因为它们而扩大修改范围）：\n"
+            + _ai_text
+        )
     # ENHANCE 2026-10-12：CONSISTENCY_AGENT_SYSTEM 已注册进 prompts 注册表（checks.py），
     # DB 优先+硬编码回退的 get_prompt 已覆盖全部场景，去掉与注册表完全相同（407 字符）的
     # 冗余 fallback，使 agent_repair 提示词可通过管理页覆盖/重置。
@@ -419,6 +478,12 @@ async def run_agent_repair(
         "unresolved": [],
         "errors": [],
         "changed_sections": [],
+        # F-2（2026-11-02）/ F-1 同类（落文 rowcount）：与 AI 补丁链路同构新增，
+        # 纯新增字段，既有键与语义不变。
+        "conflicts_used": 0,
+        "ai_findings_used": 0,
+        "written_sections": 0,
+        "not_written_sections": [],
         "conflict_states": None,
         "message": "",
     }
@@ -436,11 +501,23 @@ async def run_agent_repair(
         return report
 
     sections = ctx["sections"]
+    ai_findings = ctx.get("ai_findings") or []
+    report["conflicts_used"] = len(ctx["conflicts"])
+    report["ai_findings_used"] = len(ai_findings)
     if not sections:
         report["message"] = "没有可供修复的正文内容"
         return report
     if not ctx["conflicts"]:
-        report["message"] = "没有未解决的一致性冲突，无需修复"
+        # F-2（2026-11-02）：只剩 AI 语义发现时不再起一轮 Agent 会话 ——
+        # 这类条目没有结构化取值，replace 动作无法收敛它们，历史上每轮
+        # 都以「仍待处理 N 条」收尾，白烧 token。
+        if ai_findings:
+            report["message"] = (
+                f"没有可自动修复的规则冲突；另有 {len(ai_findings)} 条 AI 语义发现"
+                "需人工核对（无结构化取值，不参与自动修复）"
+            )
+        else:
+            report["message"] = "没有未解决的一致性冲突，无需修复"
         return report
 
     if provider is None:
@@ -454,6 +531,10 @@ async def run_agent_repair(
 
     events: list[dict] = []
     turn = 0
+    # P3 加固（2026-11-03·unresolved 跨轮去重）：Agent 会话多轮往返时，模型常在
+    # 下一轮复述上一轮已登记的同一 unresolved 条目，UI 计数虚高且列表冗余。
+    # 按 (section_id, reason) 二元组去重、首见保留（同一问题只登记一次）。
+    unresolved_seen: set[tuple[str, str]] = set()
     for turn in range(max_turns):
         result = await _agent_turn(provider, ctx, _format_feedback(events), turn)
         if result is None:
@@ -472,10 +553,15 @@ async def run_agent_repair(
         if result.get("unresolved"):
             for item in result["unresolved"]:
                 if isinstance(item, dict) and (item.get("section_id") or item.get("reason")):
-                    report["unresolved"].append({
+                    entry = {
                         "section_id": str(item.get("section_id") or ""),
                         "reason": str(item.get("reason") or ""),
-                    })
+                    }
+                    sig = (entry["section_id"], entry["reason"])
+                    if sig in unresolved_seen:
+                        continue
+                    unresolved_seen.add(sig)
+                    report["unresolved"].append(entry)
         for action in (result.get("actions") or [])[:MAX_ACTIONS_PER_TURN]:
             if not isinstance(action, dict):
                 continue
@@ -542,31 +628,54 @@ async def run_agent_repair(
     # 冲突状态收敛」是同步重操作，此前直接跑在事件循环里（写锁争用时事件
     # 循环最长冻结 _db_write_lock_timeout=8s）。现整段移入线程池，事件循环
     # 不再被阻塞；异常语义与原实现一致。
-    def _persist_changed_sections() -> dict:
+    def _persist_changed_sections() -> tuple[dict, list[int], list[dict]]:
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        # BUG-FIX 2026-11-02（F-1 同类·落文不校验 rowcount）：与
+        # `consistency_auditor.apply_autofix` / `consistency_repair.repair_with_ai`
+        # 同口径。Agent 会话期间用户可能删掉章节、或目录生成把章节
+        # DELETE+INSERT 换成新 id，此时 UPDATE 命中 0 行 —— 旧实现照样
+        # 宣布"修改 N 个小节"、按全量 changed 失效缓存并收敛冲突状态。
+        # 现返回 (收敛结果, 实际写入的章节 id, 未命中明细)，由调用方按真实落库口径出报告。
+        written_ids: list[int] = []
+        not_written: list[dict] = []
         with get_db() as conn:
             for s in changed:
-                conn.execute(
+                cur = conn.execute(
                     "UPDATE sections SET content = ?, updated_at = ? "
                     "WHERE id = ? AND project_id = ?",
                     (s["content"], now, s["id"], project_id),
                 )
+                if cur.rowcount:
+                    written_ids.append(int(s["id"]))
+                else:
+                    not_written.append({
+                        "section_id": str(s["id"]),
+                        "title": s.get("title") or "",
+                        "reason": "章节不属于本项目或已被删除/重建，UPDATE 未命中任何行",
+                    })
             # 全量正文 + 摘要/已确认事实基准做收敛判定，避免「局部范围扫描
             # 把真实旧取值洗白」。BUG-FIX 2026-10-11：审计器的事实来源除章节
             # 正文外还有摘要与事实基准，判据「全文还剩几个取值」必须扫同一宇宙，
             # 否则只在摘要/基准里的旧取值会让冲突被误标已解决。
             verify_scope = _load_all_project_content(conn, project_id)
-            for s in changed:
-                verify_scope[int(s["id"])] = s["content"]
-            return refresh_conflict_states(
+            # F-1 同类：只用**实际写入**的章节覆盖判定视图（未命中的章节
+            # 内容仍停留在库里，用内存值覆盖会把未落库的修改当成已生效）。
+            changed_by_id = {int(s["id"]): s for s in changed}
+            for sid in written_ids:
+                verify_scope[sid] = changed_by_id[sid]["content"]
+            states = refresh_conflict_states(
                 conn,
                 project_id,
                 verify_scope,
                 extra_texts=_load_project_summary_and_baseline(conn, project_id),
             )
+        return states, written_ids, not_written
 
     try:
-        report["conflict_states"] = await asyncio.to_thread(_persist_changed_sections)
+        states, written_ids, not_written = await asyncio.to_thread(_persist_changed_sections)
+        report["conflict_states"] = states
+        report["written_sections"] = len(written_ids)
+        report["not_written_sections"] = not_written
     except Exception as e:
         report["message"] = f"落库失败：{e!s}"
         report["errors"].append(f"落库失败：{e!s}")
@@ -574,23 +683,44 @@ async def run_agent_repair(
         return report
 
     # 旁路直写正文 → 失效三层缓存
+    # F-1 同类（2026-11-02）：只失效**实际写入**的章节。
     try:
         from .sections import invalidate_content_caches
-        await asyncio.to_thread(
-            invalidate_content_caches, project_id, [s["id"] for s in changed]
-        )
+        if written_ids:
+            await asyncio.to_thread(
+                invalidate_content_caches, project_id, written_ids
+            )
     except Exception as e:
         logger.warning("[Agent修复] 缓存失效失败（忽略）: %s", e)
+
+    if not written_ids:
+        # 一条都没落库：不能宣布成功（即便 Agent 提交了 replace）。
+        report["message"] = (
+            f"Agent 执行 {report['turns']} 轮，{len(changed)} 个小节均未能落库"
+            "（章节可能已被删除或重建），未做任何修改"
+        )
+        return report
 
     states = report["conflict_states"] or {}
     report["success"] = True
     report["message"] = (
-        f"Agent 执行 {report['turns']} 轮，修改 {len(changed)} 个小节"
+        f"Agent 执行 {report['turns']} 轮，修改 {len(written_ids)} 个小节"
         f"（拒绝 {len(report['rejected'])} 条，登记 unresolved {len(report['unresolved'])} 条）；"
         f"冲突已解决 {states.get('resolved', 0)} 条，仍待处理 {states.get('still_open', 0)} 条"
     )
+    if not_written:
+        report["message"] += (
+            f"；另有 {len(not_written)} 个小节未能落库（章节已被删除或重建），请重新审计"
+        )
+    # F-2(2026-11-02)：不可验证条目（AI 语义发现/无结构化取值）单列计数，
+    # 不再混进「仍待处理」——否则该数字永远降不到 0，用户反复点修复。
+    _nv = states.get("not_verifiable", report["ai_findings_used"])
+    if _nv:
+        report["message"] += (
+            f"；另有 {_nv} 条为语义发现（无结构化取值），需人工核对（不参与自动收敛）"
+        )
     logger.info(
         "[Agent修复] 完成 project=%s, turns=%d, 小节=%d, 冲突解决=%d",
-        project_id, report["turns"], len(changed), states.get("resolved", 0),
+        project_id, report["turns"], len(written_ids), states.get("resolved", 0),
     )
     return report

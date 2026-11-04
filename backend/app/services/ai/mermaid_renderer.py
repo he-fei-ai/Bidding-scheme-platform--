@@ -242,9 +242,14 @@ def render_mermaid_to_bytes(
     #     · 内层为 Mermaid 语法（非 { 开头）→ 作为纯 Mermaid 代码（HTTP 可渲染）
     #     · 内层为 JSON → 解包为结构化数据（PIL v2 渲染），继承外层 title
     #   - 包装器无 "code" 字段（architecture/labor 等原生数据）→ 保持原样，PIL v2 直接处理
+    # ENHANCE 2026-11-04（P2·甘特图标题丢失）：包装器 title 记入 _payload_title，
+    # 供甘特图 PIL 兜底构造 plan 时使用（原硬编码「施工进度计划」会覆盖
+    # 载荷 title / Mermaid title，违反图题四级优先级——需求 8）。
+    _payload_title = ""
     try:
         _wrapper = json.loads(code)
         if isinstance(_wrapper, dict):
+            _payload_title = str(_wrapper.get("title") or "").strip()
             _inner = _wrapper.get("code")
             if isinstance(_inner, str) and _inner.strip():
                 _inner = _inner.strip()
@@ -499,6 +504,10 @@ def render_mermaid_to_bytes(
                     _level2_result = _render_flowchart_image_v2(_seq_code)
 
         # === 甘特图（优先 v2 商业级：自动开始日期 + 真实进度）===
+        # ENHANCE 2026-11-04（P2·图题优先级）：plan title 取载荷包装器 title
+        # （_payload_title，含 AI/hintTitle 链路产物），空时回退类型通用名——
+        # 原硬编码「施工进度计划」导致 AI 拟定的图名在 PIL 兜底路径全部丢失。
+        _gantt_default_title = _payload_title or "施工进度计划"
         if _level2_result is None and chart_type == "gantt":
             if "gantt" in code.lower() and "section" in code.lower():
                 tasks = _parse_mermaid_gantt(code)
@@ -506,7 +515,7 @@ def render_mermaid_to_bytes(
                     max_end = max((t["end"] for t in tasks), default=duration)
                     plan = {
                         "type": "gantt",
-                        "title": "施工进度计划",
+                        "title": _gantt_default_title,
                         "totalDays": max(max_end, duration),
                         "tasks": [
                             {
@@ -544,7 +553,7 @@ def render_mermaid_to_bytes(
                         max_end = max((t["end"] for t in tasks), default=duration)
                         plan = {
                             "type": "gantt",
-                            "title": "施工进度计划",
+                            "title": _gantt_default_title,
                             "totalDays": max(max_end, duration),
                             "tasks": [
                                 {

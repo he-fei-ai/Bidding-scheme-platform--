@@ -10,6 +10,7 @@
 """
 from __future__ import annotations
 
+import json
 import time
 import pytest
 from pathlib import Path
@@ -238,3 +239,188 @@ class TestFindSofficeTtlRetry:
         assert result2 == result1 or result2 is not None, (
             f"TTL 超时后应重新探测；result1={result1} result2={result2}"
         )
+
+
+# ========== GAP-1（2026-11-02）：HTML 导出图表 base64 嵌入 ==========
+
+class TestHtmlChartBase64Embed:
+    """chart_marker → ChartCache 持久件 → base64 <img>；未命中保持占位符。
+
+    缓存键口径与 DOCX 侧 _render_commercial 完全同构：
+    _strip_fig_no_for_cache(payload) + chart_type，fig_no 不进键。
+    """
+
+    _PAYLOAD = {"type": "flowchart", "title": "施工流程", "code": "graph TD\nA-->B"}
+
+    def _marker_text(self, payload: dict) -> str:
+        return json.dumps(
+            {"chart_type": payload.get("type", ""), "description": json.dumps(payload, ensure_ascii=False)},
+            ensure_ascii=False,
+        )
+
+    def _invoke_with_payload(self, monkeypatch, payload: dict, *, cached_bytes):
+        from types import SimpleNamespace
+        from app.services import export_cache as ec
+        from app.services import html_export as he
+
+        class _FakeCached:
+            def __init__(self, data):
+                self._data = data
+
+            def read_bytes(self):
+                return self._data
+
+        class _FakeCache:
+            def get(self, key, fmt="png", chart_type=""):
+                if cached_bytes is None:
+                    return None
+                return _FakeCached(cached_bytes)
+
+        monkeypatch.setattr(he, "_chart_cache", _FakeCache())
+
+        token = ec._fig_counter_ctx_var.set({})
+        title_token = ec._used_chart_titles_ctx_var.set({})
+        try:
+            block = SimpleNamespace(
+                type="chart_marker", text=self._marker_text(payload), level=0, raw_line=""
+            )
+            section_row = {"flowchart_json": json.dumps(payload, ensure_ascii=False)}
+            return he._render_block_to_html(
+                block, base_level=1,
+                section=section_row, config=None,
+                project_id=999, chapter_number="1",
+            )
+        finally:
+            ec._fig_counter_ctx_var.reset(token)
+            ec._used_chart_titles_ctx_var.reset(title_token)
+
+    def test_cache_hit_embeds_base64_with_caption(self, monkeypatch):
+        """持久件命中 → <img data:image/png;base64> + 图题「图1-1 施工流程」。"""
+        import base64 as _b64
+
+        png = b"\x89PNG_FAKE_DATA"
+        out = self._invoke_with_payload(monkeypatch, dict(self._PAYLOAD), cached_bytes=png)
+        assert "data:image/png;base64," in out
+        assert '<figure class="chart-figure">' in out
+        assert _b64.b64encode(png).decode("ascii") in out
+        assert "图1-1" in out and "施工流程" in out
+        assert "chart-placeholder" not in out
+
+    def test_cache_miss_keeps_placeholder(self, monkeypatch):
+        """未命中 → 保持占位符，且**不消耗图号**（图号虚跳同口径）。"""
+        out = self._invoke_with_payload(monkeypatch, dict(self._PAYLOAD), cached_bytes=None)
+        assert "chart-placeholder" in out
+        assert "data:image" not in out
+        assert "图1-" not in out
+
+    def test_fig_no_not_in_cache_key(self, monkeypatch):
+        """fig_no 不进缓存键：同一 payload 带不同 fig_no，取件键恒一致。"""
+        from types import SimpleNamespace
+        from app.services.export_cache import _strip_fig_no_for_cache
+        from app.services import html_export as he
+
+        p1 = dict(self._PAYLOAD, fig_no="图1-1")
+        p2 = dict(self._PAYLOAD, fig_no="图1-2")
+        assert _strip_fig_no_for_cache(p1) == _strip_fig_no_for_cache(p2)
+
+        taken: list[str] = []
+
+        class _SpyCache:
+            def get(self, key, fmt="png", chart_type=""):
+                taken.append(key)
+                return None
+
+        monkeypatch.setattr(he, "_chart_cache", _SpyCache())
+
+        from app.services import export_cache as ec
+
+        token = ec._fig_counter_ctx_var.set({})
+        title_token = ec._used_chart_titles_ctx_var.set({})
+
+        def _render(payload: dict):
+            block = SimpleNamespace(
+                type="chart_marker", text=self._marker_text(payload), level=0, raw_line=""
+            )
+            row = {"flowchart_json": json.dumps(payload, ensure_ascii=False)}
+            return he._render_block_to_html(
+                block, base_level=1, section=row, config=None,
+                project_id=999, chapter_number="1",
+            )
+
+        try:
+            _render(p1)
+            _render(p2)
+        finally:
+            ec._fig_counter_ctx_var.reset(token)
+            ec._used_chart_titles_ctx_var.reset(title_token)
+        assert len(taken) == 2 and taken[0] == taken[1]
+
+    def test_title_dedupe_keeps_first_only(self, monkeypatch):
+        """同章同题第二张图：与 DOCX F-2/B-4 同口径仅保留首图。"""
+        from types import SimpleNamespace
+        from app.services import export_cache as ec
+        from app.services import html_export as he
+
+        png = b"\x89PNG_R"
+
+        class _FakeCached:
+            def read_bytes(self):
+                return png
+
+        class _FakeCache:
+            def get(self, key, fmt="png", chart_type=""):
+                return _FakeCached()
+
+        monkeypatch.setattr(he, "_chart_cache", _FakeCache())
+
+        payload = dict(self._PAYLOAD)
+        # 两个不同 payload（缓存键不同，都会命中），但图题相同
+        payload_b = dict(self._PAYLOAD, code="graph TD\nA-->B\nB-->C")
+
+        token = ec._fig_counter_ctx_var.set({})
+        title_token = ec._used_chart_titles_ctx_var.set({})
+        try:
+            def _render(p):
+                block = SimpleNamespace(
+                    type="chart_marker", text=self._marker_text(p), level=0, raw_line=""
+                )
+                row = {"flowchart_json": json.dumps(p, ensure_ascii=False)}
+                return he._render_block_to_html(
+                    block, base_level=1, section=row, config=None,
+                    project_id=999, chapter_number="1",
+                )
+
+            first = _render(payload)
+            second = _render(payload_b)
+        finally:
+            ec._fig_counter_ctx_var.reset(token)
+            ec._used_chart_titles_ctx_var.reset(title_token)
+
+        assert "data:image/png;base64," in first
+        assert second == ""  # 重复图题被去重，不占号不输出
+
+    def test_unknown_chart_type_placeholder(self, monkeypatch):
+        """未识别图表类型（无字段映射）→ 占位符，不报错。"""
+        from types import SimpleNamespace
+        from app.services import html_export as he
+
+        block = SimpleNamespace(
+            type="chart_marker",
+            text=json.dumps({"chart_type": "nonexistent", "description": "{}"}, ensure_ascii=False),
+            level=0, raw_line="",
+        )
+        out = he._render_block_to_html(block, base_level=1, section={}, config=None)
+        assert "chart-placeholder" in out
+
+    def test_backward_compat_no_section_kwargs(self, monkeypatch):
+        """旧调用方式（不传 section/config）不抛异常，仍产出占位符。"""
+        from types import SimpleNamespace
+        from app.services import html_export as he
+
+        block = SimpleNamespace(
+            type="chart_marker",
+            text="旧格式纯文本标记",
+            level=0, raw_line="",
+        )
+        out = he._render_block_to_html(block, base_level=1)
+        assert "chart-placeholder" in out

@@ -71,6 +71,13 @@ const REAL_BACKEND_REPORT_KEYS = [
   "errors",
   "changed_sections",
   "conflict_states",
+  // F-2 / F-1 同类（2026-11-02）：与 AI 补丁链路报告同构新增的 4 个键
+  // （conflicts_used 只算规则冲突 / ai_findings_used 语义发现参考条数 /
+  // written_sections 实际落库章节数 / not_written_sections 落库未命中明细）。
+  "conflicts_used",
+  "ai_findings_used",
+  "written_sections",
+  "not_written_sections",
   "message",
 ] as const;
 
@@ -90,6 +97,11 @@ const DEFAULT_REPAIR = async (
   rejected: [],
   unresolved: [],
   errors: [],
+  // F-2 / F-1 同类（2026-11-02）：与后端报告 dict 新增键对齐（见下方键集用例）
+  conflicts_used: 1,
+  ai_findings_used: 0,
+  written_sections: 1,
+  not_written_sections: [],
   message: "Agent 修复完成",
 });
 
@@ -289,5 +301,76 @@ describe.skipIf(!hasDom)("AgentRepairTab", () => {
       .filter((m) => m.includes("reading 'length'") || m.includes("TypeError"));
     expect(renderErrors).toEqual([]);
     errSpy.mockRestore();
+  });
+
+  // ── F-2 / F-1 同类（2026-11-02）：新报告键的组件级消费 ─────────────
+
+  it("实际落库 / 落库未命中标签与明细按真实口径渲染", async () => {
+    repairMock.mockImplementation(async () => ({
+      status: "ok",
+      success: true,
+      dry_run: false,
+      project_id: 1,
+      turns: 2,
+      max_turns: 8,
+      conflict_states: { resolved: 1, still_open: 0, not_verifiable: 2 },
+      changed_sections: [
+        { id: 3, title: "施工方案" },
+        { id: 4, title: "进度计划" },
+      ],
+      applied: [],
+      rejected: [],
+      unresolved: [],
+      errors: [],
+      conflicts_used: 2,
+      ai_findings_used: 3,
+      written_sections: 1,
+      not_written_sections: [
+        { section_id: "4", title: "进度计划", reason: "章节不属于本项目或已被删除/重建，UPDATE 未命中任何行" },
+      ],
+      message: "Agent 执行 2 轮",
+    }));
+    render(<AgentRepairTab projectId={1} />);
+    screen.getByRole("button", { name: /执行修复/ }).click();
+    await waitFor(() => {
+      // 「Agent 改写 2 章」与「实际落库 1 章」分开展示 —— 落库口径必须真实
+      expect(screen.getAllByText(/Agent 改写 2 章/).length).toBeGreaterThan(0);
+      expect(screen.getAllByText(/实际落库 1 章/).length).toBeGreaterThan(0);
+      expect(screen.getAllByText(/落库未命中 1 章/).length).toBeGreaterThan(0);
+      // F-2：语义发现单列（仅参考），不再混进「仍待处理」
+      expect(screen.getAllByText(/语义发现 3 条/).length).toBeGreaterThan(0);
+      expect(screen.getAllByText(/需人工核对 2/).length).toBeGreaterThan(0);
+      // 落库未命中明细区渲染宿主真实原因
+      expect(screen.getAllByText(/UPDATE 未命中任何行/).length).toBeGreaterThan(0);
+    });
+  });
+
+  it("dry_run 预览不展示实际落库标签（预览不落库）", async () => {
+    repairMock.mockImplementation(async () => ({
+      status: "ok",
+      success: true,
+      dry_run: true,
+      project_id: 1,
+      turns: 1,
+      max_turns: 8,
+      conflict_states: { resolved: 0, still_open: 1 },
+      changed_sections: [{ id: 3, title: "施工方案" }],
+      applied: [],
+      rejected: [],
+      unresolved: [],
+      errors: [],
+      conflicts_used: 1,
+      ai_findings_used: 0,
+      written_sections: 0,
+      not_written_sections: [],
+      message: "预览完成",
+    }));
+    render(<AgentRepairTab projectId={1} />);
+    screen.getByRole("button", { name: /预览/ }).click();
+    await waitFor(() => {
+      expect(screen.getAllByText(/预览完成/).length).toBeGreaterThan(0);
+    });
+    expect(document.body.textContent).not.toContain("实际落库");
+    expect(document.body.textContent).not.toContain("落库未命中");
   });
 });

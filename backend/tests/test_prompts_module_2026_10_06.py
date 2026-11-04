@@ -175,16 +175,41 @@ def _collect_provided() -> dict[str, set[str]]:
             self.generic_visit(node)
 
     v = V()
+    # 记账口径加固（2026-11-03，对齐 site-audit not-run 口径）：扫描面必须显式记账，
+    # 解析失败不允许静默 continue——历史上并行会话编辑源文件时出现过半写快照被
+    # 静默跳过 → 注入点漏统计 → 报"missing variables"的误导性失败。现改为：
+    # 失败先重读一次（消除瞬时态），二次仍失败则显式失败并指出文件。
+    scan_total = 0
+    scan_ok = 0
+    scan_failed: list[tuple[str, str]] = []
     for root, _d, files in os.walk(APP):
         for fn in files:
             if not fn.endswith(".py"):
                 continue
             p = os.path.join(root, fn)
-            try:
-                tree = ast.parse(open(p, encoding="utf-8").read(), filename=p)
-            except Exception:
+            scan_total += 1
+            tree = None
+            last_exc: Exception | None = None
+            for _attempt in (1, 2):
+                try:
+                    tree = ast.parse(open(p, encoding="utf-8").read(), filename=p)
+                    break
+                except Exception as exc:  # noqa: BLE001
+                    last_exc = exc
+            if tree is None:
+                scan_failed.append((p, repr(last_exc)))
                 continue
+            scan_ok += 1
             v.visit(tree)
+    assert not scan_failed, (
+        "AST 审计存在解析失败文件（已重读一次仍失败，不允许静默跳过；"
+        f"若为并行会话编辑瞬时态请整跑复验）: {scan_failed}"
+    )
+    # 扫描面下限护栏：防止扫描根目录漂移/遍历失效导致审计静默空转
+    # （当前 app/ 下 .py 文件约 254 个，下限取 200 容忍正常增删）
+    assert scan_ok >= 200, (
+        f"AST 审计扫描文件数异常偏少（ok={scan_ok}/total={scan_total} < 200），疑似扫描面失效"
+    )
     # ENHANCE 2026-10-12：已注册的 legacy 编排模板 CONTENT_ORCHESTRATION_LEGACY_USER
     # 也走 _render_orch_user 渲染（三元表达式链 AST 无法静态推断 user_template 的值），
     # 这里手动标记其注入覆盖范围，防止误报 missing variables。

@@ -212,71 +212,59 @@ def test_latency_middleware_e2e():
 
 
 def test_arrange_illustration_endpoint():
-    """测试插图编排端点注册正常"""
+    """ILLUSTRATION-REMOVAL 2026-11-04（遗留项3·生图功能下线）：
+    generate-illustration 端点已删除（图表全部自动生成，不设生图入口），
+    访问应返回 404（路由不存在），而非 405/200。"""
     from fastapi.testclient import TestClient
     from app.main import app
 
     client = TestClient(app)
 
-    # 端点路径应为 /api/v1/projects/{project_id}/sections/{section_id}/generate-illustration
-    # 不存在的 section_id 应返回 404，而非 405 Method Not Allowed
     resp = client.post("/api/v1/projects/1/sections/999/generate-illustration", params={"project_id": 1})
-    # 可能是 404（章节不存在）或 422（缺少认证），但不能是 405（路由不存在）
-    assert resp.status_code != 405, f"端点未注册，返回 405: {resp.text[:200]}"
-    print(f"[PASS] test_arrange_illustration_endpoint (端点已注册，状态码: {resp.status_code})")
+    assert resp.status_code == 404, (
+        f"端点应已下线（404），实际 {resp.status_code}: {resp.text[:200]}"
+    )
+    print(f"[PASS] test_arrange_illustration_endpoint (端点已下线，状态码: {resp.status_code})")
 
 
-@patch('app.services.ai.provider_factory.create_provider')
-@patch('app.services.ai.provider_factory.get_ai_config')
-@patch('app.routers.sections.get_section')
-@patch('app.routers.sections.require_project_permission')
-def test_arrange_illustration_endpoint_with_mock(
-    mock_permission, get_section_mock, get_ai_config_mock, create_provider_mock
-):
-    """测试插图编排接口在AI配置可用时的行为"""
+def test_arrange_illustration_endpoint_with_mock():
+    """ILLUSTRATION-REMOVAL 2026-11-04 守卫升级：
+
+    旧用例 mock 三个生图函数并期待 200，但功能下线后这些函数已删除（patch 会
+    直接 AttributeError）。等价护栏改为**双向断言**，既不允许端点复活，也不
+    允许已删除的生图实现回流：
+
+      1. ``generate-illustration`` 不在 OpenAPI 路径中（端点未注册）；
+      2. ``image_engine`` 不再导出 generate_illustration_arrange/prompt/image；
+      3. 实际 POST 返回 404（路由不存在，而非 405/200）。
+    """
     from fastapi.testclient import TestClient
     from app.main import app
-    from app.models import Section
-    import json
+    from app.services.ai import image_engine
 
     client = TestClient(app)
 
-    # Mock AI config — must include api_key so the route doesn't short-circuit
-    mock_ai_config = {
-        "image_provider": "volcengine",
-        "concurrency": 4,
-        "api_key": "mock-api-key",
-    }
-    get_ai_config_mock.return_value = mock_ai_config
-
-    # Mock provider
-    mock_provider = MagicMock()
-    create_provider_mock.return_value = mock_provider
-
-    # Mock permission check to skip DB lookup for project 999
-    mock_permission.return_value = None
-
-    # Mock section lookup so the endpoint doesn't hit the DB
-    mock_section = Section(
-        id=999, project_id=999, title="测试章节", level=3,
-        content="测试内容", section_type="text", status="pending",
-        created_at="2024-01-01", updated_at="2024-01-01",
+    openapi_paths = app.openapi().get("paths", {})
+    assert not any("generate-illustration" in p for p in openapi_paths), (
+        "人工配图端点不得重新注册（产品口径：图表全部自动生成）"
     )
-    get_section_mock.return_value = mock_section
+    for _fn in (
+        "generate_illustration_arrange",
+        "generate_illustration_prompt",
+        "generate_illustration_image",
+    ):
+        assert not hasattr(image_engine, _fn), (
+            f"已删除的生图实现 {_fn} 不得回流（避免人工配图链路复辟）"
+        )
 
-    # Mock arrange/prompt/image generation functions
-    with patch('app.services.ai.image_engine.generate_illustration_arrange', new_callable=AsyncMock) as mock_arrange, \
-         patch('app.services.ai.image_engine.generate_illustration_prompt', new_callable=AsyncMock) as mock_prompt, \
-         patch('app.services.ai.image_engine.generate_illustration_image', new_callable=AsyncMock) as mock_image:
-        mock_arrange.return_value = {"needed": True, "style": "engineering_diagram", "reason": "测试"}
-        mock_prompt.return_value = {"prompt": "test prompt", "style": "engineering_diagram"}
-        mock_image.return_value = {"image_url": "http://example.com/test.png"}
-
-        resp = client.post("/api/v1/projects/999/sections/999/generate-illustration", json={"project_id": 999})
-        # Should reach the mock functions, not hit the DB
-        assert resp.status_code == 200, f"预期200，得到{resp.status_code}: {resp.text}"
-        assert mock_arrange.called, "应调用 arrange 函数"
-        print(f"[PASS] test_arrange_illustration_endpoint_with_mock (端点正常工作)")
+    resp = client.post(
+        "/api/v1/projects/999/sections/999/generate-illustration",
+        json={"project_id": 999},
+    )
+    assert resp.status_code == 404, (
+        f"端点应已下线（404），实际 {resp.status_code}: {resp.text[:200]}"
+    )
+    print("[PASS] test_arrange_illustration_endpoint_with_mock (端点与生图实现均已下线)")
 
 
 if __name__ == "__main__":

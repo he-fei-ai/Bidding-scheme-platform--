@@ -126,6 +126,47 @@ async def test_get_analysis_returns_scheme_extraction():
         resp = await ai_module.get_analysis(123, None)
     assert resp["scheme_extraction"] == {"project_overview": [{"field": "工程名称", "value": "X"}]}
     assert "scheme_extraction_json" in resp
+    # 遗留项 L1(2026-11-03)：显式「已解析」状态位 —— 非空 dict 即 True
+    assert resp["scheme_extracted"] is True
+
+
+@pytest.mark.asyncio
+async def test_get_analysis_scheme_extracted_state_flag():
+    """L1(2026-11-03)：scheme_extracted 状态位的四种形态判定。"""
+    base = {
+        "summary_json": "", "scoring_points_json": "[]", "confirmed_summary": 0,
+        "confirmed_scoring": 0, "boq_json": "[]", "work_interface_json": "[]",
+        "construction_method_json": "[]", "confirmed_boq": 0, "confirmed_work_interface": 0,
+        "confirmed_construction_method": 0, "global_facts_json": "[]", "confirmed_facts": 0,
+        "scope": "", "facts_policy": "fabricate",
+    }
+    # ① 列为 '{}'（未解析）→ False
+    with patch.object(ai_module, "enforce_project_access", new=AsyncMock()), \
+         patch.object(ai_module, "_sync_get_analysis",
+                      new=lambda pid: {**base, "scheme_extraction_json": "{}"}):
+        resp = await ai_module.get_analysis(1, None)
+    assert resp["scheme_extracted"] is False
+    # ② 列为 '[]'（历史空数组形态，json.loads 得 list 非 dict）→ False
+    with patch.object(ai_module, "enforce_project_access", new=AsyncMock()), \
+         patch.object(ai_module, "_sync_get_analysis",
+                      new=lambda pid: {**base, "scheme_extraction_json": "[]"}):
+        resp = await ai_module.get_analysis(1, None)
+    assert resp["scheme_extracted"] is False
+    # ③ 五类全空但确实解析过（五键空数组）→ True（用户执行过解析动作）
+    with patch.object(ai_module, "enforce_project_access", new=AsyncMock()), \
+         patch.object(ai_module, "_sync_get_analysis", new=lambda pid: {
+            **base,
+            "scheme_extraction_json": '{"project_overview":[],"scheme_type":[],'
+                                      '"dangerous_work_params":[],"basis_list":[],'
+                                      '"construction_condition":[]}',
+         }):
+        resp = await ai_module.get_analysis(1, None)
+    assert resp["scheme_extracted"] is True
+    # ④ 列缺失（老库行）→ 回退 {} → False
+    with patch.object(ai_module, "enforce_project_access", new=AsyncMock()), \
+         patch.object(ai_module, "_sync_get_analysis", new=lambda pid: dict(base)):
+        resp = await ai_module.get_analysis(1, None)
+    assert resp["scheme_extracted"] is False
 
 
 class _FakeConn:

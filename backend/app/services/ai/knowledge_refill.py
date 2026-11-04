@@ -60,6 +60,59 @@ def _extract_sys_prompt() -> str:
         return _EXTRACT_SYSTEM_PROMPT
 
 
+def _extract_user_prompt(batch: str) -> str:
+    """读取第一轮提取 user 提示词：DB 优先 → 注册表 → 硬编码回退。
+
+    BUG-FIX-PROMPT-E10（2026-11-03）：原 user 侧提示词为调用点内联 f-string，
+    绕过注册表（管理页看不到、无法覆盖），与 E6 已收编的 system 侧不对称。
+    现注册 KB_REFILL_EXTRACT_USER 并在此接线；fallback 文本与注册文本逐字一致。
+    """
+    try:
+        from .prompts import get_prompt, render_prompt
+        tpl = get_prompt("KB_REFILL_EXTRACT_USER")
+        if tpl:
+            return render_prompt(tpl, batch=batch)
+    except Exception:
+        pass
+    return f"请提取以下招标文件内容中的关键知识条目：\n\n{batch}"
+
+
+def _gap_user_prompt(existing_titles_text: str, section_titles_text: str, bid_source: str) -> str:
+    """读取第二轮查漏 user 提示词：DB 优先 → 注册表 → 硬编码回退（E10，同上）。"""
+    try:
+        from .prompts import get_prompt, render_prompt
+        tpl = get_prompt("KB_REFILL_GAP_USER")
+        if tpl:
+            return render_prompt(
+                tpl,
+                existing_titles_text=existing_titles_text,
+                section_titles_text=section_titles_text,
+                bid_source=bid_source,
+            )
+    except Exception:
+        pass
+    return f"""请检查招标文件中是否有以下目录章节涉及但未提取的关键信息。
+
+已有知识条目：
+{existing_titles_text}
+
+目录章节：
+{section_titles_text}
+
+招标文件正文（取材来源，只允许从中提取、禁止编造）：
+{bid_source}
+
+请从上述招标文件正文中提取与这些章节相关、但尚未包含在已有知识条目中的关键信息。
+
+输出格式：JSON 数组，每个元素包含：
+- title: 知识条目标题
+- content: 知识条目详细内容
+- category: 分类
+- keywords: 关键词数组
+
+只返回 JSON 数组，不要包含任何解释或 markdown 围栏。"""
+
+
 @dataclass
 class RefillResult:
     """补漏结果。"""
@@ -149,9 +202,10 @@ async def extract_knowledge_items(
         # _EXTRACT_SYSTEM_PROMPT 硬编码，管理页无法查看/编辑/覆盖。现统一走
         # get_prompt()（DB 优先 → 注册表 → 硬编码回退），保留硬编码作为
         # DB 不可用时的最小 fallback。
+        # BUG-FIX-PROMPT-E10（2026-11-03）：user 侧同样收编（原内联 f-string）。
         messages = [
             {"role": "system", "content": _extract_sys_prompt()},
-            {"role": "user", "content": f"请提取以下招标文件内容中的关键知识条目：\n\n{batch}"},
+            {"role": "user", "content": _extract_user_prompt(batch)},
         ]
 
         try:
@@ -259,26 +313,9 @@ async def refill_knowledge_gaps(
         _truncated = True
     _bid_source = _excerpt + ("\n…（招标文件正文已截断，请基于可见部分提取）" if _truncated else "")
 
-    prompt = f"""请检查招标文件中是否有以下目录章节涉及但未提取的关键信息。
-
-已有知识条目：
-{existing_titles_text}
-
-目录章节：
-{section_titles_text}
-
-招标文件正文（取材来源，只允许从中提取、禁止编造）：
-{_bid_source}
-
-请从上述招标文件正文中提取与这些章节相关、但尚未包含在已有知识条目中的关键信息。
-
-输出格式：JSON 数组，每个元素包含：
-- title: 知识条目标题
-- content: 知识条目详细内容
-- category: 分类
-- keywords: 关键词数组
-
-只返回 JSON 数组，不要包含任何解释或 markdown 围栏。"""
+    # BUG-FIX-PROMPT-E10（2026-11-03）：user 提示词收编进注册表
+    # （KB_REFILL_GAP_USER），DB 优先 + 逐字一致硬编码 fallback。
+    prompt = _gap_user_prompt(existing_titles_text, section_titles_text, _bid_source)
 
 
     messages = [

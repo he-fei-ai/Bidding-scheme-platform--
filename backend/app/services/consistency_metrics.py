@@ -13,8 +13,21 @@
 """
 import logging
 import threading
+import time
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
+
+#: G-3(2026-11-02)：进程启动时刻（epoch 秒）。随 `GET /consistency/metrics`
+#: 的 `since` 字段下发——本模块计数器是**进程内累计、重启归零**，没有起点
+#: 时间就无法解读累计值（「audit_failed=3」是 10 秒内还是 30 天内失败 3 次
+#: 含义完全不同）。不改计数器实现，只补元信息。
+_PROCESS_STARTED_AT = time.time()
+
+
+def process_started_at() -> str:
+    """当前进程启动时刻（本地时间，`YYYY-MM-DD HH:MM:SS`）。"""
+    return datetime.fromtimestamp(_PROCESS_STARTED_AT).strftime("%Y-%m-%d %H:%M:%S")
 
 #: 已知指标键（快照渲染时缺键补 0，前端卡片不出现「undefined」）。
 KNOWN_KEYS: tuple[str, ...] = (

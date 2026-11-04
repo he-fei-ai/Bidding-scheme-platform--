@@ -91,6 +91,9 @@ export default function AgentRepairTab({ projectId }: AgentRepairTabProps) {
   const unresolved = report?.unresolved ?? [];
   const errors = report?.errors ?? [];
   const changedSections = report?.changed_sections ?? [];
+  // F-1 同类(2026-11-02)：Agent 改了但 UPDATE 未命中（章节被删除/重建）的明细；
+  // 老后端不返回该键时归一为空数组，行为不变。
+  const notWritten = report?.not_written_sections ?? [];
 
   return (
     <Space direction="vertical" style={{ width: "100%" }} size="middle">
@@ -166,7 +169,17 @@ export default function AgentRepairTab({ projectId }: AgentRepairTabProps) {
           {/* 统计指标 */}
           <Space size={[8, 8]} wrap style={{ marginBottom: 16 }}>
             {changedSections.length > 0 && (
-              <Tag color="geekblue">修改章节 {changedSections.length} 个</Tag>
+              <Tag color="geekblue">Agent 改写 {changedSections.length} 章</Tag>
+            )}
+            {/* F-1 同类(2026-11-02)：实际落库口径（UPDATE rowcount 校验后），
+                dry_run/老后端无此键时不展示，与「Agent 改写」区分开。 */}
+            {!report.dry_run && typeof report.written_sections === "number" && (
+              <Tag color={report.written_sections > 0 ? "green" : "red"}>
+                实际落库 {report.written_sections} 章
+              </Tag>
+            )}
+            {notWritten.length > 0 && (
+              <Tag color="red">落库未命中 {notWritten.length} 章</Tag>
             )}
             {report.conflict_states && (
               <>
@@ -176,7 +189,18 @@ export default function AgentRepairTab({ projectId }: AgentRepairTabProps) {
                 {report.conflict_states.still_open > 0 && (
                   <Tag color="orange">仍待处理 {report.conflict_states.still_open}</Tag>
                 )}
+                {/* F-2(2026-11-02)：不可自动收敛条目（AI 语义发现/无结构化取值）
+                    单列计数，不再混进「仍待处理」——后者此前永远降不到 0。 */}
+                {!!report.conflict_states.not_verifiable && (
+                  <Tag color="purple">
+                    需人工核对 {report.conflict_states.not_verifiable}
+                  </Tag>
+                )}
               </>
+            )}
+            {/* F-2(2026-11-02)：语义发现仅作参考区条目数，与可收敛冲突分开 */}
+            {!!report.ai_findings_used && (
+              <Tag color="purple">语义发现 {report.ai_findings_used} 条（仅参考）</Tag>
             )}
             {rejected.length > 0 && (
               <Tag color="red">被拒绝 {rejected.length} 条</Tag>
@@ -237,6 +261,24 @@ export default function AgentRepairTab({ projectId }: AgentRepairTabProps) {
                 {unresolved.map((u, i) => (
                   <Text type="secondary" key={i} style={{ display: "block", fontSize: 12 }}>
                     [{u.section_id}] {u.reason}
+                  </Text>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* 落库未命中明细（F-1 同类 2026-11-02）：Agent 改了但正文没写进去，
+              此前照常宣布成功 —— 用户会以为冲突收敛了。 */}
+          {notWritten.length > 0 && (
+            <div style={{ marginBottom: 12 }}>
+              <Space>
+                <CloseCircleOutlined style={{ color: "#ff4d4f" }} />
+                <Text strong>未能落库的章节：</Text>
+              </Space>
+              <div style={{ marginTop: 4 }}>
+                {notWritten.map((n, i) => (
+                  <Text type="danger" key={i} style={{ display: "block", fontSize: 12 }}>
+                    [{n.section_id} {n.title ?? ""}] {n.reason}
                   </Text>
                 ))}
               </div>

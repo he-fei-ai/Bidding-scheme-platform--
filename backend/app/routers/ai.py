@@ -256,7 +256,8 @@ async def get_analysis(project_id: int, current_user: Annotated[object, Depends(
         # 与 `facts_policy` 两键，而有行分支都有 —— 同一端点在「analysis 行存在与否」
         # 两种状态下形态不同，消费方（测试/集成调用）按有行形态读键会 KeyError。
         # 补齐为与有行分支一致的默认形态。
-        return {'summary_json': '', 'scoring_points_json': '[]', 'confirmed_summary': False, 'confirmed_scoring': False, 'boq_json': '[]', 'work_interface_json': '[]', 'construction_method_json': '[]', 'confirmed_boq': False, 'confirmed_work_interface': False, 'confirmed_construction_method': False, 'global_facts_json': '[]', 'global_facts_items': [], 'confirmed_facts': False, 'scheme_extraction_json': '[]', 'scheme_extraction': {}, 'scope': '', 'facts_policy': 'fabricate'}
+        # 遗留项 L1(2026-11-03)：「已解析」显式状态位（无行分支同样形态统一）。
+        return {'summary_json': '', 'scoring_points_json': '[]', 'confirmed_summary': False, 'confirmed_scoring': False, 'boq_json': '[]', 'work_interface_json': '[]', 'construction_method_json': '[]', 'confirmed_boq': False, 'confirmed_work_interface': False, 'confirmed_construction_method': False, 'global_facts_json': '[]', 'global_facts_items': [], 'confirmed_facts': False, 'scheme_extraction_json': '[]', 'scheme_extraction': {}, 'scheme_extracted': False, 'scope': '', 'facts_policy': 'fabricate'}
     result = dict(row)
     scoring_json = result.get('scoring_points_json', '[]')
     if scoring_json and scoring_json != '[]':
@@ -295,6 +296,16 @@ async def get_analysis(project_id: int, current_user: Annotated[object, Depends(
     except Exception:
         result['scheme_extraction'] = {}
     result['scheme_extraction_json'] = se_json if isinstance(se_json, str) else json.dumps(se_json, ensure_ascii=False)
+    # 遗留项 L1(2026-11-03)：「已解析」显式状态位。此前前端只能用
+    # `Object.keys(scheme_extraction).length > 0` 隐式推断，一旦解析结果形态
+    # 变化（例如五类全空的 dict、或未来把「未解析」也写成带键空结构）判定
+    # 就会静默漂移。现由后端权威下发：scheme_extraction 为**非空 dict** 即视为
+    # 已解析（五类全空但确实解析过的场景 keys>0，同样算已解析 —— 用户执行过
+    # 解析动作，按钮应显示「重新解析」）。纯新增字段，老前端不受影响。
+    result['scheme_extracted'] = (
+        isinstance(result.get('scheme_extraction'), dict)
+        and len(result['scheme_extraction']) > 0
+    )
     return result
 
 class ScopeUpdate(BaseModel):
@@ -313,7 +324,7 @@ async def generate_summary(project_id: int, current_user: Annotated[object, Depe
     await enforce_project_access(project_id, current_user)
     full_text = await latest_extracted_text(project_id)
     if not full_text:
-        raise HTTPException(status_code=400, detail='请先上传文件')
+        raise HTTPException(status_code=400, detail='未提取到可分析的文本内容，请先上传文件并确保至少一个文件解析成功')
     tender_context = await extract_tender_context_async(full_text)
     has_cached, cached = await asyncio.to_thread(_sync_read_summary, project_id)
     if has_cached:
@@ -342,7 +353,7 @@ async def generate_scoring(project_id: int, current_user: Annotated[object, Depe
     await enforce_project_access(project_id, current_user)
     full_text = await latest_extracted_text(project_id)
     if not full_text:
-        raise HTTPException(status_code=400, detail='请先上传文件')
+        raise HTTPException(status_code=400, detail='未提取到可分析的文本内容，请先上传文件并确保至少一个文件解析成功')
     tender_context = await extract_tender_context_async(full_text)
     has_cached, cached, summary = await asyncio.to_thread(_sync_read_scoring_and_summary, project_id)
     cached_scoring_json = None
@@ -467,7 +478,7 @@ async def generate_scheme_extraction(project_id: int, current_user: Annotated[ob
     await enforce_project_access(project_id, current_user)
     full_text = await latest_extracted_text(project_id)
     if not full_text:
-        raise HTTPException(status_code=400, detail='请先上传文件')
+        raise HTTPException(status_code=400, detail='未提取到可分析的文本内容，请先上传文件并确保至少一个文件解析成功')
     provider, used_fb = await get_working_provider(get_ai_config())
     if used_fb:
         logger.info('专项方案提取已降级到兜底提供商: %s', used_fb)
@@ -589,7 +600,7 @@ async def analyze_boq(project_id: int, current_user: Annotated[object, Depends(g
     else:
         full_text = await latest_extracted_text(project_id)
         if not full_text:
-            raise HTTPException(status_code=400, detail='请先上传文件')
+            raise HTTPException(status_code=400, detail='未提取到可分析的文本内容，请先上传文件并确保至少一个文件解析成功')
         logger.info('[AI清单] 未找到清单文件，降级使用招标文件进行分析，长度: %d 字符', len(full_text))
         tender_context = await extract_tender_context_async(full_text)
         analysis_text = tender_context
@@ -621,7 +632,7 @@ async def analyze_work_interface(project_id: int, current_user: Annotated[object
     else:
         full_text = await latest_extracted_text(project_id)
         if not full_text:
-            raise HTTPException(status_code=400, detail='请先上传文件')
+            raise HTTPException(status_code=400, detail='未提取到可分析的文本内容，请先上传文件并确保至少一个文件解析成功')
         logger.info('[AI界面] 未找到工作界面文件，降级使用招标文件进行分析，长度: %d 字符', len(full_text))
         tender_context = await extract_tender_context_async(full_text)
         analysis_text = tender_context
@@ -652,7 +663,7 @@ async def analyze_construction_method(project_id: int, current_user: Annotated[o
     else:
         full_text = await latest_extracted_text(project_id)
         if not full_text:
-            raise HTTPException(status_code=400, detail='请先上传文件')
+            raise HTTPException(status_code=400, detail='未提取到可分析的文本内容，请先上传文件并确保至少一个文件解析成功')
         logger.info('[AI作法] 未找到工程作法文件，降级使用招标文件进行分析，长度: %d 字符', len(full_text))
         tender_context = await extract_tender_context_async(full_text)
         analysis_text = tender_context

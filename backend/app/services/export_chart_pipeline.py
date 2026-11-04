@@ -1,39 +1,37 @@
 """图表管线模块（2026-10-12 从 export.py 拆出）
 
-职责：
+职责（F6 文档修正 2026-11-03：拆分后 Block 5/6 已二次迁移回 export.py 主模块，
+本模块只保留数据/推断/格式化/检测四层，详见各 Block 注释）：
   1. 图表类型推断（_CHART_TYPE_MAP, _infer_chart_type_from_text, _afc_enabled）
   2. 本地兜底 Mermaid 模板（_generate_local_mermaid_chart）
   3. 通用格式化工具（_heading_font_for, _heading_size_for, _apply_font, _nested_list_left_chars）
   4. 内联图表标记检测与缓存（_detect_inline_chart_*, _get_cached_inline_chart_*）
-  5. 图表渲染管线（_add_inline_chart, _add_diagram_picture, _render_section_charts）
-  6. 渲染线程池管理（_get_render_executor, _preload_chart_images_parallel）
+  5. ~~图表渲染管线~~ → 已归属 export.py（_add_inline_chart / _add_diagram_picture /
+     _render_section_charts 在 export.py 主模块；export.py 顶部 re-export 本模块符号）
+  6. ~~渲染线程池管理~~ → 已归属 export.py / export_cache.py
+     （_get_render_executor / _preload_chart_images_parallel / single-flight）
 
-从 export.py 拆出后，export.py 顶部加 `from .export_chart_pipeline import *` re-export，
+export.py 顶部 `from .export_chart_pipeline import *` re-export 保持有效，
 所有既有 `from app.services.export import _add_inline_chart` 调用方无需改动。
 
 循环 import 说明：
   - 本模块纯数据（Block 1）+ 纯推断（Block 2）+ 通用格式化工具（Block 3）+ 检测层（Block 4）
     全部零循环依赖——要么纯函数，要么只依赖 export_cache.py（独立加载）或 docx 库。
-  - 渲染层函数（Block 5）会调用 Block 1-4 本模块函数，也会调用 export_cache.py 的
-    re-exported 符号——全部是已经建立好的 import 链路，无循环。
   - export.py 顶部的 re-export 放在 export_cache import 之后、其余代码之前，
     此时 export_cache 已加载完毕（它无 export 反向依赖），不会死锁。
 """
 from __future__ import annotations
 
-import contextvars  # HARDENING 2026-10-11（遗留·图号计数器会话化）
-import hashlib  # P3-1 同代码 hash 去重（2026-10-17）
+# TD-3（2026-11-02）：清理拆分时带入的未使用 import（contextvars/uuid/
+# concurrent.futures/BytesIO/Path——对应实现已随模块化搬迁归属
+# export_cache.py 与 export.py 主模块）。
 import json
 import logging
 import os
 import re
 import threading
 import time
-import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from io import BytesIO
-from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from docx.oxml import parse_xml
 from docx.oxml.ns import nsdecls, qn
@@ -83,76 +81,14 @@ AUTO_FALLBACK_CHARTS = os.getenv("AUTO_FALLBACK_CHARTS", "0") == "1"
 # P3 性能调优（2026-10-17）
 # ============================================================
 
-# P3-1: 同代码 hash 去重缓存
-# 相同 Mermaid 代码只渲染一次，后续复用缓存结果。
-# 缓存键: hash(mermaid_code) -> (timestamp, rendered_bytes)
-_CHART_HASH_CACHE: dict[str, tuple[float, bytes]] = {}
-_CHART_HASH_CACHE_LOCK = threading.Lock()
-_CHART_HASH_CACHE_MAX_SIZE = 1000  # 最大缓存条目数
-_chart_hash_cache_stats = {"hits": 0, "misses": 0, "evictions": 0}
-
-
-def _get_chart_hash(mermaid_code: str) -> str:
-    """计算 Mermaid 代码的 hash（P3-1 同代码去重）
-
-    用于识别相同图表代码，避免重复渲染。
-    使用 SHA1 而非 MD5 以获得更好的碰撞抗性。
-    """
-    return hashlib.sha1(mermaid_code.encode("utf-8")).hexdigest()
-
-
-def _get_cached_chart_render(mermaid_code: str) -> bytes | None:
-    """获取缓存的图表渲染结果（P3-1 同代码去重）
-
-    Args:
-        mermaid_code: Mermaid 图表代码
-
-    Returns:
-        bytes: 缓存的渲染结果，未命中返回 None
-    """
-    chart_hash = _get_chart_hash(mermaid_code)
-    with _CHART_HASH_CACHE_LOCK:
-        entry = _CHART_HASH_CACHE.get(chart_hash)
-        if entry:
-            _chart_hash_cache_stats["hits"] += 1
-            return entry[1]  # 返回缓存的渲染数据
-        _chart_hash_cache_stats["misses"] += 1
-        return None
-
-
-def _cache_chart_render(mermaid_code: str, rendered_bytes: bytes) -> None:
-    """缓存图表渲染结果（P3-1 同代码去重）
-
-    Args:
-        mermaid_code: Mermaid 图表代码
-        rendered_bytes: 渲染结果字节数据
-    """
-    chart_hash = _get_chart_hash(mermaid_code)
-    with _CHART_HASH_CACHE_LOCK:
-        # LRU 淘汰：超过最大缓存条数时移除最旧的
-        if len(_CHART_HASH_CACHE) >= _CHART_HASH_CACHE_MAX_SIZE:
-            # 简单策略：移除第一个插入的条目
-            oldest_key = next(iter(_CHART_HASH_CACHE))
-            del _CHART_HASH_CACHE[oldest_key]
-            _chart_hash_cache_stats["evictions"] += 1
-        _CHART_HASH_CACHE[chart_hash] = (time.time(), rendered_bytes)
-
-
-def get_chart_hash_cache_stats() -> dict[str, int]:
-    """获取 hash 缓存统计信息（P3-3 性能监控）"""
-    with _CHART_HASH_CACHE_LOCK:
-        return {
-            "cache_size": len(_CHART_HASH_CACHE),
-            **_chart_hash_cache_stats,
-        }
-
-
-def clear_chart_hash_cache() -> None:
-    """清空图表 hash 缓存（测试用）"""
-    with _CHART_HASH_CACHE_LOCK:
-        _CHART_HASH_CACHE.clear()
-        _chart_hash_cache_stats.update({"hits": 0, "misses": 0, "evictions": 0})
-
+# TD-1 清理（2026-11-02）：原 P3-1「同代码 hash 去重缓存」系列
+# （_CHART_HASH_CACHE / _get_chart_hash / _get_cached_chart_render /
+# _cache_chart_render / get_chart_hash_cache_stats / clear_chart_hash_cache）
+# 已删除——全 app 目录零生产调用（P3-1 优化当年未接线），且与
+# export_cache.py 的 L1 渲染缓存（_get_cached_chart_render(payload_str,
+# chart_type) 双参版，生产主链路实际消费）重复实现，属误导性死代码。
+# 同代码去重的等价能力由 export_cache._chart_render_cache +
+# _single_flight_render 提供。
 
 # P3-2: 动态批量大小优化
 # 根据图表数量和系统资源动态调整线程池大小
@@ -309,7 +245,7 @@ def _generate_local_mermaid_chart(chart_type: str, title: str = "", description:
         return {"type": "architecture", "code": mermaid, "title": title}
 
     elif ctype == "labor":
-        mermaid = f"""graph LR
+        mermaid = """graph LR
     A[项目总工] --> B[施工员]
     A --> C[质检员]
     B --> D[劳务班组]
@@ -317,21 +253,23 @@ def _generate_local_mermaid_chart(chart_type: str, title: str = "", description:
         return {"type": "labor", "code": mermaid, "title": title}
 
     elif ctype == "comparison":
-        mermaid = f"""flowchart LR
-    A[方案一] --> C{{比选}}
+        # TD-3：原为 f-string（{{比选}} 转义输出 {比选}）；去 f 前缀后
+        # 直接写单花括号字面量，最终 Mermaid 输出逐字节不变。
+        mermaid = """flowchart LR
+    A[方案一] --> C{比选}
     B[方案二] --> C
     C --> D[推荐方案]"""
         return {"type": "comparison", "code": mermaid, "title": title}
 
     elif ctype == "layout":
-        mermaid = f"""graph TD
+        mermaid = """graph TD
     A[塔吊区] --> B[加工场]
     B --> C[材料堆场]
     C --> D[施工区]"""
         return {"type": "layout", "code": mermaid, "title": title}
 
     elif ctype == "timeline":
-        mermaid = f"""flowchart LR
+        mermaid = """flowchart LR
     A[开工] --> B[关键节点1]
     B --> C[关键节点2]
     C --> D[竣工]"""
@@ -565,6 +503,52 @@ def _get_cached_inline_chart_types(section_detail) -> set[str]:
     return _get_cached_inline_chart_markers(section_detail)[0]
 
 
+#: 业务数值型图表（A3 建议 1 第三点·矛盾告警范围）：载荷数字是业务数据
+#: （工期/人数/占比/日期），与正文矛盾有实害。layout 的 zones 坐标是绘图
+#: 参数、architecture 无数字语义，不在检测范围。
+_NUMERIC_CHART_TYPES = frozenset({"gantt", "timeline", "labor", "comparison"})
+
+_NUM_TOKEN_RE = re.compile(r"\d+(?:\.\d+)?")
+
+
+def warn_local_template_data_mismatch(
+    source_obj: Any, content: str, chart_type: str, section_title: str = ""
+) -> bool:
+    """本地模板载荷数字与正文零交集时输出导出 WARNING（A3 建议 1 第三点）。
+
+    需求 1（显式披露）后端已于 2026-10-27 落地；本函数补齐其第三点（可选
+    加固）：``source="local"`` 载荷的数字与正文数字集合**完全无交集** →
+    模板示例数字未按项目实际核定，导出日志 WARNING 提示核查（只告警，
+    不阻断导出——披露标签/括注仍是第一道防线，日志是导出侧的最后一道
+    观测）。AI 载荷受提示词数据约束且基于正文生成，不参与检测。
+    """
+    if not isinstance(source_obj, dict):
+        return False
+    if str(source_obj.get("source") or "") != "local":
+        return False
+    ct = (chart_type or "").strip().lower()
+    if ct not in _NUMERIC_CHART_TYPES:
+        return False
+    content = content or ""
+    content_nums = set(_NUM_TOKEN_RE.findall(content))
+    if not content_nums:
+        return False  # 正文无数字 → 无矛盾对象（空态场景由编排侧 no_real_data_local 收口）
+    payload_nums = set(_NUM_TOKEN_RE.findall(json.dumps(source_obj, ensure_ascii=False)))
+    if not payload_nums:
+        return False
+    if payload_nums & content_nums:
+        return False  # 有任意数字重合 → 不告警（保守口径，零误报优先）
+    logger.warning(
+        "[图表矛盾告警] 本地模板载荷数字与正文无交集，请按项目实际核定: "
+        "section=%s type=%s 正文数字样本=%s 载荷数字样本=%s",
+        (section_title or "")[:30],
+        ct,
+        sorted(content_nums)[:8],
+        sorted(payload_nums)[:8],
+    )
+    return True
+
+
 __all__ = [
     # Block 1: 常量
     "_CHART_TYPE_MAP",
@@ -586,4 +570,6 @@ __all__ = [
     "_detect_inline_chart_markers",
     "_get_cached_inline_chart_markers",
     "_get_cached_inline_chart_types",
+    # Block 5: 观测层（A3 建议 1 第三点·矛盾告警）
+    "warn_local_template_data_mismatch",
 ]

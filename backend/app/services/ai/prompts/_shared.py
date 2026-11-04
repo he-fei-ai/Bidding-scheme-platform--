@@ -1,11 +1,16 @@
 """提示词共享规则库（L1 层）。
 
-所有目录生成提示词中重复出现的规则统一在此定义，
-通过 {shared:NAME} 引用注入到各提示词中，避免维护时遗漏不一致。
+共享规则统一在此定义并注册（管理页可查看/覆盖），供任意模板通过
+{shared:NAME} 引用注入，避免规则文本多处复制后维护漂移。
 
-注入机制已落地：render_prompt() 在渲染时会将模板中的 {shared:NAME} 替换为
+E10 审计（2026-11-03）探针结论：当前 138 个注册模板中已无本库规则的
+内联副本，亦暂无模板使用 {shared:NAME} 引用（调用方历史改造已消除重复）。
+本库作为共享规则的单一事实源与管理页可编辑资产保留；后续新增模板时
+优先用 {shared:NAME} 引用而非复制规则文本。
+
+注入机制：render_prompt() 在渲染时会将模板中的 {shared:NAME} 替换为
 _ALL_PROMPTS 中对应共享规则（SHARED_HEADING_RULES / SHARED_FORBIDDEN_WORDS /
-SHARED_OUTPUT_SPEC）的内容。各提示词可直接引用，无需再复制规则文本。
+SHARED_OUTPUT_SPEC）的内容。
 查找顺序：NAME -> SHARED_NAME -> NAME.upper() -> SHARED_<NAME.upper()>。
 """
 

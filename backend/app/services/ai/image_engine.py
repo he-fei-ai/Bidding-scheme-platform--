@@ -1,59 +1,27 @@
-from collections import OrderedDict
 import hashlib
 import json
 import logging
+import os as _os
 import re
+import tempfile
 import threading
 import time
 from typing import Any
+
+try:  # requests 在精简部署环境可能缺失，缺失时 download_and_embed_image 直接降级
+    import requests as _requests
+except ImportError:  # pragma: no cover
+    _requests = None
 
 from .prompts import get_prompt, render_prompt, sanitize_prompt_value
 from .providers.base import AIMessage
 from .image_styles import DEFAULT_IMAGE_STYLES, get_image_style
 from .workflows import collect_json_response
 
+logger = logging.getLogger(__name__)
 
-# 图片生成结果缓存（基于 Prompt+Style+Size+Provider 的 MD5 哈希）
-# 使用 OrderedDict 实现 LRU 淘汰，最大 100 条
-# key: MD5 hexdigest, value: 图片 URL
-_IMAGE_CACHE: OrderedDict[str, str] = OrderedDict()
-_IMAGE_CACHE_MAX_SIZE = 100
-_image_cache_lock = threading.Lock()
-
-# 失败结果缓存（BUG 修复）：旧实现把失败结果以 None 写入 _IMAGE_CACHE，
-# 但读取判断是 `if _cached_url is not None`，"键不存在"与"值为 None"无法区分，
-# 失败缓存永远无法命中——每张失败配图都会重复走完整 Provider 降级链。
-# 现改用独立字典记录失败时间戳，短 TTL（10 分钟）内快速失败，过期后允许重试。
-_IMAGE_FAIL_CACHE: dict[str, float] = {}
-_IMAGE_FAIL_TTL = 600.0
-
-
-def _image_cache_set(key: str, value: str | None) -> None:
-    """写入图片缓存。
-
-    - value 为 URL：写入 LRU 成功缓存，超出最大条目数时淘汰最旧条目
-    - value 为 None（生成失败）：写入短 TTL 失败缓存，避免重复失败尝试，
-      同时不会永久记住瞬时故障
-    """
-    with _image_cache_lock:
-        if value is None:
-            # BUG-FIX 2026-09-16（低）：失败缓存无容量上限，写入时顺带清理
-            # 过期条目，避免长期运行缓慢泄漏
-            now = time.monotonic()
-            if len(_IMAGE_FAIL_CACHE) >= 512:
-                _expired = [k for k, ts in _IMAGE_FAIL_CACHE.items() if now - ts >= _IMAGE_FAIL_TTL]
-                for k in _expired:
-                    _IMAGE_FAIL_CACHE.pop(k, None)
-            _IMAGE_FAIL_CACHE[key] = now
-            return
-        _IMAGE_FAIL_CACHE.pop(key, None)
-        if key in _IMAGE_CACHE:
-            _IMAGE_CACHE.move_to_end(key)
-        _IMAGE_CACHE[key] = value
-        while len(_IMAGE_CACHE) > _IMAGE_CACHE_MAX_SIZE:
-            _IMAGE_CACHE.popitem(last=False)
-
-
+# ILLUSTRATION-REMOVAL 2026-11-04（遗留项3）：已移除 _IMAGE_CACHE/_IMAGE_FAIL_CACHE
+# 生图结果缓存（唯一消费方 generate_illustration_image 已删）。
 def validate_mermaid(code: str) -> tuple[bool, str]:
     """基础 Mermaid 语法校验"""
     if not code or not code.strip():
@@ -86,8 +54,15 @@ def validate_mermaid(code: str) -> tuple[bool, str]:
         if "--> " not in code and "-->" not in code:
             return False, "流程图缺少连接关系"
 
-        # For simple flowcharts detected without prefix, skip length check as they may be short
-        is_simple_flowchart = code.startswith("graph TD\n") or code.startswith("flowchart TD\n")
+        # BUG-FIX 2026-11-02（方向偏见·短流程图误杀）：旧实现只豁免 "graph TD\n" /
+        # "flowchart TD\n" 前缀，导致其他合法方向的最小流程图（如 "graph LR\nC-->D"，
+        # 13 字符）被误判"流程图代码过短" → _fence_payload_to_marker_text 返回 None →
+        # extract_section_charts 静默丢图。LR 是招投标流程图最常见方向，影响面大。
+        # 改为按 Mermaid 全部合法方向（TD/TB/BT/RL/LR）统一豁免长度门；退化输入
+        # 仍由后续 node_count<2 / edge_count<1 / 语法错误行等结构检查兜底拦截。
+        is_simple_flowchart = bool(
+            re.match(r"(?:graph|flowchart)\s+(?:TD|TB|BT|RL|LR)\b", code)
+        )
         if not is_simple_flowchart and len(code) < 20:
             return False, "流程图代码过短"
         if "`" in code:
@@ -284,6 +259,14 @@ def _render_arrange_sys(
     __WRITING_LENGTH__ 占位符，但调用方原先是 `get_prompt(KEY)` 不带任何 kwargs，
     模板原样发给模型（框架日志一直在报 missing variables）。
     模型因此拿不到章节标题与写作长度，无法按 short/standard/detailed 调整配图粒度。
+
+    UNIFY-R2b（2026-11-04，家族约定）：编排 system 模板族（charts.py 五个
+    *_ARRANGE_SYSTEM + mermaid.py FLOWCHART_ARRANGE_SYSTEM）的 ``{SUMMARY}``
+    槽位承载的**语义是项目概述**（调用方统一传 project_overview 的值）。该约定
+    为全家族一致设计（6/6 模板同拼法），与 user 侧模板族的
+    ``{PROJECT_OVERVIEW}`` 拼法不同但各自内部一致——勿单独改动某一个，
+    否则跨模板复用 kwarg 集时会踩错名（R2a 只统一了 GANTT/FLOWCHART 两个
+    姊妹 USER 模板间的分裂）。
     """
     try:
         rendered = get_prompt(
@@ -810,6 +793,30 @@ async def generate_layout_arrange(
     return result
 
 
+def _strip_generation_fence(raw: str) -> str:
+    """剥离 AI 输出中的 Markdown 代码围栏（```` ```mermaid ```` / ```` ```json ````
+    / 泛化 ```` ``` ````），返回内部载荷文本。
+
+    ENHANCE 2026-11-04（P1·JSON 契约冲突配套）：原各 generate_*_mermaid 内联的
+    剥离正则 `` ```(?:mermaid)? `` 只认 mermaid 语言标签——模型遵从「纯 JSON」
+    提示词却用 ```json 围栏包裹时，会残留 ``json`` 语言标签行，下游
+    validate_mermaid / json.loads 双双失败。本函数同时识别 ```json / ```mermaid
+    及无标签围栏；未匹配到完整围栏时退回逐行剔除围栏标记的旧行为。
+    """
+    text = str(raw or "")
+    if "```" in text:
+        m = re.search(r"```(?:mermaid|json)?\s*\n(.*?)\n?```", text, re.DOTALL)
+        if m:
+            return m.group(1).strip()
+        # 围栏不完整（缺闭合）：逐行剔除围栏标记行
+        lines = [
+            ln for ln in text.split("\n")
+            if not ln.strip().startswith("```")
+        ]
+        return "\n".join(lines).strip()
+    return text.strip()
+
+
 async def generate_layout_mermaid(
     provider: Any,
     *,
@@ -838,13 +845,17 @@ async def generate_layout_mermaid(
         AIMessage(role="user", content=user_prompt),
     ]
 
+    # ENHANCE 2026-11-04（P1·JSON 契约冲突）：LAYOUT_GENERATE_SYSTEM 要求纯 JSON
+    # 输出，渲染端 PIL v2 也原生消费 JSON 载荷。此前对 AI 原文一律跑 repair_mermaid
+    # （引号/括号/补头机械修复会改写 JSON 语义），且 ```json 围栏剥离正则只认
+    # ```mermaid → 残留 "json" 语言标签行，validate_mermaid 必败。现改为：
+    # JSON 输出剥离围栏后原样返回；Mermaid 语法输出（AI 未遵从提示词时）才走
+    # 修复链。JSON 合法性由 validate_chart_for_ai_pipeline 的结构化分支把关。
     raw = await with_timeout(provider.chat(messages, temperature=0.7), timeout=30)
-    if "```" in raw:
-        m = re.search(r"```(?:mermaid)?\s*\n(.*?)\n```", raw, re.DOTALL)
-        if m:
-            raw = m.group(1)
-    raw = repair_mermaid(raw)
-    return raw.strip()
+    raw = _strip_generation_fence(raw)
+    if raw.startswith("{"):
+        return raw.strip()
+    return repair_mermaid(raw).strip()
 
 
 async def generate_timeline_arrange(
@@ -911,13 +922,14 @@ async def generate_timeline_mermaid(
         AIMessage(role="user", content=user_prompt),
     ]
 
+    # ENHANCE 2026-11-04（P1·JSON 契约冲突）：与 generate_layout_mermaid 同口径——
+    # TIMELINE_GENERATE_SYSTEM 要求纯 JSON（TimelinePlan），JSON 输出剥离围栏后
+    # 原样返回；Mermaid 语法输出（AI 未遵从提示词时）才走 repair_mermaid 修复链。
     raw = await with_timeout(provider.chat(messages, temperature=0.7), timeout=30)
-    if "```" in raw:
-        m = re.search(r"```(?:mermaid)?\s*\n(.*?)\n```", raw, re.DOTALL)
-        if m:
-            raw = m.group(1)
-    raw = repair_mermaid(raw)
-    return raw.strip()
+    raw = _strip_generation_fence(raw)
+    if raw.startswith("{"):
+        return raw.strip()
+    return repair_mermaid(raw).strip()
 
 
 async def generate_comparison_arrange(
@@ -984,13 +996,16 @@ async def generate_comparison_mermaid(
         AIMessage(role="user", content=user_prompt),
     ]
 
+    # ENHANCE 2026-11-04（健壮性）：COMPARISON_GENERATE_SYSTEM 要求纯净 Mermaid
+    # Pie/xychart 代码，但模型偶发输出 JSON 数据（渲染端 PIL v2 原生支持）。
+    # 此前 ```json 围栏剥离正则只认 ```mermaid → 残留 "json" 语言标签行。
+    # 现统一围栏剥离；JSON 输出原样返回（validate_chart_for_ai_pipeline 的
+    # JSON 分支与渲染端均已支持），Mermaid 输出仍走 repair_mermaid 修复链。
     raw = await with_timeout(provider.chat(messages, temperature=0.7), timeout=30)
-    if "```" in raw:
-        m = re.search(r"```(?:mermaid)?\s*\n(.*?)\n```", raw, re.DOTALL)
-        if m:
-            raw = m.group(1)
-    raw = repair_mermaid(raw)
-    return raw.strip()
+    raw = _strip_generation_fence(raw)
+    if raw.startswith("{"):
+        return raw.strip()
+    return repair_mermaid(raw).strip()
 
 
 async def generate_mermaid_flowchart(
@@ -1108,13 +1123,16 @@ async def generate_mermaid_gantt(
         arrange_info = json.dumps(arrange_result, ensure_ascii=False, indent=2)
 
     # SECURITY-FIX 2026-10-06：与流程图同理，注入用户内容前做元标记中和。
+    # UNIFY-R2a（2026-11-04）：模板概述槽位 {SUMMARY}→{PROJECT_OVERVIEW}（与
+    # MERMAID_FLOWCHART_USER / chart 家族统一），此处 kwarg 同步更名，
+    # 消除 `summary=project_overview` 的形参-语义错位适配。
     gt_user = get_prompt(
         "MERMAID_GANTT_USER",
         section_title=section_title,
         section_content=section_content,
         scoring_standard=scoring_standard,
         industry_profile=industry_profile,
-        summary=summary or "未提供项目概述，请根据章节内容和行业经验合理推断工期。",
+        project_overview=summary or "未提供项目概述，请根据章节内容和行业经验合理推断工期。",
         arrange_info=arrange_info,
         sanitize=True,
     )
@@ -1163,318 +1181,13 @@ async def generate_mermaid_gantt(
 
     return raw_content
 
-
-async def generate_illustration_prompt(
-    provider: Any,
-    *,
-    section_title: str,
-    section_content: str,
-    section_path: str,
-    industry_profile: str,
-) -> dict:
-    """AI 生成配图描述（图片生成提示词）
-
-    Returns { "prompt": "...", "style": "...", "description": "..." }
-    """
-    logger.info("[配图方案] 开始: title=%s, path=%s", section_title, section_path)
-    ill_sys = get_prompt("ILLUSTRATION_PLAN_SYSTEM")
-    logger.info("[配图方案] 提示词加载: SYSTEM=%d字", len(ill_sys))
-    # ENHANCE 2026-10-18（审计遗留 D2 批次 2 收编）：原为隐式 f-string 拼接，
-    # 收编为 ILLUSTRATION_PLAN_USER，并对注入内容开启元标记中和。
-    ill_user = get_prompt(
-        "ILLUSTRATION_PLAN_USER",
-        section_path=section_path,
-        section_title=section_title,
-        section_content=section_content[:2000] if section_content else "（暂无正文）",
-        industry_profile=industry_profile or "通用工程",
-        sanitize=True,
-    )
-    if not ill_user:
-        logger.warning("[配图方案] 用户提示词未注册")
-        return {}
-
-    messages = [
-        AIMessage(role="system", content=ill_sys),
-        AIMessage(role="user", content=ill_user),
-    ]
-
-    result = await collect_json_response(provider, messages, max_retries=3)
-    return result
-
-
-async def generate_illustration_arrange(
-    provider: Any,
-    *,
-    section_title: str,
-    section_content: str,
-    project_overview: str = "",
-    scoring_standard: str = "",
-    industry_profile: str = "",
-) -> dict:
-    """AI 编排判断 — 该章节是否需要配图及图像风格偏好
-
-    返回包含 {"needed": bool, "style": string, "reason": string} 的判断结果
-    """
-    logger.info("[配图编排] 插图: title=%s, content_len=%d", section_title, len(section_content))
-    arr_sys = get_prompt("ILLUSTRATION_ARRANGE_SYSTEM")
-    logger.info("[配图编排] 插图 提示词加载: %d字", len(arr_sys))
-
-    user_prompt = get_prompt(
-        "ILLUSTRATION_ARRANGE_USER",
-        section_title=section_title,
-        section_content=section_content,
-        project_overview=project_overview or "未提供项目概述",
-        scoring_standard=scoring_standard or "未提供评分标准",
-        industry_profile=industry_profile or "未提供行业背景",
-        sanitize=True,
-    )
-
-    messages = [
-        AIMessage(role="system", content=arr_sys),
-        AIMessage(role="user", content=user_prompt),
-    ]
-
-    result = await collect_json_response(provider, messages, max_retries=3)
-    # 确保返回必要的字段
-    if result and isinstance(result, dict):
-        result.setdefault("needed", False)
-        result.setdefault("style", "engineering_diagram")
-        result.setdefault("reason", "")
-    return result
-
-
-async def generate_illustration_image(
-    provider: Any,
-    prompt: str,
-    style: str = "engineering_diagram",
-    section_size: str = "16:9",
-    provider_name: str = "volcengine",
-    image_config: dict | None = None,
-) -> str | None:
-    """使用配置的图像模型提供商生成实际图片
-
-    支持 Provider 降级链：主 Provider → qwen_image → dashscope → agnes。
-    当主 Provider 调用失败时，自动尝试下一个备选 Provider。
-    全部失败则返回 None，不阻塞调用方。
-
-    内置基于 MD5 的图片生成缓存，相同 Prompt 不会重复生成。
-
-    Args:
-        provider: 文本 AI 提供商实例（仅用于兜底获取 API 配置）
-        prompt: 图片生成提示词
-        style: 图像风格（engineering_diagram/realistic_photo/technical_drawing/custom）
-        section_size: 尺寸比例（16:9/1:1/9:16/4:3/3:4）
-        provider_name: 图像提供商标识（agnes/dashscope/hunyuan 等）
-        image_config: 图像模型配置（model_configs 表 image_* 字段），
-                      优先于此处的 provider 实例；应包含 image_api_key_enc /
-                      image_base_url / image_model / image_default_size 等
-
-    Returns:
-        生成的图片 URL，失败返回 None
-    """
-    from .image_providers.registry import ProviderRegistry
-
-    # ---- 图片生成缓存（基于 MD5，含 provider_name 避免切换 provider 后误命中） ----
-    _cache_key = hashlib.md5(
-        f"{prompt}|{style}|{section_size}|{provider_name}".encode()
-    ).hexdigest()
-    with _image_cache_lock:
-        _cached_url = _IMAGE_CACHE.get(_cache_key)
-        if _cached_url is not None:
-            # 命中缓存，将 key 移到末尾（LRU 刷新）
-            _IMAGE_CACHE.move_to_end(_cache_key)
-            logger.info("generate_illustration_image: 命中缓存 (key=%s)", _cache_key[:12])
-            return _cached_url
-        # BUG 修复：失败缓存命中检查。旧实现失败结果（None）永远无法命中，
-        # 每张失败配图都会重复走完整 Provider 降级链（多次网络调用）。
-        # 现在短 TTL（10 分钟）内的失败直接快速返回 None，过期后允许重试。
-        _fail_ts = _IMAGE_FAIL_CACHE.get(_cache_key)
-        if _fail_ts is not None:
-            if time.monotonic() - _fail_ts < _IMAGE_FAIL_TTL:
-                logger.info(
-                    "generate_illustration_image: 命中失败缓存，跳过重试 (key=%s)",
-                    _cache_key[:12],
-                )
-                return None
-            _IMAGE_FAIL_CACHE.pop(_cache_key, None)
-
-    def _resolve_api_key(cfg: dict) -> str:
-        """从图像配置中解析 API Key（兼容明文与 ENC: 加密前缀）"""
-        raw = (cfg or {}).get("image_api_key_enc") or (cfg or {}).get("api_key") or ""
-        if not raw:
-            return ""
-        try:
-            from ..crypto import decrypt_api_key, is_encrypted
-
-            if is_encrypted(raw):
-                return decrypt_api_key(raw)
-        except Exception as e:
-            logger.debug("图像 API Key 解密失败，按原样使用: %s", e)
-        return raw
-
-    def _resolve_base_url(cfg: dict) -> str:
-        """归一化 base_url，去掉误填的 /images/generations 端点后缀"""
-        url = (cfg or {}).get("image_base_url") or (cfg or {}).get("base_url") or ""
-        if not url:
-            return ""
-        return re.sub(r"/(?:dashscope/)?images/generations$", "", url.rstrip("/"))
-
-    # 优先使用图像专用配置
-    if image_config and image_config.get("image_enabled", True):
-        _fallback_api_key = getattr(provider, "api_key", "") or ""
-        _cfg_api_key = _resolve_api_key(image_config) or _fallback_api_key
-        _cfg_base_url = _resolve_base_url(image_config) or getattr(provider, "base_url", "") or ""
-        _cfg_model = image_config.get("image_model") or getattr(provider, "model", "default-model")
-        _cfg_default_size = image_config.get("image_default_size", "2K")
-        _cfg_price = image_config.get("image_price_per_image", 0.0)
-    else:
-        # 没有图像配置时回退到 provider 实例（文本模型配置，仅作兜底）
-        _cfg_api_key = getattr(provider, "api_key", "") or ""
-        _cfg_base_url = getattr(provider, "base_url", "") or ""
-        _cfg_model = getattr(provider, "model", "default-model")
-        _cfg_default_size = "2K"
-        _cfg_price = 0.0
-
-    # 降级链定义：主 Provider → 备选1 → 备选2
-    _FALLBACK_CHAIN = ["qwen_image", "dashscope", "agnes"]
-
-    # 如果传入的 provider_name 不在降级链中，将其作为第一优先级
-    _provider_queue: list[str] = []
-    if provider_name and provider_name not in _FALLBACK_CHAIN:
-        _provider_queue.append(provider_name)
-    _provider_queue.extend(_FALLBACK_CHAIN)
-
-    # 已尝试过的 provider（避免重复）
-    _tried_providers: set[str] = set()
-
-    # 映射 size 参数到适配器期望的像素尺寸格式（dashscope 风格：仅 size 字段）
-    _size_map = {
-        "16:9": "1920x1080",
-        "1:1": "1024x1024",
-        "9:16": "1024x1792",
-        "4:3": "1024x768",
-        "3:4": "768x1024",
-        "2:3": "768x1024",
-        "3:2": "1024x768",
-        "21:9": "1920x810",
-    }
-    _pixel_size = _size_map.get(section_size, "1024x1024")
-
-    # 注入风格约束（ENHANCE 2026-10-05 / P-16：文案正本见 image_styles.py）
-    _final_prompt = prompt
-    if style != "custom":
-        _style_prefix = get_image_style(style, include_fallback=False)
-        if _style_prefix:
-            _final_prompt = f"{_style_prefix}\n{prompt}"
-
-    # 尝试降级链中的每个 Provider
-    _last_error: str | None = None
-    for _pname in _provider_queue:
-        if _pname in _tried_providers:
-            continue
-        _tried_providers.add(_pname)
-
-        try:
-            # --- 处理特殊 provider: qwen_image ---
-            # qwen_image 不是注册的 provider ID，它使用 dashscope 适配器 + qwen-image 模型
-            _actual_provider = _pname
-            _model_override = None
-            if _pname == "qwen_image":
-                _actual_provider = "dashscope"
-                _model_override = "qwen-image-3.0-pro"
-
-            # 从图像配置构建适配器配置（优先图像 key，而非文本模型 key）
-            _adapter_config = {
-                "api_key": _cfg_api_key,
-                "base_url": _cfg_base_url,
-                "model": _model_override or _cfg_model,
-                "default_size": _cfg_default_size,
-                "default_ratio": section_size,
-                "timeout": 60,
-                "price_per_image": _cfg_price,
-            }
-
-            # 获取适配器实例（注意：get_adapter 需要传入 config）
-            _adapter = ProviderRegistry.get_adapter(_actual_provider, _adapter_config)
-
-            # 尺寸语义自适应：
-            # - 适配器支持 1K/2K + ratio 风格（agnes 等）→ 传默认尺寸 + 宽高比
-            # - 适配器只接受像素尺寸（dashscope 等）→ 传宽x高像素值
-            _supported_sizes = getattr(_adapter, "supported_sizes", None)
-            if _supported_sizes and _cfg_default_size in _supported_sizes:
-                _size_arg, _ratio_arg = _cfg_default_size, section_size
-            else:
-                _size_arg, _ratio_arg = _pixel_size, None
-
-            # 调用适配器生成图像
-            _result = await _adapter.generate(
-                prompt=_final_prompt,
-                model=_adapter_config.get("model", ""),
-                size=_size_arg,
-                ratio=_ratio_arg,
-            )
-
-            # 提取图片 URL
-            _image_url = (
-                _result.get("image_url")
-                or _result.get("url")
-                or (
-                    _result.get("data", [{}])[0].get("url")
-                    if isinstance(_result.get("data"), list)
-                    else None
-                )
-            )
-
-            if not _image_url and isinstance(_result, dict):
-                for _key in ["url", "image", "imageUrl", "picture"]:
-                    if _key in _result:
-                        _image_url = _result[_key]
-                        break
-
-            if _image_url:
-                logger.info(
-                    "generate_illustration_image: Provider '%s' 生成成功 (原始: '%s')",
-                    _actual_provider,
-                    _pname,
-                )
-                # 写入缓存
-                _image_cache_set(_cache_key, _image_url)
-                return _image_url
-
-            _last_error = f"Provider '{_pname}' 返回空 URL"
-            logger.warning(
-                "generate_illustration_image: Provider '%s' 返回空结果，尝试下一个",
-                _pname,
-            )
-
-        except Exception as e:
-            _last_error = f"Provider '{_pname}' 异常: {e}"
-            logger.warning(
-                "generate_illustration_image: Provider '%s' 失败 (%s)，尝试下一个",
-                _pname,
-                e,
-            )
-            continue
-
-    # 所有 Provider 均失败
-    logger.error(
-        "generate_illustration_image: 所有 Provider 均失败，prompt='%s...', last_error=%s",
-        prompt[:80],
-        _last_error,
-    )
-    # 缓存失败结果（避免重复失败尝试）
-    _image_cache_set(_cache_key, None)
-    return None
-
-
-def build_illustration_url(prompt: str, image_size: str = "landscape_16_9") -> str:
-    """构建配图 URL（使用 text-to-image API）"""
-    import urllib.parse
-
-    encoded_prompt = urllib.parse.quote(prompt)
-    return f"https://trae-api-cn.mchost.guru/api/ide/v1/text_to_image?prompt={encoded_prompt}&image_size={image_size}"
-
-
+# ILLUSTRATION-REMOVAL 2026-11-04（遗留项3·生图功能下线）：已移除 4 个仅被
+# POST /sections/{id}/generate-illustration 端点消费的生图函数——
+# generate_illustration_prompt / generate_illustration_arrange /
+# generate_illustration_image（含 _image_cache_* 渲染缓存）/ build_illustration_url。
+# 产品口径：图表全部自动生成，不设生图功能；配图阶段对 image 类型恒跳过
+# （illustration_phase.ai_image_disabled），全仓无其他调用方。
+# 保留：image_styles.py 与 image_providers/（image_providers.service 自用）。
 async def generate_labor_arrange(
     provider: Any,
     *,
@@ -1734,18 +1447,11 @@ async def generate_all_chart_arrangements(
     # ENHANCE 2026-10-12: 批量编排系统提示词已注册进 prompts 注册表（_integrate.py），
     # DB 优先 + 硬编码回退的 get_prompt 已覆盖全部场景，管理员可通过管理页覆盖/重置。
     # R1: chart_hints 通过模板变量注入，不再硬编码拼接。
-    batch_arrange_sys = (
-        get_prompt("CHART_BATCH_ARRANGE_SYSTEM", chart_hints_block=_hint_block)
-        or (_BATCH_ARRANGE_SYS_FALLBACK + _hint_block)
-    )
-    logger.info(
-        "[批量编排] 开始 章节=%s 内容长度=%d 概述长度=%d 正文配图提示=%s",
-        section_title,
-        len(section_content),
-        len(project_overview),
-        sorted((chart_hints or {}).keys()),
-    )
-
+    # BUG-FIX 2026-11-04（P1·UnboundLocalError）：原实现先在 or 右侧引用
+    # _BATCH_ARRANGE_SYS_FALLBACK（:1746），赋值却在同函数其后（:1756）——
+    # 当 get_prompt 返回空（注册表/DB 故障）时触发 UnboundLocalError，
+    # 被 sse_charts 宽 except 吞成「批量图表编排失败」→ 整章静默丢图，
+    # fallback 永远不可达。现将 fallback 常量定义移到引用之前。
     _BATCH_ARRANGE_SYS_FALLBACK = """# 批量图表编排（系统提示词）— V8.0 商业级优化版
 > **设计目标**：单次 AI 调用同时判断所有 7 种图表类型的适配性，
 > 确保后续 v2 商业级渲染器获得高质量数据（2x 超采样 + 300 DPI 输出）。
@@ -1807,6 +1513,18 @@ async def generate_all_chart_arrangements(
 | comparison | 3组数据 | 饼图总和=100%，柱状图有明确对比；数据单位为工程常用指标 |
 | layout | 3个功能区 | 坐标不重叠，有连接关系；区域名含具体功能描述 |
 | timeline | 3个里程碑 | 日期有序，状态合理分配；里程碑描述含具体验收标准 |"""
+
+    batch_arrange_sys = (
+        get_prompt("CHART_BATCH_ARRANGE_SYSTEM", chart_hints_block=_hint_block)
+        or (_BATCH_ARRANGE_SYS_FALLBACK + _hint_block)
+    )
+    logger.info(
+        "[批量编排] 开始 章节=%s 内容长度=%d 概述长度=%d 正文配图提示=%s",
+        section_title,
+        len(section_content),
+        len(project_overview),
+        sorted((chart_hints or {}).keys()),
+    )
 
     # ENHANCE 2026-10-12: 从注册表读取用户提示词模板，支持管理页覆盖。
     # 保留 f-string 作为 DB 不可用时的 fallback。
@@ -1901,177 +1619,11 @@ async def generate_all_chart_arrangements(
         logger.warning("[批量编排] 返回非 dict 结果: %r", result)
     return result
 
-
-# ============================================================
-# V7.0 更新：图像生成服务（ImageGenerationService）
-# ============================================================
-import os as _os
-import tempfile
-
-
-try:
-    import requests as _requests
-except ImportError:
-    _requests = None  # type: ignore
-
-logger = logging.getLogger(__name__)
-
-
-class ImageGenerationService:
-    """V7.0 图像生成服务 - 统一接口，支持多图像模型提供商
-
-    用于在标书正文中插入 AI 生成的配图（如施工现场示意图、设备布置图等）。
-
-    设计特点：
-        - 支持 volcengine, openai, dashscope 等多种后端
-        - 自动适配不同厂商的 API 格式
-        - 向后兼容旧版调用方式
-
-    使用示例：
-        gen = ImageGenerationService(provider, "volcengine")
-        url = gen.generate("施工现场平面布置示意图", style="engineering_diagram")
-        if url:
-            download_and_embed_image(url, doc)
-    """
-
-    # 全局风格约束（确保生成的图片适合投标技术方案）
-    # ENHANCE 2026-10-05（P-16）：文案正本收敛到 image_styles.DEFAULT_IMAGE_STYLES，
-    # 此处保留同名类属性以兼容既有 `self.STYLE_PROMPTS[...]` 读取方式。
-    STYLE_PROMPTS = DEFAULT_IMAGE_STYLES
-
-    def __init__(self, provider: Any, provider_name: str = "volcengine"):
-        """Args:
-        provider: AI 提供商实例（需有 chat 接口用于生成 prompt）
-        provider_name: 图像模型提供商名称（volcengine/openai 等）
-        """
-        self.provider = provider
-        self.provider_name = provider_name
-        self._client = None
-
-    def _init_client(self):
-        """初始化图像生成客户端（懒加载）"""
-        if self._client is not None:
-            return
-
-        if self.provider_name == "volcengine":
-            self._init_volcengine()
-        elif self.provider_name == "openai":
-            self._init_openai()
-
-    def _init_volcengine(self):
-        """初始化火山引擎 Seedream 客户端"""
-        try:
-            from volcengine.visual.VisualService import VisualService
-
-            self._client = VisualService()
-            ak = getattr(self.provider, "api_key", "") or _os.environ.get("VOLC_ACCESS_KEY", "")
-            sk = getattr(self.provider, "api_secret", "") or _os.environ.get("VOLC_SECRET_KEY", "")
-            if ak and sk:
-                self._client.set_ak(ak)
-                self._client.set_sk(sk)
-            self._model = "seedream-2.0"
-        except ImportError:
-            logger.warning("AIMageGenerator: volcengine SDK 未安装，图像生成功能不可用")
-            self._client = None
-
-    def _init_openai(self):
-        """初始化 OpenAI DALL-E 客户端"""
-        try:
-            import openai as _openai
-
-            api_key = getattr(self.provider, "api_key", "") or _os.environ.get("OPENAI_API_KEY", "")
-            base_url = getattr(self.provider, "base_url", "") or _os.environ.get(
-                "OPENAI_BASE_URL", ""
-            )
-            self._client = _openai.OpenAI(api_key=api_key, base_url=base_url or None)
-            self._model = "dall-e-3"
-        except ImportError:
-            logger.warning("AIMageGenerator: openai SDK 未安装，图像生成功能不可用")
-            self._client = None
-
-    def generate(
-        self,
-        prompt: str,
-        style: str = "engineering_diagram",
-        size: str = "1024x1024",
-    ) -> str | None:
-        """生成 AI 图片，返回图片 URL 或本地路径
-
-        Args:
-            prompt: 图片描述提示词
-            style: 风格（engineering_diagram/realistic_photo/technical_drawing）
-            size: 图片尺寸
-
-        Returns:
-            图片 URL 或本地路径，失败返回 None
-        """
-        # ENHANCE 2026-10-05（P-16）：走唯一正本，支持 IMAGE_STYLE_OVERRIDE 覆盖
-        style_prompt = get_image_style(style)
-        full_prompt = f"{style_prompt}\n{prompt}"
-
-        self._init_client()
-        if self._client is None:
-            logger.warning("AIMageGenerator: 图像生成客户端未初始化")
-            return None
-
-        try:
-            if self.provider_name == "volcengine":
-                return self._generate_volcengine(full_prompt, size)
-            elif self.provider_name == "openai":
-                return self._generate_openai(full_prompt, size)
-            else:
-                return build_illustration_url(full_prompt)
-        except Exception as e:
-            logger.error("AIMageGenerator: 图像生成失败 (%s): %s", self.provider_name, e)
-            return None
-
-    def _generate_volcengine(self, prompt: str, size: str) -> str | None:
-        """火山引擎 Seedream 图像生成"""
-        try:
-            form = {
-                "req_key": self._model,
-                "prompt": prompt,
-                "model_version": "general_v2.0",
-                "width": 1024,
-                "height": 1024,
-            }
-            resp = self._client.cv_process(form)
-            if resp and resp.get("code") == 10000:
-                image_urls = resp.get("data", {}).get("image_urls", [])
-                return image_urls[0] if image_urls else None
-            logger.warning("AIMageGenerator: 火山引擎返回错误: %s", resp)
-            return None
-        except Exception as e:
-            logger.error("AIMageGenerator: 火山引擎调用失败: %s", e)
-            return None
-
-    def _generate_openai(self, prompt: str, size: str) -> str | None:
-        """OpenAI DALL-E 图像生成"""
-        try:
-            response = self._client.images.generate(
-                model=self._model,
-                prompt=prompt,
-                size=size,
-                quality="standard",
-                n=1,
-            )
-            return response.data[0].url if response.data else None
-        except Exception as e:
-            logger.error("AIMageGenerator: OpenAI 调用失败: %s", e)
-            return None
-
-    async def generate_async(
-        self,
-        prompt: str,
-        style: str = "engineering_diagram",
-        size: str = "1024x1024",
-    ) -> str | None:
-        """异步生成 AI 图片（使用线程池避免阻塞）"""
-        import asyncio
-
-        return await asyncio.to_thread(self.generate, prompt, style, size)
-
-
+# ILLUSTRATION-REMOVAL 2026-11-04（遗留项3·生图功能下线）：已移除 V7.0
+# ImageGenerationService 图像生成服务类与 AIMageGenerator 别名、生图缓存统计
+# （get_image_cache_stats/clear_image_cache）——唯一消费方为已删除的
+# POST /sections/{id}/generate-illustration 端点与 generate_illustration_image。
+# 生图产品口径：图表全部自动生成，不设生图功能；独立图像任务管理
 def download_and_embed_image(
     url: str,
     doc,
@@ -2276,37 +1828,8 @@ class InlineChartDetector:
         return results
 
 
-# ============================================================
-# Backward compatibility: AIMageGenerator is an alias for ImageGenerationService
-# ============================================================
-AIMageGenerator = ImageGenerationService
 
-
-# ============================================================
-# 图片生成缓存管理
-# ============================================================
-
-
-def get_image_cache_stats() -> dict:
-    """获取图片生成缓存统计信息"""
-    with _image_cache_lock:
-        hit_count = sum(1 for v in _IMAGE_CACHE.values() if v is not None)
-        miss_count = sum(1 for v in _IMAGE_CACHE.values() if v is None)
-        return {
-            "total": len(_IMAGE_CACHE),
-            "hit": hit_count,
-            "miss": miss_count,
-            "keys": list(_IMAGE_CACHE.keys()),
-        }
-
-
-def clear_image_cache() -> None:
-    """清空图片生成缓存"""
-    with _image_cache_lock:
-        _IMAGE_CACHE.clear()
-    logger.info("generate_illustration_image: 图片生成缓存已清空")
-
-
+# （routers/images.py → image_providers.service.ImageGenerationService）不受影响。
 # AI调用超时装饰器
 async def with_timeout(coro, timeout: int = 30, error_msg: str = "AI调用超时"):
     """带超时的AI调用装饰器"""
@@ -2652,9 +2175,72 @@ def validate_chart_for_ai_pipeline(
 
     elif chart_type in MERMAID_CODE_TYPES:
         # Mermaid 代码型 → repair_mermaid + validate_mermaid + 结构化完整性校验
-        raw = str(chart_data.get("code") or "")
-        # 始终拿 repair_mermaid diff（return_diff=True 开销极小——只组 dict），
-        # 保证 step_counts 统计完整；verbose 参数只控制 repair_context 是否收集给调用方
+        raw = str(chart_data.get("code") or "").strip()
+
+        # ---------- ENHANCE 2026-11-04（P1·layout/timeline JSON 契约冲突）----------
+        # LAYOUT/TIMELINE_GENERATE_SYSTEM 与 CHART_DATA_FIX 速查表承诺 JSON 数据
+        # 载荷（LayoutPlan/TimelinePlan/GanttPlan），且渲染端 PIL v2 原生支持 JSON
+        # 载荷（mermaid_renderer V6.1 归一化）；但本管线此前一律按 Mermaid 代码
+        # 校验 → JSON 载荷被 validate_mermaid 判「不支持的 Mermaid 类型」，且
+        # repair_mermaid 的机械修复（引号/括号/补头）会改写 JSON 语义；AI 修复轮
+        # 返回的结构化 dict（无 code 字段）又因空 code 二轮必败 → 图表整单丢失。
+        # 现对 JSON 载荷走 chart_validators 结构化校验，并把结构化字段提升到
+        # 载荷顶层、移除 code（与 architecture/labor 同构，build_chart_fence
+        # 据此产出 chart-json 围栏，渲染/前端/导出全链路口径一致）。
+        _JSON_TRIGGER_KEYS = {
+            "gantt": ("tasks",),
+            "layout": ("zones", "areas"),
+            "timeline": ("milestones",),
+            "comparison": ("items", "rows"),
+            "flowchart": ("nodes",),
+        }
+        _json_payload: dict | None = None
+        if raw.startswith("{"):
+            try:
+                _parsed = json.loads(raw)
+                if isinstance(_parsed, dict):
+                    _json_payload = _parsed
+            except (json.JSONDecodeError, TypeError, ValueError):
+                _json_payload = None
+        elif not raw:
+            # AI 修复轮直接返回结构化 dict（无 code）——chart_data 本身即载荷
+            _trigger = _JSON_TRIGGER_KEYS.get(chart_type, ())
+            if _trigger and any(k in chart_data for k in _trigger):
+                _json_payload = chart_data
+
+        if _json_payload is not None:
+            merged = {**chart_data}
+            for _k, _v in _json_payload.items():
+                if _k not in ("type", "code", "title", "source", "needed"):
+                    merged[_k] = _v
+            merged.pop("code", None)
+            if chart_type == "comparison" and "headers" in _json_payload:
+                # 表格型对比图（headers+rows 多指标）：渲染端支持但无专用结构化
+                # 校验器，只做最小完整性检查，不套用饼图百分比校验（会误杀）
+                _rows_list = merged.get("rows")
+                if isinstance(_rows_list, list) and _rows_list:
+                    sok, serrs = True, []
+                else:
+                    sok, serrs = False, ["表格型对比图 rows 不能为空"]
+            else:
+                try:
+                    sok, serrs = validate_chart_payload(chart_type, merged)
+                except Exception as ve:
+                    sok, serrs = False, [f"结构化校验异常: {ve!s}"]
+            if sok:
+                chart_data = merged
+                mutated = True
+            else:
+                errors.extend(list(serrs or ["结构化校验未通过"])[:5])
+            if verbose:
+                repair_context = {
+                    "repair_mermaid": None,
+                    "parsed_structure": _json_payload,
+                    "structural_validation_errors": list(serrs or [])[:5],
+                    "original_chart_type": (chart_data.get("type") or chart_type),
+                }
+            return (len(errors) == 0, errors, chart_data, mutated, repair_context)
+
         repaired, _rm_diff = repair_mermaid(raw, return_diff=True)
         ok, msg = validate_mermaid(repaired)
         if not ok:
@@ -2710,8 +2296,14 @@ def validate_chart_for_ai_pipeline(
 
         # ENHANCE 2026-10-11: 模块级统计收集（chart_type × step_name → 累计次数）
         # 用于后续 celery beat 定时批量汇总
+        # BUG-FIX 2026-11-04（P0·校验管线静默失效）：`_REPAIR_STATS_TOTAL += 1`
+        # 对模块级全局做增强赋值却未声明 global → UnboundLocalError。此前任何
+        # 触发机械修复（step_counts 非空）的图表都会让本函数抛异常，被 sse_charts
+        # 的宽 except 吞成「图表校验管线不可用」→ 首轮校验整体跳过（fail-open），
+        # 坏数据直通落库、修复统计恒空。补 global 声明恢复统计与校验。
         if _rm_diff and _rm_diff.get("step_counts"):
             with _repair_stats_lock:
+                global _REPAIR_STATS_TOTAL
                 _step_stats = _REPAIR_STATS.setdefault(chart_type, {})
                 for _sn, _cnt in _rm_diff["step_counts"].items():
                     _step_stats[_sn] = _step_stats.get(_sn, 0) + _cnt

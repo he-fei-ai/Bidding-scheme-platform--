@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import queue
+import re
 import time
 from types import SimpleNamespace
 
@@ -257,7 +258,12 @@ class TestAgentRepairContract:
         src = inspect.getsource(agent_repair.run_agent_repair)
         assert "asyncio.to_thread(build_agent_workspace" in src
         assert "asyncio.to_thread(_persist_changed_sections)" in src
-        assert "asyncio.to_thread(\n            invalidate_content_caches" in src
+        # 2026-11-03：F-1（2026-11-02）把失效调用包进 `if written_ids:` 后缩进
+        # 变化，旧的精确缩进断言失效。契约不变：同步失效仍必须经 to_thread 卸载，
+        # 改为缩进无关的正则匹配。
+        assert re.search(
+            r"asyncio\.to_thread\(\s*\n?\s*invalidate_content_caches", src
+        ), "invalidate_content_caches 必须经 asyncio.to_thread 卸载"
 
     def test_build_agent_workspace_uses_readonly_connection(self):
         """R7（契约）：纯读工作区准备不得抢全局写锁。"""

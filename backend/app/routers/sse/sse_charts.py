@@ -145,7 +145,13 @@ async def _auto_generate_charts_for_section(
 
     # PERF-FIX-2026-09-08: save helper（to_thread 包装 sync update_section）
 
-    async def _save_section_field(_sid: int, _field: str, _json: str) -> None:
+    async def _save_section_field(_sid: int, _field: str, _json: str) -> bool:
+
+        """落库图表字段；返回是否成功（BUG-FIX 2026-11-04：失败时调用方不得
+
+        登记 real_charts —— 旧实现失败被吞但照常登记，chart_hints 按类型剔除后
+
+        该类型图彻底不生成，仅一条 warning，编排兜底重试机制被绕过。）"""
 
         try:
 
@@ -157,6 +163,8 @@ async def _auto_generate_charts_for_section(
 
             )
 
+            return True
+
         except Exception as _e:
 
             logger.warning(
@@ -164,6 +172,8 @@ async def _auto_generate_charts_for_section(
                 "保存内联图表失败 section=%d field=%s: %s", _sid, _field, _e,
 
             )
+
+            return False
 
 
 
@@ -202,7 +212,9 @@ async def _auto_generate_charts_for_section(
             payload = _merged
         if not payload:
             continue
-        await _save_section_field(section_id, chart_field, json.dumps(payload, ensure_ascii=False))
+        if not await _save_section_field(section_id, chart_field, json.dumps(payload, ensure_ascii=False)):
+            # 落库失败：不登记 real_charts，让该类型继续留在编排意图里兜底重试
+            continue
         real_charts.append({"type": chart_type, "data": payload})
         logger.info("内联图表数据已落库: section=%d type=%s", section_id, chart_type)
 

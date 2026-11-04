@@ -2,7 +2,7 @@
 from fastapi import APIRouter, Depends, HTTPException
 from ..models import BatchImportRequest, GenerateChildrenRequest, IndustryNodeCreate, IndustryNodeUpdate, MatchIndustryRequest, ReorderRequest
 from ..security.auth import get_current_user
-from ..services.industry_tree import batch_import, create_node, create_version, delete_node, get_audit_logs, get_children, get_default_scoring_items, get_full_tree, get_industry_knowledge_map, get_industry_references, get_node_by_id, get_path, get_root_nodes, get_stats, get_versions, link_knowledge_to_industry, match_industry_by_ai, match_industry_by_text, reorder_nodes, search_nodes, update_node
+from ..services.industry_tree import batch_import, create_node, create_version, delete_node, get_audit_logs, get_children, get_default_scoring_items, get_full_tree, get_industry_knowledge_map, get_industry_references, get_node_by_id, get_path, get_root_nodes, get_stats, get_versions, link_knowledge_to_industry, match_industry_by_ai, match_industry_by_text, reorder_nodes, rollback_to_version, search_nodes, update_node
 from ..services.industry_tree import generate_children as ai_generate_children
 router = APIRouter(prefix='/industry-tree', tags=['行业树'])
 

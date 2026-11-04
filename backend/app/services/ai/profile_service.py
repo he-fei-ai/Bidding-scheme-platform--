@@ -57,7 +57,7 @@ _PROFILE_DEFAULTS = {
 
 
 class ConflictError(Exception):
-    """閰嶇疆鍐欏叆鍚庝紶鍏冩牸鍙?鍚戒负 409 Conflict(ETag / If-Match 鍙傚墠绯诲垪涓嶈祫鍙?。"""
+    """配置写入版本冲突（ETag / If-Match 前置校验不通过）时抛出，对外映射为 409 Conflict。"""
 
 
 def _clamp_profile_params(data: dict) -> dict:
@@ -245,18 +245,19 @@ def create_profile(data: dict) -> dict:
 def update_profile(name: str, data: dict, if_match: int | None = None) -> dict:
     """更新 Profile
 
-    if_match 钳制负褰撳嶇疆鐗堟湰鍙?(ETag)。鍐欏叆涔熷悗鍐欏叆, 鍐欑幇鍚庯祫婧愮幇鍦ㄥ彲鍦?409 Conflict。
+    if_match 为调用方持有的当前配置版本号（ETag）。写入前校验，
+    若版本已被其他写入推进则抛出 ConflictError（映射为 409 Conflict）。
     """
-    # 鍙傚墠绯诲垪(If-Match / etag): 鍐欏叆涔熷悗鍐欏叆, 鍐欑幇鍚庯紝祫婧愮幇鍦ㄥ彲鍦?409
+    # 乐观锁前置校验(If-Match / etag): 版本不一致时拒绝写入, 返回 409
     if if_match is not None:
         from .provider_factory import get_ai_config_version
         try:
             if int(if_match) != get_ai_config_version():
                 raise ConflictError(
-                    "閰嶇疆巳鏈夋牸鍐欏叆(etag=%s)锛屼笉鍙堟暟鎹勫垎鍐欏叆 Profile '%s'" % (if_match, name)
+                    "配置已被其他写入更新(etag=%s)，请刷新后再修改 Profile '%s'" % (if_match, name)
                 )
         except (TypeError, ValueError):
-            raise ConflictError("If-Match 鍙傚墠绯诲垪閿欒")
+            raise ConflictError("If-Match 值不合法")
     # G-1（2026-10-11）：只钳制 data 中实际提供的数值字段；未提供的保持
     # None（COALESCE 会保留库内原值），不覆盖用户「仅改一个字段」的意图。
     clamped = _clamp_profile_params(data)

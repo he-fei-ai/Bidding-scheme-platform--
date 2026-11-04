@@ -267,6 +267,18 @@ class TestD7ExtractClauses:
     def test_list(self):
         c=rcov._extract_clauses([{"id":"r001","description":"条款内容足够长"}])
         assert len(c)==1
+    def test_check_items_plain_strings(self):
+        """B-13-1：check_items 为纯文本数组时不得静默漏提取。"""
+        ci=["投标文件未加盖单位公章", "投标报价超过最高限价"]
+        c=rcov._extract_clauses(None,ci)
+        assert len(c)==2 and c[0]["text"]=="投标文件未加盖单位公章"
+    def test_check_items_grouped_dict(self):
+        """B-13-1：{"废标": [ {...} ]} 分组字典需递归展开。"""
+        ci={"废标":[{"id":"r001","description":"投标文件未加盖单位公章"}]}
+        c=rcov._extract_clauses(None,ci)
+        assert len(c)==1 and c[0]["text"]=="投标文件未加盖单位公章"
+    def test_check_items_short_string_filtered(self):
+        assert rcov._extract_clauses(None,["证"]) == []
 
 # === C. 静态守卫 ===
 class TestStaticGuards:

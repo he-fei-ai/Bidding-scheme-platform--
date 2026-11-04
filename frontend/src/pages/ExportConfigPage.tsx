@@ -113,6 +113,12 @@ export default function ExportConfigPage() {
   const [presetCatalog, setPresetCatalog] = useState<ExportPresetCatalog | null>(null);
   const [presetId, setPresetId] = useState("");
   const [themeId, setThemeId] = useState("");
+  // B-4 修复（2026-11-04 导出模块加固轮）：预设加载失败要可感知、可重试。
+  // 旧实现 catch 里 `presetsLoadedRef.current = false` 意图重试，但挂载 effect
+  // 依赖数组为 []，永不重跑 —— 重试意图是死代码，失败后只能整页刷新。
+  // 现在：失败置 presetsLoadFailed → 卡片内出现「重试加载预设」按钮（点击重新
+  // 拉取，成功后自动消失）；加载失败仍不阻塞导出（手调配置照常可用，历史行为）。
+  const [presetsLoadFailed, setPresetsLoadFailed] = useState(false);
   // 预设只在首次挂载时拉取一次；用 ref 守卫避免 applyLayoutPreset 身份变化导致的重复请求
   const presetsLoadedRef = useRef(false);
 
@@ -132,24 +138,30 @@ export default function ExportConfigPage() {
     if (typeof c.line_spacing === "number") setLineSpacing(c.line_spacing);
   }, [presetCatalog]);
 
-  useEffect(() => {
+  /** 拉取预设目录并套用默认版式/主题（挂载时自动调用一次；失败后可手动重试） */
+  const loadPresets = useCallback(() => {
     if (presetsLoadedRef.current) return;
     presetsLoadedRef.current = true;
     getExportPresets()
       .then((catalog) => {
         setPresetCatalog(catalog);
+        setPresetsLoadFailed(false);
         // 默认套用推荐版式，避免用户面对空白配置无从下手
         const defaultLayout = catalog.defaults?.layout_id || catalog.layouts?.[0]?.id || "";
         if (defaultLayout) applyLayoutPreset(defaultLayout, catalog);
         if (catalog.defaults?.theme_id) setThemeId(catalog.defaults.theme_id);
       })
       .catch(() => {
-        // 预设加载失败不阻塞导出：用户仍可用手调配置导出
+        // 预设加载失败不阻塞导出：用户仍可用手调配置导出；复位守卫允许手动重试
         presetsLoadedRef.current = false;
+        setPresetsLoadFailed(true);
         console.warn("加载导出预设失败，已回退为手动配置");
       });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [applyLayoutPreset]);
+
+  useEffect(() => {
+    loadPresets();
+  }, [loadPresets]);
 
   const activeLayout = (presetCatalog?.layouts || []).find((item) => item.id === presetId);
   const activeTheme = (presetCatalog?.themes || []).find((item) => item.id === themeId);
@@ -220,14 +232,20 @@ export default function ExportConfigPage() {
     show_header_footer: showHeaderFooter,
     bidder_name: bidderName,
     // BUG-FIX-53 修复：原未传递这些字段，用户无法配置图表参数和严格模式
-    image_max_width_cm: 18.0,
+    // BUG-FIX 2026-11-02（B-1·前端硬编码覆盖预设）：原固定传
+    // image_max_width_cm: 18.0 / gantt_max_columns: 18。resolve_export_config
+    // 中显式字段优先级最高 → 选「宽表格横版」等预设时这两个字段恒被 18 覆盖，
+    // 图片可用宽度与甘特列数不随版式生效。修复模式与 image_dpi（2026-10-28）
+    // 同型：省略这两个字段，由后端按 preset_id 解析补全；无预设时后端模型
+    // 默认值即历史口径（18.0 / 18），行为向后兼容。
+    // image_max_width_cm: 18.0,
     // BUG-FIX 2026-10-28（P2）：原硬编码 image_dpi: 300 覆盖后端 F9 修复
     // （ExportConfig.image_dpi 默认值 = config.EXPORT_IMAGE_DPI）。运维设
     // EXPORT_IMAGE_DPI 环境变量经前端主路径导出恒被中和为 300。
     // 现省略该字段（可选），由后端 default_factory 懒读 config 默认值，
     // 不设环境变量时行为与历史一致（300），设了即生效（向后兼容）。
     // image_dpi: 300,
-    gantt_max_columns: 18,
+    // gantt_max_columns: 18,
     strict_mode: strictMode,
     // ENHANCE（本轮跨模块深度探索·审核×导出打通）：一致性闸门透传后端
     block_on_high_conflicts: blockOnHighConflicts,
@@ -663,6 +681,17 @@ export default function ExportConfigPage() {
                 共 {(presetCatalog?.layouts || []).length} 套版式 × {(presetCatalog?.themes || []).length} 套主题。
                 套用版式后仍可在下方逐项微调；主题只影响标题色、表头底色与边框色。
               </Text>
+              {/* B-4 修复（2026-11-04）：预设加载失败可感知、可重试（旧实现重试意图是死代码） */}
+              {presetsLoadFailed && (
+                <Space size={8} align="center">
+                  <Text type="warning" style={{ fontSize: 12 }}>
+                    预设目录加载失败，当前为手动配置模式
+                  </Text>
+                  <Button size="small" onClick={loadPresets}>
+                    重试加载预设
+                  </Button>
+                </Space>
+              )}
             </Space>
           </Card>
 

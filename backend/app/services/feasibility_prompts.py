@@ -167,6 +167,84 @@ ANALYSIS_FIELDS: list[tuple[str, str]] = [
 _TITLE_PREFIX_RE = re.compile(r"^第?[一二三四五六七八九十百零〇\d.、\s]+[章节篇]?\s*")
 
 
+# ========== 注册表接线（BUG-FIX-PROMPT-E10，2026-11-03） ==========
+# 以下 fallback 文本与 _integrate_batch4.py 中对应 key 的注册文本逐字一致；
+# 注册表可用时以 get_prompt() 结果为准（DB 可覆盖），不可用时回退本常量。
+
+_FB_ANALYSIS_SYSTEM = (
+    "你是严谨的中国建设项目可行性研究资料分析专家。只能基于项目参数和用户资料提取事实；"
+    "不得编造金额、规模、地点、期限、政策名称或技术参数。"
+    "无资料文件时只使用项目参数（含建设内容与规模）；此时资料块可能为\"未导入资料文件\"。"
+)
+_FB_ANALYSIS_MERGE_SYSTEM = (
+    "你是严谨的可行性研究资料合并专家。只能合并用户提供的分析结果，不得创造新事实。"
+)
+_FB_ANALYSIS_MERGE_USER = (
+    "请合并重复信息、保留具体事实并标明资料矛盾。missing_information 只保留综合全部分段后"
+    "仍然缺失、矛盾或需要确认的关键项。只返回与输入相同字段的 JSON。"
+)
+_FB_OUTLINE_SYSTEM = (
+    "你是可行性研究报告总编。请基于项目实际资料，在通用大纲框架内形成完整、可执行、"
+    "可编辑的三级以内报告目录。"
+)
+_FB_PARAMETERS_SYSTEM = (
+    "你是可行性研究报告的关键参数审校专家。你必须区分已知事实与缺失信息，"
+    "严禁自行编造数字、政策、设备参数、地点或资金安排。"
+)
+_FB_PARAMETERS_USER = """请生成"关键参数与编制口径"Markdown，至少包含：项目身份信息、建设目标与规模、建设地点与条件、建设期与进度、技术路线与主要设备、投资与资金来源、运营期与组织、安全环保能源口径、经济社会效益口径、风险与待确认事项。
+
+规则：
+1. 已有明确事实直接写入。
+2. 未提供的关键参数统一写"【待补充】"，不要填常见值或经验值。
+3. 资料存在冲突时写"【待确认】"并列出冲突内容。
+4. 本阶段不自动计算 NPV、IRR、回收期等财务指标。
+5. 使用二级标题和简短 bullet，直接输出 Markdown。"""
+_FB_CONTENT_SYSTEM = (
+    "你是专业的可行性研究报告编制专家。正文必须基于用户提供的项目事实和资料，"
+    "论证清晰、语言正式。不得编造金额、规模、地点、期限、批复、政策名称、设备参数或财务指标。"
+)
+_FB_CONTENT_WRITING_RULES = """写作规则：
+1. 只生成当前叶子章节正文，不重复输出章节标题。
+2. 对已有资料进行分析、论证和结构化表达；可以使用 Markdown 小标题、列表和必要表格。
+3. 没有依据的关键数据明确写"【待补充】"或采用不含虚构数字的定性表达。
+4. 不把需求、建议或通用规范写成已经完成的事实。
+5. 与全文关键参数保持一致。
+6. 若当前章节涉及项目选址与建设条件、总图布置、工艺流程、环保设施或实施进度等工程技术/选址章节，请在最佳位置嵌入且仅嵌入 1 处插图指引框，格式固定为：
+> **【插图指引】：图片名称**
+> *说明：此处请插入...*
+7. 直接输出 Markdown 正文。"""
+_FB_KB_BACKGROUND_NOTE = (
+    "以下清单是行业知识素材（来自其它项目的同类报告），仅用于理解行业背景、"
+    "专业术语与常见论证口径。严禁把这些素材里的金额、规模、地点、期限、批复、"
+    "政策名称或技术参数当作本项目事实写入分析结果；本项目事实只能来自项目基础参数与本项目资料。"
+)
+_FB_KB_CATALOG_NOTE = (
+    "以下是可选用的知识素材清单（编号 + 标题 + 摘要），可用于细化相关章节的写作重点。"
+    "不需要逐条使用，也不要引用清单编号或提及素材来源。"
+)
+_FB_KB_MATERIAL_NOTE = (
+    "以下是可吸收的知识素材。请把它们改写到本项目的语境与数据体系中，"
+    "不要提及\"知识库\"\"历史文档\"或资料来源；素材与本项目资料冲突时，以本项目资料为准。"
+)
+_FB_HUMAN_WRITING_SYSTEM = (
+    "你是中文公文与工程咨询报告润色编辑。请对给定章节做自然化审校，使行文更像人工撰写。"
+    "保护事实和参数，压缩重复表达，改善中文词序，清理模板腔与模型腔，同时保持正式可研文风。"
+    "必须完整保留所有数量、单位、金额、日期、比例，以及【待补充】【待确认】标记。"
+    "不得新增事实、不得删改结论口径、不得计算财务指标。"
+    "不得输出章节标题，不得补写资料中不存在的事实。只输出修订后的 Markdown 正文，不要解释。"
+)
+
+
+def _static_fb(key: str, fallback: str) -> str:
+    """读取静态可研提示词：注册表（DB 优先）→ 硬编码 fallback（E10 收编）。"""
+    try:
+        from .ai.prompts import get_prompt as _gp
+
+        return _gp(key) or fallback
+    except Exception:
+        return fallback
+
+
 def normalize_template(template_id: Any) -> str:
     tid = str(template_id or "").strip()
     return tid if tid in OUTLINE_TEMPLATES else "government"
@@ -242,16 +320,27 @@ def analysis_to_markdown(payload: dict) -> str:
 
 
 def build_analysis_system_prompt() -> str:
-    return (
-        "你是严谨的中国建设项目可行性研究资料分析专家。只能基于项目参数和用户资料提取事实；"
-        "不得编造金额、规模、地点、期限、政策名称或技术参数。"
-        "无资料文件时只使用项目参数（含建设内容与规模）；此时资料块可能为\"未导入资料文件\"。"
-    )
+    """资料分析系统提示词（BUG-FIX-PROMPT-E10：注册表接线）。"""
+    return _static_fb("FEASIBILITY_ANALYSIS_SYSTEM", _FB_ANALYSIS_SYSTEM)
 
 
 def build_analysis_user_instruction(segment_index: int, total_segments: int) -> str:
+    """资料分析用户指令（BUG-FIX-PROMPT-E10：注册表接线，动态段注入）。"""
     fields = {key: "Markdown 文本" for key, _title in ANALYSIS_FIELDS}
     import json as _json
+    try:
+        from .ai.prompts import get_prompt, render_prompt
+
+        tpl = get_prompt("FEASIBILITY_ANALYSIS_USER")
+        if tpl:
+            return render_prompt(
+                tpl,
+                segment_index=segment_index,
+                total_segments=total_segments,
+                fields_json=_json.dumps(fields, ensure_ascii=False, indent=2),
+            )
+    except Exception:
+        pass
     return (
         "请把当前资料中可用于编制可行性研究报告的信息整理为 JSON。\n\n"
         "要求：\n"
@@ -273,30 +362,40 @@ def build_analysis_user_instruction(segment_index: int, total_segments: int) -> 
 
 
 def build_analysis_merge_system_prompt() -> str:
-    return "你是严谨的可行性研究资料合并专家。只能合并用户提供的分析结果，不得创造新事实。"
+    """资料合并系统提示词（BUG-FIX-PROMPT-E10：注册表接线）。"""
+    return _static_fb("FEASIBILITY_ANALYSIS_MERGE_SYSTEM", _FB_ANALYSIS_MERGE_SYSTEM)
 
 
 def build_analysis_merge_user_instruction() -> str:
-    return (
-        "请合并重复信息、保留具体事实并标明资料矛盾。missing_information 只保留综合全部分段后"
-        "仍然缺失、矛盾或需要确认的关键项。只返回与输入相同字段的 JSON。"
-    )
+    """资料合并用户指令（BUG-FIX-PROMPT-E10：注册表接线）。"""
+    return _static_fb("FEASIBILITY_ANALYSIS_MERGE_USER", _FB_ANALYSIS_MERGE_USER)
 
 
 def build_outline_system_prompt() -> str:
-    return (
-        "你是可行性研究报告总编。请基于项目实际资料，在通用大纲框架内形成完整、可执行、"
-        "可编辑的三级以内报告目录。"
-    )
+    """目录生成系统提示词（BUG-FIX-PROMPT-E10：注册表接线）。"""
+    return _static_fb("FEASIBILITY_OUTLINE_SYSTEM", _FB_OUTLINE_SYSTEM)
 
 
 def build_outline_user_instruction(template_id: Any, target_words: Any, has_knowledge: bool = False) -> str:
+    """目录生成用户指令（BUG-FIX-PROMPT-E10：注册表接线，动态段注入）。"""
     knowledge_rule = (
         '6. 可选为叶子节点推荐素材："knowledge_item_ids": [素材编号]。'
         "编号只能取自知识素材清单，不确定就留空，不要编造编号。\n"
         if has_knowledge
         else ""
     )
+    try:
+        from .ai.prompts import get_prompt, render_prompt
+
+        tpl = get_prompt("FEASIBILITY_OUTLINE_USER")
+        if tpl:
+            return render_prompt(
+                tpl,
+                outline_template_md=build_outline_template_markdown(template_id, target_words),
+                knowledge_rule=knowledge_rule,
+            )
+    except Exception:
+        pass
     return (
         "请基于以下材料，生成可行性研究报告目录，只返回 JSON。\n\n"
         f"【项目基础参数】\n（见上一条消息）\n\n"
@@ -316,47 +415,23 @@ def build_outline_user_instruction(template_id: Any, target_words: Any, has_know
 
 
 def build_parameters_system_prompt() -> str:
-    return (
-        "你是可行性研究报告的关键参数审校专家。你必须区分已知事实与缺失信息，"
-        "严禁自行编造数字、政策、设备参数、地点或资金安排。"
-    )
+    """关键参数系统提示词（BUG-FIX-PROMPT-E10：注册表接线）。"""
+    return _static_fb("FEASIBILITY_PARAMETERS_SYSTEM", _FB_PARAMETERS_SYSTEM)
 
 
 def build_parameters_user_instruction() -> str:
-    return (
-        "请生成\"关键参数与编制口径\"Markdown，至少包含：项目身份信息、建设目标与规模、"
-        "建设地点与条件、建设期与进度、技术路线与主要设备、投资与资金来源、运营期与组织、"
-        "安全环保能源口径、经济社会效益口径、风险与待确认事项。\n\n"
-        "规则：\n"
-        "1. 已有明确事实直接写入。\n"
-        "2. 未提供的关键参数统一写\"【待补充】\"，不要填常见值或经验值。\n"
-        "3. 资料存在冲突时写\"【待确认】\"并列出冲突内容。\n"
-        "4. 本阶段不自动计算 NPV、IRR、回收期等财务指标。\n"
-        "5. 使用二级标题和简短 bullet，直接输出 Markdown。"
-    )
+    """关键参数用户指令（BUG-FIX-PROMPT-E10：注册表接线）。"""
+    return _static_fb("FEASIBILITY_PARAMETERS_USER", _FB_PARAMETERS_USER)
 
 
 def build_content_system_prompt() -> str:
-    return (
-        "你是专业的可行性研究报告编制专家。正文必须基于用户提供的项目事实和资料，"
-        "论证清晰、语言正式。不得编造金额、规模、地点、期限、批复、政策名称、设备参数或财务指标。"
-    )
+    """正文生成系统提示词（BUG-FIX-PROMPT-E10：注册表接线）。"""
+    return _static_fb("FEASIBILITY_CONTENT_SYSTEM", _FB_CONTENT_SYSTEM)
 
 
 def build_content_writing_rules() -> str:
-    return (
-        "写作规则：\n"
-        "1. 只生成当前叶子章节正文，不重复输出章节标题。\n"
-        "2. 对已有资料进行分析、论证和结构化表达；可以使用 Markdown 小标题、列表和必要表格。\n"
-        "3. 没有依据的关键数据明确写\"【待补充】\"或采用不含虚构数字的定性表达。\n"
-        "4. 不把需求、建议或通用规范写成已经完成的事实。\n"
-        "5. 与全文关键参数保持一致。\n"
-        "6. 若当前章节涉及项目选址与建设条件、总图布置、工艺流程、环保设施或实施进度等"
-        "工程技术/选址章节，请在最佳位置嵌入且仅嵌入 1 处插图指引框，格式固定为：\n"
-        "> **【插图指引】：图片名称**\n"
-        "> *说明：此处请插入...*\n"
-        "7. 直接输出 Markdown 正文。"
-    )
+    """正文写作规则（BUG-FIX-PROMPT-E10：注册表接线）。"""
+    return _static_fb("FEASIBILITY_CONTENT_WRITING_RULES", _FB_CONTENT_WRITING_RULES)
 
 
 def build_knowledge_background_note() -> str:
@@ -365,37 +440,22 @@ def build_knowledge_background_note() -> str:
     知识库素材来自其它项目的同类报告：只能用于理解行业背景、专业术语与论证口径，
     **不得**当成本项目事实（金额/规模/地点/批复等），否则会把别的项目数据带进分析结论。
     """
-    return (
-        "以下清单是行业知识素材（来自其它项目的同类报告），仅用于理解行业背景、"
-        "专业术语与常见论证口径。严禁把这些素材里的金额、规模、地点、期限、批复、"
-        "政策名称或技术参数当作本项目事实写入分析结果；本项目事实只能来自项目基础参数与本项目资料。"
-    )
+    return _static_fb("FEASIBILITY_KB_BACKGROUND_NOTE", _FB_KB_BACKGROUND_NOTE)
 
 
 def build_knowledge_catalog_note() -> str:
     """目录/参数阶段注入知识库条目清单时的约束。"""
-    return (
-        "以下是可选用的知识素材清单（编号 + 标题 + 摘要），可用于细化相关章节的写作重点。"
-        "不需要逐条使用，也不要引用清单编号或提及素材来源。"
-    )
+    return _static_fb("FEASIBILITY_KB_CATALOG_NOTE", _FB_KB_CATALOG_NOTE)
 
 
 def build_knowledge_material_note() -> str:
     """正文生成阶段注入知识库素材时的约束（改写为本项目语境）。"""
-    return (
-        "以下是可吸收的知识素材。请把它们改写到本项目的语境与数据体系中，"
-        "不要提及\"知识库\"\"历史文档\"或资料来源；素材与本项目资料冲突时，以本项目资料为准。"
-    )
+    return _static_fb("FEASIBILITY_KB_MATERIAL_NOTE", _FB_KB_MATERIAL_NOTE)
 
 
 def build_human_writing_system_prompt() -> str:
-    return (
-        "你是中文公文与工程咨询报告润色编辑。请对给定章节做自然化审校，使行文更像人工撰写。"
-        "保护事实和参数，压缩重复表达，改善中文词序，清理模板腔与模型腔，同时保持正式可研文风。"
-        "必须完整保留所有数量、单位、金额、日期、比例，以及【待补充】【待确认】标记。"
-        "不得新增事实、不得删改结论口径、不得计算财务指标。"
-        "不得输出章节标题，不得补写资料中不存在的事实。只输出修订后的 Markdown 正文，不要解释。"
-    )
+    """人工化润色系统提示词（BUG-FIX-PROMPT-E10：注册表接线）。"""
+    return _static_fb("FEASIBILITY_HUMAN_WRITING_SYSTEM", _FB_HUMAN_WRITING_SYSTEM)
 
 
 def render_outline_for_prompt(items: list, prefix: str = "") -> str:

@@ -322,3 +322,88 @@ class TestRejectionCoverage:
             # no_checks 分支不返回 items（预期行为）；有任务时返回 items=[]
             if data.get("status") == "ok":
                 assert isinstance(data.get("items"), list)
+
+
+# ============================================================================
+# 废标覆盖率结果增强（TD-2/3/4，2026-11-02）
+# ============================================================================
+
+
+def _seed_rejection_check(project_id: int, *, check_items: list, results: dict) -> None:
+    """注入一条已完成的废标检查任务（覆盖率服务的输入源）。"""
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO rejection_checks "
+            "(project_id, tender_text, check_items, results, status, progress) "
+            "VALUES (?, '', ?, ?, 'completed', 100)",
+            (
+                project_id,
+                json.dumps(check_items, ensure_ascii=False),
+                json.dumps(results, ensure_ascii=False),
+            ),
+        )
+
+
+class TestRejectionCoverageEnhancements2026_11_02:
+    """TD-3 `section_hits.title` / TD-4 `total_clauses` + `truncated`。"""
+
+    def test_section_hits_carry_section_title(self):
+        """命中章节必须带 title（此前只有裸 section_id，用户无法定位章节）。"""
+        from app.services.rejection_coverage import rejection_answer_coverage
+
+        pid = _new_project("TD3-命中章节标题")
+        clause = "投标人须提交完整的施工进度计划，包括横道图、网络图及关键线路分析"
+        _seed_section(
+            pid, title="第三章 施工进度计划",
+            content="本章提交完整的施工进度计划，包括横道图、网络图及关键线路分析，"
+                    "并按里程碑节点分解关键线路分析的偏差控制措施。",
+            sort_order=0,
+        )
+        _seed_rejection_check(
+            pid,
+            check_items=[{"id": "C1", "clause": clause}],
+            results={"rejection": []},
+        )
+
+        data = rejection_answer_coverage(pid)
+        assert data["status"] == "done"
+        target = next(i for i in data["items"] if i["id"] == "C1")
+        assert target["section_hits"], "正文已正面承接条款却无命中章节统计"
+        hit = target["section_hits"][0]
+        assert hit["title"] == "第三章 施工进度计划"
+        assert "matched_bigrams" in hit and "section_id" in hit
+
+    def test_over_max_clauses_reports_truncation(self):
+        """>200 条款：不再静默截断，`total_clauses` 给总数、`truncated` 显式标记。"""
+        from app.services.rejection_coverage import rejection_answer_coverage
+
+        pid = _new_project("TD4-条款截断显式化")
+        _seed_section(pid, title="方案", content="施工组织设计正文。", sort_order=0)
+        items = [
+            {"id": f"C{i}", "clause": f"第{i}项废标条款要求：投标人须逐项响应内容{i:04d}"}
+            for i in range(1, 202)
+        ]
+        _seed_rejection_check(pid, check_items=items, results={"rejection": []})
+
+        data = rejection_answer_coverage(pid)
+        assert data["status"] == "done"
+        assert data["total_clauses"] == 201
+        assert data["truncated"] is True
+        assert data["scanned_clauses"] == 200
+
+    def test_within_max_clauses_not_truncated(self):
+        """≤200 条款：truncated=False，total_clauses 与实际一致（向后兼容钉）。"""
+        from app.services.rejection_coverage import rejection_answer_coverage
+
+        pid = _new_project("TD4-未截断")
+        _seed_section(pid, title="方案", content="施工组织设计正文。", sort_order=0)
+        items = [
+            {"id": f"C{i}", "clause": f"废标条款要求响应内容{i:03d}"}
+            for i in range(1, 51)
+        ]
+        _seed_rejection_check(pid, check_items=items, results={"rejection": []})
+
+        data = rejection_answer_coverage(pid)
+        assert data["total_clauses"] == 50
+        assert data["truncated"] is False
+        assert data["scanned_clauses"] == 50

@@ -227,13 +227,17 @@ CATEGORY_POLICY: dict[str, tuple[str, bool]] = {
     # user_feedback（`derive_status`），让用户在"逐条确认"弹窗里看到一条
     # 由关键词表猜出来的结论。
     "zone-order": ("warning", False),
-    # 以下为既有自检提示词（OUTLINE_V51_SELFCHECK_SYSTEM）的 7 个维度
+    # 以下为既有自检提示词（OUTLINE_V51_SELFCHECK_SYSTEM）的 8 个维度
     "truncated": ("error", True),
     "mixed_lang": ("warning", False),
     "overlap": ("warning", True),
     "count_violation": ("warning", True),
     "parent_word_leak": ("warning", False),
     "generic_l3": ("warning", False),
+    # 编号残留（BUG-FIX 2026-11-02）：标题带「（2）/专项6」等编号前后缀。
+    # 清洗链（_cleanup_placeholder_titles + 落库安全网）已确定性剥除，
+    # 自检报告到这里是「上游漏点」的信号——定为提示级、不需用户确认。
+    "numbering_residue": ("warning", False),
 }
 
 
@@ -261,6 +265,8 @@ _CATEGORY_ALIASES: dict[str, str] = {
     "single_child": "single-child",
     "parent-word-leak": "parent_word_leak",
     "generic-l3": "generic_l3",
+    "numbering-residue": "numbering_residue",
+    "numbering": "numbering_residue",
     "mixed-lang": "mixed_lang",
     "count-violation": "count_violation",
     "professional_structure": "professional-structure",
@@ -293,6 +299,7 @@ _CATEGORY_LABELS: dict[str, str] = {
     "count_violation": "节点数量不合规",
     "parent_word_leak": "三级标题泄漏了父级词汇",
     "generic_l3": "三级标题空泛、缺技术含量",
+    "numbering_residue": "标题残留编号前缀/后缀",
     "placeholder": "标题残留未渲染占位符",
     "invalid-id": "节点编号缺失或与层级不匹配",
     "empty-title": "节点标题为空",

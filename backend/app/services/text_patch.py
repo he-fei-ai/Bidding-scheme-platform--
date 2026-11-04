@@ -37,6 +37,12 @@ import logging
 import re
 from typing import Any, Callable
 
+# LEFTOVER-3 收敛 2026-11-02：normalize_newlines 曾有 text_patch / app.utils /
+# workflows_sections 兜底三份定义（口径漂移风险）。app.utils 为唯一权威实现，
+# 其 Any 容错语义（str(text or "")）与本模块原局部实现逐值等价；此处删除副本，
+# 统一从权威模块引用（app.utils 无 services 依赖，无循环导入风险）。
+from ..utils import normalize_newlines
+
 
 logger = logging.getLogger(__name__)
 
@@ -53,11 +59,6 @@ class PatchApplyError(Exception):
 
 
 # ========== 基础工具 ==========
-
-
-def normalize_newlines(text: Any) -> str:
-    """统一换行符为 \\n（CRLF / CR → LF）。"""
-    return str(text or "").replace("\r\n", "\n").replace("\r", "\n")
 
 
 def single_line(value: Any) -> str:
@@ -434,12 +435,35 @@ def apply_patches(
 # ========== 字符区间编辑（宿主路径，用于确定性修复） ==========
 
 
-def find_value_occurrences(content: Any, value: Any, *, digit_boundary: bool = True) -> list[int]:
-    """定位 value 在正文中的所有出现位置。
+def find_value_spans(
+    content: Any,
+    value: Any,
+    *,
+    digit_boundary: bool = True,
+    tolerant: bool = True,
+) -> list[tuple[int, int]]:
+    """定位 value 在正文中的所有出现位置，返回 ``(start, end)`` 字符跨度列表。
 
-    **数字边界保护**：当 value 是纯数字（含千分位/小数）时，要求其左右不能紧邻数字或小数点，
-    否则跳过。本软件的 `FACT_PATTERNS` 会把工期抽成 `"30"` 这种极短串，不加保护会把
-    `"300 日历天"`、`"3.30"`、`"1300"` 里的 `30` 一并改掉。
+    BUG-FIX 2026-11-04（第 11 轮·P2·带空格金额写法定位失效）：2026-10-09 起
+    金额取值是「数字+单位」拼接串（如 ``1200万元``），而正文高频写法
+    「合同价 1200 万元」（数字与单位间有空格）**字面上不包含该串** ——
+    字面查找返回 0 处，autofix 对该章节永远回「未定位到待统一的值」，
+    修复链路对这类写法整体失效（语料库第一条正例即此形态）。
+
+    现分两级定位：
+
+    1. **字面查找**（既有口径，含数字边界保护）；
+    2. 字面零命中、``tolerant=True`` 且取值**含非数字字符**（即带单位，
+       纯数字取值不启用）时，回退**空白容忍正则**（逐字符间允许空白），
+       命中跨度含内部空白，调用方按跨度整体替换，不会残留半截单位。
+       数字边界保护同样适用（命中前后不得紧邻数字/小数点，
+       防「11200 万元」吃进「1200万元」）。
+
+    ``tolerant=False`` 只走字面查找 —— `replace_values` 用它实现
+    「针级兜底」：仅当某取值全文零字面命中时才启用容忍跨度，
+    避免与其它取值的字面编辑交叠触发整批拒绝（见 round6 E3 契约）。
+
+    纯数字取值（工期「450」、人数「20」）行为与历史逐字一致：只走字面查找。
     """
     text = str(content or "")
     needle = str(value or "")
@@ -447,20 +471,48 @@ def find_value_occurrences(content: Any, value: Any, *, digit_boundary: bool = T
         return []
 
     need_boundary = bool(digit_boundary and _NUMERIC_VALUE_RE.match(needle))
-    positions: list[int] = []
+    spans: list[tuple[int, int]] = []
     start = 0
     while start <= len(text):
         index = text.find(needle, start)
         if index < 0:
             break
-        start = index + len(needle)
+        end = index + len(needle)
+        start = end
         if need_boundary:
             before = text[index - 1] if index > 0 else ""
-            after = text[start] if start < len(text) else ""
+            after = text[end] if end < len(text) else ""
             if before.isdigit() or before == "." or after.isdigit() or after == ".":
                 continue
-        positions.append(index)
-    return positions
+        spans.append((index, end))
+
+    if spans or not tolerant or not any(not ch.isdigit() for ch in needle):
+        return spans
+
+    # 空白容忍回退（仅带单位取值；逐字符 \s* 连接，命中跨度含内部空白）。
+    try:
+        tolerant_re = re.compile(r"\s*".join(re.escape(ch) for ch in needle))
+    except re.error:  # pragma: no cover - re.escape 对任意字符均安全，防御兜底
+        return spans
+    for m in tolerant_re.finditer(text):
+        start, end = m.start(), m.end()
+        # 数字边界保护：命中前后不得紧邻数字/小数点（与字面分支同口径）
+        before = text[start - 1] if start > 0 else ""
+        after = text[end] if end < len(text) else ""
+        if before.isdigit() or before == "." or after.isdigit() or after == ".":
+            continue
+        spans.append((start, end))
+    return spans
+
+
+def find_value_occurrences(content: Any, value: Any, *, digit_boundary: bool = True) -> list[int]:
+    """定位 value 在正文中的所有出现位置（返回起始下标；兼容既有调用方）。
+
+    **数字边界保护**：当 value 是纯数字（含千分位/小数）时，要求其左右不能紧邻数字或小数点，
+    否则跳过。本软件的 `FACT_PATTERNS` 会把工期抽成 `"30"` 这种极短串，不加保护会把
+    `"300 日历天"`、`"3.30"`、`"1300"` 里的 `30` 一并改掉。
+    """
+    return [start for start, _end in find_value_spans(content, value, digit_boundary=digit_boundary)]
 
 
 def build_value_replacement_edits(
@@ -470,6 +522,7 @@ def build_value_replacement_edits(
     *,
     digit_boundary: bool = True,
     keep: Callable[[int, int], bool] | None = None,
+    tolerant: bool = True,
 ) -> list[dict]:
     """为「把 old_value 统一成 new_value」构造字符区间编辑列表。
 
@@ -478,14 +531,38 @@ def build_value_replacement_edits(
             返回 False 的出现位置将被跳过。用于一致性 autofix 的「事实标签词
             就近校验」（避免把「钢筋直径 30 mm」里的 30 当成工期改掉）。
             默认 None = 全部保留（与既有行为完全一致）。
+        tolerant: 是否启用空白容忍回退定位（见 :func:`find_value_spans`）。
     """
     text = str(content or "")
+    old_str = str(old_value or "")
     replacement = str(new_value or "")
     edits = []
-    for position in find_value_occurrences(text, old_value, digit_boundary=digit_boundary):
-        end = position + len(str(old_value or ""))
+    # BUG-FIX 2026-11-04（第 11 轮）：改用 `find_value_spans` 的完整跨度 ——
+    # 空白容忍回退命中的跨度含内部空白（「1200 万元」），按跨度整体替换才能
+    # 不残留半截单位（旧 `position + len(old_value)` 只覆盖前缀，会留下「元」）。
+    for position, end in find_value_spans(
+        text, old_value, digit_boundary=digit_boundary, tolerant=tolerant
+    ):
         if keep is not None and not keep(position, end):
             continue
+        # BUG-FIX 2026-11-04（第 11 轮·P2·「已是目标写法」被二次替换成叠字）：
+        # 当 replacement 以 old_value 开头（即本次替换是「补单位/补后缀」形态，
+        # 如 `1200万 → 1200万元`、`450 → 450天`）时，若某处出现位置的正文
+        # **已经拼出了目标形态**（可能单位写法不同但归一后等价，如
+        # 「1200 万元」「450 日历天」），旧实现仍会把该处的 old_value 前缀
+        # 替换成 replacement，产出「1200万元元」「450天天 日历天」这类叠字
+        # 污染 —— 且无任何报错，冲突被标已解决，正文被静默改坏（实测探针
+        # 见 `tests/test_consistency_patch_guard_2026_11_04.py`）。
+        # 守卫：取值之后（跳过空白与量词「个」）的连续文字若与补上的后缀
+        # **归一化等价**（「日历天/自然日/工作日→天」「万元→万」等由
+        # `normalize_fact_value` 的既有单位口径统一），则该处已是目标写法，
+        # 跳过不替换。替换目标与 old 无前缀关系时（如 460→450）不受影响。
+        if len(replacement) > len(old_str) and replacement.startswith(old_str):
+            remainder = replacement[len(old_str):]
+            tail_match = re.match(r"\s*个?\s*([一-鿿a-zA-Z]+)", text[end:])
+            tail = tail_match.group(1) if tail_match else ""
+            if tail and _normalize_for_suffix_compare(tail) == _normalize_for_suffix_compare(remainder):
+                continue
         edits.append(
             {
                 "start": position,
@@ -494,6 +571,21 @@ def build_value_replacement_edits(
             }
         )
     return edits
+
+
+def _normalize_for_suffix_compare(text: str) -> str:
+    """补后缀守卫的尾部等价比较：复用事实值归一口径（日历天→天、万元→万等）。
+
+    `facts_service.normalize_fact_value` 会把数字也抽出来；这里比较的是
+    「纯单位尾巴」（正则已保证不含数字），走同一套单位归一即可，不引入
+    第二套换算口径。导入失败时退化为去空白原文比较（守卫降级不升级）。
+    """
+    try:
+        from .facts_service import normalize_fact_value
+
+        return normalize_fact_value(text)
+    except Exception:  # pragma: no cover - 导入失败时守卫降级，不阻断替换主链路
+        return "".join((text or "").split())
 
 
 def apply_range_edits(content: Any, edits: Any) -> dict:
@@ -583,6 +675,12 @@ def replace_values(
     Args:
         keep: 逐处出现位置的过滤器 ``keep(start, end) -> bool``，透传给
             :func:`build_value_replacement_edits`。默认 None = 不过滤。
+
+    空白容忍定位（2026-11-04）采用**针级兜底**：先对所有取值只做字面定位；
+    仅当某取值全文零字面命中时，才为它启用空白容忍跨度，且容忍编辑若与
+    已收集的编辑交叠即丢弃（同目标替换下冗余）。这样既修复「合同价 1200 万元」
+    这类带空格写法无法定位的问题，又不改变既有契约——两个取值都能**字面**
+    命中且区间重叠时（round6 E3 的 partial 用例），依旧整批拒绝交回人工。
     """
     if isinstance(replacements, dict):
         pairs = list(replacements.items())
@@ -591,18 +689,43 @@ def replace_values(
 
     text = str(content or "")
     edits: list[dict] = []
+    missed_pairs: list[tuple[str, str]] = []
     for old_value, new_value in pairs:
         if not old_value or str(old_value) == str(new_value):
             continue
-        edits.extend(
-            build_value_replacement_edits(
-                text,
-                old_value,
-                new_value,
-                digit_boundary=digit_boundary,
-                keep=keep,
-            )
+        needle_edits = build_value_replacement_edits(
+            text,
+            old_value,
+            new_value,
+            digit_boundary=digit_boundary,
+            keep=keep,
+            tolerant=False,
         )
+        if needle_edits:
+            edits.extend(needle_edits)
+        else:
+            missed_pairs.append((old_value, new_value))
+
+    # 针级兜底：零字面命中的取值才启用空白容忍跨度。
+    for old_value, new_value in missed_pairs:
+        tolerant_edits = build_value_replacement_edits(
+            text,
+            old_value,
+            new_value,
+            digit_boundary=digit_boundary,
+            keep=keep,
+            tolerant=True,
+        )
+        for edit in tolerant_edits:
+            # 容忍跨度与已收集编辑（任何取值的字面/容忍命中）交叠即丢弃：
+            # 同一冲突的所有待替换值统一到同一目标，交叠意味着同一处正文
+            # 被两个取值认领，保留先到的（字面）编辑即可。
+            if any(
+                edit["start"] < kept["end"] and kept["start"] < edit["end"]
+                for kept in edits
+            ):
+                continue
+            edits.append(edit)
 
     if not edits:
         return {"content": text, "changed": False, "applied": [], "errors": []}

@@ -146,7 +146,7 @@ class TestA3SaveUploadTaskOrder:
         )
         monkeypatch.setattr(
             files_mod, "_update_parse_task",
-            lambda pid, status, progress=0, error_message="", filename="": updated.append(
+            lambda pid, status, progress=0, error_message="", filename="", **kw: updated.append(
                 (pid, status, filename)
             ),
         )

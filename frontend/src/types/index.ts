@@ -95,6 +95,12 @@ export interface AnalysisResult {
   /** 专项方案解析结果（未解析时为 `{}`）。可选，保证旧响应零破坏。 */
   scheme_extraction?: SchemeExtractionResult;
   scheme_extraction_json?: string;
+  /**
+   * 遗留项 L1（2026-11-03）：「已解析」显式状态位（后端权威下发）。
+   * 未拉到该字段的老后端为 undefined，消费方须回退
+   * `Object.keys(scheme_extraction || {}).length > 0` 判定。
+   */
+  scheme_extracted?: boolean;
 }
 
 export interface UploadResult {
@@ -121,18 +127,27 @@ export interface UploadResult {
  */
 export interface FileParsingStatus {
   status: string;
-  processing: number;
-  recent_completed: number;
-  recent_failed: number;
-  total_tasks: number;
-  latest: {
+  // BUG-FIX 2026-11-04（F-12-3 类型与后端 idle 响应对齐）：后端
+  // routers/tasks.py:322 在项目无任何解析任务行时只返回
+  // `{status:'idle', message:'没有文件解析任务'}` —— 聚合计数字段全部缺省。
+  // 此前这里把 5 个聚合字段声明为必填，类型对真实响应「撒谎」，消费方
+  // （formatParsingStatusText）在 idle 响应下产出「最近解析完成 undefined 个」。
+  // 现改为可选，并补充 message 字段（idle 响应携带）；消费点须自行空值兜底。
+  processing?: number;
+  recent_completed?: number;
+  recent_failed?: number;
+  total_tasks?: number;
+  message?: string;
+  latest?: {
     status: string;
     filename: string;
     file_type: string;
     progress: number;
     total_files: number;
     completed_files: number;
-    error_message: string;
+    // DB 中 error_message 可为 NULL（任务行正常完成时写空串之外的历史行），
+    // 运行时可能是 null 而非 string；消费方已有 `|| ""` 防护。
+    error_message: string | null;
     started_at: string;
     updated_at: string;
   } | null;
@@ -373,6 +388,11 @@ export interface ExportResult {
   download_url?: string | null;
   /** 磁盘相对路径（相对 PROJECTS_DATA_DIR，供运维排查与日志定位） */
   relative_path?: string;
+  // E-3（2026-11-04 导出模块加固轮）：SSE completed 事件的 record_failed
+  // （导出记录写库失败标记，后端 routers/export.py completed 载荷）此前未入类型，
+  // 页面只能靠 export_id == null 间接判断。纯新增可选字段，向后兼容。
+  /** 导出记录未能写入数据库（本次文件可下载但不出现在导出历史）时为 true */
+  record_failed?: boolean;
 }
 
 export interface AIConfig {
@@ -451,7 +471,7 @@ export interface TextProviderConfig {
 export interface TextProviderSavePayload {
   /** 厂商名（text_provider_configs 主键） */
   provider_name: string;
-  /** 厂商类型，默认 openai_compatible */
+  /** 厂商协议类型；D1（2026-11-03）后端语义：未提供 = 保留库内原值/目录默认 */
   provider_type?: string;
   /** API Key；占位符/空串 = 保留原值，非空 = 覆盖 */
   api_key?: string;

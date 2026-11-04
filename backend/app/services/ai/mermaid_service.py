@@ -448,10 +448,18 @@ class MermaidServiceClient:
         mmdc = self._mmdc_path or "mmdc"
         _t0 = __import__("time").perf_counter()
         try:
+            # BUG-FIX 2026-11-04（导出模块加固轮 B-1·GBK 解码崩溃）：text=True
+            # 未指定 errors 时按默认严格 UTF-8 解码；中文 Windows 上 mmdc 未安装时
+            # cmd 输出 GBK 错误文本（"'mmdc' 不是内部或外部命令"，首字节 0xB2），
+            # _readerthread 解码崩溃 → 探测线程异常（pytest 报
+            # PytestUnhandledThreadExceptionWarning，生产侧为不可观测的线程死亡）。
+            # errors="replace" 让非法字节降级为 U+FFFD：探测结论只看 returncode，
+            # 输出内容可安全有损，行为向后兼容（可用性判定不变）。
             result = subprocess.run(
                 [mmdc, "--version"],
                 capture_output=True,
                 text=True,
+                errors="replace",
                 timeout=10,
                 shell=sys.platform == "win32",
             )

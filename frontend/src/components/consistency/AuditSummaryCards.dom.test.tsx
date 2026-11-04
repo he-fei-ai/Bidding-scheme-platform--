@@ -111,4 +111,28 @@ describe.skipIf(!hasDom)("AuditSummaryCards", () => {
     const { container } = render(<AuditSummaryCards summary={null} />);
     expect(container.firstChild).toBeNull();
   });
+
+  // ── TD-9（2026-11-02）：已解决侧来源拆分（恒等式对称） ─────────────
+
+  it("已解决卡片按规则冲突/AI 发现拆分展示（resolved_rule_conflicts 下发时）", () => {
+    render(
+      <AuditSummaryCards
+        summary={{
+          ...RULE_ONLY_SUMMARY,
+          resolved_conflicts: 4,
+          resolved_rule_conflicts: 3,
+          resolved_ai_findings: 1,
+        }}
+      />,
+    );
+    expect(screen.getByText(/另有 4 处已解决（规则冲突 3 \/ AI 发现 1）/)).toBeTruthy();
+  });
+
+  it("老后端无 resolved_rule_conflicts 时回退不拆分（向后兼容）", () => {
+    // RULE_ONLY_SUMMARY 只有一侧的 resolved_ai_findings、没有 resolved_rule_conflicts
+    // —— 两键不齐即视为老后端，保持原「另有 N 处已解决」文案。
+    render(<AuditSummaryCards summary={RULE_ONLY_SUMMARY} />);
+    expect(screen.getByText(/另有 1 处已解决$/)).toBeTruthy();
+    expect(screen.queryByText(/规则冲突 \d+ \/ AI 发现/)).toBeNull();
+  });
 });

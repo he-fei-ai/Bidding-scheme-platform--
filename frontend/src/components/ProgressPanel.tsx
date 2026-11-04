@@ -146,10 +146,13 @@ export default React.memo(function ProgressPanel({ items, total, success, failed
         {cancelled > 0 && <Tag style={{ fontSize: 11, lineHeight: "16px", padding: "0 4px", marginRight: 2 }}>{cancelled}取</Tag>}
         {isRunning && <Tag color="processing" style={{ fontSize: 11, lineHeight: "16px", padding: "0 4px" }}>生成中</Tag>}
       </div>
+      {/* BUG-FIX 2026-11-05（遗留4·废弃 prop）：antd v5 Progress 已废弃 strokeWidth，
+          改用 size。size="small" 本身即 6px 线条高 + 小号文本，与旧
+          size="small" + strokeWidth={6} 渲染逐像素等价（strokeWidth 完全冗余），
+          移除废弃 prop 消除控制台告警。 */}
       <Progress
         percent={effectivePercent}
         size="small"
-        strokeWidth={6}
         status={progressStatus}
       />
       {items.length > 0 && (

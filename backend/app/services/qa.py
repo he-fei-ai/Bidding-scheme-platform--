@@ -213,20 +213,35 @@ async def qa_chat(
     }
 
 
-def _build_system_prompt(project_name: str, ctx: dict[str, Any]) -> str:
-    """构造问答系统提示词"""
+# ========== 系统提示词（注册表接线，BUG-FIX-PROMPT-E10） ==========
+# 以下 fallback 文本与 _integrate_batch3.py 中对应 key 的注册文本逐字一致：
+# 注册表可用时以 get_prompt() 结果为准（DB 可覆盖），不可用时回退本常量。
+
+_QA_FALLBACK_ROLE = (
+    "你是一名资深的招投标方案编写专家。请基于以下提供的项目信息、招标文件与已生成章节内容，"
+    "回答用户关于本项目的问题。\n\n【项目名称】{project_name}"
+)
+_QA_FALLBACK_TENDER_BLOCK = "【招标文件要点】\n{tender_text}"
+_QA_FALLBACK_SECTIONS_BLOCK = "【已生成章节内容】\n{sections_text}"
+_QA_FALLBACK_REQUIREMENTS = (
+    "回答要求：\n"
+    "1. 优先基于上述上下文作答，引用具体章节或招标条款时说明来源；\n"
+    "2. 上下文未覆盖的内容，结合招投标专业经验补充，但需明确说明是建议；\n"
+    "3. 回答使用中文，结构清晰，可直接用于标书编写参考。"
+)
+
+
+def _legacy_system_prompt(project_name: str, ctx: dict[str, Any]) -> str:
+    """注册表不可用时的最小 fallback（与收编前实现逐字节一致）。"""
     parts = [
         "你是一名资深的招投标方案编写专家。请基于以下提供的项目信息、招标文件与已生成章节内容，"
         "回答用户关于本项目的问题。",
         f"【项目名称】{project_name}",
     ]
-
     if ctx.get("tender_text"):
         parts.append("【招标文件要点】\n" + ctx["tender_text"])
-
     if ctx.get("sections_text"):
         parts.append("【已生成章节内容】\n" + ctx["sections_text"])
-
     parts.append(
         "回答要求：\n"
         "1. 优先基于上述上下文作答，引用具体章节或招标条款时说明来源；\n"
@@ -234,6 +249,49 @@ def _build_system_prompt(project_name: str, ctx: dict[str, Any]) -> str:
         "3. 回答使用中文，结构清晰，可直接用于标书编写参考。"
     )
     return "\n\n".join(parts)
+
+
+def _build_system_prompt(project_name: str, ctx: dict[str, Any]) -> str:
+    """构造问答系统提示词
+
+    BUG-FIX-PROMPT-E10（2026-11-03，注册表接线）：原四段全部硬编码——管理页
+    无法查看/编辑/覆盖，``_integrate_batch3.py`` 注册的 QA_SYSTEM_ROLE /
+    QA_CONTEXT_TENDER_BLOCK / QA_CONTEXT_SECTIONS_BLOCK / QA_ANSWER_REQUIREMENTS
+    四个 key 也从未被接线（孤儿 key）。现改为从注册表读取各块（DB 优先，
+    保留硬编码作为注册表不可用时的最小 fallback），按 ctx 条件拼装，
+    拼装语义与原实现逐字节一致。get_prompt/render_prompt 使用标准名调用，
+    便于 tests/test_prompts_module 占位符覆盖审计静态识别。
+    """
+    try:
+        from .ai.prompts import get_prompt, render_prompt
+
+        head_tpl = get_prompt("QA_SYSTEM_ROLE")
+        if head_tpl is None:
+            head_tpl = _QA_FALLBACK_ROLE
+        parts = [render_prompt(head_tpl, project_name=project_name)]
+
+        tender_text = ctx.get("tender_text")
+        if tender_text:
+            tpl = get_prompt("QA_CONTEXT_TENDER_BLOCK")
+            if tpl is None:
+                tpl = _QA_FALLBACK_TENDER_BLOCK
+            parts.append(render_prompt(tpl, tender_text=tender_text))
+
+        sections_text = ctx.get("sections_text")
+        if sections_text:
+            tpl = get_prompt("QA_CONTEXT_SECTIONS_BLOCK")
+            if tpl is None:
+                tpl = _QA_FALLBACK_SECTIONS_BLOCK
+            parts.append(render_prompt(tpl, sections_text=sections_text))
+
+        req = get_prompt("QA_ANSWER_REQUIREMENTS")
+        if req is None:
+            req = _QA_FALLBACK_REQUIREMENTS
+        parts.append(req)
+        return "\n\n".join(parts)
+    except Exception:
+        # 注册表模块不可用（导入失败等极端场景）：整体回退硬编码拼装。
+        return _legacy_system_prompt(project_name, ctx)
 
 
 async def _call_ai(messages: list[AIMessage]) -> str:

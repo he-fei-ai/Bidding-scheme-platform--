@@ -11,7 +11,7 @@ from urllib.parse import urlparse
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 import httpx
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 from ..config import AGNES_API_KEY, AGNES_BASE_URL, AGNES_MODEL
 from ..db import get_db, get_db_with_retry
@@ -19,9 +19,8 @@ from ..security.auth import get_current_user
 from ..services.ai import provider_catalog
 from ..services.ai.cache_metrics import snapshot
 from ..services.ai.image_providers.registry import ProviderRegistry
-from ..services.ai.image_styles import list_image_styles
+from ..services.ai.image_styles import list_image_styles as _list_image_styles
 from ..services.ai.provider_factory import (
-    _clear_ai_config_cache,
     bump_ai_config_version,
     detect_provider_type,
     get_ai_config_version,
@@ -67,7 +66,8 @@ def _display_api_key(key: str) -> str:
 
 
 def _current_user_of(request: Request | None) -> dict | None:
-    """鑾峰彇褰撳鐢ㄦ埛鍙傛暟鍙?JwtAuthMiddleware 鍐呭彨(request.state.current_user) 鍚?get_current_user 鍙傚墠绯诲垪锛屾墍鏈夶粠鍙傛暟鑷?"""
+    """读取当前用户：优先取 JwtAuthMiddleware 写入的 request.state.current_user，
+    回退 get_current_user；两者都拿不到返回 None。"""
     if request is None:
         return None
     cu = getattr(request.state, 'current_user', None)
@@ -80,10 +80,10 @@ def _current_user_of(request: Request | None) -> dict | None:
 
 
 def _require_admin(request: Request) -> dict:
-    """RBAC: 鏄?admin浠ュ悄杩斿洗鐢ㄦ埛鍙傛暟鍙?涓嶅彲鍦?admin鍐欏叆 HTTP 403"""
+    """RBAC：仅 admin 可调用，返回当前用户；非 admin 一律 HTTP 403。"""
     user = _current_user_of(request)
     if not user or user.get('role') != 'admin':
-        raise HTTPException(status_code=403, detail='P0-RBAC: 鍙傚墠绌€')
+        raise HTTPException(status_code=403, detail='P0-RBAC: 需要管理员权限')
     return user
 
 
@@ -459,7 +459,10 @@ async def save_ai_config(data: AIConfigData, request: Request = None):
                f"before={before_desc} "
                f"after={data.provider_name or '-'}/{data.model or '-'} "
                f"key={mask_key_for_audit(data.api_key)}", request)
-        record_provider_usage(data.provider_name, data.provider, data.base_url, success=True)
+        # D4（2026-11-03）：provider_history 记录**解析后**的类型（与写入主表、
+        # 降级链所用口径一致）；此前直传 data.provider，留空时落库为空串，
+        # 降级链第四层取出的 provider 类型因此失真。
+        record_provider_usage(data.provider_name, provider, data.base_url, success=True)
     await asyncio.to_thread(_post_save_bookkeeping)
     return JSONResponse(
         content={'status': 'ok', 'version': new_version},
@@ -477,10 +480,10 @@ async def save_ai_config(data: AIConfigData, request: Request = None):
 
 @router.get('/config/export')
 async def export_ai_config(include_secret: bool = False, request: Request = None):
-    """閰嶇疆鍙戣疆鍙峰紩(JSON)。
+    """导出当前配置快照（JSON）。
 
-    include_secret=true 鍒欐垨鍔犲瘑鐨?api_key 鍐欏叆(鍐欑幇鍚庡彲鍦ㄥぇ灏?admin)，
-    鍐欏叆鏃?涓嶈祫婧愯幇鍦?403。鏋勯€犳湰寮忎繑鍥炲彲浠?璇锋眰(include_secret=false)鍏ㄥ悗鑷?03。
+    默认不含密钥（keys_included=false）。include_secret=true 时要求 admin，
+    非 admin 一律 403；导出动作本身写入配置审计。
     """
     from ..services.ai.provider_factory import get_ai_config as _get_config
 
@@ -515,10 +518,10 @@ async def export_ai_config(include_secret: bool = False, request: Request = None
 
 @router.get('/config/rotation-status')
 async def config_rotation_status(request: Request = None):
-    """API Key 鏃犵骇鏃ユ湰鏁?澶勭悊(鍙栧嵄绀猴紝 鏃犵骇缁欎簨/鏄?鍙栧嵄)。
+    """API Key 轮转到期状态（只读展示，不修改任何状态）。
 
-    鍐欏叆缁欎簨锛?days_since_rotation(鍒?缁欎簨涓嶅悓鍒?null)、rotation_due(鏄?鍙栧嵄)、
-    rotation_interval_days(鍦?AI_KEY_ROTATION_DAYS, 榛樿 90 鏃?)。
+    返回字段：days_since_rotation（无轮转记录时为 null）、rotation_due（是否到期）、
+    rotation_interval_days（取 AI_KEY_ROTATION_DAYS，默认 90 天）、api_key_set。
     """
     from ..services.ai.provider_factory import get_ai_config as _get_config
 
@@ -530,11 +533,11 @@ async def config_rotation_status(request: Request = None):
 
 @router.get('/config/stream')
 async def stream_ai_config(request: Request):
-    """SSE: 閰嶇疆鍐欏叆鍚庨€掑鐗堟湰鍙?。
+    """SSE: 配置版本变更推送（前端热更新感知）。
 
-    EventSource 涓嶆敮鎸佽嚜瀹氫箍, 鍏ㄩ€夋嫨鍙傛暟 `?token=` 鍐欏叆(鍚庣灞?Vite 浠ｇ悊),
-    灞℃牸 /api/v1/ 鍙傛暟浠?Authorization 鍙傛暟鍐欏叆。
-    鍐欑粰鍙?event: config-changed (data: {event, version, ts}) 鍙栧嵄鍐欏叆(2s 蹇?娉?)。
+    EventSource 不支持自定义 Header，故支持 `?token=` 查询参数兜底；
+    经 /api/v1/ 代理时也可从 Authorization 头读取。
+    事件：event: config-changed (data: {event, version, ts})，2s 轮询版本变化。
     """
 
     async def _event_generator():
@@ -588,6 +591,10 @@ class ModelFetchRequest(BaseModel):
     # BUG-FIX（2026-10-16）：可选厂商名，用于占位符密钥按厂商解析（厂商隔离），
     # 否则已配置厂商的模型列表请求会误用主配置密钥。
     provider: str = ''
+    # G-C（2026-11-04）：可选显式协议类型。网关/代理域名场景 URL 启发式无法
+    # 识别 Anthropic 协议端点，anthropic_compatible 时请求头补 x-api-key +
+    # anthropic-version（Anthropic 原生 /v1/models 校验该头），否则列表请求 401。
+    provider_type: str = ''
 
 @router.post('/models')
 async def fetch_available_models(data: ModelFetchRequest):
@@ -602,9 +609,15 @@ async def fetch_available_models(data: ModelFetchRequest):
         base = base[:_matched_ver.start()].rstrip('/')
     _stored_ver = _matched_ver.group(1) if _matched_ver else None
     api_key = _resolve_provider_api_key(data.provider, data.api_key)
+    # G-C（2026-11-04）：显式协议透传 —— anthropic_compatible 端点需要 x-api-key
+    # 头（原生 API 不认 Bearer）；同时保留 Bearer 兼容 OpenAI 形态的网关。
+    _pt = data.provider_type if data.provider_type in _TEXT_PROVIDER_TYPES else ''
     headers = {'User-Agent': 'BidAssistant/1.0 (AI Config Service; +https://github.com/bid-assistant)'}
     if api_key:
         headers['Authorization'] = f'Bearer {api_key}'
+        if _pt == 'anthropic_compatible':
+            headers['x-api-key'] = api_key
+            headers['anthropic-version'] = '2023-06-01'
     is_dashscope = 'dashscope' in base.lower()
     is_xfyun_maas = 'xf-yun.com' in base.lower() or 'spark-api' in base.lower()
     _XFYUN_BUILTIN_MODELS = ['spark-5.5-pro', 'spark-5.5-lite', 'spark-5.0-pro', 'spark-5.0-lite', 'spark-4.0-turbo', 'spark-3.5', 'spark-3.0', 'spark-2.0']
@@ -693,6 +706,11 @@ class AIConfigTest(BaseModel):
     base_url: str
     max_tokens: int = 4096
     temperature: float = 0.7
+    # G-B/G-C（2026-11-04）：显式协议类型（前端 R4 协议下拉的值）。
+    # 此前「测试连接」的 wire 格式只能靠 URL 启发式：网关/代理域名 +
+    # Anthropic 协议时用错端点（/chat/completions vs /messages），出现
+    # 「测试通过但生成失败」或反之，用户无法定位。
+    provider_type: str = ''
 
 def _get_china_accessible_providers() -> list[dict]:
     """返回国内可直接访问的推荐提供商列表（D-1：正本在 provider_catalog）"""
@@ -832,12 +850,22 @@ async def test_ai_connection(data: AIConfigTest):
                     raise HTTPException(status_code=400, detail='base_url 不能为空')
                 data.base_url = default_base
             config = {'provider': data.provider, 'api_key': _resolve_provider_api_key(data.provider, data.api_key), 'model': data.model, 'base_url': data.base_url, 'max_tokens': data.max_tokens, 'temperature': data.temperature}
+            # G-C（2026-11-04）：显式协议优先（白名单校验），让 _make_provider 走
+            # G-1 路由 —— 网关域名 + Anthropic 协议时探针与真实生成同 wire 格式。
+            if data.provider_type in _TEXT_PROVIDER_TYPES:
+                config['provider'] = data.provider_type
             provider = _create_shared_provider(config)
             result = await provider.chat(messages=[AIMessage(role='user', content='回复OK即可')], max_tokens=256, temperature=0.1)
-            record_provider_usage(data.provider, data.provider, data.base_url, success=True)
+            # G-B（2026-11-04）：provider_history.provider_type 是降级链第 3 层的
+            # 协议类型正本，此前两处参数都传中文展示名（data.provider），把
+            # 「DeepSeek」这类展示名当协议写入，白名单拒绝后历史降级条目失真。
+            # 现写解析后的协议类型（显式声明 > URL 启发式），provider_name 不变。
+            _resolved_pt = data.provider_type if data.provider_type in _TEXT_PROVIDER_TYPES else detect_provider_type(data.base_url)
+            record_provider_usage(data.provider, _resolved_pt, data.base_url, success=True)
             return {'status': 'ok', 'message': f'连接成功: {result[:50]}'}
         except Exception as e:
-            record_provider_usage(data.provider, data.provider, data.base_url, success=False)
+            _fail_pt = data.provider_type if data.provider_type in _TEXT_PROVIDER_TYPES else detect_provider_type(data.base_url or '')
+            record_provider_usage(data.provider, _fail_pt, data.base_url, success=False)
             raise HTTPException(status_code=400, detail=f'连接失败: {e!s}') from e
     finally:
         _sem.release()
@@ -863,8 +891,28 @@ async def quick_setup(data: QuickSetupRequest, request: Request = None):
     1. 测试列出的国内可用提供商
     2. 返回可达且认证通过的提供商
     3. 如果指定了 provider_name，优先测试该提供商
+
+    G-H（2026-11-04）：与 /test 同款进程级并发信号量 —— 单次请求内会对最多
+    N 个厂商串行发探针（每个 10s 超时），此前无并发上限，多用户/脚本并发触发
+    会成倍放大出站请求。并发上限与 /test 共用 AI_TEST_CONCURRENCY_LIMIT。
     """
     import time
+    _sem = _get_test_connection_semaphore()
+    try:
+        await asyncio.wait_for(_sem.acquire(), timeout=30)
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            status_code=429,
+            detail=f'配置测试请求过载，请稍后重试（并发上限 {_TEST_CONCURRENCY_LIMIT}）',
+        ) from None
+    try:
+        return await _quick_setup_impl(data, request)
+    finally:
+        _sem.release()
+
+
+async def _quick_setup_impl(data: QuickSetupRequest, request: Request = None) -> QuickSetupResult:
+    """quick_setup 主体（G-H 拆出，便于信号量包裹；行为与拆分前逐字节一致）"""
     providers_to_test = _get_china_accessible_providers()
     if data.provider_name:
         providers_to_test = [p for p in providers_to_test if p['name'] == data.provider_name]
@@ -879,7 +927,9 @@ async def quick_setup(data: QuickSetupRequest, request: Request = None):
     for provider in providers_to_test:
         start = time.time()
         base_url = provider['base_url']
-        provider_type = provider['type']  # F-5：下方落库改用 best 自身的 type/model，此变量仅为循环内可读性
+        # F-5（2026-11-03 收尾）：删除循环内的 provider_type 局部赋值——落库取的是
+        # best 自身的 type/model（见下方 _write_quick_setup），该变量早已无引用，
+        # 留着只会让人误以为写入类型来自循环变量（ruff F841 同点告警）。
         model = data.model or (provider['models'][0] if provider.get('models') else 'default')
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(10, connect=5, read=10), **build_httpx_proxy_settings()) as client:
@@ -1006,7 +1056,10 @@ async def list_image_styles():
     image_engine.py 两处），现已收敛到 services/ai/image_styles.py 作为唯一正本。
     支持通过 IMAGE_STYLE_OVERRIDE 环境变量追加/覆盖风格，本接口会一并返回。
     """
-    return list_image_styles()
+    # BUG-FIX 2026-11-04（P1 · 路由函数名遮蔽服务函数）：本路由函数与
+    # services.ai.image_styles.list_image_styles 同名，直接调用会**无限递归**
+    # 触发 RecursionError（500）。改为显式别名调用。
+    return _list_image_styles()
 
 
 @router.get('/cache-metrics')
@@ -1524,10 +1577,19 @@ async def truncate_usage_stats(days: int=90):
     deleted = _truncate(keep_days=days)
     return {'status': 'ok', 'deleted_records': deleted}
 
+# R3（2026-11-03）：文本 Provider 协议类型白名单——与
+# provider_factory.detect_provider_type 返回值域及 provider_catalog
+# （KNOWN_PROVIDERS 的 type 字段）完全一致；新增协议时三处需同步。
+_TEXT_PROVIDER_TYPES = frozenset({"openai_compatible", "deepseek", "anthropic_compatible"})
+
+
 class TextProviderConfigData(BaseModel):
     """单个厂商的文本模型配置"""
     provider_name: str
-    provider_type: str = 'openai_compatible'
+    # D1（2026-11-03）：None = 未提供 → 保留库内原值/目录默认（此前默认
+    # 'openai_compatible' 会让每次保存把库内 deepseek/anthropic 类型塌缩）；
+    # 显式字符串 = 覆盖。与 document_profile 的 P1-DOC 语义对齐。
+    provider_type: str | None = None
     api_key: str = ''
     base_url: str = ''
     model: str = ''
@@ -1543,6 +1605,20 @@ class TextProviderConfigData(BaseModel):
     # TD-5（2026-10-06）：保存后是否自动激活为主配置。默认 True 保持向后兼容；
     # 前端"仅编辑参数不切换主用"场景可显式传 False。
     activate_after_save: bool = True
+
+    @field_validator('provider_type')
+    @classmethod
+    def _validate_provider_type(cls, v: str | None) -> str | None:
+        """R3（2026-11-03）：显式 provider_type 写入口白名单校验，非法值 422。
+
+        None = 未提供（保留原值语义）直接放行；与 detect_provider_type /
+        provider_factory 降级链的白名单口径保持一致，杜绝污染值再入库。
+        """
+        if v is not None and v not in _TEXT_PROVIDER_TYPES:
+            raise ValueError(
+                f"provider_type 非法: {v!r}，仅支持 {sorted(_TEXT_PROVIDER_TYPES)}"
+            )
+        return v
 
 
 def _row_to_dict(row, col_names: list[str]) -> dict:
@@ -1680,13 +1756,24 @@ async def save_text_provider_config(provider_name: str, data: TextProviderConfig
             # document_profile：None=未提供→保留原值 / ""=显式清空（P1-DOC）。
             # 列是 NOT NULL，INSERT 路径不能用 SQL COALESCE（NULL 会触发约束失败），
             # 故在同一事务内先回读旧值再决定写入值（与 save_ai_config 同口径）。
+            # D1（2026-11-03）：provider_type 同语义——None=保留库内原值，
+            # 首存时回退厂商目录默认类型（deepseek/anthropic 等），再兜底 openai_compatible。
             _dp_row = conn.execute(
-                'SELECT document_profile FROM text_provider_configs WHERE provider_name = ?',
+                'SELECT document_profile, provider_type FROM text_provider_configs WHERE provider_name = ?',
                 [provider_name],
             ).fetchone()
             _dp_current = (_dp_row[0] or '') if _dp_row else ''
             effective_dp = _dp_current if data.document_profile is None else data.document_profile
-            conn.execute("\n            INSERT INTO text_provider_configs\n                (provider_name, provider_type, api_key, base_url, model,\n                 max_tokens, concurrency, temperature, document_profile, timeout, is_active)\n            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)\n            ON CONFLICT(provider_name) DO UPDATE SET\n                provider_type=excluded.provider_type,\n                api_key=excluded.api_key,\n                base_url=excluded.base_url,\n                model=excluded.model,\n                max_tokens=excluded.max_tokens,\n                concurrency=excluded.concurrency,\n                temperature=excluded.temperature,\n                document_profile=excluded.document_profile,\n                timeout=excluded.timeout,\n                is_active=text_provider_configs.is_active,\n                updated_at=datetime('now', 'localtime')\n        ", (data.provider_name, data.provider_type, data.api_key, data.base_url, data.model, data.max_tokens, data.concurrency, data.temperature, effective_dp, data.timeout))
+            if data.provider_type is not None:
+                effective_pt = data.provider_type
+            elif _dp_row and _dp_row[1] in _TEXT_PROVIDER_TYPES:
+                # R3（2026-11-03）：库内旧值只有落在白名单内才保留；
+                # 历史污染值（非法协议名）视同缺失，回落目录默认。
+                effective_pt = _dp_row[1]
+            else:
+                _known = next((p for p in KNOWN_PROVIDERS if p['name'] == provider_name), None)
+                effective_pt = (_known or {}).get('type', 'openai_compatible')
+            conn.execute("\n            INSERT INTO text_provider_configs\n                (provider_name, provider_type, api_key, base_url, model,\n                 max_tokens, concurrency, temperature, document_profile, timeout, is_active)\n            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)\n            ON CONFLICT(provider_name) DO UPDATE SET\n                provider_type=excluded.provider_type,\n                api_key=excluded.api_key,\n                base_url=excluded.base_url,\n                model=excluded.model,\n                max_tokens=excluded.max_tokens,\n                concurrency=excluded.concurrency,\n                temperature=excluded.temperature,\n                document_profile=excluded.document_profile,\n                timeout=excluded.timeout,\n                is_active=text_provider_configs.is_active,\n                updated_at=datetime('now', 'localtime')\n        ", (data.provider_name, effective_pt, data.api_key, data.base_url, data.model, data.max_tokens, data.concurrency, data.temperature, effective_dp, data.timeout))
             conn.commit()
     await asyncio.to_thread(_write_text_provider_config)
     # L-3/L-5：降级链第二层来源变化也要跨进程失效 + 审计
@@ -1727,6 +1814,49 @@ async def get_text_provider_config(provider_name: str):
         }
     # G-3：api_key_set 前端可据它显示「已配置/未配置」，无需再判字符串
     return _provider_view(row, _TEXT_PROVIDER_COLS, provider_name)
+
+
+@router.delete('/provider-configs/{provider_name}')
+async def delete_text_provider_config(provider_name: str, request: Request = None):
+    """G-E（2026-11-04）：删除指定厂商的文本模型配置。
+
+    此前厂商配置只能被覆盖保存、无删除能力 —— 配错的厂商（错误 URL/残留密钥）
+    永久残留在 text_provider_configs，且永远参与 /provider-configs 列表与
+    降级链第 1.5 层。语义：
+      - 未配置 → 404；
+      - 该厂商是当前激活厂商 → 409（删除会瞬间掏空主配置与降级链首层，
+        必须先切换到其他厂商；内置默认 agnes 无配置行，不影响回退）；
+      - 正常删除：整行移除（密钥一并销毁）→ bump 版本号跨进程失效 → 审计。
+    """
+    def _delete_row():
+        with get_db_with_retry() as conn:
+            row = conn.execute(
+                'SELECT is_active FROM text_provider_configs WHERE provider_name = ?',
+                [provider_name],
+            ).fetchone()
+            if not row:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"厂商 '{provider_name}' 没有已保存的配置",
+                )
+            is_active = bool(row['is_active']) if hasattr(row, 'keys') else bool(row[0])
+            if is_active:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(f"厂商 '{provider_name}' 是当前使用中的配置，"
+                            f"请先切换到其他厂商再删除"),
+                )
+            conn.execute(
+                'DELETE FROM text_provider_configs WHERE provider_name = ?',
+                [provider_name],
+            )
+            conn.commit()
+    await asyncio.to_thread(_delete_row)
+    bump_ai_config_version()
+    await asyncio.to_thread(
+        lambda: _audit('delete_provider_config', provider_name, request=request)
+    )
+    return {'status': 'ok', 'provider_name': provider_name}
 
 # F-13：单厂商 GET 与列表接口口径不一致（列表有 updated_at，单查无），
 # 前端刷新单卡时拿不到更新时间。补列保持两接口同构，新增字段向后兼容。
@@ -1784,12 +1914,28 @@ async def activate_text_provider_config(provider_name: str, request: Request = N
                 if not row:
                     raise HTTPException(status_code=404, detail=f"厂商 '{provider_name}' 的配置不存在，请先保存")
                 d = _row_to_dict(row, _TEXT_PROVIDER_COLS)
+                # G-D（2026-11-04，激活守卫）：此前保存路径对空 base_url 只落 warning
+                #（TD-6），激活路径完全无守卫 —— 激活一个空 URL 厂商会把 ai_config
+                # 主配置的 base_url 一并清空，之后**所有** AI 调用（含降级链主条目）
+                # 直接失败。这是「把好配置写坏」的单点，必须在激活入口拦截。
+                # 影响面：历史空 base_url 记录此前激活必然产生坏主配置，本守卫不会
+                # 误伤任何可用路径；保存仍允许空值（兼容历史记录编辑），仅激活拒绝。
+                if not (d.get('base_url') or '').strip():
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(f"厂商 '{provider_name}' 的 Base URL 为空，激活后所有 AI 调用都会失败；"
+                                f"请先在该厂商卡片填写 Base URL 并保存"),
+                    )
                 conn.execute('UPDATE text_provider_configs SET is_active = 0')
                 conn.execute('UPDATE text_provider_configs SET is_active = 1 WHERE provider_name = ?', [provider_name])
                 # P1-CFG（2026-10-14）：激活时把厂商级 timeout 同步到主配置 —— 否则
                 # 「某厂商专门调了超时」在激活后不生效（主配置保持上一次的值/默认 120s）。
                 # P1-DOC：document_profile 用 COALESCE 保留语义（激活不覆盖「未提供」）。
-                conn.execute("INSERT INTO ai_config (id, provider_name, provider, api_key, model, base_url,\n                document_profile, concurrency, temperature, max_tokens, timeout, updated_at)\n               VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now', 'localtime'))\n               ON CONFLICT(id) DO UPDATE SET\n                provider_name=excluded.provider_name, provider=excluded.provider,\n                api_key=excluded.api_key, model=excluded.model,\n                base_url=excluded.base_url,\n                document_profile=excluded.document_profile,\n                concurrency=excluded.concurrency,\n                temperature=excluded.temperature,\n                max_tokens=excluded.max_tokens,\n                timeout=excluded.timeout,\n                updated_at=datetime('now', 'localtime')", (d.get('provider_name', provider_name), d.get('provider_type', 'openai_compatible'), d.get('api_key') or '', d.get('model') or '', d.get('base_url') or '', d.get('document_profile') or '', d.get('concurrency') or 4, d.get('temperature') or 0.7, d.get('max_tokens') or 4096, d.get('timeout') or 120))
+                # D2（2026-11-03）：temperature 用 None 判断而非 `or 0.7`——
+                # 0.0 是合法配置（确定性输出），`or` 写法会把厂商显式 0 吞成 0.7。
+                # concurrency/max_tokens/timeout 写入时已 clamp 到 ≥1/≥256/≥5，0 值
+                # 不可能出现，维持 `or` 兜底口径不变。
+                conn.execute("INSERT INTO ai_config (id, provider_name, provider, api_key, model, base_url,\n                document_profile, concurrency, temperature, max_tokens, timeout, updated_at)\n               VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now', 'localtime'))\n               ON CONFLICT(id) DO UPDATE SET\n                provider_name=excluded.provider_name, provider=excluded.provider,\n                api_key=excluded.api_key, model=excluded.model,\n                base_url=excluded.base_url,\n                document_profile=excluded.document_profile,\n                concurrency=excluded.concurrency,\n                temperature=excluded.temperature,\n                max_tokens=excluded.max_tokens,\n                timeout=excluded.timeout,\n                updated_at=datetime('now', 'localtime')", (d.get('provider_name', provider_name), d.get('provider_type', 'openai_compatible'), d.get('api_key') or '', d.get('model') or '', d.get('base_url') or '', d.get('document_profile') or '', d.get('concurrency') or 4, d.get('temperature') if d.get('temperature') is not None else 0.7, d.get('max_tokens') or 4096, d.get('timeout') or 120))
                 conn.commit()
             return d
         try:

@@ -508,6 +508,23 @@ export default React.memo(function OutlineEditorPage() {
           eventSourceRef.current = null;
         } else if (data.status === "fallback") {
           message.warning(data.message || "正在切换兜底提供商...");
+        } else if (data.status === "outline_degraded") {
+          // BUG-FIX 2026-11-02（降级透知）：L2 生成部分章节 AI 失败时，
+          // 后端回退模板默认目录（标题泛化）。此前只有服务端日志可见，
+          // 用户拿到"成功"目录却不知质量已退化。收到事件即弹非阻断警告。
+          message.warning(
+            data.message ||
+              `有 ${data.fallback_count ?? "?"} 个章节回退为模板默认目录，标题可能较为通用，建议重新生成或手工调整`
+          );
+          setProgressMessage(data.message || "部分章节目录已降级为模板默认目录");
+        } else if (data.status === "outline_l1_placeholder") {
+          // 遗留项 3 加固（2026-11-02）：一级章名为占位形态（如「专项6」），
+          // 清洗链按既定取舍不重写 L1（保护评分项映射），交付前透知用户人工调整。
+          message.warning(
+            data.message ||
+              `有 ${data.placeholder_count ?? "?"} 个一级章节标题为占位形态，建议在目录编辑器中人工调整`
+          );
+          setProgressMessage(data.message || "部分一级章节标题为占位形态，建议人工调整");
         } else if (data.status === "review_auto_confirm") {
           // V5.1 自动确认：记录审核通过状态
           const phase = data.phase || "unknown";

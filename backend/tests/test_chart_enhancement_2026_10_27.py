@@ -340,17 +340,20 @@ def _make_section(title: str, content: str) -> dict:
 
 
 class TestAutoOrchestrateRaceGuard:
-    ORIGINAL = "第一段：项目概况说明。\n\n第二段：本项目设置项目经理部，下设技术负责人、安全员、质检员等岗位。"
+    # ENHANCE 2026-11-04 注：围栏去重已放宽为「同类型去重 + 每章 ≤2 图」
+    # （chart_fence_type_conflict），竞态场景改为**同类型**（施工工艺流程 →
+    # flowchart 分析）围栏，保持本组用例「竞态输家不得写库」的原意。
+    ORIGINAL = "第一段：项目概况说明。\n\n第二段：本项目按土方开挖、主体结构、装饰装修顺序组织施工。"
     RACED = ORIGINAL + "\n\n```mermaid\nflowchart TD\n    A-->B\n```\n"
 
     def test_reread_detects_concurrent_fence_and_skips(self):
-        """读-检-写窗口内他人已插入围栏 → 重读后跳过，不产生同章双图。"""
+        """读-检-写窗口内他人已插入**同类型**围栏 → 重读后跳过，不产生同章双图。"""
         calls = {"n": 0}
 
         def _get_section(sid):
             calls["n"] += 1
-            # 第 1 次读：无围栏（编排判定通过）；第 2 次读（竞态护栏）：已含围栏
-            return _make_section("项目组织架构", self.RACED if calls["n"] > 1 else self.ORIGINAL)
+            # 第 1 次读：无围栏（编排判定通过）；第 2 次读（竞态护栏）：已含同类围栏
+            return _make_section("施工工艺流程", self.RACED if calls["n"] > 1 else self.ORIGINAL)
 
         rec = _UpdateRecorder()
         result = auto_orchestrate_section(10, 1, _get_section=_get_section, _update_section=rec)

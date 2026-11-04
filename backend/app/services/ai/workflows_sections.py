@@ -8,6 +8,7 @@ The full implementation will be restored incrementally.
 import asyncio
 import json
 import logging
+import os
 import re
 import time
 from typing import Any, Callable
@@ -39,10 +40,13 @@ except ImportError:  # pragma: no cover - 兜底路径，与权威实现语义�
             return 0
         return len(_COUNT_WORDS_FALLBACK_RE.findall(text))
 
-    def normalize_newlines(text: str) -> str:
-        """CRLF / CR → LF 兜底实现（与 app.utils.normalize_newlines 等价）。"""
+    def normalize_newlines(text):
+        """CRLF / CR → LF 兜底实现（与 app.utils.normalize_newlines 逐分支同构，
+        含 LEFTOVER-3 收敛 2026-11-02 的 Any 容错语义）。"""
         if not text:
             return ""
+        if not isinstance(text, str):
+            text = str(text)
         if "\r" not in text:
             return text
         return text.replace("\r\n", "\n").replace("\r", "\n")
@@ -150,6 +154,93 @@ def _resolve_section_system_prompt(planned: bool = False) -> str:
     )
 
 
+# ──────────────────────────────────────────────────────────────────────
+# LEFTOVER-2（2026-11-02，Risk-P3c 落地）：SectionContentCache 可选 Redis L2 共享层。
+# 默认关（SECTION_CONTENT_REDIS_SHARED_ENABLED 未设置/0/false/off/no）= 纯进程内
+# 行为逐字不变，单 worker 部署零影响、零新依赖；开启后在内存 L1 miss 时回源
+# Redis，使 uvicorn 多 worker / Web+Celery 混部场景下 worker A 生成的正文缓存
+# 可被 worker B 命中，且各级 invalidate 同步清理共享键，杜绝跨进程旧正文回灌。
+# 与 CacheService 的 Redis 整包快照（section_content:project:{id}，30min）互不
+# 干扰：共享层键统一加 "ssc:" 前缀，只存单章正文字符串。
+def _section_cache_redis_shared_enabled() -> bool:
+    """L2 共享层开关：call-time 读 env，支持部署环境一键开合（与 facts_service._env_flag 同口径）。"""
+    raw = str(os.getenv("SECTION_CONTENT_REDIS_SHARED_ENABLED", "0") or "0").strip().lower()
+    return raw not in {"", "0", "false", "off", "no"}
+
+
+class _RedisSharedBackend:
+    """RedisCache 适配器：把共享层四个原语收敛到统一接口，内部全降级。
+
+    任何后端异常（Redis 未装/不可达/序列化失败）只记日志并返回中性值，
+    绝不让 L2 故障穿透到正文生成主链路（L1 + DB 仍是正确性兜底）。
+    """
+
+    def get(self, full_key: str) -> str | None:
+        try:
+            from ..redis_cache import RedisCache
+
+            value = RedisCache.get(full_key)
+            # RedisCache 自动 JSON 反序列化：字符串往返后仍是 str；
+            # 非 str（脏数据）按 miss 处理，避免类型污染下游
+            return value if isinstance(value, str) else None
+        except Exception as e:
+            logger.debug("[正文缓存L2] Redis GET 降级 key=%s: %s", full_key, e)
+            return None
+
+    def set(self, full_key: str, value: str, ttl: int) -> bool:
+        try:
+            from ..redis_cache import RedisCache
+
+            return RedisCache.set(full_key, value, expire=ttl)
+        except Exception as e:
+            logger.debug("[正文缓存L2] Redis SET 降级 key=%s: %s", full_key, e)
+            return False
+
+    def delete(self, full_key: str) -> None:
+        try:
+            from ..redis_cache import RedisCache
+
+            RedisCache.delete(full_key)
+        except Exception as e:
+            logger.debug("[正文缓存L2] Redis DEL 降级 key=%s: %s", full_key, e)
+
+    def scan_delete(self, key_prefix: str) -> int:
+        """按前缀批量删除（SCAN 游标，避免 KEYS 阻塞）。invalidate 低频路径专用。"""
+        try:
+            from ..redis_cache import RedisCache, get_redis_client
+
+            client = get_redis_client()
+            if not client:
+                return 0
+            pattern = RedisCache._make_key(key_prefix) + "*"
+            count = 0
+            for k in client.scan_iter(match=pattern, count=200):
+                client.delete(k)
+                count += 1
+            return count
+        except Exception as e:
+            logger.debug("[正文缓存L2] Redis SCAN-DEL 降级 prefix=%s: %s", key_prefix, e)
+            return 0
+
+
+_SHARED_BACKEND = _RedisSharedBackend()
+
+
+def _shared_backend():
+    """L2 后端获取缝隙（测试 monkeypatch 此函数注入 fake，无需真实 Redis）。"""
+    return _SHARED_BACKEND
+
+
+def _shared_call_safely(fn, *args):
+    """L2 调用安全包裹：即便 backend 实现自身抛异常（真实适配器内部已降级，
+    此处兜住 fake/未来实现破口），也绝不允许穿透正文生成主链路。"""
+    try:
+        return fn(*args)
+    except Exception as e:
+        logger.debug("[正文缓存L2] 调用降级 %s: %s", getattr(fn, "__name__", fn), e)
+        return None
+
+
 class SectionContentCache:
     """章节内容缓存 - 内存 LRU 缓存
 
@@ -162,6 +253,11 @@ class SectionContentCache:
     在 uvicorn 多 worker 部署时，每个 worker 有独立缓存 → worker A 写入的缓存
     worker B 无法命中，且 invalidate_by_ids 只清本进程。项目当前单 worker 模式
     下无影响；若后期横向扩容，需引入 Redis 共享缓存层替换本类。
+
+    LEFTOVER-2 落地 2026-11-02：上述"若后期扩容"已提供渐进方案——开启
+    ``SECTION_CONTENT_REDIS_SHARED_ENABLED=1`` 后本类升级为 L1(内存)+L2(Redis)
+    两级：L1 miss 回源 L2、写入与各级失效同步维护 L2，跨 worker 命中且失效
+    跨进程可见。默认关 = 行为与单级时代逐字一致（向后兼容红线）。
     """
 
     def __init__(self, max_size: int = 100, ttl: int = 3600):
@@ -172,6 +268,18 @@ class SectionContentCache:
         self._hits = 0
         self._misses = 0
 
+    @staticmethod
+    def _shared_key(key: str) -> str:
+        """本地键 → 共享层键（加 ssc: 前缀与 CacheService 整包快照键隔离）。"""
+        return f"ssc:{key}"
+
+    @staticmethod
+    def _shared_prefix(project_id: int | None) -> str:
+        """项目级共享键前缀（project_id=None 时为全局前缀）。"""
+        if project_id is None:
+            return "ssc:section_content:"
+        return f"ssc:section_content:{project_id}:"
+
     async def get(self, key: str) -> str | None:
         async with self._lock:
             if key in self._cache:
@@ -180,6 +288,20 @@ class SectionContentCache:
                     self._hits += 1
                     return value
                 del self._cache[key]
+        # LEFTOVER-2 L2 回源：开关关闭时跳过（逐字保持旧行为）；Redis IO 放在
+        # 锁外经 to_thread 执行，避免网络抖动阻塞事件循环与其它协程的 L1 访问。
+        if _section_cache_redis_shared_enabled():
+            hit = await asyncio.to_thread(
+                _shared_call_safely, _shared_backend().get, self._shared_key(key)
+            )
+            if hit is not None:
+                async with self._lock:
+                    self._hits += 1
+                    # 回填 L1（沿用当前时间戳：L2 剩余 TTL 由 Redis 保证，
+                    # 本地重新计时最多让副本略旧于源，读侧均有失效联动，无害）
+                    self._cache[key] = (hit, time.time())
+                return hit
+        async with self._lock:
             self._misses += 1
         return None
 
@@ -189,6 +311,15 @@ class SectionContentCache:
                 oldest = min(self._cache, key=lambda k: self._cache[k][1])
                 del self._cache[oldest]
             self._cache[key] = (value, time.time())
+        # LEFTOVER-2：写入同步落 L2（TTL 与 L1 一致），供其它 worker 回源命中
+        if _section_cache_redis_shared_enabled():
+            await asyncio.to_thread(
+                _shared_call_safely,
+                _shared_backend().set,
+                self._shared_key(key),
+                value,
+                self._ttl,
+            )
 
     def get_stats(self) -> dict:
         """返回缓存统计（同步快照，避免锁嵌套；计数由异步 get/set 维护）"""
@@ -199,6 +330,9 @@ class SectionContentCache:
             "hits": self._hits,
             "misses": self._misses,
             "hit_rate": (f"{self._hits / total:.1%}" if total else "-"),
+            # LEFTOVER-2：运维可见性——/monitor 与 SSE cache_stats 可直接看出
+            # 当前进程是否启用了 Redis L2 共享层（纯新增键，旧消费端忽略即可）
+            "redis_shared_enabled": _section_cache_redis_shared_enabled(),
         }
 
     async def invalidate_by_title(self, project_id: int | None, titles: list | None = None) -> int:
@@ -225,11 +359,24 @@ class SectionContentCache:
                 if project_id is None:
                     count = len(self._cache)
                     self._cache.clear()
+                    # LEFTOVER-2：全局清空同步清 L2（scan 前缀删除，低频路径）
+                    if _section_cache_redis_shared_enabled():
+                        await asyncio.to_thread(
+                            _shared_call_safely,
+                            _shared_backend().scan_delete,
+                            self._shared_prefix(None),
+                        )
                     return count
                 # 仅清空该项目缓存
                 keys_to_del = [k for k in self._cache if k.startswith(prefix)]
                 for k in keys_to_del:
                     del self._cache[k]
+                if _section_cache_redis_shared_enabled():
+                    await asyncio.to_thread(
+                        _shared_call_safely,
+                        _shared_backend().scan_delete,
+                        self._shared_prefix(project_id),
+                    )
                 return len(keys_to_del)
             targets = {t.strip() for t in titles if t}
             keys_to_del = [
@@ -238,6 +385,15 @@ class SectionContentCache:
             ]
             for k in keys_to_del:
                 del self._cache[k]
+            # LEFTOVER-2：titles 是标题子串匹配，而共享键（pid:sid）不含标题、
+            # 无法在 L2 精确对应 → 按「宁紧勿松」失效整项目前缀（多删只是少一次
+            # 缓存命中，漏删会把旧正文回灌进生成链路）。
+            if keys_to_del and _section_cache_redis_shared_enabled():
+                await asyncio.to_thread(
+                    _shared_call_safely,
+                    _shared_backend().scan_delete,
+                    self._shared_prefix(project_id),
+                )
             return len(keys_to_del)
 
     async def invalidate_by_ids(self, project_id: int | None, ids: list | None = None) -> int:
@@ -264,12 +420,27 @@ class SectionContentCache:
             ]
             for k in keys_to_del:
                 del self._cache[k]
-            return len(keys_to_del)
+        # LEFTOVER-2：按 id 精确删除共享键（键含 sid，可一一对应，无需整项目清理）
+        if keys_to_del and _section_cache_redis_shared_enabled():
+            backend = _shared_backend()
+
+            def _drop_shared() -> None:
+                for _k in keys_to_del:
+                    _shared_call_safely(backend.delete, self._shared_key(_k))
+
+            await asyncio.to_thread(_drop_shared)
+        return len(keys_to_del)
 
     async def clear(self) -> None:
         """清空所有缓存（与 invalidate_by_title(None) 等价，提供一致的 API 形态）"""
         async with self._lock:
             self._cache.clear()
+        if _section_cache_redis_shared_enabled():
+            await asyncio.to_thread(
+                _shared_call_safely,
+                _shared_backend().scan_delete,
+                self._shared_prefix(None),
+            )
 
     # BUG-FIX 2026-09-18（P2）：此处曾有两个同名 invalidate_ids_sync 定义，
     # 前者（逻辑一致但 docstring 缺“锁仅保护异步路径”说明）被后定义静默
@@ -298,6 +469,17 @@ class SectionContentCache:
             keys_to_del = [k for k in list(self._cache) if k.startswith(prefix)]
         for k in keys_to_del:
             self._cache.pop(k, None)
+        # LEFTOVER-2：同步失效路径（一致性修复/版本回滚/Celery 旁路直写后经
+        # invalidate_content_caches 进入）同样维护 L2。ids 精确删；整项目走
+        # scan 前缀删。本函数调用方多处于非事件循环线程，直接同步执行。
+        if _section_cache_redis_shared_enabled():
+            backend = _shared_backend()
+            if ids:
+                # 本地未命中≠共享层未命中：按传入 id 直接构造键，保证跨进程失效
+                for _i in id_set:
+                    _shared_call_safely(backend.delete, self._shared_key(f"{prefix}{_i}"))
+            else:
+                _shared_call_safely(backend.scan_delete, self._shared_prefix(project_id))
         return len(keys_to_del)
 
 
@@ -521,9 +703,21 @@ def extract_section_charts(content: str, section_title: str = "", summary: str =
 
         ENHANCE 2026-10-08（已修复）：`_validate_chart_data` 已接入落库前判定链，
         调用 `chart_validators` 权威校验器；畸形数据不再伪装成真实图表堵住配图编排。
+        BUG-FIX 2026-11-04（P2·mermaid 围栏整体误降级）：`code` 形态载荷
+        （```mermaid 围栏 → {"type":..., "code": <源码>}）的权威校验是渲染端
+        Mermaid 语法闸门（image_engine.validate_mermaid / 导出端语法检查），
+        **不是**节点结构校验器——旧实现按节点形态校验（nodes 缺失）恒失败，
+        所有 mermaid 围栏被降级为 _hint 条目：①D2「围栏→真实数据落库」对
+        mermaid 全部落空；②sse_charts「已有真实数据 → 跳过编排」短路永不命中
+        → 编排管线对同一章重复生成同类型图（AI 调用浪费 + DB *_json 与正文
+        围栏两张图数据漂移）。code 非空即视为真实数据，语法合法性由渲染闸门
+        兜底（与 content_cleaning._validate_chart_json_structure 对 fence 路径
+        「仅日志不删块」的保守口径一致）。
         """
         if not isinstance(d, dict) or not _chart_has_real_data(d):
             return None
+        if str(d.get("code") or "").strip():
+            return d
         _ok, _err = _validate_chart_data(str(d.get("type") or ""), d)
         if not _ok:
             logger.info(
@@ -1311,8 +1505,15 @@ def build_chapter_content_messages(chapter_info: dict, facts: Any = None,
                 "word_count_tier": chapter_info.get("word_count_tier"),
             },
             writing_length=_mode,
+            # BUG-FIX 2026-11-04（P3-3·None 语义强转）：`bool(chapter_info.get(...))`
+            # 对**键缺失**（直接构造 section dict 调 generate_sections 的路径：
+            # 单章重生成包装/脚本/测试）把 None 强转为 False → resolver 跳过
+            # L3-own 直接落全局档位（1200），而压缩/校验侧对同一章节按
+            # is_l3_own=None（L3 叶子 → True → 300±20%）解析 → 提示词让写
+            # 1200、压缩 360 就触发，自相矛盾。原样透传，None 语义交 resolver
+            # （L3 叶子按 300±20%，与 DB 行路径一致）。
             is_l3_own=(
-                bool(chapter_info.get("is_l3_own")) if _chapter_level == 3 else None
+                chapter_info.get("is_l3_own") if _chapter_level == 3 else None
             ),
             strict_override=_wc_ov,
         )
@@ -3108,6 +3309,16 @@ async def generate_sections(
         if kw_key in kwargs and ctx_key not in merged_context:
             merged_context[ctx_key] = kwargs[kw_key]
 
+    # BUG-FIX 2026-11-04（P1·generation_mode 死参数）：generation_mode 是本函数
+    # 的**具名形参**，调用方（sse_content 主生成/重试路径）的关键字实参绑定到
+    # 形参后**不会出现在 kwargs 里** → kw_to_ctx 永远拷贝不到 → merged_context
+    # 恒无该键 → 下方 L3518 恒回落 config.CONTENT_GENERATION_MODE。后果：用户
+    # 在前端显式选择的 serial/parallel 被静默忽略（恒按系统默认 batch 跑），
+    # 且 verify_generation_completeness 按请求模式校验、与实际执行模式分叉。
+    # 显式形参优先（向后兼容：None 时不覆盖 context 里可能已带的值）。
+    if generation_mode:
+        merged_context.setdefault("generation_mode", generation_mode)
+
     # --- 提取可选控制参数 ---
     section_complete_callback = kwargs.get("section_complete_callback")
     cancel_event: asyncio.Event | None = kwargs.get("cancel_event")
@@ -3433,6 +3644,38 @@ async def generate_sections(
             for i, s in enumerate(sections)
         ]
         gathered = await asyncio.gather(*tasks, return_exceptions=True)
+
+    # BUG-FIX 2026-11-04（P2·None 占位静默过滤）：gather(return_exceptions=True)
+    # 的异常结果旧实现零消费（异常对象连日志都没有）；子任务抛非 Exception
+    # 异常（CancelledError 未随全局取消、provider 不符约定等）时 results[idx]
+    # 停留 None，最终返回前被静默过滤 → 该章节凭空消失：不计 failed、不进
+    # 重试、不落库，前端 total 与 success+failed+cancelled 出现缺口。
+    # 现三重加固：① gathered 异常逐个记 ERROR（batch 模式下 gathered 为多批
+    # 拼接，与 sections 下标不对齐，故不按下标取章节，章节定位由下方 None
+    # 占位补记精确完成）；② None 占位补终态结果（cancel_event 已置位 →
+    # cancelled，否则 failed）；③ 返回长度恒等于输入。
+    for _gexc in gathered or []:
+        if isinstance(_gexc, BaseException):
+            logger.error(
+                "[正文生成] 子任务异常退出（gather 吞异常防护，章节定位见下方占位补记）: %r",
+                _gexc,
+            )
+    for _ni, _nres in enumerate(results):
+        if _nres is not None:
+            continue
+        _n_sec = sections[_ni] if _ni < len(sections) else {}
+        _n_cancelled = cancel_event is not None and cancel_event.is_set()
+        results[_ni] = {
+            "id": _n_sec.get("id"),
+            "title": _n_sec.get("title", ""),
+            "status": "cancelled" if _n_cancelled else "failed",
+            "content": "",
+            "error": "已取消" if _n_cancelled else "子任务异常退出，未产出结果",
+        }
+        logger.error(
+            "[正文生成] 章节 %s（%s）无结果占位，已补记 %s",
+            _n_sec.get("id"), _n_sec.get("title", ""), results[_ni]["status"],
+        )
 
     # --- 生成后自检（ENHANCE 2026-10-07）---
     # 有字段契约时，对每个成功章节做「占位标记 / 与全局数据字典冲突 / 过短」自检，

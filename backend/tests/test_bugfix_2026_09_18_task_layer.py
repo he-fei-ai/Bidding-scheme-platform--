@@ -165,6 +165,15 @@ class TestACeleryLayerNotDead:
         assert ".delay(" not in src
         assert "apply_async(" not in src
 
+    def test_a6_bulk_content_task_invalidates_caches(self):
+        """BUG-FIX 2026-11-02：批量正文任务旁路直写 sections.content 后必须
+        失效三层缓存（对齐 SSE 主管线落库即失效口径），否则 Redis 整包章节
+        缓存（TTL 1800s）持续回灌旧正文喂给后续生成。"""
+        src = _source_without_comments("app/tasks/__init__.py")
+        assert "invalidate_content_caches" in src, (
+            "tasks.content.generate_sections 直写正文后必须接线缓存失效"
+        )
+
 
 # ============================================================================
 # B. cleanup_old_results 真实清理

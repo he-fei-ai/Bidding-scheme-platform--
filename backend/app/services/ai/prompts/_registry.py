@@ -28,6 +28,11 @@ _VARIABLE_PATTERN = re.compile(r"\{([A-Za-z_]\w{1,})\}|__([A-Z_][A-Z0-9_]*)__")
 # 替换后残留占位符检测（用于验证变量是否全部替换）
 _RESIDUAL_PLACEHOLDER_PATTERN = re.compile(r"\{[A-Za-z_]\w{1,}\}|__[A-Z_][A-Z0-9_]*__")
 
+# BUG-FIX-PROMPT-M6：畸形占位符（闭括号前带空白，如 ``{VAR }``）。
+# 此形态不被 _VARIABLE_PATTERN 提取、渲染时也不会被替换（合并正则要求名后紧跟
+# `}`），却会被原样发给模型——纳入残留检测使其在渲染路径可见（仅告警不阻断）。
+_RESIDUAL_MALFORMED_PATTERN = re.compile(r"\{[A-Za-z_]\w*(?=\s+\})")
+
 # 零宽字符正则（含软连字符 \u00AD）
 _ZERO_WIDTH_PATTERN = re.compile(r"[\u00AD\u200B\u200C\u200D\uFEFF]")
 
@@ -117,7 +122,9 @@ def has_residual_placeholders(text: str) -> bool:
     """
     if _RESIDUAL_PLACEHOLDER_PATTERN.search(text):
         return True
-    return bool(_SHARED_PATTERN.search(text))
+    if _SHARED_PATTERN.search(text):
+        return True
+    return bool(_RESIDUAL_MALFORMED_PATTERN.search(text))
 
 
 def resolve_shared_refs(template: str) -> str:
@@ -332,6 +339,14 @@ def validate_prompt_content(key: str, content: str) -> list[str]:
     # 畸形占位符：单个 { 后跟空白/结束（排除 JSON 示例体的正常换行）
     if re.search(r"\{[A-Za-z_]\w*\s*$", content or "", re.MULTILINE):
         problems.append("存在未闭合的变量占位符（{ 后缺少 }）")
+
+    # BUG-FIX-PROMPT-M6（2026-11-04，畸形占位符漏检）：``{VAR }``（闭括号前带
+    # 空白）既不被 _VARIABLE_PATTERN 提取为变量、也不被上方「未闭合」规则命中、
+    # has_residual_placeholders 也检不出——于是以字面量形式静默发给模型。
+    # 实测复现：validate_prompt_content('K', 'xx {VAR } yy') -> []（零告警）。
+    # 已核对注册表 139 个模板与生产库全部行对该模式零命中，加入不会误伤存量。
+    if re.search(r"\{[A-Za-z_]\w*(?=\s+\})", content or ""):
+        problems.append("存在闭合前带空白的变量占位符（{VAR } 应写为 {VAR}）")
 
     return problems
 

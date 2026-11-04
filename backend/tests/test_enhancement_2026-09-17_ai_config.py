@@ -381,9 +381,13 @@ async def test_test_image_connection_resolves_masked_key(monkeypatch):
 
     with get_db() as conn:
         conn.execute("DELETE FROM image_provider_configs WHERE provider_name = ?", (provider,))
+        # 2026-11-03 隔离修复：显式 is_active=0。MIG-38 部分唯一索引限定
+        # 全表至多一行 is_active=1，而库内常有真实激活行（如 agnes）；
+        # 缺省列值=1 时组合运行会触发 UNIQUE 冲突（单跑偶然通过）。
+        # 本测试只验证「占位符按 provider_name 解析密钥」，与激活态无关。
         conn.execute(
-            "INSERT INTO image_provider_configs (provider_name, api_key, base_url, model) "
-            "VALUES (?, ?, ?, ?)",
+            "INSERT INTO image_provider_configs (provider_name, api_key, base_url, model, is_active) "
+            "VALUES (?, ?, ?, ?, 0)",
             (provider, saved_key, "https://example.com/v1", "m"),
         )
         conn.commit()

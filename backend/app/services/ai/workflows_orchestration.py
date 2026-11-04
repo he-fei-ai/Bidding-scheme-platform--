@@ -294,6 +294,18 @@ def _build_orch_user_messages(template: str, proj_overview: str, leaf_json: str,
         leaf_marker=_LEAF_LIST_MARKER,
     )
     before, after = split_rendered_template(rendered, _LEAF_LIST_MARKER)
+    # HARDEN-R3（2026-11-04，哨兵缺失静默丢数据）：哨兵依赖 DB 模板保留叶子列表
+    # 占位符（{OUTLINE}/__OUTLINE__/{leaf_list_json} 之一）。管理员编辑模板时若
+    # 误删该占位符，切分函数会整体视为稳定段（marker 不存在 → (rendered, "")），
+    # 每个叶子的目录上下文只剩任务块里的 JSON——判断规则里"从上方章节列表选择"
+    # 的引用全部落空，且无任何报错。此处对「占位符丢失」显式告警（不阻断，
+    # 保持拆分结构向后兼容）。
+    if _LEAF_LIST_MARKER not in rendered:
+        logger.warning(
+            "[编排拆分] 用户模板缺少叶子列表占位符（OUTLINE/leaf_list_json），"
+            "目录列表将不进入稳定前缀，仅存在于任务差异块；"
+            "请检查 CONTENT_ORCHESTRATION_USER 模板是否被误删占位符"
+        )
     blocks = [b for b in (before.strip(), after.strip()) if b]
     blocks.append(
         "### 待编排章节（JSON）\n"
@@ -945,29 +957,34 @@ def _adjudicate_illustrations(plans: list[dict],
     # 仅在 prefer_mermaid=True 时走这条路径：mermaid 先占位，image 在
     # 剩余空位里按段补。prefer_mermaid=False 时两类合并竞争同一配额，
     # 见下方 merged 分支——两条路径互斥，否则会双双执行、突破 max_ai_images。
+    # ENHANCE 2026-11-04（需求·全部自动生成不设生图）：AI 生图功能已产品级
+    # 关闭（illustration_phase 对 image 恒跳过 ai_image_disabled，全仓无启用
+    # 配置），此前仍分配 illustration_type="ai" 且占 max_ai_images 配额——
+    # 配额被空转消耗、mermaid/chart 候选被挤出，用户不可见。现不再为
+    # image 候选分配任何类型，配额让给 mermaid/chart。
     if prefer_mermaid and max_ai_images > 0:
         ai_quota_per_seg = max(1, max_ai_images // segments)
         remaining_quota = max_ai_images
         for seg in range(segments):
             if remaining_quota <= 0:
                 break
-            seg_im = [(i, pr) for i, pr in image_candidates
-                      if _segment_of(i) == seg
-                      and plans[i].get("illustration_type") is None]  # 已占位的跳过
-            if not seg_im:
+            seg_ct2 = [(i, pr) for i, pr in chart_candidates
+                       if _segment_of(i) == seg
+                       and plans[i].get("illustration_type") is None]
+            if not seg_ct2:
                 continue
-            seg_im.sort(key=lambda x: -x[1])
-            seg_pick_count = min(ai_quota_per_seg, len(seg_im), remaining_quota)
-            for pick_idx, _ in seg_im[:seg_pick_count]:
-                plans[pick_idx]["illustration_type"] = "ai"
+            seg_ct2.sort(key=lambda x: -x[1])
+            seg_pick_count = min(ai_quota_per_seg, len(seg_ct2), remaining_quota)
+            for pick_idx, _ in seg_ct2[:seg_pick_count]:
+                plans[pick_idx]["illustration_type"] = "chart"
                 remaining_quota -= 1
 
     # 关闭 prefer_mermaid 时，各类候选合并按 priority 竞争同一配额
+    # （ENHANCE 2026-11-04：image 候选已产品级关闭，不再进入合并竞争）
     if not prefer_mermaid and max_ai_images > 0:
         merged = ([(i, pr, "mermaid") for i, pr in mermaid_candidates]
-                  + [(i, pr, "image") for i, pr in image_candidates]
                   + [(i, pr, "chart") for i, pr in chart_candidates])
-        merged.sort(key=lambda x: (-x[1], 0 if x[2] == "image" else 1))
+        merged.sort(key=lambda x: (-x[1], 1))
         remaining = max_ai_images
         for idx, _pr, kind in merged:
             if plans[idx].get("illustration_type") is not None:

@@ -664,6 +664,46 @@ def _normalize_review_placeholders(template: str) -> str:
     return template
 
 
+def _normalize_review_placeholders_dynamic(template: str) -> str:
+    """BUG-FIX-PROMPT-M7（2026-11-04，DB 新增占位符泄漏）：白名单版
+    ``_normalize_review_placeholders`` 只认 4 个固定名字——管理员在 DB 里给
+    OUTLINE_REVIEW_* 新增占位符（如 ``{WRITING_LENGTH}``）时，该占位符既不被
+    规范化、也不在 mapping/labels 里，会以字面量 ``{WRITING_LENGTH}`` 原样
+    发给模型（2026-10-23 P1 同类盲区复发，触发源从"模板风格"变为"DB 定制"）。
+
+    现叠加动态派生：对 ``extract_variables``（与注册表/渲染器完全同口径的
+    保守占位符模式）识别出的全部 {VAR} 一并规范化为 __VAR__。经实测两个
+    审核模板的 extract_variables 结果与固定名单完全一致——本改造对现状
+    零行为变化，仅对未来 DB 定制生效；JSON 示例花括号（带引号/逗号/空白
+    形态）天然不被该模式匹配，不受影响。
+    """
+    try:
+        from .prompts import extract_variables
+
+        for _name in extract_variables(template):
+            template = template.replace("{" + _name + "}", "__" + _name + "__")
+    except Exception:  # 动态派生失败时退化为白名单行为
+        pass
+    return template
+
+
+def _warn_residual_review_placeholders(template: str) -> None:
+    """填充后仍有残留占位符时告警（可观测性：DB 定制引入未知变量时可见）。"""
+    try:
+        from .prompts import extract_variables, has_residual_placeholders
+
+        if template and has_residual_placeholders(template):
+            leftover = [v for v in extract_variables(template)]
+            dunder = re.findall(r"__([A-Z][A-Z0-9_]{1,})__", template)
+            if leftover or dunder:
+                logger.warning(
+                    "目录审核提示词填充后仍有未注入的占位符（DB 定制超出映射名单？）: %s",
+                    sorted(set(leftover) | set(dunder)),
+                )
+    except Exception:
+        pass
+
+
 def _build_outline_review_texts(
     scoring_points: str,
     outline: str,
@@ -684,8 +724,10 @@ def _build_outline_review_texts(
     """
     review_sys = get_prompt("OUTLINE_REVIEW_SYSTEM")
     review_user = get_prompt("OUTLINE_REVIEW_USER")
-    review_sys = _normalize_review_placeholders(review_sys)
-    review_user = _normalize_review_placeholders(review_user)
+    # BUG-FIX-PROMPT-M7：先动态派生规范化（覆盖 DB 定制新增占位符），再过白名单
+    # 兜底（两步幂等：已规范化名不会二次替换）。
+    review_sys = _normalize_review_placeholders(_normalize_review_placeholders_dynamic(review_sys))
+    review_user = _normalize_review_placeholders(_normalize_review_placeholders_dynamic(review_user))
     # SECURITY 2026-10-06：审核链路注入的评分点/目录/概述均为外部衍生数据，开启
     # sanitize=True 与全平台高注入风险链路（workflows_analysis）口径对齐，做
     # 元标记中和纵深防御；默认脱敏保持关闭以免误伤结构化文本（如需再开 desensitize）。
@@ -701,6 +743,9 @@ def _build_outline_review_texts(
         labels=_OUTLINE_REVIEW_LABELS,
         sanitize=True,
     )
+    # BUG-FIX-PROMPT-M7：填充后残留占位符告警（DB 定制引入未知变量时可观测）
+    _warn_residual_review_placeholders(review_sys_text)
+    _warn_residual_review_placeholders(review_user_text)
     return review_sys_text, review_user_text
 
 

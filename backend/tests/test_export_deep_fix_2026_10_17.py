@@ -8,7 +8,7 @@
 | FIX-B | P2 | services/export.py:`_EXPORT_ARTIFACT_SUFFIXES` | 孤儿清理白名单补齐 `.dotx`，与 routers/export.py 下载白名单收敛一致 |
 | FIX-C | P2 | services/export.py:`_atomic_save_docx` | Windows 目标文件被占用时 `os.replace` 抛 PermissionError → 重试 + 独立文件名兜底，导出不因占用整体失败 |
 | FIX-D | P3 | services/export.py:`build_docx` | 改为先写 exports 表、成功后再登记缓存索引，消除「缓存有记录、DB 无记录」幽灵缓存 |
-| R-3   | P3 | services/export_chart_pipeline.py 图表 hash 缓存 | 补齐 LRU 容量淘汰路径测试（此前仅验证条目为 bytes 类型） |
+| R-3   | P3 | ~~services/export_chart_pipeline.py 图表 hash 缓存~~ | （TD-1 2026-11-02：该 hash 缓存系列为未接线死代码已删除，R-3 测试类随之移除；L1 容量淘汰行为由 export_cache X-9 测试覆盖） |
 
 全部先复现后修复，测试钉住修复后行为；运行：`py -3 -m pytest tests/test_export_deep_fix_2026_10_17.py -v`
 """
@@ -25,7 +25,8 @@ from docx import Document
 from app.db import get_db, init_db
 from app.models import ExportConfig
 from app.services import export as export_mod
-from app.services import export_chart_pipeline as chart_pipeline_mod
+# TD-1（2026-11-02）：export_chart_pipeline 的 _CHART_HASH_CACHE 死代码系列
+# 已删除，R-3 测试类随之移除，本文件不再需要 chart_pipeline_mod。
 
 
 OWNER = 4401
@@ -232,27 +233,8 @@ class TestCacheDbWriteOrdering:
         assert export_id is None
         assert cache_calls == [], "DB 写入失败时不得登记缓存索引（避免幽灵缓存）"
 
-
-# ============================================================================
-# R-3 —— 图表 hash 缓存 LRU 容量淘汰路径
-# ============================================================================
-
-
-class TestChartHashCacheLruEviction:
-    """R-3：_CHART_HASH_CACHE_MAX_SIZE 限制下，超量写入时淘汰最旧条目。"""
-
-    def test_lru_eviction_on_overflow(self, monkeypatch):
-        chart_pipeline_mod.clear_chart_hash_cache()
-        monkeypatch.setattr(chart_pipeline_mod, "_CHART_HASH_CACHE_MAX_SIZE", 2)
-        codes = ["flowchart TD\n A-->B", "graph LR\n C-->D", "gantt\n title t"]
-        for c in codes:
-            chart_pipeline_mod._cache_chart_render(c, b"PNGDATA")
-        # 容量上限 2：写入 3 条后应淘汰最旧 1 条，仅剩 2 条
-        with chart_pipeline_mod._CHART_HASH_CACHE_LOCK:
-            size = len(chart_pipeline_mod._CHART_HASH_CACHE)
-        assert size == 2, f"LRU 淘汰后缓存大小应为 2，实际 {size}"
-        # 最旧条目（第一条 code）应已被淘汰
-        assert chart_pipeline_mod._get_cached_chart_render(codes[0]) is None
-        # 最新两条仍在
-        assert chart_pipeline_mod._get_cached_chart_render(codes[2]) is not None
-        chart_pipeline_mod.clear_chart_hash_cache()
+# TD-1 清理（2026-11-02）：原 R-3「TestChartHashCacheLruEviction」针对
+# export_chart_pipeline.py 中从未接线生产的 _CHART_HASH_CACHE 死代码，
+# 随该系列删除；容量淘汰断言已迁移至
+# tests/test_chart_performance_p3_2026_10_17.py::TestL1RenderCacheEviction
+# （export_cache 生产 L1 渲染缓存）。

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 from io import BytesIO
+from typing import Any
 
 from PIL import Image, ImageDraw
 
@@ -946,9 +947,10 @@ def flowchart_json_to_mermaid(data: dict) -> str:
         if direction not in ("TD", "LR", "RL", "BT"):
             direction = "TD"
         lines = [f"flowchart {direction}"]
-        title = data.get("title")
-        if title:
-            lines.append(f"    title {title}")
+        # BUG-FIX 2026-11-04（P2·非法 title 行）：Mermaid flowchart 语法不支持
+        # `title` 语句（仅 frontmatter/部分图类型支持），此前的 `    title {title}`
+        # 行会让 HTTP 渲染服务解析失败、validate_mermaid 判「不支持的行」。
+        # 图题由载荷包装器/引导语承载（图题四级优先级），代码内不再内嵌。
 
         # 节点定义
         for node in norm_nodes:

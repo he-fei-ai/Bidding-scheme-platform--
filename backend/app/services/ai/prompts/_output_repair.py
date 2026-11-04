@@ -134,13 +134,20 @@ async def repair_json_output(
     error_info: str = "",
     target_schema: str = "",
     max_retries: int = 1,
+    max_input_chars: int = 2000,
 ) -> tuple[Any | None, bool]:
-    """统一 JSON 输出修复入口。
+    """统一 JSON 输出修复入口（独立/轻量场景）。
 
     流程：
     1. 静态修复：剥离围栏 + 提取 JSON 主体
     2. 尝试解析：成功则直接返回
     3. AI 修复：解析失败则调用 JSON_REPAIR_PROMPT 修复
+
+    定位说明（UNIFY-R4 2026-11-04）：workflows_base.collect_json_response 内含
+    **更重的修复链**（json_mode 降级、错误对象识别、schema 校验、重试）且已在
+    使用本模块的 extract_json_body/try_parse_json 原语——那是生产主路径，勿用
+    本函数替换。本函数服务于「无 schema 校验循环的独立 AI 调用点」的一次性
+    修复需求（如工具脚本、管理端诊断），与主链路共享 JSON_REPAIR_PROMPT。
 
     Args:
         provider: AI provider 实例
@@ -148,6 +155,10 @@ async def repair_json_output(
         error_info: 校验失败的错误信息
         target_schema: 目标 Schema 描述
         max_retries: AI 修复最大重试次数
+        max_input_chars: 回喂修复模型的原始输出截断上限（token 保护）。
+            UNIFY-R4：原为硬编码 ``[:2000]`` 且不可配置——超长 JSON（图表数据
+            常态）被截断后修复模型只见前 2000 字符，"保留原有内容"的最小修改
+            原则无从谈起。现参数化，默认值与历史行为一致（向后兼容）。
 
     Returns:
         (解析后的数据, 是否成功)
@@ -173,7 +184,7 @@ async def repair_json_output(
 
     for attempt in range(max_retries):
         user_msg = f"""原始输出：
-{raw_output[:2000]}
+{raw_output[:max(0, max_input_chars)]}
 
 错误信息：
 {error_info or err}

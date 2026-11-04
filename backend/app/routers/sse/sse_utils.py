@@ -1221,7 +1221,15 @@ def _build_leaf_dicts(
                 # L3 自身正文（三级目录）：用于生成与校验的独立标识
                 # L3 自身正文不含下级目录章节；只有存在 L4+ 子目录时
                 # 四档口径（子树总字数）才参与校验。
-                "is_l3_own": leaf.get("level") == 3,
+                # BUG-FIX 2026-11-05（字数口径 · 含下级 L3 误判为 L3-own）：旧实现
+                # `leaf.get("level") == 3` 对**含 L4+ 子目录**的 L3 也恒为 True，
+                # 而 child_chapters（L1226-1237）已按真实子节点填充 → 该类 L3 被
+                # word_target_resolver（lvl==3 且 is_l3_own 为真 → 300±20%）与
+                # workflows_sections 按「L3 自身正文 300 字」控制，而非四档子树
+                # 总字数口径。与 word_count.py::_is_l3_own_section（按 parent_id
+                # 区分）及 writing_length_config 设计注释对齐：仅**叶子** L3 才是
+                # L3-own；存在子目录时按子树总字数参与校验。
+                "is_l3_own": leaf.get("level") == 3 and not children_map.get(leaf["id"]),
                 # L3 下级目录章节（仅当存在 L4+ 时才有真实子目录）
                 "child_chapters": [
                     {

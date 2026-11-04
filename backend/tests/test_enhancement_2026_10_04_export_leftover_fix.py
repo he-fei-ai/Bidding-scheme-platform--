@@ -535,8 +535,13 @@ class TestConvertDocxToPdf:
         converted = {"n": 0}
 
         def _fake_run(cmd, **kw):
+            # 2026-11-03 适配（临时 outdir + 原子收编）：LibreOffice 现写
+            # --outdir 指向的同卷临时目录，由实现负责原子搬到终态位。
+            # 钉子意图不变：mtime 相等 → 必须重新转换并以新产物收编。
             converted["n"] += 1
-            pdf.write_bytes(b"freshly converted pdf")  # 模拟 LibreOffice 覆写产物
+            _outdir = Path(cmd[cmd.index("--outdir") + 1])
+            _outdir.mkdir(parents=True, exist_ok=True)
+            (_outdir / pdf.name).write_bytes(b"freshly converted pdf")
             return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
 
         monkeypatch.setattr(pdf_export.subprocess, "run", _fake_run)
@@ -553,12 +558,16 @@ class TestConvertDocxToPdf:
 
         def _fake_run(cmd, **kw):
             captured["cmd"] = [str(c) for c in cmd]
-            target.write_bytes(b"pdf!")
+            # 2026-11-03 适配：产物写 --outdir 临时目录（实现负责原子收编终态位）
+            _outdir = Path(cmd[cmd.index("--outdir") + 1])
+            _outdir.mkdir(parents=True, exist_ok=True)
+            (_outdir / target.name).write_bytes(b"pdf!")
             return SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
 
         monkeypatch.setattr(pdf_export.subprocess, "run", _fake_run)
         out = pdf_export.convert_docx_to_pdf(docx)
         assert out == target
+        assert target.read_bytes() == b"pdf!", "临时产物必须被原子收编到终态位"
         assert any(str(c).startswith("-env:UserInstallation=") for c in captured["cmd"]), (
             "必须使用独立 UserInstallation profile（并发多转换时共享 profile 会静默失败）"
         )

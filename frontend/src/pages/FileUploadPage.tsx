@@ -655,7 +655,9 @@ export default function FileUploadPage() {
       <Space direction="vertical" size={18} style={{ width: "100%" }}>
         {parseStatusText ? (
           <Alert
-            type={parseStatus && parseStatus.recent_failed > 0 ? "warning" : "info"}
+            // F-12-3 2026-11-04：recent_failed 已随 idle 响应对齐改为可选字段，
+            // 空值兜底为 0（undefined > 0 虽运行时为 false，但类型层面不合格）
+            type={parseStatus && (parseStatus.recent_failed ?? 0) > 0 ? "warning" : "info"}
             showIcon
             style={{ borderRadius: 8 }}
             message={parseStatusText}

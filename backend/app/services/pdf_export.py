@@ -134,6 +134,14 @@ def convert_docx_to_pdf(docx_path: Path, *, timeout_seconds: int = 180) -> Path:
         return target
 
     profile_dir = Path(tempfile.gettempdir()) / f"lo_profile_{uuid.uuid4().hex[:8]}"
+    # BUG-FIX 2026-11-03（P3·/pdf 并发转换竞态，第九轮报告 §7-1）：原实现
+    # `--outdir docx_path.parent` 让 LibreOffice 直接写最终目标 `{name}.pdf`——
+    # 同一 export_id 并发 /pdf 时两个 soffice 实例同写一个目标文件（半写状态
+    # 被对方读走/收编），且转换中途失败会摧毁既有的旧 PDF。现改为：产物先落
+    # 「同卷独立临时目录」，再原子 os.replace 收编到目标位——目标路径上的文件
+    # 要么不存在、要么是完整 PDF；并发窗口内后完成者发现目标已「明确新于源」
+    # 则直接复用对方的产物，不再覆盖。
+    tmp_outdir = docx_path.parent / f".pdf_tmp_{uuid.uuid4().hex[:12]}"
     profile_uri = profile_dir.as_uri()
     cmd = [
         soffice,
@@ -143,21 +151,37 @@ def convert_docx_to_pdf(docx_path: Path, *, timeout_seconds: int = 180) -> Path:
         "--convert-to",
         "pdf",
         "--outdir",
-        str(docx_path.parent),
+        str(tmp_outdir),
         str(docx_path),
     ]
     logger.info("开始 PDF 转换: %s -> %s", docx_path.name, target.name)
     try:
-        proc = subprocess.run(cmd, capture_output=True, timeout=timeout_seconds, check=False)
-    except subprocess.TimeoutExpired as e:
-        raise RuntimeError(f"PDF 转换超时（>{timeout_seconds}s），请稍后重试") from e
+        try:
+            proc = subprocess.run(cmd, capture_output=True, timeout=timeout_seconds, check=False)
+        except subprocess.TimeoutExpired as e:
+            raise RuntimeError(f"PDF 转换超时（>{timeout_seconds}s），请稍后重试") from e
+        tmp_outdir.mkdir(parents=True, exist_ok=True)
+        tmp_pdf = tmp_outdir / target.name
+        if not tmp_pdf.exists():
+            raise RuntimeError(
+                "LibreOffice 未生成 PDF（exit=%d）: %s"
+                % (proc.returncode, (proc.stderr or proc.stdout or b"").decode("utf-8", "replace")[:200])
+            )
+        if target.exists() and target.stat().st_mtime > docx_path.stat().st_mtime:
+            # 并发竞态收口：另一请求已完成转换并收编，直接复用其产物（省一次覆盖）
+            logger.info("并发转换竞态：目标 PDF 已由并行请求产出且明确新于源，复用: %s", target.name)
+        else:
+            try:
+                os.replace(tmp_pdf, target)
+            except OSError:
+                # Windows 下目标 PDF 被并发读句柄短暂占用时 replace 可能失败：
+                # 小退避重试一次（瞬态；持续失败则向上抛 500，旧产物未被破坏）
+                time.sleep(0.2)
+                os.replace(tmp_pdf, target)
+        logger.info("PDF 转换完成: %s (%d bytes)", target.name, target.stat().st_size)
+        return target
     finally:
-        # LibreOffice 退出后 profile 目录无保留价值；失败也清理，避免 temp 堆积
+        # LibreOffice 退出后 profile 目录与临时产物目录均无保留价值；失败也清理，
+        # 避免 temp/导出目录堆积（失败路径上既有旧 PDF 保持原样未受损）
         shutil.rmtree(profile_dir, ignore_errors=True)
-    if not target.exists():
-        raise RuntimeError(
-            "LibreOffice 未生成 PDF（exit=%d）: %s"
-            % (proc.returncode, (proc.stderr or proc.stdout or b"").decode("utf-8", "replace")[:200])
-        )
-    logger.info("PDF 转换完成: %s (%d bytes)", target.name, target.stat().st_size)
-    return target
+        shutil.rmtree(tmp_outdir, ignore_errors=True)

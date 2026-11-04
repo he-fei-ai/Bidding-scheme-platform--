@@ -263,6 +263,40 @@ def test_claim_chart_title_dedupes_within_chapter():
     assert _claim_chart_title("7", "环保与速干材料交叉施工协调") is True
 
 
+def test_unclaim_chart_title_releases_phantom_claim():
+    """BUG-FIX 2026-11-06：单图渲染失败时撤销图题登记，后续同名图可重新登记。
+
+    背景：`_claim_chart_title` 在渲染**前**登记图题，而单图渲染失败只回滚图号
+    （_rewind_figure_number），不回滚图题登记 → 本章后续同名图被判「重复」而
+    静默跳过，正文出现「有图题无图」的缺失。`_unclaim_chart_title` 与其对称，
+    撤销后允许同名图重新登记并渲染。
+    """
+    from app.services.export_cache import (
+        _claim_chart_title,
+        _unclaim_chart_title,
+        _used_chart_titles_ctx_var,
+    )
+
+    token = _used_chart_titles_ctx_var.set({})
+    try:
+        # 首次登记成功
+        assert _claim_chart_title("7", "施工进度计划") is True
+        # 同名（含图号/冒号归一）重复 → 跳过
+        assert _claim_chart_title("7", "图7-1：施工进度计划") is False
+        # 撤销后同名图可重新登记（模拟失败图表的图题释放）
+        _unclaim_chart_title("7", "施工进度计划", None)
+        assert _claim_chart_title("7", "施工进度计划") is True
+        # 跨章撤销不影响其他章
+        assert _claim_chart_title("8", "施工进度计划") is True
+        _unclaim_chart_title("7", "施工进度计划", None)
+        assert _claim_chart_title("8", "施工进度计划") is False  # 第8章仍登记
+    finally:
+        _used_chart_titles_ctx_var.reset(token)
+
+    # 上下文缺席（非导出链路直接调用）→ 空操作，不抛异常
+    _unclaim_chart_title("7", "施工进度计划", None)
+
+
 def test_export_media_types_constant_consistency():
     """TECH-DEBT 2026-10-27（单一事实来源）：download_export / download_latest 曾各自
     内联同一份 _MEDIA_TYPES dict，后收敛为 routers/export.py:EXPORT_MEDIA_TYPES，

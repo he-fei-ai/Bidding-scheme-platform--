@@ -193,13 +193,16 @@ class TestAdjudicateChart:
         assert out[0]["illustration_type"] == "mermaid"
 
     def test_chart_and_image_can_coexist_in_different_sections(self):
+        """ENHANCE 2026-11-04（不设生图）：image 候选不再被分配任何类型
+        （原分配 "ai" 后被 execute 阶段恒跳过 ai_image_disabled，配额空转
+        挤占 mermaid/chart），chart 候选不受影响。"""
         plans = [self._plan(f"{i}") for i in range(1, 4)]
         plans[0]["plan"]["chart"]["needed"] = True
         plans[2]["plan"]["image"]["needed"] = True
         out = _adjudicate_illustrations(plans, max_ai_images=2)
         kinds = {p["section_id"]: p["illustration_type"] for p in out}
         assert kinds["1"] == "chart"
-        assert kinds["3"] == "ai"
+        assert kinds["3"] == "none"  # 生图已产品级关闭：image 提名不再占用类型槽位
 
     def test_merged_mode_includes_chart(self):
         plans = [self._plan("1", chart=True), self._plan("2", mermaid=True)]

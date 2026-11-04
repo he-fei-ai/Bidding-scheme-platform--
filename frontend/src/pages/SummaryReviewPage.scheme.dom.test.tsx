@@ -15,6 +15,7 @@
  * 依赖未安装时整组 skip，不阻塞纯函数测试。
  */
 import { describe, it, expect, vi, beforeAll, beforeEach } from "vitest";
+import type { AnalysisResult } from "../types";
 
 const hasDom = typeof window !== "undefined" && typeof document !== "undefined";
 
@@ -37,7 +38,10 @@ const TEMPLATE = {
 
 const apiMock = {
   getProject: vi.fn(async () => ({ id: 1, name: "测试项目" })),
-  getAnalysis: vi.fn(async () => ({
+  // 2026-11-02：显式锚定 getAnalysis 真实返回类型（AnalysisResult，
+  // scheme_extraction 为可选字段）—— 否则 TS 会从下方默认 mock 的对象形状
+  // 推断 scheme_extraction 必填，导致「未解析」用例无法整体省略该字段。
+  getAnalysis: vi.fn(async (): Promise<AnalysisResult> => ({
     summary_json: "摘要",
     scoring_points_json: "[]",
     boq_json: "[]",
@@ -48,6 +52,7 @@ const apiMock = {
     confirmed_boq: false,
     confirmed_work_interface: false,
     confirmed_construction_method: false,
+    scope: "",
     scheme_extraction: EXTRACTION,
   })),
   generateSummary: vi.fn(),
@@ -174,7 +179,12 @@ describe.skipIf(!hasDom)("SummaryReviewPage 专项方案解析 Tab 级交互", (
       confirmed_boq: false,
       confirmed_work_interface: false,
       confirmed_construction_method: false,
-      scheme_extraction: {},
+      scope: "",
+      // 2026-11-02：`scheme_extraction` 在 AnalysisResult 上为可选字段、
+      // 未解析时后端不下发（types/index.ts「未解析时为 {}」注释）。
+      // 此处必须整体省略：若填五键空数组，SummaryReviewPage 的
+      // `Object.keys(schemeExtraction || {}).length > 0` 会把「无结果」误判为
+      // 「已解析」，按钮变「重新解析」，本用例的「开始解析」断言即失败。
     });
 
     const Page = (await import("./SummaryReviewPage")).default;
@@ -221,6 +231,74 @@ describe.skipIf(!hasDom)("SummaryReviewPage 专项方案解析 Tab 级交互", (
     expect(await rtl.screen.findByText("该专项任务未成功")).toBeTruthy();
     expect(await rtl.screen.findByText("AI 超时")).toBeTruthy();
 
+    rtl.cleanup();
+  });
+
+  // L1(2026-11-03)：按钮判定改为后端显式状态位 `scheme_extracted` 优先。
+  // 两组用例分别钉住「状态位权威」与「老后端回退」两个方向：
+  it("scheme_extracted=true 且五类全空（解析过但无结果）→ 显示「重新解析」", async () => {
+    const rtl = await loadRtl();
+    if (!rtl) return;
+    await cleanDom(rtl);
+
+    // 解析器五类全空的落库形态：五键空数组。keys>0 会被旧判定当成
+    // 「未解析」，现在以后端状态位为准 → 「重新解析」。
+    apiMock.getAnalysis.mockResolvedValueOnce({
+      summary_json: "摘要",
+      scoring_points_json: "[]",
+      boq_json: "[]",
+      work_interface_json: "[]",
+      construction_method_json: "[]",
+      confirmed_summary: true,
+      confirmed_scoring: true,
+      confirmed_boq: false,
+      confirmed_work_interface: false,
+      confirmed_construction_method: false,
+      scope: "",
+      scheme_extraction: {
+        project_overview: [],
+        scheme_type: [],
+        dangerous_work_params: [],
+        basis_list: [],
+        construction_condition: [],
+      },
+      scheme_extracted: true,
+    } as AnalysisResult);
+
+    const Page = (await import("./SummaryReviewPage")).default;
+    rtl.render(<Page />);
+
+    expect(await rtl.screen.findByText("重新解析")).toBeTruthy();
+    rtl.cleanup();
+  });
+
+  it("scheme_extracted=false 优先于 keys 判定（状态位权威）→ 显示「开始解析」", async () => {
+    const rtl = await loadRtl();
+    if (!rtl) return;
+    await cleanDom(rtl);
+
+    // 反向钉子：即使 scheme_extraction 里残留内容（keys>0），后端明确说
+    // 「未解析」时以状态位为准，不再被隐式 keys 判定反向覆盖。
+    apiMock.getAnalysis.mockResolvedValueOnce({
+      summary_json: "摘要",
+      scoring_points_json: "[]",
+      boq_json: "[]",
+      work_interface_json: "[]",
+      construction_method_json: "[]",
+      confirmed_summary: true,
+      confirmed_scoring: true,
+      confirmed_boq: false,
+      confirmed_work_interface: false,
+      confirmed_construction_method: false,
+      scope: "",
+      scheme_extraction: EXTRACTION,
+      scheme_extracted: false,
+    } as AnalysisResult);
+
+    const Page = (await import("./SummaryReviewPage")).default;
+    rtl.render(<Page />);
+
+    expect(await rtl.screen.findByText("开始解析")).toBeTruthy();
     rtl.cleanup();
   });
 

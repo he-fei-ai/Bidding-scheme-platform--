@@ -36,7 +36,6 @@ from ..db import DatabaseWriteLockTimeout, get_db
 from ..models import ReorderRequest, SectionCreate, SectionUpdate
 from ..security.auth import get_current_user
 from ..services.generation_manager import generation_manager
-from ..services.task_guard import reject_if_generation_running as _reject_if_generation_running
 from ..services.sections import build_tree, clear_project_sections, create_section, delete_section_tree, get_section, get_section_word_budget, list_sections, move_section, reorder_sections, update_section
 from ..services.v51_state import cancel_v51_task, clear_v51_state_from_db, get_v51_confirm_version, get_v51_last_reject_reason, get_v51_state, load_v51_state_from_db, resume_v51_task
 from .rate_limiter import limit_per_endpoint
@@ -271,9 +270,18 @@ async def generate_content(request: Request, project_id: int, writing_length: st
         # 被 422 拒绝。权威 key 见 writing_length_config.WRITING_LENGTH_TIER_CONFIG；
         # 旧别名（short/extra_long）仍接受并交由 normalize_writing_length 归一化
         # （向后兼容旧调用方），故白名单 = 权威 key + 旧别名全集。
-        from ..services.ai.writing_length_config import normalize_writing_length as _norm_wl
+        from ..services.ai.writing_length_config import (
+            is_valid_writing_length as _is_valid_wl,
+        )
         valid_lengths = ('brief', 'standard', 'detailed', 'long')
-        if _norm_wl(writing_length) not in valid_lengths:
+        # BUG-FIX 2026-11-05（writing_length 422 死代码）：旧实现用
+        # `_norm_wl(writing_length) not in valid_lengths`，而
+        # normalize_writing_length 对非法输入回落到 DEFAULT_WORD_COUNT_TIER
+        # （== "standard"，恰在 valid_lengths 内）→ 该条件恒为 False，422 永不
+        # 触发，用户拼错档位 key（如 "standrad"）被静默按 standard 生成。
+        # 改在**归一化前**用 is_valid_writing_length 判定原始值（权威 key +
+        # 旧别名全集），真正非法值才拒绝；权威 key / 旧别名仍放行，向后兼容。
+        if not _is_valid_wl(writing_length):
             raise HTTPException(status_code=422, detail=f'writing_length 必须是 {valid_lengths} 之一')
     except HTTPException as _e:
         _error_detail = _e.detail
@@ -779,273 +787,31 @@ async def expand_content(request: Request, project_id: int, writing_length: str=
     _reject_if_generation_running(project_id)
     # BUG-FIX 2026-10-28（P1 前后端不同步）：同 generate-content，权威 key
     # brief/standard/detailed/long，旧别名交 normalize 归一化（向后兼容）。
-    from ..services.ai.writing_length_config import normalize_writing_length as _norm_wl
+    # BUG-FIX 2026-11-04（P3·422 死代码）：`_norm_wl` 对非法输入回落
+    # DEFAULT_WORD_COUNT_TIER（恰在 valid_lengths 内）→ 旧校验恒 False，
+    # 拼错档位被静默按 standard 扩写。与 generate-content（上方 L275-286）
+    # 同口径，改用归一化前的 is_valid_writing_length，真正非法值才 422。
+    from ..services.ai.writing_length_config import is_valid_writing_length as _is_valid_wl
     valid_lengths = ('brief', 'standard', 'detailed', 'long')
-    if _norm_wl(writing_length) not in valid_lengths:
+    if not _is_valid_wl(writing_length):
         raise HTTPException(status_code=422, detail=f'writing_length 必须是 {valid_lengths} 之一')
     return await expand_content_impl(project_id, writing_length, level2_default, concurrency)
 
-@router.post('/{section_id}/generate-illustration')
-async def generate_illustration(section_id: int, project_id: int, request: Request, prompt: str='', style: str='engineering_diagram', size: str='16:9', current_user: Annotated[Any, Depends(get_current_user)]=None):
-    """为章节生成配图（三步：AI 编排 → AI 生成提示词 → AI 生成图像）"""
-    from ..services.ai.image_engine import build_illustration_url, generate_illustration_arrange, generate_illustration_image, generate_illustration_prompt
-    if current_user:
-        await require_project_permission(project_id, current_user)
-    section = get_section(section_id)
-    if not section:
-        raise HTTPException(status_code=404, detail='章节不存在')
-    if section.project_id != project_id:
-        raise HTTPException(status_code=404, detail='章节不属于该项目')
-    from ..services.ai.provider_factory import create_provider, get_ai_config
-    ai_config = get_ai_config()
-    if not ai_config or not ai_config.get('api_key'):
-        return {'success': False, 'error': '请先配置文本模型 API Key'}
-    text_provider = create_provider(ai_config)
-    from ..services.ai.image_providers.service import load_image_config
-    image_config = load_image_config()
-    all_sections = await asyncio.to_thread(list_sections, project_id, readonly=True)
-    overview_section = next((s for s in all_sections if s.title == '项目概述'), None)
-    industry_profile = (ai_config or {}).get('document_profile', '')
-    arrange_result = await generate_illustration_arrange(text_provider, section_title=section.title or '', section_content=section.content or '', project_overview=overview_section.content if overview_section else '', industry_profile=industry_profile)
-    if not arrange_result.get('needed', False):
-        _prev_url = ''
-        if section.illustration_data:
-            try:
-                _prev_url = json.loads(section.illustration_data).get('image_url', '') or ''
-            except Exception:
-                _prev_url = ''
-                logger.warning('[配图] illustration_data 损坏，无法解析: section_id=%d', section_id)
-        return {'success': True, 'imageUrl': _prev_url, 'image_url': _prev_url, 'style': section.illustration_type or 'engineering_diagram', 'prompt': '', 'description': '', 'reason': arrange_result.get('reason', '该章节内容不需要配图'), 'step': 'arrange'}
-    prompt_result = await generate_illustration_prompt(text_provider, section_title=section.title or '', section_content=section.content or '', section_path='...', industry_profile=industry_profile)
-    generated_prompt = prompt_result.get('prompt', prompt or arrange_result.get('reason', ''))
-    generated_style = prompt_result.get('style', style)
-    generated_description = prompt_result.get('description', '')
-    image_url = None
-    _image_key = (image_config or {}).get('image_api_key_enc') or ''
-    if image_config and image_config.get('image_enabled', True) and _image_key:
-        image_url = await generate_illustration_image(text_provider, prompt=generated_prompt, style=generated_style, section_size=size, provider_name=image_config.get('image_provider', 'agnes'), image_config=image_config)
-        _last_step = 'image'
-    else:
-        _last_step = 'arrange'
-        if not _image_key:
-            image_url = build_illustration_url(generated_prompt, image_size='landscape_16:9')
-        else:
-            image_url = None
-    if not image_url:
-        image_url = build_illustration_url(generated_prompt, image_size='landscape_16:9')
-    try:
-        from ..db import get_db_with_retry
 
-        # PERF（2026-10-05）：持久化写操作派发至工作线程（写锁在 worker 阻塞）
-        def _persist_illustration():
-            with get_db_with_retry() as conn:
-                conn.execute("UPDATE sections SET illustration_type = ?, illustration_data = ?, updated_at = datetime('now', 'localtime') WHERE id = ?", (generated_style, json.dumps({'prompt': generated_prompt, 'style': generated_style, 'description': generated_description, 'image_url': image_url, 'image_size': size}, ensure_ascii=False), section_id))
-                conn.commit()
+# ILLUSTRATION-REMOVAL 2026-11-04（遗留项3·生图功能下线）：已移除
+# POST /{section_id}/generate-illustration 端点（AI 编排→提示词→生图三步）。
+# 产品口径：图表全部自动生成（正文内联 ```mermaid / ```chart-json 围栏 + SSE
+# 自动编排），不设人工配图/生图入口；前端 API 此前已删（api/index.ts 注释
+# 「已移除人工配图 generate-illustration 前端 API」），全仓仅 test_integration
+# 2 例绑定（已改为「端点已下线」404 契约）。image_engine 中仅本端点消费的
+# generate_illustration_arrange/prompt/image 与 build_illustration_url 同批删除。
+# sections.illustration_type/illustration_data 列保留（NULLable schema 列，
+# 删列需迁移且无实害；现全仓无写入方）。
 
-        await asyncio.to_thread(_persist_illustration)
-    except Exception as e:
-        logger.warning('持久化配图结果失败: %s', e)
-        return {'success': False, 'error': '配图已生成但保存失败，请重试'}
-    return {'success': True, 'imageUrl': image_url, 'image_url': image_url, 'style': generated_style, 'prompt': generated_prompt, 'description': generated_description, 'reason': arrange_result.get('reason', ''), 'step': _last_step}
-
-@router.post('/{section_id}/generate-flowchart')
-async def generate_flowchart(section_id: int, project_id: int, current_user: Annotated[Any, Depends(get_current_user)]=None):
-    """AI 生成流程图（Mermaid）"""
-    if current_user:
-        await require_project_permission(project_id, current_user)
-    section = get_section(section_id)
-    if not section:
-        raise HTTPException(status_code=404, detail='章节不存在')
-    if section.project_id != project_id:
-        raise HTTPException(status_code=404, detail='章节不属于该项目')
-    from ..services.ai.provider_factory import create_provider, get_ai_config
-    ai_config = get_ai_config()
-    if not ai_config or not ai_config.get('api_key'):
-        raise HTTPException(status_code=503, detail='未配置 AI 模型，请先在管理页面配置')
-    provider = create_provider(ai_config)
-    if not provider:
-        raise HTTPException(status_code=503, detail='无法创建 AI 提供商')
-    getattr(section, 'summary', '') or ''
-    scoring_standard = getattr(section, 'scoring_standard', '') or ''
-    industry_profile = getattr(section, 'industry_profile', '') or ''
-    project_overview = getattr(section, 'project_overview', '') or ''
-    from ..services.ai.image_engine import generate_mermaid_flowchart, validate_mermaid
-    mermaid_code = await generate_mermaid_flowchart(provider, section_title=section.title, section_content=section.content or '', scoring_standard=scoring_standard, industry_profile=industry_profile, project_overview=project_overview)
-    valid, _ = validate_mermaid(mermaid_code)
-    return {'mermaid_code': mermaid_code, 'valid': valid}
-
-@router.post('/{section_id}/arrange-flowchart')
-async def arrange_flowchart(section_id: int, project_id: int, current_user: Annotated[Any, Depends(get_current_user)]=None):
-    """AI 编排判断：是否需要流程图"""
-    if current_user:
-        await require_project_permission(project_id, current_user)
-    section = get_section(section_id)
-    if not section:
-        raise HTTPException(status_code=404, detail='章节不存在')
-    if section.project_id != project_id:
-        raise HTTPException(status_code=404, detail='章节不属于该项目')
-    from ..services.ai.provider_factory import create_provider, get_ai_config
-    ai_config = get_ai_config()
-    if not ai_config or not ai_config.get('api_key'):
-        raise HTTPException(status_code=503, detail='未配置 AI 模型，请先在管理页面配置')
-    provider = create_provider(ai_config)
-    if not provider:
-        raise HTTPException(status_code=503, detail='无法创建 AI 提供商')
-    from ..services.ai.image_engine import generate_flowchart_arrange
-    result = await generate_flowchart_arrange(provider, section_title=section.title or '', section_content=section.content or '', project_overview=section.project_overview or '', scoring_standard=section.scoring_standard or '', industry_profile=section.industry_profile or '')
-    return {'need_arrange': result.get('needed', False), 'reason': result.get('reason', '')}
-
-@router.post('/{section_id}/generate-gantt')
-async def generate_gantt(section_id: int, project_id: int, current_user: Annotated[Any, Depends(get_current_user)]=None):
-    """AI 生成甘特图（Mermaid）"""
-    if current_user:
-        await require_project_permission(project_id, current_user)
-    section = get_section(section_id)
-    if not section:
-        raise HTTPException(status_code=404, detail='章节不存在')
-    if section.project_id != project_id:
-        raise HTTPException(status_code=404, detail='章节不属于该项目')
-    from ..services.ai.provider_factory import create_provider, get_ai_config
-    ai_config = get_ai_config()
-    if not ai_config or not ai_config.get('api_key'):
-        raise HTTPException(status_code=503, detail='未配置 AI 模型，请先在管理页面配置')
-    provider = create_provider(ai_config)
-    if not provider:
-        raise HTTPException(status_code=503, detail='无法创建 AI 提供商')
-    summary = getattr(section, 'summary', '') or ''
-    scoring_standard = getattr(section, 'scoring_standard', '') or ''
-    industry_profile = getattr(section, 'industry_profile', '') or ''
-    from ..services.ai.image_engine import generate_mermaid_gantt, validate_mermaid
-    mermaid_code = await generate_mermaid_gantt(provider, section_title=section.title, section_content=section.content or '', scoring_standard=scoring_standard, industry_profile=industry_profile, summary=summary)
-    valid, _ = validate_mermaid(mermaid_code)
-    return {'mermaid_code': mermaid_code, 'valid': valid}
-
-@router.post('/{section_id}/arrange-architecture')
-async def arrange_architecture(section_id: int, project_id: int, current_user: Annotated[Any, Depends(get_current_user)]=None):
-    """AI 编排判断：是否需要架构图"""
-    if current_user:
-        await require_project_permission(project_id, current_user)
-    section = get_section(section_id)
-    if not section:
-        raise HTTPException(status_code=404, detail='章节不存在')
-    if section.project_id != project_id:
-        raise HTTPException(status_code=404, detail='章节不属于该项目')
-    from ..services.ai.provider_factory import create_provider, get_ai_config
-    ai_config = get_ai_config()
-    if not ai_config or not ai_config.get('api_key'):
-        raise HTTPException(status_code=503, detail='未配置 AI 模型，请先在管理页面配置')
-    provider = create_provider(ai_config)
-    if not provider:
-        raise HTTPException(status_code=503, detail='无法创建 AI 提供商')
-    from ..services.ai.image_engine import generate_architecture_arrange
-    result = await generate_architecture_arrange(provider, section_title=section.title or '', section_content=section.content or '', project_overview=getattr(section, 'project_overview', '') or '', scoring_standard=getattr(section, 'scoring_standard', '') or '', industry_profile=getattr(section, 'industry_profile', '') or '')
-    return {'need_arrange': result.get('needed', False), 'reason': result.get('reason', '')}
-
-@router.post('/{section_id}/generate-architecture')
-async def generate_architecture(section_id: int, project_id: int, current_user: Annotated[Any, Depends(get_current_user)]=None):
-    """AI 生成架构图"""
-    if current_user:
-        await require_project_permission(project_id, current_user)
-    section = get_section(section_id)
-    if not section:
-        raise HTTPException(status_code=404, detail='章节不存在')
-    if section.project_id != project_id:
-        raise HTTPException(status_code=404, detail='章节不属于该项目')
-    from ..services.ai.provider_factory import create_provider, get_ai_config
-    ai_config = get_ai_config()
-    if not ai_config or not ai_config.get('api_key'):
-        raise HTTPException(status_code=503, detail='未配置 AI 模型，请先在管理页面配置')
-    provider = create_provider(ai_config)
-    if not provider:
-        raise HTTPException(status_code=503, detail='无法创建 AI 提供商')
-    from ..services.ai.image_engine import generate_architecture_arrange, generate_architecture_tree
-    arrange_result = await generate_architecture_arrange(provider, section_title=section.title or '', section_content=section.content or '', project_overview=getattr(section, 'project_overview', '') or '', scoring_standard=getattr(section, 'scoring_standard', '') or '', industry_profile=getattr(section, 'industry_profile', '') or '')
-    tree = await generate_architecture_tree(provider, section_title=section.title or '', section_content=section.content or '', project_overview=section.project_overview or '', arrange_result=arrange_result)
-    return {'tree': tree}
-
-@router.post('/{section_id}/arrange-labor')
-async def arrange_labor(section_id: int, project_id: int, current_user: Annotated[Any, Depends(get_current_user)]=None):
-    """AI 编排判断：是否需要劳动力图"""
-    if current_user:
-        await require_project_permission(project_id, current_user)
-    section = get_section(section_id)
-    if not section:
-        raise HTTPException(status_code=404, detail='章节不存在')
-    if section.project_id != project_id:
-        raise HTTPException(status_code=404, detail='章节不属于该项目')
-    from ..services.ai.provider_factory import create_provider, get_ai_config
-    ai_config = get_ai_config()
-    if not ai_config or not ai_config.get('api_key'):
-        raise HTTPException(status_code=503, detail='未配置 AI 模型，请先在管理页面配置')
-    provider = create_provider(ai_config)
-    if not provider:
-        raise HTTPException(status_code=503, detail='无法创建 AI 提供商')
-    from ..services.ai.image_engine import generate_labor_arrange
-    result = await generate_labor_arrange(provider, section_title=section.title or '', section_content=section.content or '', project_overview=getattr(section, 'project_overview', '') or '', scoring_standard=getattr(section, 'scoring_standard', '') or '', industry_profile=getattr(section, 'industry_profile', '') or '')
-    return {'need_arrange': result.get('needed', False), 'reason': result.get('reason', '')}
-
-@router.post('/{section_id}/generate-labor')
-async def generate_labor(section_id: int, project_id: int, writing_length: str='standard', current_user: Annotated[Any, Depends(get_current_user)]=None):
-    """AI 生成劳动力图数据"""
-    if current_user:
-        await require_project_permission(project_id, current_user)
-    section = get_section(section_id)
-    if not section:
-        raise HTTPException(status_code=404, detail='章节不存在')
-    if section.project_id != project_id:
-        raise HTTPException(status_code=404, detail='章节不属于该项目')
-    from ..services.ai.provider_factory import create_provider, get_ai_config
-    ai_config = get_ai_config()
-    if not ai_config or not ai_config.get('api_key'):
-        raise HTTPException(status_code=503, detail='未配置 AI 模型，请先在管理页面配置')
-    provider = create_provider(ai_config)
-    if not provider:
-        raise HTTPException(status_code=503, detail='无法创建 AI 提供商')
-    from ..services.ai.image_engine import generate_labor_arrange, generate_labor_data
-    arrange_result = await generate_labor_arrange(provider, section_title=section.title or '', section_content=section.content or '', project_overview=getattr(section, 'project_overview', '') or '', scoring_standard=getattr(section, 'scoring_standard', '') or '', industry_profile=getattr(section, 'industry_profile', '') or '')
-    labor_data = await generate_labor_data(provider, section_title=section.title or '', section_content=section.content or '', project_overview=getattr(section, 'project_overview', '') or '', arrange_result=arrange_result, writing_length=writing_length, industry_profile=getattr(section, 'industry_profile', '') or '')
-    return {'labor_data': labor_data, 'valid': True}
-
-@router.post('/{section_id}/arrange-comparison')
-async def arrange_comparison(section_id: int, project_id: int, current_user: Annotated[Any, Depends(get_current_user)]=None):
-    """AI 编排判断：是否需要对比图"""
-    if current_user:
-        await require_project_permission(project_id, current_user)
-    section = get_section(section_id)
-    if not section:
-        raise HTTPException(status_code=404, detail='章节不存在')
-    if section.project_id != project_id:
-        raise HTTPException(status_code=404, detail='章节不属于该项目')
-    from ..services.ai.provider_factory import create_provider, get_ai_config
-    ai_config = get_ai_config()
-    if not ai_config or not ai_config.get('api_key'):
-        raise HTTPException(status_code=503, detail='未配置 AI 模型，请先在管理页面配置')
-    provider = create_provider(ai_config)
-    if not provider:
-        raise HTTPException(status_code=503, detail='无法创建 AI 提供商')
-    from ..services.ai.image_engine import generate_comparison_arrange
-    result = await generate_comparison_arrange(provider, section_title=section.title or '', section_content=section.content or '', project_overview=getattr(section, 'project_overview', '') or '', scoring_standard=getattr(section, 'scoring_standard', '') or '', industry_profile=getattr(section, 'industry_profile', '') or '')
-    return {'need_arrange': result.get('needed', False), 'reason': result.get('reason', '')}
-
-@router.post('/{section_id}/generate-comparison')
-async def generate_comparison(section_id: int, project_id: int, current_user: Annotated[Any, Depends(get_current_user)]=None):
-    """AI 生成对比图（Mermaid Pie/xychart）"""
-    if current_user:
-        await require_project_permission(project_id, current_user)
-    section = get_section(section_id)
-    if not section:
-        raise HTTPException(status_code=404, detail='章节不存在')
-    if section.project_id != project_id:
-        raise HTTPException(status_code=404, detail='章节不属于该项目')
-    from ..services.ai.provider_factory import create_provider, get_ai_config
-    ai_config = get_ai_config()
-    if not ai_config or not ai_config.get('api_key'):
-        raise HTTPException(status_code=503, detail='未配置 AI 模型，请先在管理页面配置')
-    provider = create_provider(ai_config)
-    if not provider:
-        raise HTTPException(status_code=503, detail='无法创建 AI 提供商')
-    from ..services.ai.image_engine import generate_comparison_arrange, generate_comparison_mermaid, validate_mermaid
-    arrange_result = await generate_comparison_arrange(provider, section_title=section.title or '', section_content=section.content or '', project_overview=getattr(section, 'project_overview', '') or '', scoring_standard=getattr(section, 'scoring_standard', '') or '', industry_profile=getattr(section, 'industry_profile', '') or '')
-    mermaid_code = await generate_comparison_mermaid(provider, section_title=section.title or '', section_content=section.content or '', project_overview=section.project_overview or '', arrange_result=arrange_result)
-    valid, _ = validate_mermaid(mermaid_code)
-    return {'mermaid_code': mermaid_code, 'valid': valid}
+# CHART-MANUAL-REMOVAL 2026-11-04：已移除 9 个「人工配图」端点
+# （generate-flowchart / arrange-flowchart / generate-gantt / arrange-architecture /
+#   generate-architecture / arrange-labor / generate-labor / arrange-comparison /
+#   generate-comparison）——产品口径：图表全部自动生成（正文内联围栏 + SSE
+#   三阶段管线 + auto-orchestrate-section + 配图阶段），不设人工配图/生图入口。
+# 对应前端 API（api/index.ts 同名函数）与死组件已同批清理；删除前经全仓
+# grep 证实零前端调用方、零测试绑定。

@@ -10,7 +10,8 @@
 
 设计原则：
   * 图表全部自动生成，不设人工配图/生图入口（人工逐类生成端点保留但不再是主链路）。
-  * 正文已有图表围栏时**跳过插入**（去重防重入），避免同一章节出现双图/图号虚跳。
+  * 正文已有图表围栏时**跳过插入**（去重防重入）；已有**同类型**内联标记时
+    围栏同样不插、载荷降级落库 chart 字段（防同章双图/图号虚跳）。
   * 校验失败不写坏块：先走 repair_mermaid 修复，仍失败则整体跳过（容错降级，
     不占图号——导出侧对不存在的围栏天然无感）。
   * 正文为空无法插入时，降级把载荷持久化到章节 chart 字段（*_json），
@@ -26,6 +27,7 @@ from typing import Any
 from ..models import SectionUpdate
 from .ai.chart_orchestrator import (
     analyze_chart_needs,
+    content_has_extractable_data,
     generate_chart_payload,
     suggest_insertion_position,
 )
@@ -122,6 +124,128 @@ def content_has_chart_fence(content: str) -> bool:
     return False
 
 
+#: 单章图表围栏数量上限（与 prompts/content.py「每章最多 2 个图表且类型不重复」
+#: 的写作契约对齐；ENHANCE 2026-11-04 前编排侧是「任一围栏即全拒」，与该契约矛盾）
+MAX_CHART_FENCES_PER_SECTION = 2
+
+
+def content_chart_fence_types(content: str) -> list[str]:
+    """正文已有图表围栏的类型列表（按出现顺序；类型不可识别时计作 "unknown"）。
+
+    ENHANCE 2026-11-04（需求 3/4·编排增强）：去重守卫从「任一围栏即全拒」
+    放宽为「同类型去重 + 每章 ≤2 图」——正文已有甘特图围栏时，仍可为该章
+    补插流程图（图文互补），与 CONTENT_SECTION_SYSTEM 的写作契约一致。
+    类型判定复用 content_cleaning.iter_chart_fences（与 parse_content 同源
+    状态机）：chart-json 围栏读载荷 type，mermaid 围栏按首行关键字推断，
+    与 _fence_payload_to_marker_text 的推断口径一致。
+    """
+    if not content:
+        return []
+    from .content_cleaning import iter_chart_fences
+
+    types: list[str] = []
+    for _lang, _body, marker_text in iter_chart_fences(content):
+        ct = ""
+        if marker_text:
+            try:
+                mt = json.loads(marker_text)
+                ct = str(mt.get("chart_type") or "").strip().lower()
+            except (json.JSONDecodeError, TypeError, ValueError):
+                ct = ""
+        types.append(ct or "unknown")
+    return types
+
+
+def chart_fence_type_conflict(content: str, chart_type: str) -> bool:
+    """编排去重守卫（ENHANCE 2026-11-04）：正文已有该类型围栏，或围栏数已达上限。
+
+    替代旧的 content_has_chart_fence 全拒语义：
+      - 同类型围栏已存在 → 拒（防同章双同类图/图号冲突，F2 语义延续）；
+      - 不同类型但已有 2 个围栏 → 拒（每章 ≤2 图上限）；
+      - 不同类型且 <2 个 → 放行（补插第二类图）。
+    """
+    if not content:
+        return False
+    fence_types = content_chart_fence_types(content)
+    ct = (chart_type or "").strip().lower()
+    if ct and ct in fence_types:
+        return True
+    return len(fence_types) >= MAX_CHART_FENCES_PER_SECTION
+
+
+def content_has_chart_marker_type(content: str, chart_type: str) -> bool:
+    """正文是否已包含**指定类型**的 ``<<CHART:...>>`` 内联标记（不查围栏）。
+
+    F2 修复 2026-11-03（需求 11·同章双图 / 编号冲突）：导出侧 parse_content
+    把 ``<<CHART:gantt>>`` 标记与 ```` ```mermaid ```` 围栏**都**转为
+    chart_marker 块、各自调用一次 _add_inline_chart 渲染。编排侧旧去重只查
+    围栏（content_has_chart_fence），正文已有该类型标记时仍插入围栏 →
+    标记+围栏并存 → 同章渲染两张同类图、图号多占一位。
+    注意必须按**类型**判定：不同类型的标记与围栏并存是合理形态
+    （甘特图围栏 + 流程图标记 = 两张不同的图），不得互相阻止。
+    """
+    if not content or not chart_type:
+        return False
+    from .content_cleaning import iter_chart_markers, resolve_chart_marker
+
+    ct = (chart_type or "").strip().lower()
+    if not ct or ct == "none":
+        return False
+    for _marker, prefix, desc in iter_chart_markers(content):
+        resolved = resolve_chart_marker(prefix, desc)
+        if resolved and resolved[0] == ct:
+            return True
+    return False
+
+
+def _compute_code_fence_regions(lines: list[str]) -> list[tuple[int, int]]:
+    """计算正文中所有代码围栏（``` 或 ~~~，含图表围栏与普通代码块）的行区间。
+
+    C7 修复（2026-11-04）的共享工具：与 content_cleaning.plan_chart_fence_lines
+    的宽松 toggle 口径一致（同字符开闭、忽略 info-string），只用于**移动插入
+    位置**，绝不做删除/改写，误判的最坏后果是插入点平移到围栏外。
+    """
+    regions: list[tuple[int, int]] = []
+    _start: int | None = None
+    _ch = ""
+    for i, ln in enumerate(lines):
+        _s = ln.lstrip()
+        if _s.startswith("```") or _s.startswith("~~~"):
+            _c = _s[0] * 3
+            if _start is None:
+                _start, _ch = i, _c
+            elif _c == _ch:
+                regions.append((_start, i))
+                _start, _ch = None, ""
+    if _start is not None:
+        # 未闭合围栏：视为延伸到文末（插入点避让其内部）
+        regions.append((_start, len(lines) - 1))
+    return regions
+
+
+def _clamp_line_no_outside_fences(lines: list[str], line_no: int) -> int:
+    """把目标行号钳制到代码围栏之外；找不到围栏外非空行时退到文末追加。"""
+    _regions = _compute_code_fence_regions(lines)
+    if not _regions:
+        return line_no
+
+    def _inside(_i: int) -> bool:
+        return any(_a <= _i <= _b for _a, _b in _regions)
+
+    if not _inside(line_no):
+        return line_no
+    # 向后找区域外的非空行（保持「插在相关段后」的语义）
+    for _j in range(line_no + 1, len(lines)):
+        if lines[_j].strip() and not _inside(_j):
+            return _j
+    # 向前找区域外的非空行
+    for _j in range(line_no - 1, -1, -1):
+        if lines[_j].strip() and not _inside(_j):
+            return _j
+    # 整篇都在围栏内：退到文末（append 语义，最不具破坏性）
+    return len(lines) - 1
+
+
 def insert_fence_at_paragraph(
     content: str,
     fence: str,
@@ -133,6 +257,12 @@ def insert_fence_at_paragraph(
     位置来源为 suggest_insertion_position（关键词打分），保证「图文逻辑连贯」：
     流程图插在工艺流程段后、甘特图插在进度计划段后。空正文时直接以
     「引导语 + 围栏」作为正文主体。
+
+    BUG-FIX 2026-11-04（P3·C7）：suggest_insertion_position 只按关键词打分、
+    不感知普通 ``` 代码围栏 —— 正文含配置示例/脚本代码块且其中恰有
+    「流程/步骤/如下图」等关键词行时，图表围栏被插进普通围栏内部中段，
+    iter_chart_fences/parse_content 把整段当坏块处理，导出删坏块后正文缺段。
+    现插入前行号强制钳制到所有代码围栏之外。
     """
     lines = content.split("\n")
     block = (lead_in + "\n\n" + fence) if lead_in else fence
@@ -141,14 +271,73 @@ def insert_fence_at_paragraph(
     if not non_empty:
         return block
     idx = max(0, min(paragraph_index, len(non_empty) - 1))
-    line_no = non_empty[idx]
+    line_no = _clamp_line_no_outside_fences(lines, non_empty[idx])
     new_lines = lines[: line_no + 1] + ["", *block_lines] + lines[line_no + 1 :]
     return "\n".join(new_lines)
+
+
+def _persist_chart_field_result(
+    result: dict[str, Any],
+    upd_sec,
+    section_id: int,
+    chart_type: str,
+    payload: dict[str, Any],
+    reason: str,
+    source: str = "",
+) -> None:
+    """把图表载荷降级持久化到章节 chart 字段（*_json）。
+
+    F2 重构 2026-11-03：降级落库口径统一收口——正文为空 / 禁止插入正文 /
+    同类型内联标记已存在三条路径复用同一写库代码，避免各分支漂移。
+
+    Args:
+        reason: 透传到 ``result["skipped_reason"]``：
+          - ``content_empty_fallback_chart_field``：正文为空或禁止插入正文（旧口径）；
+          - ``chart_marker_exists_fallback_chart_field``：正文已有同类型
+            ``<<CHART:...>>`` 标记，围栏不得再插（防同章双图），标记渲染路径
+            消费该 chart 字段出图。
+        source: 分析来源（local/ai），R2 观测加固：随日志输出用于统计
+            AI 命中率（``[自动编排]`` 日志驱动的全链路观测）。
+    """
+    field = CHART_FIELD_MAP.get(chart_type)
+    if not field:
+        result["skipped_reason"] = "unsupported_chart_type"
+        return
+    upd_sec(
+        section_id,
+        SectionUpdate(**{field: json.dumps(payload, ensure_ascii=False)}),
+    )
+    result["persisted_chart_field"] = field
+    result["skipped_reason"] = reason
+    logger.info(
+        "[自动编排] 已持久化 chart 字段 section=%d field=%s reason=%s source=%s",
+        section_id, field, reason, source,
+    )
 
 
 # ============================================================
 # 闭环编排（含 DB 读写；DB 依赖通过模块级名字注入，便于单测 monkeypatch）
 # ============================================================
+
+
+def section_to_dict(section: Any) -> dict[str, Any]:
+    """把章节对象统一归一为 dict。
+
+    BUG-FIX 2026-11-04（P1·契约不一致）：闭环编排/配图阶段全链路按「dict 章节」
+    编写（`section.get("title")` 等），而服务层 `services.sections.get_section`
+    返回 pydantic `Section`（无 `.get`）。生产路径（未注入测试 fake）首次访问即
+    AttributeError → 单章节自动编排接口 500 / 配图阶段整体崩溃。测试全量注入
+    dict fake 掩盖了该缺陷。此处统一归一，同时兼容 dict / pydantic v2 模型 /
+    其它 duck-typed 对象；None 原样返回由调用方判空。
+    """
+    if section is None or isinstance(section, dict):
+        return section
+    if hasattr(section, "model_dump"):
+        try:
+            return section.model_dump()
+        except Exception:  # pragma: no cover - model_dump 异常时退回字段拷贝
+            pass
+    return dict(vars(section)) if hasattr(section, "__dict__") else dict(section)
 
 
 def auto_orchestrate_section(
@@ -189,7 +378,7 @@ def auto_orchestrate_section(
         "fence": "",
     }
 
-    section = get_sec(section_id)
+    section = section_to_dict(get_sec(section_id))
     if not section:
         result["ok"] = False
         result["skipped_reason"] = "section_not_found"
@@ -203,7 +392,7 @@ def auto_orchestrate_section(
         section_title=title, content=content, ai_client=ai_client
     )
     analysis["insert_paragraph_index"] = (
-        suggest_insertion_position(content, analysis.get("chart_type", "none"))
+        suggest_insertion_position(content, analysis.get("chart_type", "none"), title)
         if analysis.get("needed")
         else -1
     )
@@ -233,6 +422,29 @@ def auto_orchestrate_section(
         )
         return result
 
+    # ②.5 A3 建议 2（空态优于错态，2026-11-03 遗留加固）：本地模板兜底仅在
+    # 正文提供可提取数据线索时才进投标文件——正文有内容但零线索（数据型
+    # 零「数字+单位」/ 结构型零关键词命中）时，模板数字/节点纯属虚构，
+    # 宁缺毋假不插围栏、不落库。仅约束 source="local" 兜底载荷：AI 载荷
+    # 受提示词数据约束且基于正文生成，不做此判定；空正文走既有降级落库
+    # 契约（content_empty_fallback_chart_field，披露标签兜底）不在此收紧。
+    # 正文已有该类型围栏/已达上限时本载荷因去重必然不出图（chart_fence_type_conflict
+    # 语义更精确，ENHANCE 2026-11-04 起「同类型/达上限」才让位），
+    # 空态判定让位——只拦「会让模板载荷实际出图」的路径（插围栏/标记降级落库）。
+    if (
+        str(payload.get("source") or "") == "local"
+        and content.strip()
+        and not chart_fence_type_conflict(content, chart_type)
+        and not content_has_extractable_data(content, chart_type)
+    ):
+        result["skipped_reason"] = "no_real_data_local"
+        logger.info(
+            "[自动编排] 正文无可提取数据，本地模板兜底跳过（宁缺毋假）"
+            "project=%d section=%d type=%s",
+            project_id, section_id, chart_type,
+        )
+        return result
+
     # ③ 统一闸门校验 + 修复（repair_mermaid 内聚于此）
     from .ai.image_engine import validate_chart_for_ai_pipeline
 
@@ -254,24 +466,50 @@ def auto_orchestrate_section(
 
     # ④ 插入正文（去重防重入）或降级持久化 chart 字段
     result["payload"] = fixed_payload
-    if insert_into_content and content and not content_has_chart_fence(content):
+    # F2 修复 2026-11-03（需求 11·同章双图 / 编号冲突）：正文已有**同类型**
+    # ``<<CHART:...>>`` 内联标记时不再插入围栏——导出侧 parse_content 把标记
+    # 与围栏都渲染成图，并存即同章两张同类图、图号多占一位。按类型判定，
+    # 不同类型的标记与围栏并存是合理形态（甘特图围栏 + 流程图标记），互不阻止。
+    # ENHANCE 2026-11-04（需求 3/4·编排增强）：围栏去重同步从「任一围栏即全拒」
+    # 放宽为「同类型去重 + 每章 ≤2 图」（chart_fence_type_conflict），对齐
+    # CONTENT_SECTION_SYSTEM「每章最多 2 个图表且类型不重复」的写作契约——
+    # 正文已有甘特图时仍可补插流程图，恢复图文互补能力。
+    _has_same_type_marker = content_has_chart_marker_type(content, chart_type)
+    if (
+        insert_into_content
+        and content
+        and not chart_fence_type_conflict(content, chart_type)
+        and not _has_same_type_marker
+    ):
         lead_in, fence = build_chart_fence(chart_type, fixed_payload)
         # RACE-GUARD 2026-10-27（需求 11·并发竞态）：自「读取正文」到「写回」
         # 之间存在窗口，其他编排请求/生成任务可能已写入围栏或改写正文。
         # 插入前重读最新正文：已含围栏 → 跳过（防同章双图/图号虚跳）；
         # 正文已变 → 以最新正文重算插入位置，保证图文连贯。
         try:
-            _latest = get_sec(section_id) or {}
+            # section_to_dict：与函数首部同口径归一（RACE-GUARD 重读同样可能
+            # 拿到 pydantic Section，旧实现 AttributeError 被 except 吞掉后
+            # 恒走 stale-content 分支，防双图/重算位置守卫在生产环境形同虚设）。
+            _latest = section_to_dict(get_sec(section_id)) or {}
             _latest_content = _latest.get("content", "") or ""
         except Exception:
             _latest_content = content
-        if _latest_content and content_has_chart_fence(_latest_content):
+        if _latest_content and chart_fence_type_conflict(_latest_content, chart_type):
             result["skipped_reason"] = "chart_fence_exists"
             return result
         if _latest_content != content:
+            if content_has_chart_marker_type(_latest_content, chart_type):
+                # 竞态窗口内同类型标记已写入 → 转降级落库
+                # （标记渲染路径消费 chart 字段出图，不再插围栏防双图）
+                _persist_chart_field_result(
+                    result, upd_sec, section_id, chart_type, fixed_payload,
+                    "chart_marker_exists_fallback_chart_field",
+                    source=analysis.get("source", ""),
+                )
+                return result
             content = _latest_content
             analysis["insert_paragraph_index"] = suggest_insertion_position(
-                content, chart_type
+                content, chart_type, title
             )
             result["insert_paragraph_index"] = analysis["insert_paragraph_index"]
         new_content = insert_fence_at_paragraph(
@@ -281,29 +519,28 @@ def auto_orchestrate_section(
         result["inserted"] = True
         result["fence"] = fence
         logger.info(
-            "[自动编排] 已插入图表围栏 project=%d section=%d type=%s 段落=%d",
-            project_id, section_id, chart_type, analysis["insert_paragraph_index"],
+            "[自动编排] 已插入图表围栏 project=%d section=%d type=%s source=%s 段落=%d",
+            project_id, section_id, chart_type,
+            analysis.get("source", ""), analysis["insert_paragraph_index"],
         )
         return result
 
-    if content and content_has_chart_fence(content):
+    if content and chart_fence_type_conflict(content, chart_type):
         result["skipped_reason"] = "chart_fence_exists"
         return result
 
-    # 正文为空：降级把载荷写入章节 chart 字段（导出按 chart 字段路径渲染）
-    field = CHART_FIELD_MAP.get(chart_type)
-    if field:
-        upd_sec(
-            section_id,
-            SectionUpdate(**{field: json.dumps(fixed_payload, ensure_ascii=False)}),
-        )
-        result["persisted_chart_field"] = field
-        result["skipped_reason"] = "content_empty_fallback_chart_field"
-        logger.info(
-            "[自动编排] 正文为空，已持久化 chart 字段 project=%d section=%d field=%s",
-            project_id, section_id, field,
-        )
-    else:
-        result["skipped_reason"] = "unsupported_chart_type"
+    # 降级把载荷写入章节 chart 字段（导出按 chart 字段路径渲染）：
+    #   - 正文为空 / 禁止插入正文 → content_empty_fallback_chart_field（旧口径）；
+    #   - 正文已有同类型内联标记 → chart_marker_exists_fallback_chart_field
+    #     （防双图，标记渲染路径消费该字段）。
+    _fallback_reason = (
+        "chart_marker_exists_fallback_chart_field"
+        if _has_same_type_marker
+        else "content_empty_fallback_chart_field"
+    )
+    _persist_chart_field_result(
+        result, upd_sec, section_id, chart_type, fixed_payload, _fallback_reason,
+        source=analysis.get("source", ""),
+    )
 
     return result

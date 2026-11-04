@@ -1268,12 +1268,17 @@ pie title 项目成本构成分析
 | 类型 | 输出格式 | 最小数据量 | 输出示例（开头） |
 |------|----------|-----------|------------------|
 | `flowchart` | Mermaid 代码 | 3 节点 + 2 连线 | `flowchart TD` |
-| `gantt` | GanttPlan JSON | 3 任务 | `{"needed":true,"totalDays":120,...}` |
+| `gantt` | Mermaid 甘特图代码（或 GanttPlan JSON） | 3 任务 | `gantt` 或 `{"needed":true,"totalDays":120,...}` |
 | `architecture` | ArchNode JSON | 1+3=4 节点 | `{"id":"root","label":"...","children":[...]}` |
 | `labor` | LaborPlan JSON | 2×2=4 数据点 | `{"phases":[...],"categories":[...],"data":[...]}` |
 | `comparison` | Mermaid 代码 | 3 组数据 | `pie title ... "A":30` |
 | `layout` | LayoutPlan JSON | 1+2=3 区域 | `{"needed":true,"type":"layout","zones":[...]}` |
 | `timeline` | TimelinePlan JSON | 5 里程碑 | `{"needed":true,"type":"timeline","milestones":[...]}` |
+
+> **格式口径（FIX 2026-11-04）**：上表「输出格式」列与本提示词第三节「各类型输出
+> 格式」为准——`gantt` 修复轮优先输出与原载荷同形态的数据（原为 Mermaid 代码则
+> 继续输出 Mermaid 代码；原为 JSON 则输出 GanttPlan JSON），不得自相矛盾。
+> 校验管线对两种形态均支持（Mermaid 语法校验 / 结构化 Schema 校验）。
 
 ### 四、多轮兜底与回退策略
 

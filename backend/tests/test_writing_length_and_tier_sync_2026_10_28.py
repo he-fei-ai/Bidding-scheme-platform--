@@ -19,23 +19,51 @@ def test_generate_content_writing_length_validates_authoritative_keys():
     src = inspect.getsource(sections_router.generate_outline_sse) if hasattr(
         sections_router, "generate_outline_sse"
     ) else ""
-    # 生成正文路由使用 normalize_writing_length 归一化 + 权威白名单
+    # BUG-FIX 2026-11-05（writing_length 422 死代码）：generate-content 在归一化前
+    # 用 is_valid_writing_length 校验原始值（权威 key + 旧别名全集），确保真正
+    # 非法值才 422（旧实现 normalize_writing_length 对非法回落 standard，
+    # 使 422 恒不可达）。
     body = inspect.getsource(
         sections_router.generate_content
     ) if hasattr(sections_router, "generate_content") else ""
-    assert "normalize_writing_length" in body, "generate-content 应归一化 writing_length"
+    assert "is_valid_writing_length" in body, (
+        "generate-content 应使用 is_valid_writing_length 校验 writing_length"
+    )
     assert "('brief', 'standard', 'detailed', 'long')" in body, (
         "generate-content 白名单应为权威 key"
     )
 
 
+def test_is_valid_writing_length_accepts_authoritative_and_aliases():
+    """is_valid_writing_length 接受权威 key + 旧别名，拒绝真正非法值。"""
+    from app.services.ai.writing_length_config import is_valid_writing_length
+
+    for ok in ("brief", "standard", "detailed", "long",
+               "short", "extra_long", "concise", "super_long", "detail",
+               "normal", "std", "BRIEF", " Standard "):
+        assert is_valid_writing_length(ok) is True, f"{ok!r} 应为合法"
+    for bad in ("standrad", "xyz", "medium", "超长x", "1"):
+        assert is_valid_writing_length(bad) is False, f"{bad!r} 应为非法（422）"
+    assert is_valid_writing_length(None) is True, "缺省值合法（Query 默认兜底）"
+    assert is_valid_writing_length("") is True, "空串合法（Query 默认兜底）"
+
+
 def test_expand_content_writing_length_uses_authoritative_keys():
-    """expand-content 路由白名单同样收敛到权威 key。"""
+    """expand-content 路由白名单同样收敛到权威 key。
+
+    BUG-FIX 2026-11-04（第 10 轮章节审计）：expand-content 旧实现沿用
+    `_norm_wl(...) not in valid_lengths` 死代码（normalize 对非法输入回落
+    standard → 恒 False，422 永不触发），与 generate-content（L275-286）
+    同步改用归一化前的 is_valid_writing_length。
+    """
     body = inspect.getsource(sections_router.expand_content)
     assert "('brief', 'standard', 'detailed', 'long')" in body, (
         "expand-content 白名单应为权威 key"
     )
-    assert "normalize_writing_length" in body
+    assert "is_valid_writing_length" in body
+    assert "if _norm_wl(writing_length) not in valid_lengths" not in body, (
+        "死代码校验（恒 False）不得残留"
+    )
 
 
 def test_legacy_keys_still_accepted_by_normalizer():

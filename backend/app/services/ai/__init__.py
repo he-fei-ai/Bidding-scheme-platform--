@@ -35,9 +35,9 @@ from .heading_standard import (
 )
 from .image_engine import (
     # V6.0 新增
-    AIMageGenerator,
+    # ILLUSTRATION-REMOVAL 2026-11-04：AIMageGenerator / build_illustration_url /
+    # generate_illustration_prompt（生图功能下线）已从 image_engine 移除。
     InlineChartDetector,
-    build_illustration_url,
     chart_data_fix,
     download_and_embed_image,
     generate_architecture_arrange,
@@ -45,7 +45,6 @@ from .image_engine import (
     generate_comparison_arrange,
     generate_comparison_mermaid,
     generate_flowchart_arrange,
-    generate_illustration_prompt,
     generate_labor_arrange,
     generate_labor_data,
     generate_layout_arrange,
@@ -112,14 +111,11 @@ __all__ = [
     "generate_comparison_mermaid",
     "generate_mermaid_flowchart",
     "generate_mermaid_gantt",
-    "generate_illustration_prompt",
     "generate_labor_arrange",
     "generate_labor_data",
     "generate_architecture_arrange",
     "generate_architecture_tree",
-    "build_illustration_url",
-    # V6.0 新增
-    "AIMageGenerator",
+    # V6.0 新增（AIMageGenerator/build_illustration_url 已随生图下线移除）
     "download_and_embed_image",
     "InlineChartDetector",
     # providers

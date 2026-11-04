@@ -2565,7 +2565,8 @@ async def test_repair_with_ai_applies_patches_and_converges_conflicts(monkeypatc
     assert len(report["applied"]) == 1
     assert _section_content(9902011) == "承诺总工期 90 日历天。"
     # 正文里只剩一个取值 → 冲突按可验证判据收敛为已解决
-    assert report["conflict_states"] == {"resolved": 1, "still_open": 0}
+    # （not_verifiable 为 F-2 2026-11-02 新增的单列计数，本例无可验证性缺失条目）
+    assert report["conflict_states"] == {"resolved": 1, "still_open": 0, "not_verifiable": 0}
     assert _conflict_resolved("cf_990201")[0] == 1
 
 
@@ -2723,7 +2724,7 @@ def test_refresh_conflict_states_keeps_open_when_two_values_remain():
     with get_db() as conn:
         states = refresh_conflict_states(conn, 990208, {9902081: "工期 45 天", 9902082: "工期 90 天"})
 
-    assert states == {"resolved": 0, "still_open": 1}
+    assert states == {"resolved": 0, "still_open": 1, "not_verifiable": 0}
     assert _conflict_resolved("cf_990208")[0] == 0
 
 

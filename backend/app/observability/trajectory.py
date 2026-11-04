@@ -107,6 +107,9 @@ def _persist(rec: dict[str, Any]) -> int | None:
                 rec["operator"], rec.get("trace_id", "-"), rec["created_at"],
             ),
         )
+        # BUG-FIX 2026-11-04：INSERT 后未返回 rowid，调用方 rec["id"] 恒为 None，
+        # 轨迹记录缺少主键（无法定位/关联）。补 return lastrowid。
+        return cur.lastrowid
 
 def get_trajectory(task_id: str) -> list[dict[str, Any]]:
     """按 task_id 返回按时间排序的运行轨迹。"""
@@ -229,5 +232,3 @@ class TaskTracker:
 
     def history(self) -> list[dict[str, Any]]:
         return list(self._history)
-
-        return cur.lastrowid

@@ -35,6 +35,11 @@ class _UploadCtx:
         conn = MagicMock()
         cursor = MagicMock()
         cursor.lastrowid = next(self._id_iter)
+        # 忠实表示「uploaded_files 空表」：任何判重 SELECT（早期 _find_duplicate_upload
+        # 与 2026-11-02 R1 的写锁内 content_hash 复核）取不到既有行 → fetchone None /
+        # fetchall []，不产生假 duplicate。本用例专注同名并发改名，内容与项目均为全新。
+        cursor.fetchone.return_value = None
+        cursor.fetchall.return_value = []
         conn.execute.return_value = cursor
         return conn
 

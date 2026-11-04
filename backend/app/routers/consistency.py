@@ -271,6 +271,10 @@ async def run_audit(project_id: int, user=Depends(get_current_user)):
                     'sources': c.sources,
                     'severity': c.severity,
                     'description': c.description,
+                    # G-1(2026-11-02)：判定依据（实例数/命中章节/去重取值/
+                    # 命中的严重度分支）。纯新增字段，老调用方忽略即可；
+                    # 前端冲突行「判定依据」浮层消费。
+                    'fact_evidence': c.evidence,
                 }
                 for c in result.conflicts
             ],
@@ -315,12 +319,17 @@ async def get_conflicts(
 
     # `severity` 归一化 + ORDER BY 补 ELSE：见 consistency_rules.severity_sort_sql
     order_by = rules.severity_sort_sql()
+    # TD-1（2026-11-02·单一事实来源）：`resolved` 判定谓词统一引用
+    # `rules.RESOLVED_SQL_OPEN / RESOLVED_SQL_RESOLVED`（均为 `COALESCE(resolved, 0)`
+    # 形式）。此前本路由用 COALESCE、而 AI 修复 / Agent 修复 / 事实回流三条链路
+    # 裸写 `resolved = 0` —— 一旦库里出现 NULL 行（老库补列 / 外部写入），
+    # 同一条冲突在列表里看得见却对修复链路隐形。取值与行为逐字不变。
     where = 'WHERE project_id = ?'
     params: list = [project_id]
     if resolved == rules.CONFLICT_STATE_OPEN:
-        where += ' AND COALESCE(resolved, 0) = 0'
+        where += ' AND ' + rules.RESOLVED_SQL_OPEN
     elif resolved == rules.CONFLICT_STATE_RESOLVED:
-        where += ' AND COALESCE(resolved, 0) = 1'
+        where += ' AND ' + rules.RESOLVED_SQL_RESOLVED
 
     def _read_conflicts():
         # PERF（2026-10-05）：纯读查询改为 readonly + to_thread，
@@ -367,6 +376,21 @@ async def get_conflicts(
                 # 现随每条冲突下发 `source_kind`（`rule` / `ai`），纯新增字段，
                 # 既有字段名与取值语义一律不动。
                 conflict['source_kind'] = rules.conflict_source_kind(conflict.get('conflict_id'))
+                # 遗留项 L5(2026-11-03)：G-1 判定依据落库后，回放同样下发
+                # `fact_evidence`（审计执行响应的字段，此前回放没有 —— 用户
+                # 重新进入页面后依据浮层打不开）。解析失败/为空/AI 发现行
+                # （NULL）时置 None，消费方按可选处理，契约字段名不变。
+                ev_json = conflict.pop('evidence_json', None)
+                conflict['fact_evidence'] = None
+                if ev_json:
+                    try:
+                        parsed_ev = json.loads(ev_json)
+                        if isinstance(parsed_ev, dict) and parsed_ev:
+                            conflict['fact_evidence'] = parsed_ev
+                    except (json.JSONDecodeError, TypeError):
+                        logger.warning(
+                            f"解析冲突判定依据失败: {conflict.get('id', 'unknown')}"
+                        )
                 conflicts.append(conflict)
         return conflicts
 
@@ -392,17 +416,18 @@ async def get_fix_suggestion(conflict_id: str, project_id: int, user=Depends(get
     await enforce_project_access(project_id, user)
     try:
         # P2：suggest_fixes 含 DB 读与正文扫描，移出事件循环
-        suggestion = await asyncio.to_thread(
-            consistency_auditor.suggest_fixes, conflict_id, project_id
+        # TD-7(2026-11-02)：此前 suggestion 与 target_value 分两次 to_thread
+        # 各自完整读库+扫描同一行（suggest_fixes / suggest_fix_target_value
+        # 内部同走 _load_suggestion_payload），同一请求两次全量推导纯属浪费。
+        # 现单次取数同时拿到 (target_value, suggestion)。
+        # BUG-FIX 2026-10-06（P1）：同时下发结构化纯目标值。此前前端把
+        # `suggestion` 整段文案（“建议将以下内容统一为：450（已确认…）”）塞进
+        # new_value 提交 autofix，会把正文旧值替换成说明文字。前端「采纳建议」
+        # 按钮现改填 target_value；suggestion 仅作人类可读展示，字段向后兼容。
+        target_value, suggestion = await asyncio.to_thread(
+            consistency_auditor._load_suggestion_payload, conflict_id, project_id
         )
         if suggestion:
-            # BUG-FIX 2026-10-06（P1）：同时下发结构化纯目标值。此前前端把
-            # `suggestion` 整段文案（“建议将以下内容统一为：450（已确认…）”）塞进
-            # new_value 提交 autofix，会把正文旧值替换成说明文字。前端「采纳建议」
-            # 按钮现改填 target_value；suggestion 仅作人类可读展示，字段向后兼容。
-            target_value = await asyncio.to_thread(
-                consistency_auditor.suggest_fix_target_value, conflict_id, project_id
-            )
             return {'status': 'ok', 'suggestion': suggestion, 'target_value': target_value}
         else:
             raise HTTPException(status_code=404, detail='未找到修复建议')
@@ -750,9 +775,13 @@ async def get_audit_summary(project_id: int, user=Depends(get_current_user)):
         with get_db(readonly=True) as conn:
             # BUG-FIX 2026-10-09：sqlite3.Row 是惰性解引用，跨语句持有会串列，
             # 故此处所有 Row 都在语句后立即物化为普通值。
+            # BUG-FIX 2026-11-04（B-13-3 · latest_audit 同秒并列风险）：
+            # audit_time 只到秒，同一秒内连续两次审计（如自动审计后用户手动
+            # 重跑）按 audit_time DESC 可能返回较旧那行。补 id DESC 作为稳定
+            # 次序键，确保「最近审计」永远取最后写入记录。
             latest = conn.execute('SELECT * FROM consistency_audit_log \
               WHERE project_id = ?\
-              ORDER BY audit_time DESC LIMIT 1', (project_id,)).fetchone()
+              ORDER BY audit_time DESC, id DESC LIMIT 1', (project_id,)).fetchone()
             latest = dict(latest) if latest is not None else None
             # ENHANCE 2026-10-17（第八轮·T7-1 技术债闭环 + §7.2-1 通用减载）：
             # `consistency_audit_log` 的 `conflicts_json` 列在大项目下可达数十 KB，
@@ -766,16 +795,18 @@ async def get_audit_summary(project_id: int, user=Depends(get_current_user)):
                     latest.pop(_col, None)
 
             unresolved = conn.execute('SELECT COUNT(*) as cnt FROM consistency_conflicts \
-               WHERE project_id = ? AND COALESCE(resolved, 0) = 0', (project_id,)).fetchone()['cnt']
+               WHERE project_id = ? AND ' + rules.RESOLVED_SQL_OPEN,
+               (project_id,)).fetchone()['cnt']
             resolved = conn.execute('SELECT COUNT(*) as cnt FROM consistency_conflicts \
-               WHERE project_id = ? AND COALESCE(resolved, 0) = 1', (project_id,)).fetchone()['cnt']
+               WHERE project_id = ? AND ' + rules.RESOLVED_SQL_RESOLVED,
+               (project_id,)).fetchone()['cnt']
             # BUG-FIX 2026-10-08（统计口径不一致）：原 by_severity **未过滤
             # resolved**，把已解决的冲突也计入「严重冲突/中等冲突」卡片，而同一屏的
             # 「未解决冲突」卡片却只算未解决的 —— 两者口径不同，用户看到
             # 「未解决 3 / 严重 1 / 中等 1」却发现表格里那条中等早已修好。
             # 现按未解决口径统计，与 conflicts 表默认过滤（open）保持一致。
             by_severity = conn.execute('SELECT severity, COUNT(*) as cnt FROM consistency_conflicts \
-               WHERE project_id = ? AND COALESCE(resolved, 0) = 0\
+               WHERE project_id = ? AND ' + rules.RESOLVED_SQL_OPEN + '\
                GROUP BY severity', (project_id,)).fetchall()
             severity_counts = {}
             for row in by_severity:
@@ -791,17 +822,20 @@ async def get_audit_summary(project_id: int, user=Depends(get_current_user)):
             # 老调用方无需改动）：
             #   - `conflicts_by_severity_rule`：只算规则冲突（前端分级卡片优先用它）
             #   - `unresolved_rule_conflicts` / `unresolved_ai_findings`
-            #   - `resolved_ai_findings`
+            #   - `resolved_ai_findings` / `resolved_rule_conflicts`
             # 恒等式：unresolved_rule_conflicts + unresolved_ai_findings
-            #         == unresolved_conflicts。
-            ai_prefix = rules.AI_CONFLICT_ID_PREFIX + "%"
+            #         == unresolved_conflicts
+            #     且 resolved_rule_conflicts + resolved_ai_findings == resolved_conflicts
+            # （TD-9，2026-11-02：补齐已解决侧的规则计数，使两侧口径对称，
+            #  前端「已解决」卡片得以区分来源。**纯新增字段**，既有字段不变。）
+            ai_prefix = rules.AI_CONFLICT_ID_LIKE
             _base_open = (
                 'SELECT {sel} FROM consistency_conflicts '
-                'WHERE project_id = ? AND COALESCE(resolved, 0) = 0'
+                'WHERE project_id = ? AND ' + rules.RESOLVED_SQL_OPEN
             )
             _base_resolved = (
                 'SELECT {sel} FROM consistency_conflicts '
-                'WHERE project_id = ? AND COALESCE(resolved, 0) = 1'
+                'WHERE project_id = ? AND ' + rules.RESOLVED_SQL_RESOLVED
             )
             unresolved_rule = conn.execute(
                 _base_open.format(sel='COUNT(*) as cnt')
@@ -816,6 +850,11 @@ async def get_audit_summary(project_id: int, user=Depends(get_current_user)):
             resolved_ai = conn.execute(
                 _base_resolved.format(sel='COUNT(*) as cnt')
                 + ' AND conflict_id LIKE ?',
+                (project_id, ai_prefix),
+            ).fetchone()['cnt']
+            resolved_rule = conn.execute(
+                _base_resolved.format(sel='COUNT(*) as cnt')
+                + ' AND conflict_id NOT LIKE ?',
                 (project_id, ai_prefix),
             ).fetchone()['cnt']
             by_severity_rule = conn.execute(
@@ -849,6 +888,7 @@ async def get_audit_summary(project_id: int, user=Depends(get_current_user)):
             'unresolved_rule_conflicts': unresolved_rule,
             'unresolved_ai_findings': unresolved_ai,
             'resolved_ai_findings': resolved_ai,
+            'resolved_rule_conflicts': resolved_rule,
         }
 
     summary = await asyncio.to_thread(_read_summary)
@@ -864,8 +904,20 @@ async def get_consistency_metrics(user=Depends(get_current_user)):
     （结论一律看 `consistency_audit_log`）。纯读、无副作用、不触碰项目数据，
     故不做 `enforce_project_access`。
     """
-    from ..services.consistency_metrics import consistency_metrics
-    return {'status': 'ok', 'metrics': consistency_metrics.snapshot_with_defaults()}
+    from ..services.consistency_metrics import consistency_metrics, process_started_at
+    return {
+        'status': 'ok',
+        'metrics': consistency_metrics.snapshot_with_defaults(),
+        # G-3(2026-11-02)：纯新增 `since`/`notes`，既有 `metrics` 键不动。
+        # 计数器为进程内累计、重启归零——缺起点时间累计值无法解读，
+        # 多进程（gunicorn/celery）下各进程还各自为政（见 notes，如实告知）。
+        'since': process_started_at(),
+        'notes': (
+            '累计值自 since（本进程启动时刻）起计，进程重启归零；'
+            '多进程部署（gunicorn/celery）下各进程独立计数，'
+            '本快照仅反映当前 API 进程。审计结论一律看 consistency_audit_log。'
+        ),
+    }
 
 
 @router.get('/scoring-compliance/{project_id}')

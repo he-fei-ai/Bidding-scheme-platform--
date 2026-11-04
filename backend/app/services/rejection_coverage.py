@@ -39,6 +39,11 @@ COVERAGE_WEAK = 0.25
 #: 参与「命中最强章节」统计的条款上限（其余不逐个扫章节）
 _TOP_CLAUSES = 30
 
+#: TD-4(2026-11-02)：条款扫描的硬上限。此前 `clauses[:200]` 静默截断，
+#: >200 条款时覆盖率报告漏项且无任何提示；现改为显式常量并在返回体
+#: 补 `total_clauses` / `truncated`，让调用方（前端）能如实展示。
+_MAX_CLAUSES = 200
+
 
 def _char_bigrams(text: str) -> set[str]:
     """中文友好的字符二元组集合（去掉空白后）。"""
@@ -66,6 +71,24 @@ def _extract_clauses(results: Any, check_items: Any = None) -> list[dict]:
     clauses: list[dict] = []
 
     def _push(raw: Any) -> None:
+        # BUG-FIX 2026-11-04（B-13-1 · dict/list<string> 形态漏提取）：
+        # AI/导入端可能把条款存成纯文本数组（["投标文件未加盖公章", ...]），
+        # 或 {"废标": [{"description": ...}]} 的分组字典。原实现对字符串直接
+        # return、对 dict 只取一层 dict 值，都会静默得到 0 条 → 覆盖率端点
+        # 误报 "no_checks"。这里同时接受 str 与 dict。
+        if isinstance(raw, str):
+            text = raw.strip()
+            if len(text) < 4:
+                return
+            clauses.append(
+                {
+                    "id": str(len(clauses) + 1),
+                    "name": text[:60],
+                    "text": text,
+                    "raw": {"description": text},
+                }
+            )
+            return
         if not isinstance(raw, dict):
             return
         # BUG-FIX 2026-10-15（D7）：补充 description —— 废标条款的标准字段
@@ -99,7 +122,11 @@ def _extract_clauses(results: Any, check_items: Any = None) -> list[dict]:
                 _push(item)
         elif isinstance(check_items, dict):
             for v in check_items.values():
-                _push(v)
+                if isinstance(v, list):
+                    for item in v:
+                        _push(item)
+                else:
+                    _push(v)
         if clauses:
             return clauses
 
@@ -142,17 +169,32 @@ def rejection_answer_coverage(
         threshold: 低于该覆盖率判 weak（默认取服务层标定值）
 
     Returns:
-        {status, scanned_clauses, full_chars, items:[{id,name,status,coverage,
-         section_hits:[{section_id,title,matched}]}], weak_count, empty_count}
+        {status, scanned_clauses, total_clauses, truncated, full_chars,
+         items:[{id,name,status,coverage,
+         section_hits:[{section_id,title,matched_bigrams}]}], weak_count, empty_count}
         status = no_checks（无已完成检查任务）/ done
+
+    TD-2(2026-11-02)：本函数只有 SELECT，改为 `get_db(readonly=True)`，
+    不再抢全局写锁（与 agent_repair.py:123-128 已修的同类问题口径一致）。
+    TD-3(2026-11-02)：`section_hits` 补 `title`——此前只回裸 section_id，
+    用户无法定位章节，前端无法深链（与函数 docstring 的既有契约对齐）。
+    TD-4(2026-11-02)：新增 `total_clauses`（解析出的条款总数）与 `truncated`
+    （是否超过 `_MAX_CLAUSES` 被截断），纯新增字段，既有键不动，向后兼容。
     """
-    with get_db() as conn:
+    with get_db(readonly=True) as conn:
         row = conn.execute(
             "SELECT results, check_items FROM rejection_checks "
             "WHERE project_id = ? AND status = 'completed' ORDER BY id DESC LIMIT 1",
             (project_id,),
         ).fetchone()
         content_by_id = _load_all_project_content(conn, project_id)
+        # TD-3：与 content_by_id 同事务取标题（sort_order 口径一致），
+        # 供 section_hits 定位展示；读失败沿用外层异常路径，不静默吞。
+        title_rows = conn.execute(
+            "SELECT id, title FROM sections WHERE project_id = ?",
+            (project_id,),
+        ).fetchall()
+    title_by_id = {int(r["id"]): (r["title"] or "") for r in title_rows}
 
     # BUG-FIX 2026-10-13（P1 · 端点对「已跑过废标检查」的项目必然 500）：
     # `row` 是 `sqlite3.Row`（`get_db` 设了 `row_factory=sqlite3.Row`），而
@@ -177,6 +219,8 @@ def rejection_answer_coverage(
             "status": "no_checks",
             "message": "该项目尚无已完成的大数据废标检查结果，无法计算应答覆盖率",
             "scanned_clauses": 0,
+            "total_clauses": 0,
+            "truncated": False,
         }
 
     try:
@@ -200,6 +244,7 @@ def rejection_answer_coverage(
     clauses = _extract_clauses(results, check_items)
     if not clauses:
         return {"status": "no_checks", "scanned_clauses": 0,
+                "total_clauses": 0, "truncated": False,
                 "message": "废标检查结果中没有可解析的检查条款"}
 
     full_text_bigrams: set[str] = set()
@@ -210,7 +255,10 @@ def rejection_answer_coverage(
     full_chars = sum(len(c or "") for c in content_by_id.values())
     items: list[dict] = []
     weak_count = empty_count = 0
-    for clause in clauses[:200]:
+    # TD-4：截断不再静默 —— 总数与是否截断随返回体一并给出
+    total_clauses = len(clauses)
+    truncated = total_clauses > _MAX_CLAUSES
+    for clause in clauses[:_MAX_CLAUSES]:
         cbg = _char_bigrams(clause["text"])
         if not cbg:
             continue
@@ -236,7 +284,12 @@ def rejection_answer_coverage(
                     scored.append((n, sid))
             scored.sort(key=lambda x: -x[0])
             for n, sid in scored[:3]:
-                section_hits.append({"section_id": sid, "matched_bigrams": n})
+                # TD-3：补 title，兑现本函数 docstring 的既有契约
+                section_hits.append({
+                    "section_id": sid,
+                    "title": title_by_id.get(sid, ""),
+                    "matched_bigrams": n,
+                })
 
         items.append({
             "id": clause["id"],
@@ -250,6 +303,8 @@ def rejection_answer_coverage(
     return {
         "status": "done",
         "scanned_clauses": len(items),
+        "total_clauses": total_clauses,
+        "truncated": truncated,
         "full_chars": full_chars,
         "threshold": threshold,
         "weak_count": weak_count,

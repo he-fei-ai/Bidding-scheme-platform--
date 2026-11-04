@@ -882,3 +882,126 @@ class TestRulesEndpointAccess:
         from app.routers.consistency import run_audit
 
         assert inspect.iscoroutinefunction(run_audit)
+
+
+# ============================================================================
+# J. 评分达标 partial 档（TD-6，2026-11-02）
+# ============================================================================
+
+
+class TestScoringPartialTier2026_11_02:
+    """TD-6：中等覆盖带此前判 covered 只在 detail 文案里提"中等"，状态与
+    计数不可见，`COVERAGE_COVERED` 阈值形同虚设。现拆出 `partial` 态，
+    但 **covered 计数口径保持含 partial**（老消费者/问题清单行为不变）。"""
+
+    def _seed_point_with_generic_answer(self, tag: str) -> int:
+        pid = _new_project(tag)
+        with get_db() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO analysis (project_id, scoring_points_json) VALUES (?, ?)",
+                (
+                    pid,
+                    '[{"id":"R1","name":"施工组织设计","weight":"10",'
+                    '"standard":"须包含施工工艺流程图并附 BIM 模型技术文件及关键线路分析"}]',
+                ),
+            )
+        _seed_section(
+            pid, title="施工组织设计",
+            content="本章介绍施工工艺的总体安排与说明。" * 4, sort_order=0,
+        )
+        with get_db() as conn:
+            conn.execute(
+                "UPDATE sections SET scoring_point_id = 'R1' WHERE project_id = ?", (pid,)
+            )
+        return pid
+
+    def test_mid_band_coverage_now_flagged_partial(self):
+        """把 covered 阈值抬到 0.99、weak 压到 0.05：落在此带内的必须出 partial 态。"""
+        from app.services.scoring_compliance import audit_scoring_compliance
+
+        pid = self._seed_point_with_generic_answer("TD6-partial档")
+        rep = audit_scoring_compliance(pid, coverage_weak=0.05, coverage_covered=0.99)
+        partials = rep.by_status("partial")
+        assert len(partials) == 1, (
+            f"中等覆盖带未拆出 partial 态：{[(g.status, g.coverage) for g in rep.all_points]}"
+        )
+        assert 0.05 <= partials[0].coverage < 0.99
+        assert "中等" in partials[0].detail
+
+    def test_partial_still_counted_as_covered_for_legacy_consumers(self):
+        """向后兼容钉：`to_dict().covered` 含 partial；`gaps` 问题清单不含 partial。"""
+        from app.services.scoring_compliance import audit_scoring_compliance
+
+        pid = self._seed_point_with_generic_answer("TD6-covered口径")
+        rep = audit_scoring_compliance(pid, coverage_weak=0.05, coverage_covered=0.99)
+        d = rep.to_dict()
+        assert d["partial"] == 1
+        # covered 计数含 partial —— 老消费者读 covered 不会凭空少算
+        assert d["covered"] == len(rep.by_status("covered")) + d["partial"]
+        assert d["covered"] >= 1
+        # partial 不进问题清单（与旧行为一致）
+        assert rep.gaps == []
+        assert all(g["status"] != "partial" for g in d["gaps"])
+
+
+    def test_strong_answer_stays_covered_not_partial(self):
+        """默认阈值下正面作答仍是 covered（拆档没有把老 covered 拉低）。"""
+        from app.services.scoring_compliance import audit_scoring_compliance
+
+        pid = _new_project("TD6-强应答不回退")
+        with get_db() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO analysis (project_id, scoring_points_json) VALUES (?, ?)",
+                (
+                    pid,
+                    '[{"id":"R1","name":"施工组织设计","weight":"10",'
+                    '"standard":"须包含施工工艺流程图并附BIM模型技术文件"}]',
+                ),
+            )
+        _seed_section(
+            pid, title="施工组织设计",
+            content="本方案包含施工工艺流程图，并附BIM模型技术文件，"
+                    "涵盖工艺流程、施工进度与技术措施，明确各工序衔接方式。" * 3,
+            sort_order=0,
+        )
+        with get_db() as conn:
+            conn.execute(
+                "UPDATE sections SET scoring_point_id = 'R1' WHERE project_id = ?", (pid,)
+            )
+
+        rep = audit_scoring_compliance(pid)
+        assert len(rep.by_status("covered")) == 1
+        assert rep.by_status("partial") == []
+        assert rep.gaps == []
+
+
+# ============================================================================
+# K. 审计失败留痕（B-13-2，2026-11-04）
+# ============================================================================
+
+
+class TestFailedAuditLeavesTrace:
+    """失败分支必须写 consistency_audit_log，否则「最近审计」仍显示上次成功。"""
+
+    def test_failed_audit_writes_failed_log_row(self, monkeypatch):
+        from app.services.consistency_auditor import consistency_auditor
+
+        pid = _new_project("K-审计失败留痕")
+        _seed_section(pid, title="概述", content="工期：450日历天。")
+
+        def _boom(*args, **kwargs):
+            raise RuntimeError("simulated audit crash")
+
+        monkeypatch.setattr(consistency_auditor, "_collect_fact_instances", _boom)
+        result = consistency_auditor.run_full_audit(pid)
+        assert result.status == "failed"
+
+        with get_db() as conn:
+            row = conn.execute(
+                "SELECT status, conflicts_found FROM consistency_audit_log "
+                "WHERE project_id = ? ORDER BY audit_time DESC, id DESC LIMIT 1",
+                (pid,),
+            ).fetchone()
+        assert row is not None, "审计失败未留痕：consistency_audit_log 无记录"
+        assert row["status"] == "failed"
+        assert row["conflicts_found"] == 0

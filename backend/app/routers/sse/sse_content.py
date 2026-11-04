@@ -1168,8 +1168,6 @@ async def generate_content_impl(
 
             # 避免前端显示"generating"卡住且用户不知道需要重试。
 
-            db_save_error = None
-
             try:
 
                 # PERF-SAVE-NO-SELECT 2026-09-08：传入 project_id 省去内部 SELECT
@@ -2310,6 +2308,11 @@ async def generate_content_impl(
 
                             level2_default=level2_default,
 
+                            # BUG-FIX 2026-11-04（P2·强控阈值脱节）：强控覆盖表
+                            # 透传逐节阈值链（与上方全局阈值计算同源），防止
+                            # 已达强的小节被档位阈值误判不足而超硬上限扩写。
+                            strict_override_map=_wc_override,
+
                         )
 
                         expand_elapsed = time.time() - expand_start
@@ -2338,6 +2341,10 @@ async def generate_content_impl(
 
                         _results_content_by_id = _results_original_by_id
 
+                        # BUG-FIX 2026-11-04（P3-6c）：可读字数口径函数（与压缩链
+                        # L2179 同源导入）
+                        from ...services.sections import _count_readable_words as _crw_expand
+
                         batch_updates = []
 
                         for r in expanded:
@@ -2346,7 +2353,13 @@ async def generate_content_impl(
 
                                 original = _results_content_by_id.get(r["id"], "")
 
-                                if len(r.get("content", "")) > len(original):
+                                # BUG-FIX 2026-11-04（P3-6c·落库判据口径）：
+                                # 旧判据用**字符长度**对比，与全链路的可读字数口径
+                                # （R1）不一致 —— 中英文占比/图表载荷占比变化时，
+                                # 可读字数净减的扩写仍会因字符变长而落库（或反之漏落）。
+                                # 统一用 _crw（与扩写质量闸、压缩、R12 同口径）。
+
+                                if _crw_expand(r.get("content", "")) > _crw_expand(original):
 
                                     batch_updates.append((r["content"], r["id"]))
 
@@ -2864,6 +2877,20 @@ async def generate_content_impl(
                             })
                     except Exception as _ill_e:
                         logger.warning("[配图阶段] 执行异常（不影响正文）: %s", _ill_e)
+                        # BUG-FIX 2026-11-04（P3·前端悬挂）：异常路径旧实现只记日志，
+                        # `illustration_phase_done` 事件永不发送，前端
+                        # illustrationPhase 常驻 loading（duration:0）永不消失。
+                        # 补发一条带失败计数的事件，与正常收尾同构。
+                        try:
+                            await queue.put({
+                                "status": "illustration_phase_done",
+                                "inserted": 0,
+                                "skipped": 0,
+                                "failed": 1,
+                                "message": "配图阶段执行异常，已跳过（正文不受影响）",
+                            })
+                        except Exception:
+                            pass
 
 
 
@@ -3126,6 +3153,18 @@ async def generate_content_impl(
 
 
 
+                # BUG-FIX 2026-11-05（遗留1·终态 total 与整体进度统一口径）：
+                # 终态事件旧用 `len(results)`，而 overall_progress（L1391）用
+                # `len(leaf_dicts)`。`_run_sections` 预分配 `[None]*len(sections)`
+                # 使二者恒等，但扩写/审计路径（L2401 `results=expanded`、
+                # L2938 `results=audited`）整体替换 results，若其返回长度与
+                # 叶子数不一致，终态 total 将与整体进度分叉 → 前端两套计数
+                # 打架。统一为叶子数口径（与 L1391 同源）；极端兜底回退
+                # len(results)，保证 total 恒为生成任务的目标章节数。
+                _terminal_total = (
+                    len(leaf_dicts) if isinstance(leaf_dicts, list) else len(results)
+                )
+
                 if cancelled_count > 0 and saved_count == 0 and failed_count == 0:
 
                     stopped = True
@@ -3139,7 +3178,7 @@ async def generate_content_impl(
                     # stopped（带全字段）不对称（探针 P8 实证）。
                     await queue.put({
                         "status": "stopped",
-                        "total": len(results),
+                        "total": _terminal_total,
                         "success": saved_count,
                         "cancelled": cancelled_count,
                         "failed": failed_count,
@@ -3155,7 +3194,7 @@ async def generate_content_impl(
 
                             "status": "completed",
 
-                            "total": len(results),
+                            "total": _terminal_total,
 
                             "success": saved_count,
 
@@ -3177,7 +3216,7 @@ async def generate_content_impl(
 
                             "status": "completed",
 
-                            "total": len(results),
+                            "total": _terminal_total,
 
                             "success": saved_count,
 
@@ -3868,8 +3907,18 @@ async def generate_content_impl(
                                     event = await asyncio.wait_for(queue.get(), timeout=30)
 
                                     # 丢弃事件，仅用于防止队列堆积
-
-                                    if event.get("status") in SSE_TERMINAL_STATUSES:
+                                    # BUG-FIX 2026-11-05（后台续跑·排空提前退出）：与 SSE 主循环
+                                    # 的断流判据（3677-3680 `status in SSE_TERMINAL_STATUSES and
+                                    # section_id is None`）保持同构。此前漏掉 `section_id is None`：
+                                    # 客户端断开、任务后台续跑期间，第一条**章节级**终态事件
+                                    # （status∈{completed,failed,cancelled} 且带 section_id）一到
+                                    # 就让 _drain_queue break → 其后的进度/终态事件在无界队列里
+                                    # 堆积并最终被丢弃，「防队列堆积」设计意图对续跑主体失效
+                                    # （无死锁/泄漏，但若队列改有界会反压卡死生成流水线）。
+                                    if (
+                                        event.get("status") in SSE_TERMINAL_STATUSES
+                                        and event.get("section_id") is None
+                                    ):
 
                                         break
 

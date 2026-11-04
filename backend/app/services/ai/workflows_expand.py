@@ -307,6 +307,7 @@ def collect_deficient_sections(
     flat_minimum: int,
     level2_default: int = 3500,
     writing_length: str | None = None,
+    strict_override_map: dict | None = None,
 ) -> list[dict]:
     """找出「字数不足」的章节，按字数/阈值比升序（最缺的排最前）。
 
@@ -323,7 +324,15 @@ def collect_deficient_sections(
         section = sections_by_id.get(r.get("id"))
         if not section:
             continue
-        threshold = section_expand_threshold(section, flat_minimum, level2_default, writing_length)
+        threshold = section_expand_threshold(
+            section, flat_minimum, level2_default, writing_length,
+            # BUG-FIX 2026-11-04（P2·强控阈值脱节）：强控项目旧实现不传
+            # strict_override → 逐节达标线按体系 A 档位（如 1200×80%=960），
+            # 而强控硬上限 hi=1.2S —— 已达强的章节被误判不足、扩写超硬上限，
+            # 再靠 R9 拉回（AI 调用浪费 + 字数横跳）。与 sse_content 全局阈值
+            # 计算同口径（strict 短路 target=S）。
+            strict_override=(strict_override_map or {}).get(r.get("id")),
+        )
         words = _words_excluding_chart_payload(content)
         if words < threshold:
             deficient.append(
@@ -337,6 +346,36 @@ def collect_deficient_sections(
             )
     deficient.sort(key=lambda item: item["words"] / max(item["threshold"], 1))
     return deficient
+
+
+def _sanitize_rewritten_content(title: str, content: str) -> str:
+    """AI 改写正文（兜底扩写/审计修复）接受前的统一净化口径。
+
+    BUG-FIX 2026-11-04（P2·落库口径三处分叉）：主生成落库必经
+    ContentCleaner.clean（sse_db_ops._save_section_to_db），压缩链已专项接入
+    normalize_newlines + _force_close_unclosed_chart_fence + clean（2026-10-17），
+    而扩写与审计修复把 AI 原文直写 DB —— AI 输出中的重复章节标题、Markdown
+    `#` 标记、编号前缀、截断在围栏中间的输出（parse_content 会整块删掉 →
+    图表静默丢失）没有任何闸门。本函数与压缩链同构，任一步失败保留原样
+    （与 _save_section_to_db 的降级口径一致，不因工具链问题丢正文）。
+    """
+    if not content:
+        return content
+    try:
+        from ..content_cleaning import ContentCleaner
+        from ...utils import normalize_newlines
+
+        _c = normalize_newlines(content)
+        try:
+            from .workflows_sections import _force_close_unclosed_chart_fence
+
+            _c, _closed = _force_close_unclosed_chart_fence(_c)
+        except Exception:  # pragma: no cover - 兜底闭合不可用时仅清洗
+            pass
+        return ContentCleaner().clean(title or "", _c)
+    except Exception as _e:
+        logger.debug("改写内容净化失败（保留原样）: %s", _e)
+        return content
 
 
 async def expand_content_fallback(
@@ -353,6 +392,7 @@ async def expand_content_fallback(
     concurrency: int = 2,
     level2_default: int = 3500,
     on_section_done: Any = None,
+    strict_override_map: dict | None = None,
 ) -> list[dict]:
     """兜底扩写：对所有字数不足的章节做 insert/replace 局部扩写（并发）。
 
@@ -368,13 +408,19 @@ async def expand_content_fallback(
         concurrency: 并发上限
         max_expansion_rounds: 每个章节的最大扩写轮次
         on_section_done: 单章扩写达标后的回调 `(section_id, title)`，同步或异步均可
+        strict_override_map: 体系 B 强控覆盖表（build_section_override 产物，
+            {section_id: 本节条目}；BUG-FIX 2026-11-04 接入逐节阈值，见
+            collect_deficient_sections）
     Returns:
         list[dict]: 原results列表（扩写成功的条目已更新 content）
     """
     if not results:
         return results
 
-    deficient = collect_deficient_sections(results, sections_by_id, minimum_words, level2_default, writing_length)
+    deficient = collect_deficient_sections(
+        results, sections_by_id, minimum_words, level2_default, writing_length,
+        strict_override_map=strict_override_map,
+    )
     if not deficient:
         logger.info("兜底扩写：没有字数不足的章节（阈值=per-section×80%%），跳过")
         return results
@@ -444,6 +490,11 @@ async def expand_content_fallback(
                         timeout=120,
                     )
                     expanded_stripped = (expanded or "").strip()
+                    # BUG-FIX 2026-11-04（P2·扩写绕过清洗链）：与主生成落库/
+                    # 压缩链同口径净化后再做质量闸与写回，防止重复标题/Markdown
+                    # 标记/截断围栏直写 DB（本路径经 sse_content._batch_update_content
+                    # 裸 SQL 落库，无第二道闸）。
+                    expanded_stripped = _sanitize_rewritten_content(title, expanded_stripped)
                     expanded_words = _crw(expanded_stripped)
                     # 质量闸：必须变长且至少达到原字数的 80%（字数口径统一用可读字数 _crw，与 R1/压缩/R12 一致）
                     if (
@@ -491,9 +542,16 @@ async def expand_content_fallback(
     )
     for _ei, _eres in enumerate(_expand_results):
         if isinstance(_eres, BaseException):
+            # BUG-FIX 2026-11-04（P3-6a·日志键错位）：entry 的键是
+            # result/section/words/threshold/deficit，旧实现直接 .get("title")
+            # 恒打 "?"，排障无线索。
             _etitle = ""
             try:
-                _etitle = str(deficient[_ei].get("title") or deficient[_ei].get("id") or "?")
+                _etitle = str(
+                    (deficient[_ei].get("section") or {}).get("title")
+                    or deficient[_ei].get("result", {}).get("id")
+                    or "?"
+                )
             except Exception:
                 _etitle = "?"
             logger.error(
@@ -981,6 +1039,18 @@ async def _audit_one_group(
         current_content = target.get("content", "")
         if not current_content:
             continue
+        # BUG-FIX 2026-11-04（P3-1·超长章节修复闸失真）：送审只发前 5000 字，
+        # 而旧 80% 闸对**全文**可比 —— 原文 1 万字时修复稿（≈5000 字）恒被拒
+        # （功能静默失效）；原文 5000~6250 字时闸反而放行，apply 后尾部
+        # 被截断丢弃（数据丢失）。现在明确：超长章节跳过修复并告警（分块
+        # 修复留作后续增强），避免「放行即丢尾」与「恒拒即空转」两种失真。
+        if len(current_content) > 5000:
+            logger.warning(
+                "一致性审计修复：章节 %s 正文 %d 字超过单次送审上限 5000 字，跳过修复"
+                "（避免截断上下文导致内容丢失）",
+                section_id, len(current_content),
+            )
+            continue
         # ENHANCE 2026-10-18（审计遗留 D2 批次 2 收编）：修复请求 system+user 两侧收编
         repair_prompt = get_prompt(
             "CONSISTENCY_REPAIR_USER",
@@ -1022,7 +1092,16 @@ async def _audit_one_group(
                 and _crw(repaired)
                 >= _crw(current_content) * 0.8
             ):
-                target["content"] = repaired
+                # BUG-FIX 2026-11-04（P2·审计修复绕过清洗链）：与扩写路径同口径
+                # 净化后再写回（本路径经 sse_content.update_section 直改 DB，
+                # services.update_section 不清洗 content）。
+                _sec_ref = (sections_by_id or {}).get(section_id)
+                _sec_title = ""
+                if isinstance(_sec_ref, dict):
+                    _sec_title = str(_sec_ref.get("title") or "")
+                elif _sec_ref is not None and hasattr(_sec_ref, "title"):
+                    _sec_title = str(getattr(_sec_ref, "title") or "")
+                target["content"] = _sanitize_rewritten_content(_sec_title, repaired)
                 repaired_count += 1
                 finding["repaired"] = True
                 logger.info("一致性审计修复：章节 %s 已修复", section_id)
@@ -1078,10 +1157,13 @@ def _persist_ai_audit_findings(
     now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with get_db() as conn:
         # 1) 清理上一轮 AI 审计的旧发现（见 docstring 的 ID 前缀约定）
+        # TD-1 同批（2026-11-02·命名空间统一）：不再硬编码 `'AI-%'`，统一引用
+        # `rules.AI_CONFLICT_ID_LIKE`（由 `AI_CONFLICT_ID_PREFIX` 派生），
+        # 与审计器的清理/折叠/复用三处、冲突列表与摘要统计完全同源。
         conn.execute(
             "DELETE FROM consistency_conflicts "
-            "WHERE project_id = ? AND conflict_id LIKE 'AI-%'",
-            (project_id,),
+            "WHERE project_id = ? AND conflict_id LIKE ?",
+            (project_id, rules.AI_CONFLICT_ID_LIKE),
         )
 
         # 2) 写入本轮发现

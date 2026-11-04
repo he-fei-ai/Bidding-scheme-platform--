@@ -8,9 +8,11 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import logging
 import re
+import threading
 from typing import Any
 
 from ..export_chart_pipeline import (
@@ -107,12 +109,84 @@ def generate_chart_payload(
     return local_payload
 
 
+#: 图引导语框架词（需求 4·图文连贯）：AI 正文为图预留的铺垫句
+#: （「下图为施工流程：」「如下图所示」「见图 3-2」），图表围栏应紧随其后。
+_LEADIN_HINT_RE = re.compile(r"如?下[面一]?图(?:所示)?|如图\s*[\d\-]*\s*所示|见下?图(?:所示)?")
+
+#: 结构化行：不可作插入锚点（小节标题 / 列表项 / 表格行 / 围栏 / 引用 / 图表标记）。
+#: 图插在标题行后会与下文断裂；插在列表/表格行后会打断列表结构（需求 11·列表样式）。
+_STRUCTURED_LINE_RE = re.compile(
+    r"^(?:#{1,6}\s|[-*+]\s|\d+[\.、)]\s|\||```|~~~|>|<<|\[\[)"
+)
+
+#: 数据型图表集合（A3 建议 2·空态优于错态）：载荷含具体数值（工期/人数/
+#: 占比/日期），正文零数字时本地模板数字纯属虚构，危害最大。
+_DATA_DRIVEN_CHART_TYPES = frozenset(
+    {"gantt", "timeline", "labor", "comparison", "layout"}
+)
+
+#: 「数字+单位」线索：正文提供了可提取的真实数据（工期/人数/金额/比例/日期）。
+#: 覆盖「90 天」「30 人」「25%」「180 工日」「30 个工日」「2026-03-01」「2026年3月」等形态。
+_NUMERIC_CLUE_RE = re.compile(
+    r"\d+(?:\.\d+)?\s*个?\s*(?:天|日|周|星期|月|季度|年|人|台|套|次|%|％|万|亿|元|米|㎡|m²|km|千米|小时|工日|工天)"
+    r"|\d{4}\s*[-/年]\s*\d{1,2}"
+)
+
+
+def content_has_extractable_data(content: str, chart_type: str) -> bool:
+    """正文是否含可提取的真实数据线索（A3 建议 2·空态优于错态）。
+
+    本地模板兜底（``_local_payload_generation``）产出的固定示例数字
+    （劳动力 3/5/2、里程碑 2025-01-01 等）与章节正文无关联，直接进入
+    投标文件存在「图文矛盾」风险。判定口径（``chart_type`` 分级）：
+
+      - 数据型（gantt/timeline/labor/comparison/layout）：正文需含
+        「数字+单位」线索（工期/人数/金额/日期），零数字 = 模板数字
+        纯虚构，宁缺毋假；
+      - 结构型（flowchart/architecture）：正文需含该类型关键词命中
+        （正文提供工序名/部门名锚定主题），正文零命中 = 模板节点
+        纯虚构。
+
+    正文为空不在判定范围（返回 False 语义上的「无线索」，但编排层对
+    空正文有独立的降级落库契约 ``content_empty_fallback_chart_field``，
+    由前端「模板数据」披露标签兜底，不在此收紧）。
+    """
+    if not content or not content.strip():
+        return False
+    if (chart_type or "").strip().lower() in _DATA_DRIVEN_CHART_TYPES:
+        return bool(_NUMERIC_CLUE_RE.search(content))
+    keywords = _CHART_FALLBACK_KEYWORDS.get(chart_type, [])
+    return any(kw in content for kw in keywords)
+
+
 def suggest_insertion_position(
     content: str,
     chart_type: str,
     section_title: str = "",
 ) -> int:
-    """AI 推荐图表插入位置。"""
+    """AI 推荐图表插入位置（返回第 N 个非空段索引，与 insert_fence_at_paragraph 同口径）。
+
+    ENHANCE 2026-11-03（需求 4·位置插入优化）：旧实现纯关键词打分且不感知
+    段落结构，存在三个缺陷：
+      1. 图可插在**小节标题行 / 列表项 / 表格行之后**——图文断裂、打断列表结构；
+      2. ``section_title`` 参数从未参与打分（死参数）——章节标题常含图表类型
+         关键词（「施工工艺流程」），标题自身是强锚点信号；
+      3. 正文已有图引导语段（「下图为…：」）时不优先——引导语是正文为图
+         预留的铺垫，图应紧随其后而非插到别处。
+
+    现按三级策略（向后兼容：返回值语义不变、关键词打分保留）：
+      ① 引导语段优先：命中 _LEADIN_HINT_RE 的段落直接作锚点（图随引导语）；
+      ② 关键词打分 + 结构过滤：跳过结构化行，**纯正文信号**打分；
+      ③ 兜底：正文无任何命中时——``section_title`` 含类型关键词 → 首段
+         （标题引入段后）作锚点；否则保持旧口径 min(1, len-1)；
+         命中结构化行则前移到最近可锚点段。
+
+    FIX 2026-11-03：首版把标题加权放进 ② 打分（首段 0+1=1 分），与正文单
+    关键词命中段（1 分）打平且严格大于不成立 → 首段占先，破坏了 2026-10-17
+    契约（图应插在含「岗位」的第二段后，全量回归实测暴露）。正文关键词命中
+    段是「图文连贯」的第一信号，标题只是**无正文信号时**的弱兜底——故把
+    加权从打分阶段移到兜底阶段。
+    """
     if not content:
         return -1
 
@@ -121,17 +195,32 @@ def suggest_insertion_position(
         return -1
 
     keywords = _CHART_FALLBACK_KEYWORDS.get(chart_type, [])
+    _title_bonus = 1 if section_title and any(kw in section_title for kw in keywords) else 0
+
+    # ① 引导语段优先：图紧随「下图为…：」铺垫句（图文逻辑连贯的最强信号）
+    for i, para in enumerate(paragraphs):
+        if _LEADIN_HINT_RE.search(para) and not _STRUCTURED_LINE_RE.match(para):
+            return i
+
+    # ② 关键词打分 + 结构化行过滤（纯正文信号，标题不参与——避免压过真实命中段）
     best_index = -1
     best_score = 0
-
     for i, para in enumerate(paragraphs):
+        if _STRUCTURED_LINE_RE.match(para):
+            continue  # 标题/列表/表格/围栏行不作锚点（防图文断裂）
         score = sum(1 for kw in keywords if kw in para)
         if score > best_score:
             best_score = score
             best_index = i
 
+    # ③ 兜底：正文无命中 → 标题含类型关键词时首段作锚点（标题引入段后）；
+    #    否则旧口径 min(1, len-1)；命中结构化行时前移到最近可锚点段
     if best_index < 0:
+        if _title_bonus and not _STRUCTURED_LINE_RE.match(paragraphs[0]):
+            return 0
         best_index = min(1, len(paragraphs) - 1)
+        while best_index > 0 and _STRUCTURED_LINE_RE.match(paragraphs[best_index]):
+            best_index -= 1
 
     return best_index
 
@@ -343,7 +432,13 @@ def _resolve_chart_provider(ai_client: Any) -> Any:
         )
         return provider
     except Exception as e:
-        logger.debug("图表 AI provider 创建失败，走本地推断: %s", e)
+        # ENHANCE 2026-11-04（P1·AI 增强弱失效不可观测）：原 logger.debug——
+        # AI 配置错误时永久静默走本地推断（2026-10-23 生产事故根因之一），
+        # 运维无法感知。升级为 warning 并带固定 tag 便于日志检索；
+        # 行为不变（仍回退本地推断，不阻塞）。
+        logger.warning(
+            "[图表AI] provider 创建失败，本章 AI 增强分析降级为本地推断: %s", e
+        )
         return None
 
 
@@ -358,18 +453,39 @@ def _chart_response_text(response: Any) -> str:
     return str(getattr(response, "content", "") or "")
 
 
+#: 模块级桥接线程池（F5 性能修复 2026-11-03·需求 10）：旧实现每次 AI 调用
+#: 新建 ``ThreadPoolExecutor(max_workers=1)``，线程创建/销毁开销随调用次数
+#: 线性增长（批量编排多章节时尤甚）。改为模块级复用（并发上限 4，与 SSE 侧
+#: _chart_worker 动态 2-4 口径一致）；进程退出由 concurrent.futures 的
+#: atexit 钩子正常回收，空闲线程不阻塞退出。
+#: R3 加固 2026-11-03：惰性初始化双重检查加锁——并发首调可能各自建池泄漏
+#: 一个（旧实现每次新建无此问题，模块级复用引入后必须防竞态）。
+_CHAT_BRIDGE_POOL: concurrent.futures.ThreadPoolExecutor | None = None
+_CHAT_BRIDGE_POOL_LOCK = threading.Lock()
+
+
+def _get_chat_bridge_pool() -> concurrent.futures.ThreadPoolExecutor:
+    global _CHAT_BRIDGE_POOL
+    if _CHAT_BRIDGE_POOL is None:  # fast path（池建好后无锁零竞争）
+        with _CHAT_BRIDGE_POOL_LOCK:
+            if _CHAT_BRIDGE_POOL is None:
+                _CHAT_BRIDGE_POOL = concurrent.futures.ThreadPoolExecutor(
+                    max_workers=4, thread_name_prefix="chart-ai-bridge"
+                )
+    return _CHAT_BRIDGE_POOL
+
+
 def _run_chat_sync(provider: Any, messages: list, **kwargs: Any) -> Any:
     """在同步函数里驱动异步 provider.chat。
 
     图表编排链路（analyze_chart_needs / generate_chart_payload /
     batch_analyze_sections ...）是同步函数，且被 async 路由在**运行中的事件
     循环内**调用（routers/charts_orchestration.py），不能直接 asyncio.run。
-    策略：当前线程无运行循环 → asyncio.run；有运行循环 → 丢到工作线程跑
-    独立 loop（provider 的 httpx 客户端惰性创建，跨 loop 顺序使用；图表调用
-    失败有本地推断兜底，风险可控）。
+    策略：当前线程无运行循环 → asyncio.run；有运行循环 → 丢到**模块级复用**
+    线程池跑独立 loop（provider 的 httpx 客户端惰性创建，跨 loop 顺序使用；
+    图表调用失败有本地推断兜底，风险可控）。
     """
     import asyncio
-    import concurrent.futures
 
     coro = provider.chat(messages, **kwargs)
     if not asyncio.iscoroutine(coro):
@@ -378,8 +494,7 @@ def _run_chat_sync(provider: Any, messages: list, **kwargs: Any) -> Any:
         asyncio.get_running_loop()
     except RuntimeError:
         return asyncio.run(coro)
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        return pool.submit(asyncio.run, coro).result()
+    return _get_chat_bridge_pool().submit(asyncio.run, coro).result()
 
 
 def _record_chart_cache(provider: Any, task_type: str, section_id: str = "") -> None:
@@ -577,6 +692,7 @@ __all__ = [
     "analyze_chart_needs",
     "generate_chart_payload",
     "suggest_insertion_position",
+    "content_has_extractable_data",
     "batch_analyze_sections",
     "generate_all_chart_payloads",
     "_generate_local_architecture",

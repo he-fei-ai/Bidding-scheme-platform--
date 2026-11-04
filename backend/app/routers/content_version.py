@@ -260,7 +260,6 @@ async def restore_content_version(
 
     section_id = result["section_id"]
     content = result["content"]
-    version = result["version"]
 
     # BUG-FIX 2026-09-18（P1）：回滚裸 SQL 写正文，原不失效任何正文缓存 →
     # 目录树 60s 内显示旧 has_content/字数，章节缓存 TTL 内读到回滚前正文。

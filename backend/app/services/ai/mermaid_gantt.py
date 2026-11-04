@@ -146,10 +146,13 @@ def _render_gantt_image_v2(plan: dict, highlight_critical_path: bool = False) ->
 
     # 提取任务
     tasks = plan.get("tasks", [])
+    # BUG-FIX 2026-11-04（P3·日志键错位）：渲染 plan 契约键是 totalDays
+    # （mermaid_renderer 构造、validate_gantt_plan 口径），原读 duration →
+    # 启动日志总工期恒 0。兼容旧键兜底。
     logger.info(
         "[PIL v2渲染] 甘特图渲染启动: 任务数=%d 总工期=%d 依赖数=%d highlight_critical_path=%s",
         len(tasks),
-        plan.get("duration", 0),
+        plan.get("totalDays") or plan.get("duration", 0),
         len([t for t in tasks if t.get("dependencies")]),
         highlight_critical_path,
     )

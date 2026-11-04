@@ -1157,7 +1157,21 @@ export function upsertSectionProgressItem<T extends { section_id: number; progre
     // 后端重试会为同一章节重发 status="generating"（progress 0），
     // 于是条目从 completed/100 掉回 0 —— 单章节百分比与 ProgressPanel 汇总一起倒退。
     // 改为「单调不降 + 钳到 [0,100]」：进入终态后不再回退，重试期间只会上探。
-    merged.progress = Math.max(clamp(item.progress), clamp((prev[existing] as T | undefined)?.progress));
+    // BUG-FIX 2026-11-04（低·重试矛盾显示）：终态 → generating（重试重发）时
+    // 单调不降会保留 100，ProgressPanel 渲染「生成中 100%」的矛盾状态。
+    // 该转移下钳到 99；回到终态（如 completed）后恢复 100。
+    const _TERMINAL = new Set(["completed", "failed", "cancelled"]);
+    const _prevStatus = String(
+      (prev[existing] as T | undefined)?.status ?? "",
+    );
+    const _cap =
+      !_TERMINAL.has(String(merged.status ?? "")) && _TERMINAL.has(_prevStatus)
+        ? 99
+        : 100;
+    merged.progress = Math.min(
+      _cap,
+      Math.max(clamp(item.progress), clamp((prev[existing] as T | undefined)?.progress)),
+    );
   }
   if (existing >= 0) {
     const updated = [...prev];
@@ -1507,6 +1521,17 @@ export function formatBatchSummary(
   if (total <= 1) return null;
   const { ok, pending, parseFailed, duplicate, failed } = totals;
   if (parseFailed === 0 && failed === 0) {
+    // BUG-FIX 2026-11-04（F-12-2 纯重复批误报 success）：整批全部被判 duplicate
+    //（内容哈希去重命中，ok=0、无在途、无失败）时走 success 分支，绿色 toast
+    //「批量上传完成，成功 0 个文件，N 个重复未上传」—— 语义级别与内容不符，
+    // 用户明明一个文件都没传上去却看到绿色成功提示。改为 warning 级并直说
+    // 「内容重复」。含成功/在途文件时维持既有 success 文案不变。
+    if (ok === 0 && pending === 0 && duplicate > 0) {
+      return {
+        type: "warning",
+        text: `批量上传完成：${duplicate} 个文件内容已存在（与已上传文件重复），未重复上传`,
+      };
+    }
     // HARDENING 2026-10-16：含后台解析中的文件时如实说明，不再一律宣称
     // 「成功 N 个」（OCR 终态尚未落库，见 classifyUploadResult 注释）
     if (pending > 0) {
@@ -1647,6 +1672,23 @@ export function formatParsingStatusText(
   s: FileParsingStatus | null | undefined,
 ): string | null {
   if (!s) return null;
+  // BUG-FIX 2026-11-04（F-12-1 idle 响应 undefined 文案）：后端
+  // GET /projects/{id}/tasks/files/status 在项目无任何解析任务行时只返回
+  // `{status:'idle', message:'没有文件解析任务'}`（routers/tasks.py:322），
+  // **不含** processing/recent_completed/recent_failed 计数字段。旧实现拿
+  // undefined 参与比较与拼接（`undefined > 0` 为 false、`undefined === 0`
+  // 也为 false），一路落到最后的模板串，产出「最近解析完成 undefined 个，
+  // 失败 undefined 个」。可达路径：首次上传在途窗口（尚未建任何任务行）、
+  // 全部文件被客户端超限拒绝（未建任务行）时 1.5s 轮询即命中。
+  // 现：idle 短路返回 null；计数字段缺省（老后端 / 异常响应）同样防御。
+  if (s.status === "idle") return null;
+  if (
+    typeof s.processing !== "number" ||
+    typeof s.recent_completed !== "number" ||
+    typeof s.recent_failed !== "number"
+  ) {
+    return null;
+  }
   if (s.processing > 0) {
     return `正在解析 ${s.processing} 个文件…`;
   }

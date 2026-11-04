@@ -292,6 +292,14 @@ def _run_retry_generation_two_rounds(monkeypatch) -> list[dict]:
             "global_facts_items": None, "facts_policy": "fabricate", "industry": "",
         }
 
+    # BUG-FIX 2026-11-05（遗留4·测试告警）：`_save_section_to_db` 是**同步**函数
+    # （经 asyncio.to_thread 调用，sse_content.py:1177），而 `_auto_generate_charts_for_section`
+    # 是 async（经 await 调用，sse_content.py:1018）。原单一 async `_noop` 同时替换二者：
+    # to_thread 里调用 async 函数返回未 await 的协程 → RuntimeWarning "coroutine was
+    # never awaited"。拆成同步 `_noop_save` 与 async `_noop`，与各自生产契约对齐。
+    def _noop_save(*a, **kw):
+        return True
+
     async def _noop(*a, **kw):
         return True
 
@@ -306,7 +314,7 @@ def _run_retry_generation_two_rounds(monkeypatch) -> list[dict]:
     monkeypatch.setattr(sc, "update_step", lambda *a, **kw: None)
     monkeypatch.setattr(sc, "generation_manager", _StubGM2())
     monkeypatch.setattr(sc, "_run_sections", _fake_run_sections)
-    monkeypatch.setattr(sc, "_save_section_to_db", _noop)
+    monkeypatch.setattr(sc, "_save_section_to_db", _noop_save)
     monkeypatch.setattr(sc, "_auto_generate_charts_for_section", _noop)
     monkeypatch.setattr(sc, "_OVERALL_PROGRESS_THROTTLE_SECS", 0.0)
 

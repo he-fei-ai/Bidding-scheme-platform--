@@ -679,3 +679,88 @@ export function validateLayoutData(data: any): ValidationResult {
   }
   return { valid: errors.length === 0, errors };
 }
+
+// ============================================================================
+// 时间线校验（与后端 chart_validators.validate_timeline_data 同口径）
+// ============================================================================
+
+export function validateTimelineData(data: Record<string, any> | string): ValidationResult {
+  const errors: string[] = [];
+  try {
+    if (typeof data === 'string') data = JSON.parse(data);
+    if (typeof data !== 'object' || data === null) {
+      errors.push('时间线数据必须是对象格式');
+      return { valid: false, errors };
+    }
+
+    const milestones: any[] = data.milestones || data.items || [];
+    if (!Array.isArray(milestones) || milestones.length < 2) {
+      errors.push('时间线至少需要2个里程碑');
+      return { valid: false, errors };
+    }
+
+    const dateRe = /^\d{4}-\d{2}-\d{2}$/;
+    const dates: string[] = [];
+    for (const m of milestones) {
+      const d = m && (m.date || m.time || m.start);
+      if (d == null) {
+        errors.push('里程碑缺少日期字段');
+        continue;
+      }
+      if (typeof d === 'string' && !dateRe.test(d)) {
+        errors.push(`里程碑日期格式应为 YYYY-MM-DD，实际: ${d}`);
+      }
+      dates.push(String(d));
+    }
+
+    // 日期逆序检测（里程碑必须按时间升序）
+    for (let idx = 1; idx < dates.length; idx++) {
+      const prev = dates[idx - 1];
+      const cur = dates[idx];
+      if (prev && cur && prev > cur) {
+        errors.push(`里程碑日期逆序: ${prev} 应早于 ${cur}`);
+      }
+    }
+  } catch (e) {
+    errors.push(`数据解析失败: ${String(e)}`);
+  }
+  return { valid: errors.length === 0, errors };
+}
+
+// ============================================================================
+// 正文重复标题预检（与后端 chart_validators.check_duplicate_title_in_content 同口径，CMP-07）
+// ============================================================================
+
+/**
+ * 检测正文前 5 行是否存在重复标题（CMP-07）。
+ * - 给定 title 时：前 5 行中出现 ≥2 次该标题（去掉 # / 空格 / 分隔符后匹配）即判定重复；
+ * - 未给定 title 时：前 5 个非空行中存在完全相同的行即判定重复。
+ */
+export function checkDuplicateTitleInContent(content: string, title?: string): boolean {
+  if (!content) return false;
+  const lines = content
+    .split('\n')
+    .map((l) => l.trim())
+    .filter(Boolean)
+    .slice(0, 5);
+  if (!lines.length) return false;
+
+  const norm = (s: string) => s.replace(/[#*\-\s]/g, '');
+
+  if (title) {
+    const t = norm(title);
+    if (!t) return false;
+    const hits = lines.filter((l) => {
+      const n = norm(l);
+      return n.includes(t) || t.includes(n);
+    }).length;
+    return hits >= 2;
+  }
+
+  const seen = new Set<string>();
+  for (const l of lines) {
+    if (seen.has(l)) return true;
+    seen.add(l);
+  }
+  return false;
+}

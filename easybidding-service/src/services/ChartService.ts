@@ -1,7 +1,13 @@
 /**
  * 图表服务 - 集成验证与缓存功能
- * 
+ *
  * @version v3.1
+ *
+ * @deprecated 遗留/未接通模块（2026-11-01 复核）：
+ *   真实的图表生成、校验、渲染与落库均由 Python 后端（backend/app/services/...）
+ *   完成；本 ChartService/ChartCache 仅返回 mock 渲染字节（见 _renderMermaid），
+ *   在当前代码库中无任何真实请求路径调用方（仅 services/index.ts 导出）。
+ *   保留仅供向后兼容与文档参照，请勿在新流程中依赖其渲染结果。
  */
 
 import { join, resolve } from "path";

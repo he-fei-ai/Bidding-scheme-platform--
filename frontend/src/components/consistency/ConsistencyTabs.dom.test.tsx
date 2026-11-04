@@ -127,6 +127,33 @@ const applyAutoFixMock = vi.fn(async () => ({
   unified_value: "450", fact_name: "工期", dry_run: false,
 }));
 
+// L3(2026-11-03)：运维指标抽屉的 metrics 快照 mock（含 G-3 的 since/notes）。
+// since/notes 按真实契约声明为**可选**（老后端不返回），使「老后端形态」
+// 用例可以合法地整体省略这两个键（TS2739/TS2345：mockResolvedValueOnce 的
+// 入参类型取自默认实现的推断返回类型）。
+const metricsMock = vi.fn(async (): Promise<{
+  status: string;
+  metrics: {
+    audit_runs: number; audit_failed: number; ai_audit_runs: number;
+    ai_findings: number; ai_findings_repaired: number; ai_patch_rejected: number;
+    guard_interceptions: number;
+  };
+  since?: string; notes?: string;
+}> => ({
+  status: "ok",
+  metrics: {
+    audit_runs: 12,
+    audit_failed: 1,
+    ai_audit_runs: 3,
+    ai_findings: 7,
+    ai_findings_repaired: 5,
+    ai_patch_rejected: 2,
+    guard_interceptions: 4,
+  },
+  since: "2026-11-03 08:00:00",
+  notes: "进程内累计，重启归零；多进程部署下各进程独立计数",
+}));
+
 vi.mock("../../api", () => ({
   getConflicts: getConflictsMock,
   getAuditSummary: getAuditSummaryMock,
@@ -138,6 +165,7 @@ vi.mock("../../api", () => ({
     rejected: [], sections: [], unresolved: [], errors: [], conflict_states: null,
   })),
   getScoringCompliance: getScoringMock,
+  getConsistencyMetrics: metricsMock,
   getConsistencyRules: vi.fn(async () => ({
     status: "ok",
     severity: {
@@ -387,5 +415,48 @@ describe.skipIf(!hasDom)("一致性校核 —— Tab 级与组件级交互", () 
       (antd.message as unknown as Record<string, unknown>).success = origSuccess;
       (antd.message as unknown as Record<string, unknown>).error = origError;
     }
+  });
+
+  // -------------------------------------------------------------------------
+  // L3（2026-11-03 遗留项加固）：运维指标抽屉（GET /consistency/metrics 消费入口）
+  // -------------------------------------------------------------------------
+
+  it("Tab 级：点「运维指标」打开抽屉，展示计数器、起点与口径说明", async () => {
+    render(<ConsistencyPage />);
+    await screen.findByText("工期", undefined, { timeout: 60_000 });
+
+    fireEvent.click(await screen.findByText("运维指标"));
+    // 抽屉标题 + 拉取到的快照
+    expect(await screen.findByText("一致性校核运维指标", undefined, { timeout: 30_000 })).toBeTruthy();
+    expect(await screen.findByText("审计执行次数", undefined, { timeout: 30_000 })).toBeTruthy();
+    expect(document.body.textContent).toContain("12");
+    // G-3：since 与 notes 随快照展示
+    expect(document.body.textContent).toContain("2026-11-03 08:00:00");
+    expect(screen.getByText(/进程内累计，重启归零/)).toBeTruthy();
+  });
+
+  it("Tab 级：老后端（无 since/notes）时抽屉仍渲染指标，不展示起点区块", async () => {
+    metricsMock.mockResolvedValueOnce({
+      status: "ok",
+      // ConsistencyMetrics 的 KNOWN_KEYS 键集必填（后端 snapshot_with_defaults 恒补 0）
+      metrics: {
+        audit_runs: 5,
+        audit_failed: 0,
+        ai_audit_runs: 0,
+        ai_findings: 0,
+        ai_findings_repaired: 0,
+        ai_patch_rejected: 0,
+        guard_interceptions: 0,
+      },
+      // since / notes 缺省 —— 老后端形态
+    });
+    render(<ConsistencyPage />);
+    await screen.findByText("工期", undefined, { timeout: 60_000 });
+
+    fireEvent.click(await screen.findByText("运维指标"));
+    expect(await screen.findByText("审计执行次数", undefined, { timeout: 30_000 })).toBeTruthy();
+    expect(screen.getByText("5")).toBeTruthy();
+    // 无 since → 不出现「计数起点」行（回退为不展示）
+    expect(screen.queryByText(/计数起点/)).toBeNull();
   });
 });

@@ -275,11 +275,28 @@ class _E2EProvider:
         raise RuntimeError("e2e mock: AI 不可用")
 
 
+#: BUG-FIX 2026-11-02（遗留项 1）：标书智能体（4）提示词顺序优化后，
+#: `<json_outline>` 骨架位于**最后一条** user 消息，旧实现用 next() 只取
+#: 第一条 → 本 mock 的 L2 脏标题注入从未真实生效，用例名义覆盖实为空跑。
+#: 修正为合并全部 user 内容判定，并用计数器钉住「必须命中 L2 填充分支」，
+#: 未来提示词再调整导致判定失效时，测试会显式失败而不是静默空转。
+_L2_HIT_COUNT = {"n": 0}
+
+
+def _all_user_text(messages) -> str:
+    return "\n".join(
+        m.content
+        for m in messages
+        if getattr(m, "role", "") == "user" and isinstance(m.content, str)
+    )
+
+
 async def _fake_collect_e2e(provider, messages, **kwargs):
     import json as _json
 
-    user = next((m.content for m in messages if getattr(m, "role", "") == "user"), "")
+    user = _all_user_text(messages)
     if "<json_outline>" in user:
+        _L2_HIT_COUNT["n"] += 1
         m = re.search(r"<json_outline>\n(.*?)\n</json_outline>", user, re.DOTALL)
         skeleton = _json.loads(m.group(1))
         for i, l2 in enumerate(skeleton.get("children", [])):
@@ -300,12 +317,19 @@ class TestEndToEndPrefixPipeline:
         真实分步全链路之后最终目录必须全部干净。"""
         import app.services.ai.workflows_outline_v51 as wo
 
+        _L2_HIT_COUNT["n"] = 0
         monkeypatch.setattr(wo, "collect_json_response", _fake_collect_e2e)
         outline = await wo.generate_outline_v51(
             _E2EProvider(), "某房建工程概述", "[]", "建筑工程",
             auto_confirm=True, outline_mode="stepwise",
         )
         assert outline, "分步路径未产出目录"
+        # 反空转护栏（2026-11-02 遗留项 1）：mock 必须真实命中过 L2 骨架
+        # 填充调用，否则本用例的脏标题注入等于没发生、断言全部空跑。
+        assert _L2_HIT_COUNT["n"] > 0, (
+            "脏标题注入未命中 L2 填充链（collect_json_response 从未收到 "
+            "<json_outline> 骨架）——用例退化为空跑，需检查提示词消息结构"
+        )
 
         def _walk(nodes, level=1):
             for n in nodes:

@@ -196,6 +196,14 @@ def _run_retry_generation(monkeypatch) -> list[dict]:
         def gate_error(self):
             return None
 
+    # BUG-FIX 2026-11-05（遗留4·测试告警）：`_save_section_to_db` 是**同步**函数
+    # （经 asyncio.to_thread 调用，sse_content.py:1177），而 `_auto_generate_charts_for_section`
+    # 是 async（经 await 调用，sse_content.py:1018）。原单一 async `_noop` 同时替换二者：
+    # to_thread 里调用 async 函数返回未 await 的协程 → RuntimeWarning "coroutine was
+    # never awaited"。拆成同步 `_noop_save` 与 async `_noop`，与各自生产契约对齐。
+    def _noop_save(*a, **kw):
+        return True
+
     async def _noop(*a, **kw):
         return True
 
@@ -210,7 +218,7 @@ def _run_retry_generation(monkeypatch) -> list[dict]:
     monkeypatch.setattr(sc, "update_step", lambda *a, **kw: None)
     monkeypatch.setattr(sc, "generation_manager", _StubGM())
     monkeypatch.setattr(sc, "_run_sections", _fake_run_sections)
-    monkeypatch.setattr(sc, "_save_section_to_db", _noop)
+    monkeypatch.setattr(sc, "_save_section_to_db", _noop_save)
     monkeypatch.setattr(sc, "_auto_generate_charts_for_section", _noop)
     monkeypatch.setattr(sc, "_OVERALL_PROGRESS_THROTTLE_SECS", 0.0)
 
@@ -269,6 +277,15 @@ class TestSSERetryProgressEndToEnd:
         completed = [e for e in events if e.get("status") == "completed"]
         assert completed and completed[-1]["success"] == 2
         assert completed[-1]["failed"] == 0
+        # BUG-FIX 2026-11-05（遗留1）：终态 total 与整体进度（overall_progress.total）
+        # 同口径（len(leaf_dicts)），不得用 len(results) 导致两套计数分叉。
+        assert completed[-1]["total"] == 2, (
+            f"终态 total 应为 len(leaf_dicts)=2，实际 {completed[-1]['total']}"
+        )
+        prog_total = progress[-1]["total"]
+        assert completed[-1]["total"] == prog_total, (
+            f"终态 total 与整体进度 total 分叉: {completed[-1]['total']} != {prog_total}"
+        )
 
     def test_progress_sequence_is_monotonic_nonregressing(self, monkeypatch):
         """进度序列不得出现「回退后双计」形态（failed 与 saved 同时含同一章）。"""

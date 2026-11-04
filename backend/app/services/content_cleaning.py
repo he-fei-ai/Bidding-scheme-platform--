@@ -408,12 +408,38 @@ def plan_chart_fence_lines(lines: list[str]) -> list[tuple[str, str, list[str], 
             # 现按常量注释的字面语义判定「载荷行数」，允许满 LIMIT 行后
             # 继续再看一眼闭合标记。
             if len(body) > _HARD_CHART_FENCE_LINE_LIMIT:
-                break  # 病态超长围栏：按坏块删除（区域有界）
+                # 病态超长围栏：按坏块删除（区域有界）。
+                # BUG-FIX 2026-11-05（围栏闭合行泄漏）：超限 break 时 `j` 停在把
+                # body 顶到 LIMIT+1 的那一行上（可能仍是载荷行），紧随其后的真实
+                # 闭合行未被计入区间 → 下一轮外层循环把余下载荷行与裸 ``` 当独立
+                # 行重处理，裸 ``` 泄漏进清洗后内容（且 _force_close 还会再插重复
+                # 闭合行）。前瞻**有界**消费直到本块闭合行（BARE 或「非新块起始
+                # 的 OPEN」）、或遇到**自然语言正文**（_looks_like_prose，说明已
+                # 出块）、或再扫描 LIMIT 行——块仍按 bad 删除，不再残留游离
+                # 载荷/闭合标记行。
+                _scan = j
+                while _scan < n and (_scan - j) < _HARD_CHART_FENCE_LINE_LIMIT:
+                    _sk, _ = _classify_fence_line(lines[_scan])
+                    if _sk == _FENCE_KIND_BARE or (
+                        _sk == _FENCE_KIND_OPEN
+                        and not _fence_line_is_new_open(lines, _scan + 1)
+                    ):
+                        _scan += 1  # 闭合行计入本块
+                        break
+                    if _looks_like_prose(lines[_scan]):
+                        break  # 非本块内容，交给外层正常处理
+                    _scan += 1
+                j = _scan
+                break
         payload, prose = _split_fence_body(body)
         action = "block" if closed else "bad"
         # consumed：起始行(1) + 闭合行(1，仅闭合块) + body 行数
         # （body = 载荷 + 误吞正文段；本条目整体覆盖，prose 不单独占区间）
-        consumed = 1 + len(body) + (1 if closed else 0)
+        # BUG-FIX 2026-11-05：改为 `j - i`——循环退出时 `j` 恰为下一条待处理行，
+        # 与上述「limit 超限后前瞻消费闭合行」严格一致，杜绝超长围栏路径下
+        # consumed 少算 1（裸闭合行泄漏）导致 sum(consumed) != len(lines) 的
+        # 区间错位；正常路径与原公式逐字等价。
+        consumed = j - i
         if payload:
             # BUG-FIX 2026-10-17（第七轮·P1 围栏吞正文）：旧实现只登记载荷，
             # `consumed` 却覆盖全部 body 行 → 载荷与正文段并存时（AI 把图表
@@ -867,10 +893,12 @@ def _fence_payload_to_marker_text(lang: str, body: str) -> str | None:
         _repaired = _repair(body)
         _ok, _msg = _validate(_repaired)
         if not _ok:
-            logger.info("[图表跳过] Mermaid 围栏块语法非法且修复后仍不通过，删除坏块: %s", _msg)
+            # ENHANCE 2026-11-02：丢图是数据损失事件（用户修复重点「渲染失败」「静默
+            # 丢图难发现」），info 级在生产默认口径下易被淹没，升为 warning 便于告警。
+            logger.warning("[图表跳过] Mermaid 围栏块语法非法且修复后仍不通过，删除坏块: %s", _msg)
             return None
         body = _repaired
-    except Exception as _e:  # 校验器不可用（循环导入等）：保留原块，交由渲染层兵底
+    except Exception as _e:  # 校验器不可用（循环导入等）：保留原块，交由渲染层兜底
         logger.debug("Mermaid 围栏预校验不可用（跳过预校验）: %s", _e)
     desc = json.dumps(
         {"type": ctype, "code": body, "title": extract_mermaid_title(body)},
@@ -3020,6 +3048,17 @@ class ContentCleaner:
             return content
 
         first_line = lines[0]
+        # BUG-FIX 2026-11-05（列表样式拍平 · 首行有序列表项误剥）：本函数只应剥
+        # 「标题式」编号前缀（如 "1、总体要求" / "（1）本项目…"），但当正文**以
+        # 有序列表开头**（"1. 施工准备" 后紧跟 "2. 材料进场"）时，剥掉首行 "1. "
+        # 会把列表第一项拍平成纯段落，渲染成「施工准备 / 2. 材料进场 / 3. …」
+        # （列表断裂、视觉上从 2 重新编号）。判定：若首个非空后续行也以编号标记
+        # 开头，则首行属于有序列表，不剥；仅当后续无编号行（标题式单行编号）时
+        # 才剥。与 prepare_for_export 的「首行可能是合法列表项」保守口径
+        # （本文件 L3041-3042 注释）对齐。
+        _next = next((l for l in lines[1:] if l.strip()), "")
+        if _next and _LEADING_NUMBERING_RE.match(_next.strip()):
+            return content
         # BUG-FIX 2026-10-17（第七轮·P5 残留）：改用同源 _LEADING_NUMBERING_RE，
         # 正确剥多层编号（"1.1 概述"→"概述"），不再残留孤立数字 "1 "。
         cleaned_first = _LEADING_NUMBERING_RE.sub("", first_line).strip()

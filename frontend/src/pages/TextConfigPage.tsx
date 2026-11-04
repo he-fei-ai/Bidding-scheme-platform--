@@ -9,11 +9,13 @@ import {
   ThunderboltOutlined,
   RocketOutlined, ExperimentOutlined, EyeOutlined, EyeInvisibleOutlined,
   ThunderboltFilled, UpOutlined, DownOutlined, QuestionCircleOutlined,
+  DeleteOutlined,
 } from "@ant-design/icons";
 import { extractApiError, findProviderMeta } from "../utils";
 import {
   getTextProviderConfigs, saveTextProviderConfig, activateTextProviderConfig,
   fetchModels, quickSetup, fetchModelInfo, testAIConnection, getAIConfig,
+  deleteTextProviderConfig,
 } from "../api";
 import type { TextProviderConfig, TextProviderSavePayload } from "../types";
 
@@ -31,6 +33,7 @@ function ProviderCard({
   const [expanded, setExpanded] = useState(false);
   const [saving, setSaving] = useState(false);
   const [activating, setActivating] = useState(false);
+  const [deleting, setDeleting] = useState(false);
   const [testResult, setTestResult] = useState<{ status: string; message: string } | null>(null);
   const [showKey, setShowKey] = useState(false);
   const [modelOptions, setModelOptions] = useState<DefaultOptionType[]>([]);
@@ -53,6 +56,8 @@ function ProviderCard({
           api_key: config.api_key || "",
           base_url: config.base_url || meta?.base_url || "",
           model: config.model || meta?.model || "",
+          // R4（2026-11-03）：协议类型回显库内值，缺失时按 OpenAI 兼容展示
+          provider_type: config.provider_type || "openai_compatible",
           max_tokens: config.max_tokens ?? undefined,
           concurrency: config.concurrency ?? undefined,
           temperature: config.temperature ?? 0.7,
@@ -68,6 +73,10 @@ function ProviderCard({
   /** 组装提交载荷：统一做范围钳制，避免各按钮逻辑漂移 */
   const buildPayload = (values: any, activate: boolean): TextProviderSavePayload => ({
     provider_name: config.provider_name,
+    // D1（2026-11-03）+ R4（2026-11-03）：提交表单里的协议类型（用户可在下拉中
+    // 手动声明，网关/代理域名场景不再被 URL 启发式误判）；表单值缺失时回退
+    // 库内原值，保持"未提供 = 保留原值"的后端语义。
+    provider_type: values.provider_type || config.provider_type,
     api_key: values.api_key || "",
     base_url: values.base_url || "",
     model: values.model || "",
@@ -121,6 +130,29 @@ function ProviderCard({
     }
   }, [config.provider_name, config.api_key_set, onSaved, buildPayload]);
 
+  // G-E（2026-11-04）：删除该厂商已保存的配置（激活中的厂商由后端 409 拦截）
+  const handleDelete = useCallback(async () => {
+    Modal.confirm({
+      title: `删除「${config.provider_name}」的配置？`,
+      content: "已保存的 API Key、地址与参数将一并删除，且不可恢复。当前使用中的厂商需先切换到其他厂商。",
+      okText: "删除",
+      okButtonProps: { danger: true },
+      cancelText: "取消",
+      onOk: async () => {
+        setDeleting(true);
+        try {
+          await deleteTextProviderConfig(config.provider_name);
+          message.success(`已删除「${config.provider_name}」的配置`);
+          onSaved();
+        } catch (err: any) {
+          message.error(`删除失败: ${extractApiError(err)}`);
+        } finally {
+          setDeleting(false);
+        }
+      },
+    });
+  }, [config.provider_name, onSaved]);
+
   const handleTest = useCallback(async () => {
     setTestResult({ status: "loading", message: "测试中..." });
     try {
@@ -132,6 +164,9 @@ function ProviderCard({
         base_url: values.base_url,
         max_tokens: values.max_tokens ?? 4096,
         temperature: values.temperature ?? 0.7,
+        // G-C（2026-11-04）：显式协议随探针下发 —— 网关域名 + Anthropic 协议时
+        // 「测试连接」与真实生成使用同一 wire 格式，避免测试结论失真。
+        provider_type: values.provider_type || config.provider_type || "",
       });
       setTestResult(result);
       if (result.status === "ok") message.success(`${config.provider_name} 连接测试成功`);
@@ -140,7 +175,7 @@ function ProviderCard({
       setTestResult({ status: "error", message: msg });
       message.error(msg);
     }
-  }, [config.provider_name, form]);
+  }, [config.provider_name, config.provider_type, form]);
 
   const handleFetchModels = useCallback(async () => {
     const apiKey = form.getFieldValue("api_key");
@@ -148,7 +183,11 @@ function ProviderCard({
     if (!apiKey || !baseUrl) { message.warning("请先填写 API Key 和 Base URL"); return; }
     setFetchingModels(true);
     try {
-      const result = await fetchModels(apiKey, baseUrl, config.provider_name);
+      // G-C（2026-11-04）：显式协议随请求下发（anthropic_compatible 时后端补 x-api-key 头）
+      const result = await fetchModels(
+        apiKey, baseUrl, config.provider_name,
+        form.getFieldValue("provider_type") || config.provider_type || "",
+      );
       const modelList: string[] = Array.isArray(result) ? result : (result.models || []);
       if (modelList.length > 0) {
         const options: DefaultOptionType[] = modelList.map((m) => ({ label: m, value: m }));
@@ -171,7 +210,7 @@ function ProviderCard({
     } finally {
       setFetchingModels(false);
     }
-  }, [config.provider_name, form]);
+  }, [config.provider_name, config.provider_id, config.provider_type, form]);
 
   const handleModelChange = useCallback((model: string) => {
     form.setFieldsValue({ model });
@@ -234,8 +273,29 @@ function ProviderCard({
               </Space.Compact>
             </Form.Item>
 
-            <Form.Item name="base_url" label="API Base URL" required>
+            <Form.Item name="base_url" label="API Base URL" required
+              // G-D（2026-11-04）：激活空 URL 厂商会被后端 400 拦截（防把主配置写坏），
+              // 前端同口径前置校验，让用户在保存前就看到问题。
+              rules={[{ required: true, message: "请填写 API Base URL（激活该厂商必需）" }]}
+            >
               <Input placeholder="https://api.example.com/v1" autoComplete="off" />
+            </Form.Item>
+
+            {/* R4（2026-11-03）：网关/代理域名（如 one-api、New API）不含厂商关键词时，
+                后端 URL 启发式只能落到 OpenAI 兼容；此处手动声明协议类型会作为显式信号
+                传给后端（白名单校验，非法值 422）。 */}
+            <Form.Item
+              name="provider_type"
+              label="协议类型"
+              tooltip="决定调用时的请求格式。通常按 Base URL 自动识别；走网关/代理域名时可在此手动声明 DeepSeek 或 Anthropic 协议。"
+            >
+              <Select
+                options={[
+                  { label: "OpenAI 兼容协议（默认自动识别）", value: "openai_compatible" },
+                  { label: "DeepSeek 官方协议", value: "deepseek" },
+                  { label: "Anthropic (Claude) 协议", value: "anthropic_compatible" },
+                ]}
+              />
             </Form.Item>
 
             <Form.Item name="model" label="模型名称" required>
@@ -350,6 +410,12 @@ function ProviderCard({
               <Button icon={<ApiOutlined />} onClick={handleTest} loading={testResult?.status === "loading"}>
                 测试连接
               </Button>
+              {/* G-E（2026-11-04）：删除已保存的配置；激活中的厂商后端 409 拦截，按钮同样禁用 */}
+              {config.api_key_set && (
+                <Button danger type="text" icon={<DeleteOutlined />} loading={deleting} onClick={handleDelete} disabled={config.is_active}>
+                  删除配置
+                </Button>
+              )}
             </Space>
 
             {testResult && (
@@ -414,8 +480,10 @@ export default function TextConfigPage() {
     try {
       const result = await quickSetup({ api_key: key });
       if (result.success) {
-        const provider = result.tested_providers?.[0];
-        message.success(`自动配置成功：${provider?.name || result.message}`);
+        // G-G（2026-11-04）：展示实际推荐的厂商。此前取 tested_providers[0]
+        //（第一个**被测**厂商），推荐结果（延迟最低者）通常不是它，提示会误导。
+        const provider = result.applied_config || result.tested_providers?.[0];
+        message.success(`自动配置成功：${provider?.provider_name || provider?.name || result.message}`);
         setQuickVisible(false);
         loadAll();
       } else {

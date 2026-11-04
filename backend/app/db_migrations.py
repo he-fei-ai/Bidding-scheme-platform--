@@ -1137,17 +1137,26 @@ def ensure_enhancement_tables():
             logger.debug("[silent-except] db_migrations.py: line 681 - %s", _e)
 
         # 29. file_parse_tasks 表（文件解析任务持久化追踪）
+        # BUG-FIX 2026-11-02（B5 默认值陷阱）：status 默认值原为 'queued'，但全仓
+        # 没有任何代码路径写入 'queued'——_create_parse_task 恒显式 INSERT
+        # 'processing'，终态收敛为 completed/failed，prune 只删 completed/failed，
+        # reclaim_stale_parse_state 只回收 processing。于是 'queued' 是一个「写了就
+        # 永远不会被任何清理/回收逻辑处理」的僵尸态：一旦将来有 INSERT 漏写 status
+        # 落到默认值，该行会永久残留且前端 processing 计数失明。现把默认值收敛到
+        # 与真实写入一致的 'processing'，让「漏写」退化为可被回收的正常在途态。
+        # 说明：CREATE TABLE IF NOT EXISTS 只对新建库生效，存量库不受影响（无行为变更）。
         conn.execute("""
             CREATE TABLE IF NOT EXISTS file_parse_tasks (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 project_id INTEGER NOT NULL,
                 filename TEXT NOT NULL,
                 file_type TEXT NOT NULL DEFAULT '',
-                status TEXT NOT NULL DEFAULT 'queued',
+                status TEXT NOT NULL DEFAULT 'processing',
                 progress INTEGER NOT NULL DEFAULT 0,
                 total_files INTEGER NOT NULL DEFAULT 1,
                 completed_files INTEGER NOT NULL DEFAULT 0,
                 error_message TEXT DEFAULT '',
+                file_id INTEGER DEFAULT NULL,
                 started_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
                 updated_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
                 completed_at TEXT
@@ -1155,6 +1164,17 @@ def ensure_enhancement_tables():
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_fpt_project ON file_parse_tasks(project_id)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_fpt_status ON file_parse_tasks(status)")
+        # 2026-11-02（B4 串写根因加固）：补 file_id 列，关联 uploaded_files.id。
+        # 建文件行后回填，异步 worker / re_extract 据此精确命中本文件任务行，
+        # 取代「project+filename+processing」模糊匹配（同名多行时会交叉误更新）。
+        # 可空 + 幂等 ALTER（存量库 CREATE IF NOT EXISTS 不生效，需显式补列）。
+        try:
+            conn.execute(
+                "ALTER TABLE file_parse_tasks ADD COLUMN file_id INTEGER DEFAULT NULL"
+            )
+        except sqlite3.OperationalError as e:
+            if "duplicate column" not in str(e).lower():
+                logger.warning("file_parse_tasks.file_id 迁移失败（异步精确命中退化）: %s", e)
         conn.commit()
         logger.info("[OK] file_parse_tasks 表已创建（文件解析任务持久化）")
 

@@ -2,6 +2,7 @@
 
 import functools
 import re
+from typing import Any
 
 from .json_parser import extract_json_from_text, safe_json_parse
 
@@ -131,7 +132,7 @@ def count_readable_words(text: str) -> int:
     return cjk_count + len(western)
 
 
-def normalize_newlines(text: str) -> str:
+def normalize_newlines(text: Any) -> str:
     """把 CRLF (\r\n) 与 CR (\r) 统一归一为 LF (\n)。
 
     HARDEN 2026-10-12：AI 网关、Windows 环境下的 DB 历史正文、上传的 .md 文档
@@ -148,13 +149,17 @@ def normalize_newlines(text: str) -> str:
     输入零成本；仅在实际含 CR 时才做 replace。
 
     Args:
-        text: 原始文本（None / 空串均返回 ""，容错调用方直接传 row["content"]）
+        text: 原始文本（None / 空串均返回 ""，容错调用方直接传 row["content"]；
+            非 str 真值按 str() 归一后处理——LEFTOVER-3 收敛 2026-11-02，
+            并入原 text_patch 版本的 Any 容错语义，收敛后全站仅此一份权威实现）
 
     Returns:
         str: 归一后的 LF 文本
     """
     if not text:
         return ""
+    if not isinstance(text, str):
+        text = str(text)
     if "\r" not in text:
         return text
     return text.replace("\r\n", "\n").replace("\r", "\n")

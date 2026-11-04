@@ -37,6 +37,13 @@ export default function AuditSummaryCards({ summary }: AuditSummaryCardsProps) {
   // 否则「未解决冲突 N」与三张分级卡片之和会对不上。
   const low = bySeverity.low || 0;
   const resolved = summary.resolved_conflicts || 0;
+  // TD-9(2026-11-02)：已解决侧的来源拆分（规则冲突 / AI 发现）。后端两侧
+  // 恒等式：resolved_rule_conflicts + resolved_ai_findings == resolved_conflicts。
+  // 纯新增字段，老后端不返回时两者 undefined → 回退不拆分（行为不变）。
+  const resolvedRule = summary.resolved_rule_conflicts;
+  const resolvedAi = summary.resolved_ai_findings;
+  const hasResolvedSplit =
+    typeof resolvedRule === "number" && typeof resolvedAi === "number";
 
   const auditSource = summary.audit_source;
   const auditSourceLabel =
@@ -111,6 +118,7 @@ export default function AuditSummaryCards({ summary }: AuditSummaryCardsProps) {
           {resolved > 0 && (
             <Text type="secondary" style={{ fontSize: 12 }}>
               另有 {resolved} 处已解决
+              {hasResolvedSplit && `（规则冲突 ${resolvedRule} / AI 发现 ${resolvedAi}）`}
             </Text>
           )}
         </Card>

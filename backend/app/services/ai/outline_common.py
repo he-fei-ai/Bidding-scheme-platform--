@@ -54,6 +54,7 @@ import logging
 import random
 import re
 import copy
+from typing import Any
 
 
 logger = logging.getLogger(__name__)
@@ -2529,6 +2530,47 @@ def _cleanup_placeholder_titles(
             # 合法章名（「总体实施策划」「其他」「说明」等），L3+ 则一律判脏。
             _level_dirty = _is_dirty_l2_title_deep if level == 2 else _is_dirty_l3_title_deep
             _is_placeholder = level >= 2 and _level_dirty(_title)
+            # ENHANCE 2026-11-02（L1 编号残留清洗）：旧实现 `level >= 2` 把
+            # L1 完全排除——AI 若产出「专项6」「总体实施策划（2）」作**一级**
+            # 章节名，会一路穿过 L1 审核、骨架预构建（按标题锚定）直到落库，
+            # 且其子树清洗全部以这个脏标题作 parent 语义源。L1 只做**确定性
+            # 剥前后缀保主体**（不做语义重写、不加「之N」——章名序数消歧会
+            # 破坏评分项一一映射的可读性）；主体仍脏/为空时保持原标题并打
+            # WARNING 暴露上游漏点，交由既有 L1 校验链处理。
+            if (
+                level == 1
+                and _title
+                and _is_dirty_l2_title_deep(_title)
+            ):
+                _body1 = _strip_legacy_redundant_suffix(
+                    _strip_ordinal_suffix(_title)
+                ).strip()
+                _body1 = _strip_ordinal_prefix(_body1).strip()
+                if (
+                    _body1
+                    and _body1 != _title
+                    and len(_body1) >= _MIN_CLEAN_BODY_LEN
+                    and _body1 not in _L3_TITLE_FRAGMENTS
+                    and not _is_dirty_l2_title_deep(_body1)
+                    # BUG-FIX 2026-11-04（遗留项 2）：两个 L1 剥号后撞同一主体
+                    # （「总体实施策划（2）/（3）」→ 都成「总体实施策划」）时，
+                    # 若强行都剥，后续 `_uniquify_outline_titles`/`_dedupe_siblings`
+                    # 会把**撞名者**语义化成「工程质量管理」等**无关通用章名**，
+                    # 破坏该章评分项一一映射的可读性。按最优方案：撞名者**保持
+                    # 原样待人工**（仍为脏标题，`outline_l1_placeholder` 事件透知），
+                    # 而非静默改写成无关章名。
+                    and _body1 not in _used
+                ):
+                    _node["title"] = _body1
+                    _used.add(_body1)
+                    _title = _body1
+                    _fixed += 1
+                else:
+                    logger.warning(
+                        "OUTLINE_L1_PLACEHOLDER: 一级标题为占位形态且无法仅靠剥离"
+                        "编号恢复主体，保持原样待上游映射链修正: %r",
+                        _title,
+                    )
             if _is_placeholder:
                 # 2026-10-15 修复（B1 · 清洗器过度剥离）：
                 # 「悬挑架安装（2）」这类标题的主体**完全具体**，只是带了个

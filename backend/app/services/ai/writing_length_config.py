@@ -159,6 +159,27 @@ def normalize_writing_length(value: Optional[str]) -> str:
     return _WRITING_LENGTH_ALIASES.get(v, DEFAULT_WORD_COUNT_TIER)
 
 
+def is_valid_writing_length(value: Optional[str]) -> bool:
+    """判断**原始输入**是否为合法档位（权威 key + 旧别名全集），不做归一化回落。
+
+    与 :func:`normalize_writing_length` 的回落行为解耦：后者对非法输入（如
+    ``"standrad"``）会返回 ``DEFAULT_WORD_COUNT_TIER``（== "standard"，恰好在
+    权威集合内），若路由用它做合法性判定，会得到恒真 → 422 校验变成死代码，
+    用户拼错档位 key 被静默按 standard 生成。本函数保留「合法输入集合」的
+    判定，供路由层校验；``None``/空串视为合法（由 Query 默认值兜底）。
+
+    Args:
+        value: 路由/调用方传入的原始写作长度（未归一化）。
+
+    Returns:
+        True = 合法（权威 key 或旧别名）；False = 应拒绝（422）。
+    """
+    if not value:
+        return True
+    v = str(value).strip().lower()
+    return v in WRITING_LENGTH_TIER_CONFIG or v in _WRITING_LENGTH_ALIASES
+
+
 def _resolve_tier_key_from_legacy(writing_length: Optional[str]) -> str:
     """把 mode（可能含 legacy key）解析为档位 key。"""
     mode = normalize_writing_length(writing_length)

@@ -62,7 +62,15 @@ def parse_and_extract_file(self, file_path: str, project_id: int, file_id: int, 
         try:
             from ..services.files import _update_parse_task
 
-            _update_parse_task(project_id, 'failed', 50, str(exc), Path(file_path).name)
+            # L1 2026-11-04：优先按 file_id 精确收尾（B4b 已让 save_upload 图片路径
+            # 与 async-reparse 端点在派发前 _link_parse_task_file，worker 运行时任务行
+            # 必已关联 file_id）；_update_parse_task 内部在 file_id 命中 0 行（历史
+            # 未关联行）时自动回退 filename 兜底，避免终态丢失。取代此前「只按
+            # filename 模糊匹配」——那是 B4 串写缺陷在异常路径的漏网之鱼。
+            _update_parse_task(
+                project_id, 'failed', 50, str(exc), Path(file_path).name,
+                file_id=file_id,
+            )
         except Exception as _e:
             logger.debug('[silent-except] __init__.py 更新解析任务行失败 - %s', _e)
         try:
@@ -226,6 +234,18 @@ def generate_section_content(self, project_id: int, section_ids: list[int], writ
                         completed += 1
                         with get_db() as conn:
                             conn.execute("UPDATE sections SET content = ?, status = 'completed', progress = 100 WHERE id = ?", (content, sid))
+                        # BUG-FIX 2026-11-02（后台任务挂接·缓存未失效）：批量正文任务
+                        # 旁路直写正文后不失效任何一层缓存 → Redis 整包章节缓存
+                        # `section_content:project:{id}`（TTL 1800s，跨进程共享）持续
+                        # 回灌旧正文，喂给后续 L1/L2 生成与前端读取。SSE 主管线落库
+                        # 即三层失效（sse_db_ops），此路径对齐同一口径；worker 进程
+                        # 与 API 进程内存缓存不互通属已知限制（Risk-P3c，单 worker
+                        # 部署无影响），Redis 层失效跨进程有效。
+                        try:
+                            from ..services.sections import invalidate_content_caches
+                            invalidate_content_caches(project_id, [sid])
+                        except Exception as _inv_e:
+                            logger.warning('批量正文: 缓存失效失败（忽略）section=%d: %s', sid, _inv_e)
                     else:
                         failed += 1
                         with get_db() as conn:

@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import { Alert, Button, Space, Tabs, Typography } from "antd";
-import { ArrowLeftOutlined, AuditOutlined } from "@ant-design/icons";
+import { ArrowLeftOutlined, AuditOutlined, DashboardOutlined } from "@ant-design/icons";
 import ErrorBoundary from "../components/ErrorBoundary";
 import { getConsistencyRules } from "../api";
 import type { ConsistencyRules } from "../api";
@@ -14,6 +14,7 @@ import ScoringComplianceTab from "../components/consistency/ScoringComplianceTab
 import AgentRepairTab from "../components/consistency/AgentRepairTab";
 import FactBackflowTab from "../components/consistency/FactBackflowTab";
 import RejectionCoverageTab from "../components/consistency/RejectionCoverageTab";
+import ConsistencyMetricsDrawer from "../components/consistency/ConsistencyMetricsDrawer";
 
 const { Text } = Typography;
 
@@ -41,6 +42,9 @@ export default function ConsistencyPage() {
   // 规则快照：一次性对齐严重度/评分状态映射，并下传给两个覆盖率 Tab
   //（ENHANCE 2026-10-13 第六轮·G7：阈值从快照取，不再硬编码 0.25）。
   const [rules, setRules] = useState<ConsistencyRules | null>(null);
+  // L3(2026-11-03 遗留项加固)：运维指标抽屉入口（GET /consistency/metrics
+  // 此前后端已备、前端零消费）。点开才拉取，不影响首屏请求。
+  const [metricsOpen, setMetricsOpen] = useState(false);
 
   // 审核规则命名空间对齐（ENHANCE 2026-10-08）。
   // 失败**不提示**：静态兜底（utils.ts 内置表）与后端默认值一致，
@@ -80,6 +84,10 @@ export default function ConsistencyPage() {
             <AuditOutlined /> 全文一致性审计
           </Typography.Title>
         </Space>
+        {/* L3(2026-11-03)：运维指标只读入口（进程内计数器 + since/notes 口径） */}
+        <Button icon={<DashboardOutlined />} onClick={() => setMetricsOpen(true)}>
+          运维指标
+        </Button>
       </div>
 
       <Alert
@@ -130,6 +138,9 @@ export default function ConsistencyPage() {
           ]}
         />
       </ErrorBoundary>
+
+      {/* L3(2026-11-03)：运维指标抽屉（点开才拉取，与 Tabs 懒挂载同策略） */}
+      <ConsistencyMetricsDrawer open={metricsOpen} onClose={() => setMetricsOpen(false)} />
 
       <Text type="secondary" style={{ fontSize: 12 }}>
         提示：点击冲突的「涉及章节」标签可直接跳转到对应章节定位问题。

@@ -1,10 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import {
-  Alert, Button, Card, Empty, Input, Modal, Segmented, Space, Table, Tag, Typography, message,
+  Alert, Button, Card, Empty, Input, Modal, Popover, Segmented, Space, Table, Tag, Typography, message,
 } from "antd";
 import {
-  BulbOutlined, CheckCircleOutlined, CheckOutlined, CloseCircleOutlined,
+  BulbOutlined, CheckCircleOutlined, CheckOutlined, CloseCircleOutlined, InfoCircleOutlined,
   ReloadOutlined, ThunderboltOutlined, WarningOutlined,
 } from "@ant-design/icons";
 import {
@@ -12,11 +12,14 @@ import {
   runConsistencyAudit,
 } from "../../api";
 import type {
-  AiRepairReport, AuditResult, AuditSummary, AutoFixReport, Conflict, ConflictFilter,
-  ConsistencyRules,
+  AiRepairReport, AuditResult, AuditSummary, AutoFixReport, Conflict, ConflictEvidence,
+  ConflictFilter, ConsistencyRules,
 } from "../../api";
 import { extractApiError, mapConsistencySeverity, parseConflictSources } from "../../utils";
+import AiRepairReportCard from "./AiRepairReportCard";
 import AuditSummaryCards from "./AuditSummaryCards";
+import AutoFixReportCard from "./AutoFixReportCard";
+import EvidenceDetail from "./EvidenceDetail";
 
 const { Text, Paragraph } = Typography;
 
@@ -30,6 +33,14 @@ const FILTER_OPTIONS: { label: string; value: ConflictFilter }[] = [
   { label: "全部", value: "all" },
 ];
 
+/**
+ * G-1(2026-11-02)：「判定依据」浮层内容见 `EvidenceDetail.tsx`。
+ *
+ * L2(2026-11-03 遗留项加固)：主文件从 840+ 行瘦身 —— 依据浮层（EvidenceDetail）、
+ * autofix 报告卡片（AutoFixReportCard）、AI 补丁报告卡片（AiRepairReportCard）
+ * 三个渲染块拆为同目录独立子组件，本文件只保留状态/工作流与表格。
+ * 纯移动，渲染输出不变。
+ */
 export interface ConflictListTabProps {
   projectId: number;
   /**
@@ -78,6 +89,12 @@ export default function ConflictListTab({ projectId, rules }: ConflictListTabPro
   const [aiRepairing, setAiRepairing] = useState(false);
   const [aiReport, setAiReport] = useState<AiRepairReport | null>(null);
 
+  // G-1(2026-11-02)：严重度判定依据。按 conflict_id 暂存，供冲突行「判定依据」
+  // 浮层消费。遗留项 L5(2026-11-03)：依据已随冲突行落库，GET /conflicts 回放
+  // 也带该字段 —— load() 会把回放依据合并进 map（重新进入页面/刷新后浮层可用）；
+  // 审计执行响应的依据仍在 handleAudit 里整体暂存（同源同值）。
+  const [evidenceById, setEvidenceById] = useState<Record<string, ConflictEvidence>>({});
+
   // BUG-FIX 2026-10-13（工作流缺口·关键结果不可见）：autofix 的真实报告会返回
   // `filtered`（被「就近标签词校验」判为其他事实、按设计跳过的取值计数）与
   // `scoped_section_ids` / `scope_fallback_reason`（替换范围是否被限定在冲突
@@ -97,11 +114,8 @@ export default function ConflictListTab({ projectId, rules }: ConflictListTabPro
   // 老后端/不传 rules 时 undefined，等同不限长（行为不变）。
   const autofixValueMaxChars = rules?.facts?.autofix_value_max_chars;
 
-  // BUG-FIX 2026-10-13：autofix 报告里的 `filtered` / `scoped_section_ids` /
-  // `scope_fallback_reason` 是后端**一直在返回、类型里刚补上**的可选字段。
-  // 这里归一一次，JSX 里即可按必填数组处理（同时过 TS 收窄）。
-  const fixFiltered = fixReport?.filtered ?? [];
-  const fixSkipped = fixReport?.skipped ?? [];
+  // L2(2026-11-03)：autofix / AI 报告的集合字段归一随卡片移入
+  // AutoFixReportCard / AiRepairReportCard，主文件不再重复。
 
   const load = useCallback(async (resolvedFilter: ConflictFilter = filter) => {
     if (!isValidProject) return;
@@ -115,6 +129,15 @@ export default function ConflictListTab({ projectId, rules }: ConflictListTabPro
       if (seq !== loadSeqRef.current) return; // 已有更新的请求，丢弃本次结果
       setConflicts(conflictRes.conflicts || []);
       setSummary(summaryRes.summary || null);
+      // L5(2026-11-03)：回放依据并入 evMap（回放值在底、既有会话值在顶，
+      // 同 conflict_id 不冲突 —— 两者同源）。刷新/重新进入页面后依据浮层可用。
+      const replayEv: Record<string, ConflictEvidence> = {};
+      for (const c of conflictRes.conflicts || []) {
+        if (c.fact_evidence) replayEv[c.conflict_id] = c.fact_evidence;
+      }
+      if (Object.keys(replayEv).length > 0) {
+        setEvidenceById((prev) => ({ ...replayEv, ...prev }));
+      }
     } catch (e) {
       if (seq !== loadSeqRef.current) return;
       message.error(extractApiError(e));
@@ -140,7 +163,14 @@ export default function ConflictListTab({ projectId, rules }: ConflictListTabPro
         await load(filter);
         return;
       }
-setAudit(result);
+      setAudit(result);
+      // G-1(2026-11-02)：暂存本次审计的判定依据（仅规则冲突带 fact_evidence，
+      // AI 发现/老后端为 undefined，自然不进 map）。
+      const evMap: Record<string, ConflictEvidence> = {};
+      for (const c of result.conflicts || []) {
+        if (c.fact_evidence) evMap[c.conflict_id] = c.fact_evidence;
+      }
+      setEvidenceById(evMap);
       // BUG-FIX 2026-10-09（筛选态被覆盖）：审计接口 `runConsistencyAudit`
       // 返回的是**本次新检出**的冲突（后端 `_save_conflicts` 只处理
       // resolved=0 的行），语义上恒等于「未解决」列表。此前这里直接
@@ -266,10 +296,34 @@ setAudit(result);
       title: "严重程度",
       dataIndex: "severity",
       key: "severity",
-      width: 100,
-      render: (v: string) => {
+      width: 130,
+      render: (v: string, record: Conflict) => {
         const cfg = mapConsistencySeverity(v);
-        return <Tag color={cfg.color}>{cfg.label}</Tag>;
+        // G-1(2026-11-02)：本次审计带判定依据时，在分级标签旁挂「依据」浮层。
+        // 列表回放（GET /conflicts）与 AI 发现没有 evidence，保持原样渲染。
+        const ev = evidenceById[record.conflict_id];
+        return (
+          <Space size={4}>
+            <Tag color={cfg.color}>{cfg.label}</Tag>
+            {ev && (
+              <Popover
+                trigger="hover"
+                placement="right"
+                content={<EvidenceDetail ev={ev} />}
+              >
+                <Button
+                  size="small"
+                  type="text"
+                  icon={<InfoCircleOutlined />}
+                  aria-label="判定依据"
+                  style={{ padding: "0 4px", color: "#8c8c8c" }}
+                >
+                  依据
+                </Button>
+              </Popover>
+            )}
+          </Space>
+        );
       },
     },
     {
@@ -423,127 +477,14 @@ setAudit(result);
         </Space>
       </div>
 
+      {/* L2(2026-11-03)：autofix 报告卡片迁入 AutoFixReportCard（渲染输出不变） */}
       {fixReport && (
-        <Card
-          size="small"
-          style={{ marginBottom: 16 }}
-          title={
-            <Space>
-              <CheckOutlined /> 自动修复结果
-              <Tag color={fixReport.status === "ok" ? "green" : "orange"}>
-                {fixReport.status}
-              </Tag>
-              <Text type="secondary" style={{ fontWeight: 400 }}>
-                统一为：{fixReport.unified_value}
-              </Text>
-            </Space>
-          }
-          extra={<Button size="small" type="link" onClick={() => setFixReport(null)}>关闭</Button>}
-        >
-          <Paragraph style={{ marginBottom: 8 }}>{fixReport.message}</Paragraph>
-          <Space size={[8, 8]} wrap style={{ marginBottom: 8 }}>
-            <Tag>修改章节 {fixReport.changed_sections} 个</Tag>
-            <Tag color="green">替换 {fixReport.total_replacements} 处</Tag>
-            {!!fixReport.replaced_values?.length && (
-              <Tag color="volcano">统一掉旧值 {fixReport.replaced_values.join("、")}</Tag>
-            )}
-            {fixSkipped.length > 0 && (
-              <Tag color="red">未能安全替换 {fixSkipped.length} 章</Tag>
-            )}
-            {fixFiltered.length > 0 && (
-              <Tag color="orange">
-                就近校验拦下 {fixFiltered.length} 章
-              </Tag>
-            )}
-          </Space>
-          {fixReport.scope_fallback_reason && (
-            <Alert
-              type="warning"
-              showIcon
-              style={{ marginBottom: 8 }}
-              message={fixReport.scope_fallback_reason}
-              description="本次替换未限定在冲突来源章节内，请核对下方明细以免误改无关数字。"
-            />
-          )}
-          {!!fixReport.scoped_section_ids?.length && (
-            <Text type="secondary" style={{ fontSize: 12, display: "block", marginBottom: 4 }}>
-              替换范围已限定在冲突来源章节：{fixReport.scoped_section_ids.join("、")}
-            </Text>
-          )}
-          {fixSkipped.map((s, i) => (
-            <div key={`sk${i}`}>
-              <Text type="danger" style={{ fontSize: 12 }}>
-                [{s.section_id} {s.title}] {s.reason}
-              </Text>
-            </div>
-          ))}
-          {fixFiltered.map((f, i) => (
-            <div key={`ft${i}`}>
-              <Text type="warning" style={{ fontSize: 12 }}>
-                [{f.section_id} {f.title}] {f.reason}
-              </Text>
-            </div>
-          ))}
-        </Card>
+        <AutoFixReportCard report={fixReport} onClose={() => setFixReport(null)} />
       )}
 
+      {/* L2(2026-11-03)：AI 补丁报告卡片迁入 AiRepairReportCard（渲染输出不变） */}
       {aiReport && (
-        <Card
-          size="small"
-          style={{ marginBottom: 16 }}
-          title={
-            <Space>
-              <ThunderboltOutlined /> AI 补丁修复{aiReport.dry_run ? "（预览）" : ""}
-              <Tag color={aiReport.status === "ok" ? "green" : "orange"}>{aiReport.status}</Tag>
-            </Space>
-          }
-          extra={<Button size="small" type="link" onClick={() => setAiReport(null)}>关闭</Button>}
-        >
-          <Paragraph style={{ marginBottom: 8 }}>{aiReport.message}</Paragraph>
-          <Space size={[8, 8]} wrap style={{ marginBottom: aiReport.rejected.length ? 8 : 0 }}>
-            <Tag>补丁 {aiReport.patches.length} 条</Tag>
-            <Tag color="green">可应用 {aiReport.applied.length}</Tag>
-            {aiReport.rejected.length > 0 && <Tag color="orange">被拒绝 {aiReport.rejected.length}</Tag>}
-            <Tag>改动小节 {aiReport.sections.length}</Tag>
-            {aiReport.conflict_states && (
-              <Tag color="blue">
-                冲突已解决 {aiReport.conflict_states.resolved} / 仍待处理 {aiReport.conflict_states.still_open}
-              </Tag>
-            )}
-          </Space>
-          {aiReport.rejected.length > 0 && (
-            <div style={{ marginBottom: aiReport.unresolved.length ? 8 : 0 }}>
-              {aiReport.rejected.slice(0, 8).map((r, i) => (
-                <div key={i}>
-                  <Text type="warning">
-                    [{r.section_id} {r.title}] {r.error}
-                  </Text>
-                </div>
-              ))}
-            </div>
-          )}
-          {aiReport.unresolved.length > 0 && (
-            <div>
-              <Text type="secondary">AI 判定无法局部修复：</Text>
-              {aiReport.unresolved.slice(0, 8).map((u, i) => (
-                <div key={i}>
-                  <Text type="secondary">
-                    [{u.section_id}] {u.reason}
-                  </Text>
-                </div>
-              ))}
-            </div>
-          )}
-          {aiReport.errors.length > 0 && (
-            <div>
-              {aiReport.errors.slice(0, 5).map((e, i) => (
-                <div key={i}>
-                  <Text type="danger">{e}</Text>
-                </div>
-              ))}
-            </div>
-          )}
-        </Card>
+        <AiRepairReportCard report={aiReport} onClose={() => setAiReport(null)} />
       )}
 
       <AuditSummaryCards summary={summary} />

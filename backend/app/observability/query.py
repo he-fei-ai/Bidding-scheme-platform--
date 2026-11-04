@@ -229,5 +229,3 @@ def export_csv(items: list[dict[str, Any]]) -> str:
 def export_json(items: list[dict[str, Any]]) -> str:
     """导出 JSON 文本。"""
     return json.dumps(items, ensure_ascii=False, default=repr, indent=2)
-
-    return d

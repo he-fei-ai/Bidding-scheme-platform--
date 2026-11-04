@@ -299,16 +299,22 @@ class TestPersonnelRoleBucketing:
         assert set(conflicts[0].values) == {"5", "8"}
 
     def test_generic_personnel_stays_bundled(self):
-        """未列举的岗位（后勤人员）仍归入通用「人员数量」，保留跨章节比对能力。"""
+        """未列举的岗位（保洁人员）仍归入通用「人员数量」，保留跨章节比对能力。
+
+        2026-11-04 第 11 轮：后勤人员已入 `PERSONNEL_ROLE_PREFIXES`（独立分桶，
+        见 test_consistency_fact_corpus 语料），通用归集的代表岗位改用仍未
+        列举的「保洁人员」——两种岗位语义都保留：已知岗位精确分桶（防跨岗位
+        误报），未知岗位通用归集（保跨章节比对能力）。
+        """
         from app.services.consistency_auditor import ConsistencyAuditor
 
         pid = _new_project("人员-通用归集")
         _seed_section(pid, title="A", level=1, sort_order=0,
-                      content="后勤人员：30人。", status="completed")
+                      content="保洁人员：30人。", status="completed")
         _seed_section(pid, title="B", level=1, sort_order=1,
-                      content="后勤人员：40人。", status="completed")
+                      content="保洁人员：40人。", status="completed")
         conflicts = [c for c in ConsistencyAuditor().detect_conflicts(pid) if c.fact_name == "人员数量"]
-        assert conflicts, "裸「人员」岗位应归入通用人员数量并可跨章比对"
+        assert conflicts, "未列举岗位（保洁人员）应归入通用人员数量并可跨章比对"
         assert set(conflicts[0].values) == {"30", "40"}
 
     def test_extract_names_are_role_specific(self):

@@ -312,6 +312,21 @@ class TestConsistencyAndSelfCheck:
             "第五章 施工进度计划", dictionary=self._dict())
         assert rep["ok"] is True
 
+    def test_self_check_field_not_called_reports_label(self):
+        """B-13-4：字段未注入分支曾引用未定义变量 lbl，触发即 NameError 500。"""
+        rep = self_check_content(
+            "本工程总工期 540 日历天。施工组织遵循总体部署要求，合理安排流水段与资源配置，确保按期履约。",
+            "第五章 施工进度计划",
+            extraction_fields={"project_name": "岳阳路项目", "duration": "540 日历天"},
+            injected_keys=["project_name"],
+        )
+        types = {i["type"] for i in rep["issues"]}
+        assert "field_not_called" in types
+        detail = next(
+            n["detail"] for n in rep["needs_review"] if n["type"] == "field_not_called"
+        )
+        assert detail, "字段未注入的复核项必须带中文标签，而不是空值/崩溃"
+
     def test_run_self_checks_attaches_report(self):
         results = [
             {"id": "1", "title": "第五章 施工进度计划", "status": "completed",

@@ -76,9 +76,18 @@ from .outline_common import (
     _detect_project_type,
     _disambiguate_title,
     _ensure_min_children,
+    _is_dirty_l2_title_deep,
     _is_dirty_l3_title_deep,
     _is_placeholder_numbered_title,
     _parse_scope_items,
+    # BUG-FIX 2026-11-04（遗留项 1）：L1 纯占位章名「评分项映射链语义兜底」需要
+    # 与 `_cleanup_placeholder_titles` L1 分支**完全同一**的「剥号保主体」判定，
+    # 才能确定哪些 L1 是「剥无可剥」的不可恢复占位（而不是重复造一套判定）。
+    _strip_legacy_redundant_suffix,
+    _strip_ordinal_prefix,
+    _strip_ordinal_suffix,
+    _MIN_CLEAN_BODY_LEN,
+    _L3_TITLE_FRAGMENTS,
     _sanitize_cross_domain_titles,
     _title_core,
     _uniquify_outline_titles,
@@ -1021,6 +1030,97 @@ def _strip_scoring_placeholders(sp_parsed: Any) -> Any:
     return strip_scoring_placeholders(sp_parsed)
 
 
+def _is_unrecoverable_l1_placeholder(title: str) -> bool:
+    """判定一级章名是否为「剥无可剥」的不可恢复占位（遗留项 1，2026-11-04）。
+
+    与 `_cleanup_placeholder_titles` 的 L1 分支**同一判定口径**：
+      - 非脏 → 不是占位，可恢复（False）；
+      - 脏且可剥出干净主体（如「总体实施策划（2）」→「总体实施策划」）→
+        由清洗链确定性恢复，本函数不介入（False）；
+      - 脏且剥后仍无语义主体（纯「专项6」「第六项」「第6项」）→ 不可恢复（True）。
+    """
+    if not title or not _is_dirty_l2_title_deep(title):
+        return False
+    body = _strip_legacy_redundant_suffix(_strip_ordinal_suffix(title)).strip()
+    body = _strip_ordinal_prefix(body).strip()
+    if (
+        body
+        and body != title
+        and len(body) >= _MIN_CLEAN_BODY_LEN
+        and body not in _L3_TITLE_FRAGMENTS
+        and not _is_dirty_l2_title_deep(body)
+    ):
+        return False  # 可剥离恢复，交给清洗链
+    return True  # 剥无可剥：只有评分项映射链能救
+
+
+def _l1_placeholder_scoring_fallback(level1: list[dict], sp_parsed: Any) -> list[dict]:
+    """L1 纯占位章名「评分项映射链语义兜底」（遗留项 1，2026-11-04）。
+
+    背景：现网 2026-11-03 日志实证 `OUTLINE_L1_PLACEHOLDER_LEAK titles=['专项6']`
+    非零——AI 弱模型偶发把「专项6」产出为**一级章名**，而 L1 清洗链对剥无可剥
+    的纯占位保持原样（既定取舍：L1 不做语义重写，保护评分项一一映射），于是
+    「专项6」静默进入正文/导出，只能靠人工调整。本函数在**L1 生成链**（评分项
+    上下文可得）就地兜底：把不可恢复占位 L1 替换为对应评分项标题。
+
+    匹配策略（兼顾 AI 合并/拆分与乱序）：
+      1. 同位命中：`L1[i]` → `评分项[i]`（AI 顺序与评分项一致时的最优解）；
+      2. 否则取**首个未被任何 L1 使用**的评分项标题（覆盖 AI 乱序）；
+      3. 候选须非脏且未占用；全部不可用则保持原样，交由 `outline_l1_placeholder`
+         事件透知（绝不静默）。
+
+    设计约束：
+      - 纯本地确定性，不调 AI、不抛异常（调用方外有 try/except 双保险）；
+      - 只替换「不可恢复占位」L1，合法 L1（含「专项施工方案」等近邻）零改动；
+      - 替换后的标题可能仍是评分项原样（未做专业改写），但**严格优于**「专项6」
+        垃圾章名——覆盖校验（`_check_scoring_coverage`）在替换后执行，覆盖率提升。
+    """
+    try:
+        items = _extract_scoring_items_list(sp_parsed)
+        if not items:
+            return level1
+        scoring_titles = [t for t in (_scoring_item_title(it) for it in items) if t]
+        if not scoring_titles:
+            return level1
+        used = {str(n.get("title") or "").strip() for n in level1 if isinstance(n, dict)}
+        changed = 0
+        for i, node in enumerate(level1):
+            if not isinstance(node, dict):
+                continue
+            t = str(node.get("title") or "").strip()
+            if not _is_unrecoverable_l1_placeholder(t):
+                continue
+            # 候选：同位评分项标题（若干净且未占用），否则第一个未占用评分项标题
+            cand = ""
+            if (
+                i < len(scoring_titles)
+                and scoring_titles[i] not in used
+                and not _is_dirty_l2_title_deep(scoring_titles[i])
+            ):
+                cand = scoring_titles[i]
+            else:
+                for st in scoring_titles:
+                    if st not in used and not _is_dirty_l2_title_deep(st):
+                        cand = st
+                        break
+            if cand:
+                logger.warning(
+                    "V5.1 L1 占位章名「%s」不可剥离，已由评分项映射链语义兜底为「%s」| "
+                    "error_code=OUTLINE_L1_PLACEHOLDER_FALLBACK error_layer=service",
+                    t, cand,
+                )
+                node["title"] = cand
+                used.add(cand)
+                changed += 1
+        if changed:
+            logger.info("V5.1 L1 评分项语义兜底: 替换 %d 个不可恢复占位一级章名", changed)
+        return level1
+    except Exception as _fb_e:
+        # 兜底失败绝不影响 L1 生成：交由清洗链 + outline_l1_placeholder 事件透知
+        logger.warning("[V5.1] L1 评分项语义兜底异常（忽略，交由清洗链）: %s", _fb_e)
+        return level1
+
+
 async def _generate_level1_v51(
     provider: Any,
     summary: str,
@@ -1338,6 +1438,12 @@ async def _generate_level1_v51(
             # 截断在覆盖校验之前执行，覆盖校验的期望值同步取 min(评分项数, 上限)，
             # 否则 AI 归并到 15 章反而会被「数量差异过大」判罚触发无意义重试。
             level1, _l1_capped = _apply_l1_chapter_cap(level1)
+            # BUG-FIX 2026-11-04（遗留项 1）：AI 偶发产出「专项6」等**剥无可剥**
+            # 纯占位一级章名（现网 2026-11-03 日志 `OUTLINE_L1_PLACEHOLDER_LEAK`
+            # 实证）。在评分项上下文可得处做语义兜底——替换为对应评分项标题，
+            # 避免脏章名静默进入正文/导出。必须在 `_check_scoring_coverage` **之前**
+            # 执行，替换后覆盖率提升（否则「专项6」覆盖不到任何评分点）。
+            level1 = _l1_placeholder_scoring_fallback(level1, _sp_parsed_cache)
             # 评分项覆盖校验
             if _score_item_count > 0:
                 _coverage_expected = _score_item_count
@@ -2031,6 +2137,30 @@ def _post_process_title_quality(level1: list[dict]) -> tuple[list[dict], int]:
             source, index, used, level=3, grandparent_title=grandparent_title
         )
 
+    # BUG-FIX 2026-11-04（替换词跨章重复·used 集合改全树级）：旧实现
+    # `used_l2_titles` / `used_l3_titles` 只按所属 L1 / L2 局部构建——同一替换词
+    # 会在不同章节反复出现（2026-11-03 实测 run 中「管理制度建立与考核实施」
+    # 「过程检查与验收标准」等修复产物在 2~3 个不同 L2 下重复），要等下游
+    # 跨章复用护栏（6031+ 收口链）再改写一次；而「二级目录审核」事件发生在
+    # 护栏之前，用户在审核界面看到的就是跨章重复形态。
+    # 现改为全树级已用集合：替换候选避开全树既有标题，从源头消除跨章重复，
+    # 也消除下游护栏的二次改写。池耗尽由 `_derive_child_title` 的
+    # `_semantic_fallback_title` 兜底（实体×维度组合空间 400+），无回归风险。
+    global_used_titles: set[str] = set()
+
+    def _collect_all_titles(nodes: Any, out: set[str]) -> None:
+        for _n in nodes:
+            if not isinstance(_n, dict):
+                continue
+            _t = str(_n.get("title") or "").strip()
+            if _t:
+                out.add(_t)
+            _ch = _n.get("children")
+            if isinstance(_ch, list):
+                _collect_all_titles(_ch, out)
+
+    _collect_all_titles(level1, global_used_titles)
+
     # 遍历所有节点
     for l1_idx, l1_node in enumerate(level1):
         if not isinstance(l1_node, dict):
@@ -2044,7 +2174,8 @@ def _post_process_title_quality(level1: list[dict]) -> tuple[list[dict], int]:
         l2_count = len(children)
 
         # V5.2：L1 下已用 L2 标题集合（用于修正时不重名）
-        used_l2_titles: set[str] = set()
+        # BUG-FIX 2026-11-04：播种全树已用集合（含兄弟），修正产物全局不重名
+        used_l2_titles: set[str] = set(global_used_titles)
         for _l2n in children:
             if isinstance(_l2n, dict) and _l2n.get("title"):
                 used_l2_titles.add(_l2n["title"].strip())
@@ -2072,6 +2203,8 @@ def _post_process_title_quality(level1: list[dict]) -> tuple[list[dict], int]:
                 )
                 used_l2_titles.discard(l2_title)
                 used_l2_titles.add(new_l2)
+                # 同步全树集合：后续章节/层级的替换候选避开本产物（跨章去重）
+                global_used_titles.add(new_l2)
                 l2_node["title"] = new_l2
                 l2_title = new_l2
                 fix_count += 1
@@ -2081,7 +2214,8 @@ def _post_process_title_quality(level1: list[dict]) -> tuple[list[dict], int]:
             if not isinstance(l3_children, list):
                 continue
             # V5.2：L2 下已用 L3 标题集合（用于修正时不重名）
-            used_l3_titles: set[str] = set()
+            # BUG-FIX 2026-11-04：播种全树已用集合（含兄弟），替换词跨章不重复
+            used_l3_titles: set[str] = set(global_used_titles)
             for _l3n in l3_children:
                 if isinstance(_l3n, dict) and _l3n.get("title"):
                     used_l3_titles.add(_l3n["title"].strip())
@@ -2112,6 +2246,8 @@ def _post_process_title_quality(level1: list[dict]) -> tuple[list[dict], int]:
                     )
                     used_l3_titles.discard(l3_title)
                     used_l3_titles.add(new_l3)
+                    # 同步全树集合：后续章节/层级的替换候选避开本产物（跨章去重）
+                    global_used_titles.add(new_l3)
                     l3_node["title"] = new_l3
                     fix_count += 1
 
@@ -2801,6 +2937,31 @@ def _merge_filled_children(
     unfilled_count = 0
     extra_count = 0
 
+    # HARDEN 2026-11-02（遗留项 5）：顺序错位检测（纯透知，不改合并行为）。
+    # 本函数按**位置**映射 AI 返回到骨架；若骨架节点原本已有标题（L3 叶子
+    # 预置名/断点续生场景），而 AI 同位返回了不同标题、该骨架标题却出现在
+    # AI 序列的**另一个位置**，即「AI 打乱了返回顺序」的强信号——静默按序
+    # 合并会让章节标题与内容错位。此处只记 WARNING 暴露信号供日志排查与
+    # 现网定位，替换策略留待证据充分后再决策（避免误伤正常的标题精化改写）。
+    _ai_title_seq = [
+        str(x.get("title") or "").strip() for x in ai_filled if isinstance(x, dict)
+    ]
+    _ai_title_pos: dict[str, int] = {}
+    for _k, _t in enumerate(_ai_title_seq):
+        if _t:
+            _ai_title_pos.setdefault(_t, _k)
+    _ai_title_set = set(_ai_title_pos)
+    # AI 精化改写（骨架「总体部署」→ AI「施工总体部署与任务划分」）时骨架标题
+    # 也会"消失"于 AI 序列——属正常改写，**不得**计为缺失。故缺失判定必须加
+    # 包含关系护栏：骨架标题与任一 AI 标题互为子串 → 视为精化改写，不计缺失。
+    _ai_title_nonempty = [t for t in _ai_title_seq if t]
+    _order_mismatch = 0
+    # HARDEN 2026-11-04（遗留项 3 加固）：骨架标题**完全缺失**于 AI 序列且无
+    # 任何包含关系（漏章/合并信号）同样是错位强信号（旧实现
+    # `_ai_title_pos.get(_skel_title, i)` 默认返回 `i`，缺失时 `== i` 恒成立 →
+    # 静默放过）。与 `_order_mismatch` 合并计数透知。
+    _missing_count = 0
+
     # BUG 修复：检查 AI 返回数量是否超出骨架数量
     if len(ai_filled) > len(skeleton_children):
         extra_count = len(ai_filled) - len(skeleton_children)
@@ -2826,6 +2987,22 @@ def _merge_filled_children(
 
         # 填充二级标题
         ai_title = ai_node.get("title", "").strip()
+        _skel_title = str(skeleton_node.get("title") or "").strip()
+        if ai_title and _skel_title and ai_title != _skel_title:
+            # HARDEN 2026-11-04：区分「错位」（骨架标题在 AI 序列另一位置）
+            # 与「缺失」（骨架标题完全不在 AI 序列——漏章/合并信号）。
+            if _skel_title in _ai_title_set:
+                if _ai_title_pos.get(_skel_title, i) != i:
+                    # 骨架原标题在 AI 序列的另一位置出现 → 顺序错位的强信号
+                    _order_mismatch += 1
+            else:
+                # 骨架标题不在 AI 序列：仅当与任一 AI 标题**无包含关系**才视为
+                # 缺失（否则是 AI 对骨架预置名的精化改写，属正常）。
+                if not any(
+                    _skel_title in _at or _at in _skel_title
+                    for _at in _ai_title_nonempty
+                ):
+                    _missing_count += 1
         if ai_title:
             skeleton_node["title"] = ai_title
         ai_desc = ai_node.get("description", "").strip()
@@ -2861,6 +3038,16 @@ def _merge_filled_children(
     if extra_count > 0:
         logger.warning(
             "_merge_filled_children: %d 个AI返回节点被忽略（骨架无对应位置）", extra_count
+        )
+    if _order_mismatch >= 2 or _missing_count >= 2:
+        # ≥2 处才算信号：单处不同多为 AI 对骨架预置名的正常精化改写
+        logger.warning(
+            "_merge_filled_children: %d 个骨架标题出现在 AI 序列的错位位置"
+            "（另有 %d 个完全缺失于 AI 序列），疑似 AI 返回顺序与骨架不一致"
+            "（已按位置合并，请复核章节标题与内容） | "
+            "error_code=OUTLINE_L2_ORDER_MISMATCH error_layer=service retryable=True",
+            _order_mismatch,
+            _missing_count,
         )
 
     return skeleton_children
@@ -5423,6 +5610,61 @@ async def _apply_l3_quality_closeout(
     return outline
 
 
+def _collect_l1_placeholder_titles(outline: Any) -> list[str]:
+    """确定性扫描仍为占位/编号残留形态的一级章名（遗留项 3，2026-11-02）。
+
+    清洗链对 L1 只做「确定性剥编号保主体」（见 outline_common
+    `_cleanup_placeholder_titles` L1 分支——不做语义重写，保护评分项一一映射）；
+    「专项6」这类剥无可剥的脏章名会保持原样交付，仅有一条
+    OUTLINE_L1_PLACEHOLDER 日志。本函数把同一判定口径（`_is_dirty_l2_title_deep`）
+    用到交付终局：命中即透知用户人工调整，避免劣质章名静默进入正文与导出。
+    """
+    bad: list[str] = []
+    for node in outline or []:
+        if not isinstance(node, dict):
+            continue
+        t = str(node.get("title") or "").strip()
+        if t and _is_dirty_l2_title_deep(t):
+            bad.append(t)
+    return bad
+
+
+async def _emit_l1_placeholder_notice(
+    outline: Any,
+    event_emitter: Callable | None,
+    outline_queue: Any,
+) -> None:
+    """交付前 L1 占位章名透知（非终态事件 + WARNING 日志，失败不阻断主流程）。"""
+    _bad = _collect_l1_placeholder_titles(outline)
+    if not _bad:
+        return
+    logger.warning(
+        "V5.1 交付目录含 %d 个占位形态一级章名（清洗链剥无可剥，保持原样），"
+        "建议人工调整 | error_code=OUTLINE_L1_PLACEHOLDER_LEAK "
+        "error_layer=service retryable=False titles=%r",
+        len(_bad), _bad[:5],
+    )
+    _evt = {
+        "status": "outline_l1_placeholder",
+        "phase": "final",
+        # ENHANCE 2026-11-04：error_code 与日志口径一致，供监控聚合。
+        "error_code": "OUTLINE_L1_PLACEHOLDER_LEAK",
+        "message": (
+            f"有 {len(_bad)} 个一级章节标题为占位形态（如「{_bad[0]}」），"
+            "无法自动生成规范章名，建议在目录编辑器中人工调整"
+        ),
+        "placeholder_count": len(_bad),
+        "placeholder_titles": _bad[:10],
+    }
+    try:
+        if event_emitter is not None:
+            await event_emitter(_evt)
+        elif outline_queue is not None:
+            await outline_queue.put(_evt)
+    except Exception as _l1_e:
+        logger.warning("[V5.1] outline_l1_placeholder 事件发送失败（忽略）: %s", _l1_e)
+
+
 async def generate_outline_v51(
     provider: Any,
     summary: str,
@@ -5508,6 +5750,15 @@ async def generate_outline_v51(
             direct, _direct_capped = _apply_l1_chapter_cap(direct)
             if _direct_capped:
                 direct = _assign_ids(direct)
+            # BUG-FIX 2026-11-04（遗留项 1 直出面对称）：`generate_outline_direct`
+            # 不走 `_generate_level1_v51`（无评分项语义兜底），弱模型同样可能
+            # 产出「专项6」一级章名。此处就地解析评分点做**同一**兜底，保证
+            # 直出/分步两条路径 L1 占位处置口径一致（函数内部自带 try/except，
+            # 解析失败时原样返回，交由 `_apply_l3_quality_closeout` 清洗+透知）。
+            direct = _l1_placeholder_scoring_fallback(
+                direct,
+                _strip_scoring_placeholders(_parse_scoring_points_json(scoring_points)[0]),
+            )
             if phase_callback:
                 await phase_callback(
                     "目录生成",
@@ -5552,7 +5803,16 @@ async def generate_outline_v51(
                 if edited is None:
                     logger.info("[V5.1] 直出目录最终审核未通过，中止")
                     return []
-                direct = edited
+                # BUG-FIX 2026-11-04（终审边界替换树零清洗·直出路径）：与分步路径
+                # 同源缺口——人工提交树（v51-confirm）与断点续生恢复的
+                # edited_outline 只做结构校验；此处返回后仅 renumber（只改 id），
+                # 脏标题唯一拦截点是落库终态网。与分步路径对称补出口侧收口
+                # （幂等、纯规则、不调 AI）。
+                direct = _post_selfcheck_title_safety_net(edited)
+                try:
+                    v51_state.edited_outline = direct
+                except Exception:
+                    logger.debug("V5.1 直出终审收口后 edited_outline 同步失败", exc_info=True)
 
         if direct:
             # 编号安全网（修复：直出路径与分步路径产物结构不一致 / 编辑后编号未重算）：
@@ -5573,6 +5833,8 @@ async def generate_outline_v51(
             # 直出成功才返回，空结果落到下方分步路径。
             # 来源透传：把参考目录的 source 标注落到生成后的一级节点（溯源）。
             _apply_reference_source(direct, reference_outline)
+            # 遗留项 3 加固（2026-11-02）：交付前 L1 占位章名确定性透知
+            await _emit_l1_placeholder_notice(direct, event_emitter, outline_queue)
             return direct
         logger.warning("[V5.1] 直出路径未产出结果，回退分步路径")
 
@@ -5687,6 +5949,35 @@ async def generate_outline_v51(
             _l2_stats.get("l2_retry_rounds", 0),
             len(_l2_stats.get("l2_recovered_titles", [])),
         )
+        # BUG-FIX 2026-11-02（降级透知）：2026-10-23 P0 修复把降级诊断从
+        # 「只有一行 WARNING」升级为 stats 出参，但消费端止步于本函数日志——
+        # SSE/前端依旧拿不到，用户看到的是一份「生成成功」但多章为模板默认
+        # 目录（标题泛化，如「总体实施策划」「专项方案（2）」）的目录树。
+        # 现把诊断作为非终态 `outline_degraded` 事件推给前端，用户可据此
+        # 决定是否重新生成。事件发送失败绝不影响主流程（降级只是质量提示）。
+        _fb_titles = list(_l2_stats.get("l2_fallback_titles", []))
+        _degraded_evt = {
+            "status": "outline_degraded",
+            "phase": "level2",
+            # ENHANCE 2026-11-04：error_code 与日志口径一致，供监控系统按
+            # 错误码聚合「目录质量退化」事件（此前事件无码，只能按 status 聚合）。
+            "error_code": "OUTLINE_L2_DEGRADED",
+            "message": (
+                f"有 {len(_fb_titles)}/{_l2_stats.get('l2_total', 0)} 个章节的二级目录"
+                "未能由 AI 生成，已回退为模板默认目录（标题较为通用，"
+                "建议稍后重新生成或手工调整）"
+            ),
+            "fallback_count": len(_fb_titles),
+            "fallback_titles": _fb_titles[:10],
+            "degraded_ratio": round(float(_l2_stats.get("l2_degraded_ratio", 0.0)), 3),
+        }
+        try:
+            if event_emitter is not None:
+                await event_emitter(_degraded_evt)
+            elif outline_queue is not None:
+                await outline_queue.put(_degraded_evt)
+        except Exception as _deg_e:
+            logger.warning("[V5.1] outline_degraded 事件发送失败（忽略）: %s", _deg_e)
     _n_l2 = sum(
         1 + sum(1 + sum(1 for _ in l2.get("children", [])) for l2 in l1.get("children", []))
         for l1 in level1
@@ -6003,7 +6294,15 @@ async def generate_outline_v51(
     if v51_state and outline_queue is not None:
         # BUG-FIX-PHASE-01：更新阶段状态
         v51_state.current_phase = "final"
-        outline_for_review = v51_state.edited_outline or level1
+        # BUG-FIX 2026-11-04（终审边界替换树零清洗·入口侧）：`outline_for_review`
+        # 可能来自断点续生恢复的 `edited_outline_json`——`load_v51_state_from_db`
+        # 只做 JSON 反序列化与结构校验，不做任何标题清洗；旧版本存储的
+        # 「专项6」「总体实施策划（2）」会随 review_needed / review_auto_confirm
+        # 事件直达前端审核界面。此处先做一次与自检后安全网同源的规则收口
+        # （幂等：干净树零改动，不调 AI、不抛异常），审核界面看到的即为净化树。
+        outline_for_review = _post_selfcheck_title_safety_net(
+            v51_state.edited_outline or level1
+        )
         edited = await _wait_for_v51_review(
             outline_queue, v51_state, "final", outline_for_review,
             auto_confirm=auto_confirm, event_emitter=event_emitter,
@@ -6012,6 +6311,20 @@ async def generate_outline_v51(
             logger.info("V5.1 最终审核未通过，中止")
             return []
         level1 = edited
+        # BUG-FIX 2026-11-04（终审边界替换树零清洗·出口侧）：人工提交树
+        # （/v51-confirm → resume_v51_task，只做类型 + 深度校验）与恢复树一样
+        # 绕开生成侧五道清洗；此前 `level1 = edited` 之后仅 renumber（只改 id
+        # 不动 title），脏标题唯一拦截点是落库终态网（sse_db_ops ERROR
+        # 「上游质量收口链漏掉了该节点」）——生成侧与落库侧之间出现空窗。
+        # 出口侧再收口一次，与入口侧对称，口径与自检后安全网完全一致。
+        level1 = _post_selfcheck_title_safety_net(level1)
+        # 收口结果回写任务态：save_v51_state_to_db 会把 edited_outline 原样
+        # 序列化入库（level1_outline = edited_outline or 结果树），不同步会把
+        # 未清洗的恢复树重新存回 DB，形成脏数据循环。
+        try:
+            v51_state.edited_outline = level1
+        except Exception:
+            logger.debug("V5.1 终审收口后 edited_outline 同步失败", exc_info=True)
 
     # ===== 返回最终结果 =====
     # 编号安全网（修复：最终审核的人工编辑/重排发生在门禁 rennumber 之后，此处按最终
@@ -6033,5 +6346,10 @@ async def generate_outline_v51(
     # 来源透传（标书智能体（一）第六节2 溯源）：把参考目录的 source 标注落到生成后的
     # 一级目录节点，供前端/审核追溯「该章节由哪个方案类型/危大参数触发」。未匹配节点不变。
     _apply_reference_source(level1, reference_outline)
+    # 遗留项 3 加固（2026-11-02）：交付前 L1 占位章名确定性透知——清洗链对
+    # 剥无可剥的脏章名（如「专项6」）保持原样是既定取舍（L1 不做语义重写，
+    # 保护评分项映射），此处把同一判定口径用于终局：命中即发非终态事件，
+    # 用户据此人工调整，而不是静默交付劣质章名。
+    await _emit_l1_placeholder_notice(level1, event_emitter, outline_queue)
     return level1
 

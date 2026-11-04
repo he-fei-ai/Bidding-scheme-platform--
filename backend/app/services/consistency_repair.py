@@ -36,6 +36,7 @@ import logging
 from typing import Any
 
 from ..db import get_db
+from . import consistency_rules as rules
 from . import text_patch
 from .ai.prompts import get_prompt
 from .ai.provider_factory import create_provider, get_ai_config
@@ -89,8 +90,63 @@ def build_conflicts_text(conflicts: Any) -> str:
     return "\n".join(lines) if lines else "未提供"
 
 
+def split_rule_and_ai(conflicts: Any) -> tuple[list, list]:
+    """按来源把冲突拆成 `(规则冲突, AI 语义发现)` 两个列表（F-2，2026-11-02）。
+
+    判定口径复用 `consistency_rules.is_ai_conflict_id`（`AI-` 前缀单一事实来源），
+    与冲突列表 / 摘要统计 / autofix 拒绝分支完全同源，不再各写一份 LIKE。
+
+    两条 AI 链路（AI 补丁修复、Agent 修复）只能对**有结构化取值**的规则冲突做
+    确定性收敛；`AI-` 发现的 `values_json` 恒为 `'[]'`，喂进补丁上下文既占 token
+    又永远无法收敛（`refresh_conflict_states` 判「不可验证 → 保持未解决」）。
+    现拆开后各自走各的展示与提示词区，**不改写入库、不影响冲突列表**。
+
+    防御式：元素既不是 dict 也没有 `conflict_id` 属性时归入规则侧
+    （宁可当成可处理项，也不要把它错标成语义发现而从修复上下文里消失）。
+    """
+    rule: list = []
+    ai: list = []
+    for conflict in conflicts or []:
+        if isinstance(conflict, dict):
+            cid = conflict.get("conflict_id")
+        else:
+            cid = getattr(conflict, "conflict_id", None)
+        if rules.is_ai_conflict_id(cid):
+            ai.append(conflict)
+        else:
+            rule.append(conflict)
+    return rule, ai
+
+
+def build_ai_findings_text(findings: Any) -> str:
+    """把 AI 语义发现渲染成**参考区**文本（F-2，2026-11-02）。
+
+    与 `build_conflicts_text` 的区别：这类条目没有结构化取值，只能提示模型
+    "语义上可能不一致"，因此不带取值列表，并在行首显式标注不可自动收敛。
+    """
+    lines = []
+    for finding in findings or []:
+        if isinstance(finding, dict):
+            name = finding.get("fact_name") or ""
+            description = finding.get("description") or ""
+        else:
+            name = getattr(finding, "fact_name", "")
+            description = getattr(finding, "description", "") or ""
+        name = str(name).strip()
+        description = str(description).strip()
+        if not (name or description):
+            continue
+        lines.append(f"- {name}：{description}" if name else f"- {description}")
+    return "\n".join(lines) if lines else "未提供"
+
+
 def build_repair_user_prompt(
-    *, sections: list[dict], conflicts_text: str, facts_text: str, failure_note: str = ""
+    *,
+    sections: list[dict],
+    conflicts_text: str,
+    facts_text: str,
+    failure_note: str = "",
+    ai_findings_text: str = "",
 ) -> str:
     """拼装送审 user prompt：事实变量 + 冲突清单 + 带行号的正文。
 
@@ -100,6 +156,12 @@ def build_repair_user_prompt(
     P1-4（facts-ns 2026-10-14，对齐易标失败回喂重试）：`failure_note` 非空时
     追加「上一轮补丁应用失败」区块，告知失败原因并要求 old_text 从下方
     最新正文原样摘抄；为空时提示词与历史完全一致。
+
+    F-2（2026-11-02）：`ai_findings_text` 非空时**追加**一个明确标注「仅参考、
+    不参与自动收敛」的语义发现区块 —— 此前 AI 语义发现与规则冲突混在
+    `conflicts_text` 里，既让模型误以为可以为其产出取值统一补丁，又白占 token。
+    为空（没有 AI 发现，或调用方不想给）时提示词与历史**逐字一致**，
+    不影响提示词缓存命中与前缀顺序。
     """
     allowed_ids = [str(section.get("node_id") or section.get("id") or "") for section in sections]
     blocks = []
@@ -116,6 +178,12 @@ def build_repair_user_prompt(
         + "\n\n".join(blocks)
         + f"\n\npatches[*].section_id 必须是以下编号之一：{'、'.join(allowed_ids) or '无'}\n请只返回 JSON。"
     )
+    if ai_findings_text:
+        prompt += (
+            "\n\n以下为 AI 语义审计发现（**仅供参考**：无结构化取值，不属于上方"
+            "「审计发现的冲突」，不要为其生成取值统一补丁，也不要因为它们而"
+            "扩大修改范围）：\n" + ai_findings_text
+        )
     if failure_note:
         prompt += (
             "\n\n上一轮修复补丁未能应用，原因清单：\n" + failure_note
@@ -154,12 +222,15 @@ async def generate_patches(
     conflicts_text: str,
     facts_text: str,
     failure_note: str = "",
+    ai_findings_text: str = "",
 ) -> tuple[list[dict], list[dict], str | None]:
     """调用 AI 生成补丁。
 
     Args:
         failure_note: P1-4 失败回喂信息（上一轮 rejected 补丁的失败原因），
             为空时行为与历史完全一致。
+        ai_findings_text: F-2（2026-11-02）AI 语义发现参考区，为空时提示词
+            与历史逐字一致。
 
     Returns:
         `(patches, unresolved, error)`；出错时 `patches=[]`、`error` 为原因。
@@ -171,6 +242,7 @@ async def generate_patches(
         conflicts_text=conflicts_text,
         facts_text=facts_text,
         failure_note=failure_note,
+        ai_findings_text=ai_findings_text,
     )
 
     try:
@@ -220,6 +292,10 @@ async def generate_patches(
 def _load_context(project_id: int, section_ids: list[int] | None) -> dict:
     """读取事实变量、未解决冲突、待修小节。
 
+    Returns `{facts, conflicts, ai_findings, sections}`：`conflicts` 为**规则冲突**
+    （有结构化取值、可被补丁收敛），`ai_findings` 为 **AI 语义发现**（仅参考，
+    见 F-2 拆分说明，2026-11-02）。
+
     PERF 2026-10-27（并发·纯读跳过全局写锁）：三段 SELECT 纯读，此前用无参
     ``get_db()`` 抢全局写锁 —— 与 fix-suggestion / 冲突列表已修的同类问题，
     写高峰期（任一项目的审计/autofix/导出落库）会把 AI 修复的上下文准备
@@ -230,8 +306,11 @@ def _load_context(project_id: int, section_ids: list[int] | None) -> dict:
             "SELECT global_facts_json FROM analysis WHERE project_id = ?", (project_id,)
         ).fetchone()
         conflict_rows = conn.execute(
+            # TD-1（2026-11-02）：`resolved` 列可空，裸 `resolved = 0` 会因三值逻辑
+            # 把 NULL 行判为 false —— 冲突在列表里看得见却对 AI 修复隐形。
+            # 统一引用 `rules.RESOLVED_SQL_OPEN`（单一事实来源，不改表结构）。
             "SELECT conflict_id, fact_name, values_json, description FROM consistency_conflicts "
-            "WHERE project_id = ? AND resolved = 0 ORDER BY id",
+            "WHERE project_id = ? AND " + rules.RESOLVED_SQL_OPEN + " ORDER BY id",
             (project_id,),
         ).fetchall()
         params: list[Any] = [project_id]
@@ -291,11 +370,22 @@ def _load_context(project_id: int, section_ids: list[int] | None) -> dict:
             }
         )
 
+    # F-2（2026-11-02·AI 发现不再混进修复上下文）：按来源拆成两路。
+    # `conflicts` 只留有结构化取值的规则冲突（补丁可收敛）；
+    # `ai_findings` 是 AI 语义发现（`values_json` 恒 `'[]'`），单列参考区，
+    # 由调用方计入报告并作为提示词里的"仅参考"区块，不参与自动收敛判定。
+    rule_conflicts, ai_findings = split_rule_and_ai(conflicts)
+
     sections = [
         {"node_id": row["id"], "id": row["id"], "title": row["title"], "content": row["content"] or ""}
         for row in sections_raw
     ]
-    return {"facts": facts, "conflicts": conflicts, "sections": sections}
+    return {
+        "facts": facts,
+        "conflicts": rule_conflicts,
+        "ai_findings": ai_findings,
+        "sections": sections,
+    }
 
 
 def _load_all_project_content(conn, project_id: int) -> dict[int, str]:
@@ -397,7 +487,18 @@ def refresh_conflict_states(
 ) -> dict:
     """按可验证判据收敛冲突状态：全文里还能找到 ≥2 个取值 → 保持未解决。
 
-    不做「补丁跑过就标已解决」这种谎报。返回 `{resolved, still_open}`。
+    不做「补丁跑过就标已解决」这种谎报。返回
+    `{resolved, still_open, not_verifiable}`：
+
+    - `resolved`：本轮判定已收敛并被标为已解决的条数；
+    - `still_open`：**有结构化取值**（可验证）但全文仍能找到 ≥2 个取值、
+      保持未解决的条数；
+    - `not_verifiable`（F-2，2026-11-02）：无取值/坏 JSON 等**不可验证**条目
+      （AI 语义发现属此类）的条数。此前混计入 `still_open`，导致两条 AI
+      链路的报告恒显「仍待处理 N 条」且 N 永远降不到 0 —— 现单列计数，
+      由调用方在 message 里以「另有 K 条需人工核对」的口径分开表述。
+      注意：**落库行为不变**，这类条目依旧保持未解决（与 2026-10-13
+      第六轮口径一致），只是计数口径拆分。
 
     `sections` 是章节正文（`{section_id: content}`）；`extra_texts` 是章节正文
     **之外**的事实来源文本（`{来源标签: 文本}`，如摘要与已确认事实基准，
@@ -405,9 +506,13 @@ def refresh_conflict_states(
     故两处都必须纳入扫描 —— 否则只在摘要/基准里存在旧取值的冲突会被误标已解决。
     向后兼容：`extra_texts` 缺省为 None 时，行为与「只扫章节正文」完全一致。
     """
+    # TD-1（2026-11-02）：谓词统一（`resolved` 列可空，裸 `= 0` 会因三值逻辑漏掉
+    # NULL 行）。此处**不**按来源剔除 AI 发现 —— 它们仍进入下方判定，只是走
+    # 「无取值 = 不可验证 → 保持未解决」分支，与 2026-10-13 第六轮修掉的
+    # 「AI 发现被误标已解决」口径逐字一致（见 `tests/test_consistency_round6_2026_10_13.py`）。
     rows = conn.execute(
         "SELECT conflict_id, values_json FROM consistency_conflicts "
-        "WHERE project_id = ? AND resolved = 0",
+        "WHERE project_id = ? AND " + rules.RESOLVED_SQL_OPEN,
         (project_id,),
     ).fetchall()
     # 扫描宇宙 = 全量章节正文 + 章节之外的来源文本（摘要 / 已确认事实基准）。
@@ -417,6 +522,7 @@ def refresh_conflict_states(
 
     resolved = 0
     still_open = 0
+    not_verifiable = 0
     for row in rows:
         try:
             values = json.loads(row["values_json"] or "[]")
@@ -438,7 +544,9 @@ def refresh_conflict_states(
         # 正文重写（`_persist_ai_audit_findings` 的既定设计）。
         verifiable = [str(v) for v in values if str(v).strip()]
         if not verifiable:
-            still_open += 1
+            # F-2(2026-11-02)：不再混计入 still_open——单列 not_verifiable，
+            # 落库行为不变（保持未解决、不写 resolved_at）。
+            not_verifiable += 1
             continue
         present = [
             str(value)
@@ -471,7 +579,7 @@ def refresh_conflict_states(
             resolved += 1
         else:
             still_open += 1
-    return {"resolved": resolved, "still_open": still_open}
+    return {"resolved": resolved, "still_open": still_open, "not_verifiable": not_verifiable}
 
 
 async def repair_with_ai(
@@ -492,6 +600,9 @@ async def repair_with_ai(
     Returns:
         修复报告：`patches` / `applied` / `rejected` / `sections` / `unresolved` /
         `conflict_states` / `message`。
+        F-2（2026-11-02）新增：`ai_findings_used`（本轮识别到的 AI 语义发现条数，
+        只作参考、不参与补丁与收敛）、`conflicts_used` 口径**收窄为规则冲突条数**
+        （此前含 AI 发现，虚高了"待修复冲突数"，且这些条目注定无法收敛）。
     """
     report: dict = {
         "success": False,
@@ -499,12 +610,15 @@ async def repair_with_ai(
         "project_id": project_id,
         "facts_used": 0,
         "conflicts_used": 0,
+        "ai_findings_used": 0,
         "batches": 0,
         "patches": [],
         "applied": [],
         "rejected": [],
         "sections": [],
         "unresolved": [],
+        "written_sections": 0,
+        "unwritten": [],
         "conflict_states": None,
         "errors": [],
         "message": "",
@@ -514,12 +628,23 @@ async def repair_with_ai(
     sections = context["sections"]
     report["facts_used"] = len(context["facts"])
     report["conflicts_used"] = len(context["conflicts"])
+    ai_findings = context.get("ai_findings") or []
+    report["ai_findings_used"] = len(ai_findings)
 
     if not sections:
         report["message"] = "没有可供修复的正文内容"
         return report
     if not context["conflicts"]:
-        report["message"] = "没有未解决的一致性冲突，无需修复"
+        # F-2（2026-11-02）：只剩 AI 语义发现时不再空跑一轮 AI ——
+        # 这类条目没有结构化取值，补丁无法收敛，历史上每轮都会以
+        # 「仍待处理 N 条」收尾。明确告知用户走人工核对 / 冲突列表处理。
+        if ai_findings:
+            report["message"] = (
+                f"没有可自动修复的规则冲突；另有 {len(ai_findings)} 条 AI 语义发现"
+                "需人工核对（无结构化取值，不参与自动修复）"
+            )
+        else:
+            report["message"] = "没有未解决的一致性冲突，无需修复"
         return report
 
     if provider is None:
@@ -527,6 +652,8 @@ async def repair_with_ai(
 
     facts_text = build_facts_text(context["facts"])
     conflicts_text = build_conflicts_text(context["conflicts"])
+    # F-2：AI 语义发现单独渲染成"仅参考"区块（为空时提示词与历史逐字一致）。
+    ai_findings_text = build_ai_findings_text(ai_findings) if ai_findings else ""
 
     batches = plan_batches(sections)
     report["batches"] = len(batches)
@@ -535,7 +662,8 @@ async def repair_with_ai(
     patches_by_section: dict[str, list[dict]] = {}
     for batch in batches:
         patches, unresolved, error = await generate_patches(
-            provider, sections=batch, conflicts_text=conflicts_text, facts_text=facts_text
+            provider, sections=batch, conflicts_text=conflicts_text, facts_text=facts_text,
+            ai_findings_text=ai_findings_text,
         )
         if error:
             report["errors"].append(error)
@@ -692,12 +820,28 @@ async def repair_with_ai(
     try:
         with get_db() as conn:
             now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            # BUG-FIX 2026-11-02（F-1 同类·落文不校验 rowcount）：与
+            # `consistency_auditor.apply_autofix` 同口径补上逐条 `rowcount` 校验。
+            # `planned` 里的小节来自本次 `_load_context`（已按 project_id 过滤），
+            # 但从读取到落文之间用户可能删了章节 / 目录生成重建了章节
+            # （DELETE+INSERT 换新 id），此时 UPDATE 命中 0 行 —— 旧实现照样
+            # 宣布"修改 N 个小节"并据此收敛冲突状态，属假成功。
+            # 现只把**真正写入**的小节计入后续口径（收敛判定 / 缓存失效 / 报告）。
+            written: list[tuple[int, str, str]] = []
             for section_id, _key, new_content in planned:
-                conn.execute(
+                cur = conn.execute(
                     "UPDATE sections SET content = ?, updated_at = ? WHERE id = ? AND project_id = ?",
                     (new_content, now, section_id, project_id),
                 )
-            content_by_id.update({section_id: content for section_id, _k, content in planned})
+                if cur.rowcount:
+                    written.append((section_id, _key, new_content))
+                else:
+                    report["unwritten"].append({
+                        "section_id": _key,
+                        "reason": "章节不属于本项目或已被删除/重建，UPDATE 未命中任何行",
+                    })
+            report["written_sections"] = len(written)
+            content_by_id.update({section_id: content for section_id, _k, content in written})
             # BUG-FIX 2026-10-09（正确性 / 误标已解决）：此前把「本次载入的
             # 小节」content_by_id 直接交给 refresh_conflict_states。该函数以
             # 「全项目正文里还能找到 ≥2 个冲突取值 → 仍算冲突」为判据，因此
@@ -728,21 +872,45 @@ async def repair_with_ai(
 
     # BUG-FIX 2026-09-18（P1）：旁路直写正文后失效三层缓存（内存/Redis/build_tree），
     # 否则旧正文会在 TTL 内被重新生成回灌，覆盖本次修复。
+    # BUG-FIX 2026-11-02（F-1 同类）：只失效**实际写入**的小节。
     from .sections import invalidate_content_caches
-    invalidate_content_caches(project_id, [sid for sid, _k, _c in planned])
+    if written:
+        invalidate_content_caches(project_id, [sid for sid, _k, _c in written])
+
+    if not written:
+        # 一条都没落库：不能宣布成功（即便 AI 产出了补丁）。
+        report["success"] = False
+        report["message"] = (
+            f"AI 产出 {len(report['applied'])} 条补丁，但 {len(planned)} 个小节均未能落库"
+            "（章节可能已被删除或重建），未做任何修改"
+        )
+        return report
 
     report["success"] = True
     states = report["conflict_states"] or {}
     report["message"] = (
-        f"已应用 {len(report['applied'])} 条补丁，修改 {len(planned)} 个小节"
+        f"已应用 {len(report['applied'])} 条补丁，修改 {len(written)} 个小节"
         f"（拒绝 {len(report['rejected'])} 条）；"
         f"冲突已解决 {states.get('resolved', 0)} 条，仍待处理 {states.get('still_open', 0)} 条"
     )
+    if report["unwritten"]:
+        # F-2 同批的可读性收敛：AI 语义发现不再计入"仍待处理"的自动修复口径，
+        # 单独告知条数，避免用户以为"点几次修复就能把它们消掉"。
+        report["message"] += (
+            f"；另有 {len(report['unwritten'])} 个小节未能落库（章节已被删除或重建），请重新审计"
+        )
+    # F-2(2026-11-02)：不可验证条目（AI 语义发现/无结构化取值）单列计数，
+    # 不再混进「仍待处理」——否则该数字永远降不到 0，用户反复点修复。
+    _nv = states.get("not_verifiable", report["ai_findings_used"])
+    if _nv:
+        report["message"] += (
+            f"；另有 {_nv} 条为语义发现（无结构化取值），需人工核对（不参与自动收敛）"
+        )
     logger.info(
         "一致性 AI 修复完成: project=%s, 补丁=%d, 小节=%d, 冲突解决=%d",
         project_id,
         len(report["applied"]),
-        len(planned),
+        len(written),
         states.get("resolved", 0),
     )
     return report

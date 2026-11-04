@@ -464,7 +464,10 @@ class TestUniquifyOrdinalDuplicates:
 
 
 class TestCleanupPlaceholderLevelScope:
-    """脏标题清洗只应作用于三级及以下，不得误伤合法的一/二级章节标题。"""
+    """脏标题清洗的分层作用域（2026-11-02 现状）：
+    L3/L2 判脏即清洗（剥 affix 保主体 → 消歧 → 语义重写）；
+    L1 只做**确定性剥编号前后缀保主体**（不做语义重写、不加序数消歧），
+    合法的一/二级章节标题不得被误伤。"""
 
     def test_l1_generic_title_is_preserved(self):
         # 28 章模板的合法一级标题（FIXED_28_CHAPTERS[27] == "其他"）
@@ -485,6 +488,10 @@ class TestCleanupPlaceholderLevelScope:
         2026-10-27（L2 清洗升级）：L2 标题「二、分阶段推进」带编号前缀（DB title
         命名空间不携带编号），现在也会被清洗（剥前缀保主体）。因此清洗数从 2
         变为 3（L2×1 + L3×2），且 L2 前缀被正确剥掉。
+
+        2026-11-02（L1 清洗升级）：L1 同样适用「DB title 命名空间不携带编号」
+        口径——「一、总体施工部署」的前缀被确定性剥除保主体。清洗数从 3 变为
+        4（L1×1 + L2×1 + L3×2）。注意 L1 只做剥前后缀，不做语义重写。
         """
         tree = [
             {"title": "一、总体施工部署", "children": [
@@ -495,8 +502,9 @@ class TestCleanupPlaceholderLevelScope:
             ]}
         ]
         fixed = _cleanup_placeholder_titles(tree)
-        # L2「二、分阶段推进」剥前缀得「分阶段推进」+ L3 两个占位 → 共 3 处
-        assert fixed == 3, f"应清洗 3 个（L2×1 + L3×2），实际 {fixed}"
+        # L1「一、总体施工部署」+ L2「二、分阶段推进」剥前缀 + L3 两个占位 → 共 4 处
+        assert fixed == 4, f"应清洗 4 个（L1×1 + L2×1 + L3×2），实际 {fixed}"
+        assert tree[0]["title"] == "总体施工部署"
         # L2 前缀被剥掉，保留合法主体「分阶段推进」
         assert tree[0]["children"][0]["title"] == "分阶段推进"
         titles = [c["title"] for c in tree[0]["children"][0]["children"]]

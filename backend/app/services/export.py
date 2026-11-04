@@ -5,7 +5,6 @@ import gc
 import hashlib
 from io import BytesIO
 import json
-import contextvars  # HARDENING 2026-10-11（遗留·图号计数器会话化）
 import logging
 import os
 from pathlib import Path
@@ -59,22 +58,25 @@ from .ai.heading_standard import (
     HeadingNumberingGeneratorV2,
 )
 from .ai.mermaid_renderer import (
-    ChartCache,
     render_mermaid_to_bytes,
 )
 from .content_cleaning import (
     ContentCleaner,
     clean_inline_text,
     extract_mermaid_title,
+    iter_chart_fences,
     parse_content,
 )
+# 遗留项 1（2026-11-04 导出加固轮）：LaTeX→OMML 公式渲染层。纯转换、可选依赖、
+# 全程可失败——任何异常由调用方按原文本回填（与关闭开关时逐字一致，零回归）。
+from .math_omml import latex_to_omml_xml, split_math_segments
 from .export_presets import resolve_export_config
 
 # MODULARIZATION 2026-10-12：缓存层 + single-flight 并发合并 + 图号计数器 +
 # 内联图表标记缓存从 export_cache.py re-export。
-# export.py 里的原实现函数体暂保留（以下同名 def 会覆盖 re-export 的值，
-# 零回归）；物理搬迁删除建议在下一 sprint 进行（涉及 ~300 行删除 + 精确验证）。
-# 消费方向：新消费者直接 import export_cache，既有消费者保持 `from app.services.export import X`。
+# 更新（2026-11-02 TD-2）：export.py 内的原同名实现**已完成物理搬迁删除**
+# （grep 证实本文件已无同名 def），以下 import 是唯一权威定义；既有消费者
+# 保持 `from app.services.export import X` 兼容路径，新消费者直接 import export_cache。
 from .export_cache import (  # noqa: F401
     _chart_cache,
     _chart_render_cache,
@@ -93,6 +95,7 @@ from .export_cache import (  # noqa: F401
     _FIG_NO_PREFIX_RE,
     _used_chart_titles_ctx_var,
     _claim_chart_title,
+    _unclaim_chart_title,
     _reset_chart_title_registry,
     _snapshot_chart_title_registry,
     _restore_chart_title_registry,
@@ -139,6 +142,13 @@ from .export_chart_pipeline import (  # noqa: F401
     _detect_inline_chart_markers,
     _get_cached_inline_chart_markers,
     _get_cached_inline_chart_types,
+    # Block 5: 观测层（A3 建议 1 第三点·本地模板数据矛盾告警）
+    warn_local_template_data_mismatch,
+    # Block 6: 渲染耗时 profiling（ENHANCE 2026-11-04·P3-3 接线）
+    _record_render_time,
+    get_render_profile,
+    get_render_profile_summary,
+    clear_render_profile,
 )
 
 #: 导出端防御性清洗器（复用实例；ContentCleaner 无状态，实例开销可忽略）
@@ -156,6 +166,12 @@ logger = logging.getLogger(__name__)
 # 覆盖：第X节/第X章、一、1、1.1、1.1.1、1）、a 等
 _HEADING_NUMBER_COMBINED = re.compile(
     r"^(?:第[一二三四五六七八九十百千万\d]+[章节][、，]?\s*"
+    # HARDEN 2026-11-02（遗留项 4）：≥4 段点分编号（正文承接目录体系时 AI
+    # 产出的「1.2.3.1」形态）必须**整串**剥除。旧实现只有 2/3 段分支，
+    # "1.2.3.1 标题"会先剥成"1 标题"留下半截编号（当前调用路径由 parse 层
+    # HEADING_PATTERNS 归为 L5 保留原文、不走本函数，属防御性收口）。
+    # 必须放在 2/3 段分支**之前**，否则 3 段分支会抢先吞掉前三段。
+    r"|\d+(?:\.\d+){3,}\s*(?:[、．.]\s*|\s+)"
     # FIX 2026-10-26（报告 G-1/G-2）：多级编号常以空格收尾（"1.2 工程概况"），
     # 旧正则只认 、．. 三种分隔符 → 只剥掉 "1." 留下 "2 工程概况"，标题里残留
     # 半截编号。多级编号额外接受「空白分隔」。
@@ -872,10 +888,18 @@ def check_document(
     high_conflicts_open = 0
     if block_on_high_conflicts:
         try:
-            with get_db() as conn:
+            # TD-1（2026-11-02·谓词单一事实来源）：`resolved` 判定统一引用
+            # `consistency_rules.RESOLVED_SQL_OPEN`（函数内导入，避免与审计链路
+            # 产生模块级耦合）。取值与原字面量 `COALESCE(resolved, 0) = 0` 逐字相同，
+            # 行为不变；今后口径调整只需改 rules 一处。
+            # PERF（2026-11-04·第 11 轮）：两条 SELECT 纯读，改 readonly 连接，
+            # 不再在导出热路径上抢全局写锁（与本仓已在 fix-suggestion / 冲突列表 /
+            # 摘要 / 回流 / Agent 工作区等 8+ 处修复的「纯读抢写锁」同类，此处为漏网点）。
+            from .consistency_rules import RESOLVED_SQL_OPEN
+            with get_db(readonly=True) as conn:
                 _hrow = conn.execute(
                     "SELECT COUNT(*) AS n FROM consistency_conflicts "
-                    "WHERE project_id = ? AND COALESCE(resolved, 0) = 0 "
+                    "WHERE project_id = ? AND " + RESOLVED_SQL_OPEN + " "
                     "AND LOWER(COALESCE(severity, '')) = 'high'",
                     (project_id,),
                 ).fetchone()
@@ -884,7 +908,7 @@ def check_document(
                     r["fact_name"]
                     for r in conn.execute(
                         "SELECT fact_name FROM consistency_conflicts "
-                        "WHERE project_id = ? AND COALESCE(resolved, 0) = 0 "
+                        "WHERE project_id = ? AND " + RESOLVED_SQL_OPEN + " "
                         "AND LOWER(COALESCE(severity, '')) = 'high' "
                         "ORDER BY id LIMIT 5",
                         (project_id,),
@@ -1012,29 +1036,27 @@ def _add_paragraph_with_format(
 
     if block_type.startswith("heading"):
         # === L1~L4：标题样式 ===
+        # TD-3（2026-11-02）：原各分支 `size = config.size_*` 为逐级字号体系
+        # （_heading_size_for，ENHANCE 2026-09-14）接线前的死变量残留，全部
+        # 无读取方，已清理；字号在下方 _apply_font 处统一应用，行为不变。
         if level == 1:
-            size = config.size_title_1
             p.alignment = WD_ALIGN_PARAGRAPH.CENTER
             pf.space_before = Pt(24)
             pf.space_after = Pt(12)
         elif level == 2:
-            size = config.size_title_2
             p.alignment = WD_ALIGN_PARAGRAPH.LEFT
             pf.space_before = Pt(18)
             pf.space_after = Pt(6)
         elif level == 3:
-            size = config.size_title_3
             p.alignment = WD_ALIGN_PARAGRAPH.LEFT
             pf.space_before = Pt(12)
             pf.space_after = Pt(6)
         elif level == 4:
-            size = config.size_title_3
             p.alignment = WD_ALIGN_PARAGRAPH.LEFT
             pf.space_before = Pt(10)
             pf.space_after = Pt(4)
         # === L5+：正文样式（2026-09-04 修订） ===
         else:  # level >= 5
-            size = config.size_body
             p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
             pf.space_before = Pt(0)
             pf.space_after = Pt(0)
@@ -1091,6 +1113,79 @@ def _add_paragraph_with_format(
         _set_paragraph_indent_chars(p, first_line_chars=_body_indent_chars(config))
         run = p.add_run(text)
         _apply_font(run, config.font_body, config.size_body)
+
+    return p
+
+
+def _add_paragraph_with_math(doc, text: str, config: ExportConfig):
+    """公式感知的正文段落渲染（遗留项 1，2026-11-04；render_math_omml 开启时调用）。
+
+    行为契约（与 math_omml.py 的「无降级」纪律一致）：
+    - 无公式候选片段 → 委托 `_add_paragraph_with_format` paragraph 分支（历史路径，
+      逐字一致）；
+    - 整段仅由一个 $$ 独立公式构成 → 居中、无首行缩进的独立公式段（m:oMathPara）；
+    - 行内公式转换成功 → 文本 run 与 `m:oMath` 元素按原顺序混排；
+    - 个别公式转换失败（依赖缺失/语法非法/CJK 误配）→ 该片段按**原文含定界符**
+      回填为文本 run，与关闭开关时的渲染结果逐字一致（零回归、零内容丢失）。
+    """
+    try:
+        segments = split_math_segments(text)
+    except Exception as e:  # 防御：切分异常按历史路径
+        logger.debug("[公式渲染] 片段切分异常，按纯文本渲染: %s", e)
+        _add_paragraph_with_format(doc, text, config, "paragraph")
+        return
+
+    if len(segments) <= 1 and (not segments or segments[0][0] == "text"):
+        _add_paragraph_with_format(doc, text, config, "paragraph")
+        return
+
+    # 独立公式段：整段只有一个 $$...$$（文本段均为空白）→ 居中独立公式
+    only_display = (
+        len(segments) == 1
+        and segments[0][0] == "math"
+        and segments[0][2]
+    ) or (
+        len(segments) == 2
+        and all(s[0] == "text" or (s[0] == "math" and s[2]) for s in segments)
+        and not any(s[0] == "text" and s[1].strip() for s in segments)
+        and any(s[0] == "math" and s[2] for s in segments)
+    )
+
+    p = doc.add_paragraph()
+    pf = p.paragraph_format
+    pf.line_spacing = config.line_spacing
+    if only_display:
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        pf.space_before = Pt(6)
+        pf.space_after = Pt(6)
+        _set_paragraph_indent_chars(p, first_line_chars=0)
+    else:
+        # 与 _add_paragraph_with_format 的 paragraph 分支同款版式
+        p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+        pf.space_before = Pt(0)
+        pf.space_after = Pt(0)
+        _set_paragraph_indent_chars(p, first_line_chars=_body_indent_chars(config))
+
+    for kind, payload, is_display in segments:
+        if kind == "text":
+            if payload:
+                run = p.add_run(payload)
+                _apply_font(run, config.font_body, config.size_body)
+            continue
+        omml_xml = latex_to_omml_xml(payload, display=is_display and only_display)
+        if omml_xml is None:
+            # 无降级回填：按原文（含 $ / $$ 定界符）作为文本 run
+            delim = "$$" if is_display else "$"
+            run = p.add_run(f"{delim}{payload}{delim}")
+            _apply_font(run, config.font_body, config.size_body)
+            continue
+        try:
+            p._p.append(parse_xml(omml_xml))
+        except Exception as e:
+            logger.debug("[公式渲染] OMML 元素插入失败，按原文回填: %s", e)
+            delim = "$$" if is_display else "$"
+            run = p.add_run(f"{delim}{payload}{delim}")
+            _apply_font(run, config.font_body, config.size_body)
 
     return p
 
@@ -1623,7 +1718,13 @@ def _add_parsed_content(
                 except Exception:
                     pass
         else:
-            _add_paragraph_with_format(doc, block.text, config, "paragraph")
+            # 遗留项 1（2026-11-04 导出加固轮·公式渲染）：开关开启且段落含
+            # LaTeX 公式片段时走公式感知渲染（m:oMath 原生公式对象）；
+            # 关闭/无公式/依赖缺失时与历史路径逐字一致（零回归）。
+            if getattr(config, "render_math_omml", False):
+                _add_paragraph_with_math(doc, block.text, config)
+            else:
+                _add_paragraph_with_format(doc, block.text, config, "paragraph")
 
     # D5 加固（2026-10-07）：章节标题命中图表关键词且全文无任何图表标记时，
     # 自动补一张本地标题模板图，避免技术标书"有章节无图"。仅命中强关键词才触发，
@@ -1678,6 +1779,12 @@ def _render_commercial(
     Returns:
         True 表示渲染成功；False 表示真实数据渲染失败，跳过该图表
     """
+    # ENHANCE 2026-11-04（需求 10·P3-3 profiling 接线）：_record_render_time
+    # 此前全仓零调用（统计恒空），现接入门禁/缓存/渲染三条路径。
+    import time as _prof_time
+
+    _prof_t0 = _prof_time.perf_counter()
+    _prof_section = section_title
 
     def _emit(stream, cap: str) -> bool:
         """把字节流插入文档；返回是否**真的插入成功**。
@@ -1790,6 +1897,9 @@ def _render_commercial(
         cached_stream, _ = cached
         ok = _emit(cached_stream, caption)
         logger.debug("商业级渲染: L1缓存命中 (%s)", typ)
+        _record_render_time(
+            f"{_prof_section}:{typ}", (_prof_time.perf_counter() - _prof_t0) * 1000, cached=True
+        )
         return ok
 
     # 策略 1: V6.0 持久化缓存
@@ -1800,6 +1910,9 @@ def _render_commercial(
             ok = _emit(BytesIO(cached_bytes), caption)
             _store_chart_render(cache_payload_str, BytesIO(cached_bytes), chart_type=typ)
             logger.debug("商业级渲染: 策略1缓存命中 (%s)", typ)
+            _record_render_time(
+                f"{_prof_section}:{typ}", (_prof_time.perf_counter() - _prof_t0) * 1000, cached=True
+            )
             return ok
     except Exception as e:
         last_error = e
@@ -1872,6 +1985,9 @@ def _render_commercial(
             logger.info(
                 "[商业级渲染] 策略2成功: %s (原始数据, %d bytes)", typ, len(_render_bytes)
             )
+            _record_render_time(
+                f"{_prof_section}:{typ}", (_prof_time.perf_counter() - _prof_t0) * 1000, cached=False
+            )
             return ok
         else:
             logger.warning(
@@ -1895,6 +2011,9 @@ def _render_commercial(
         typ,
         section_title,
         last_error,
+    )
+    _record_render_time(
+        f"{_prof_section}:{typ}", (_prof_time.perf_counter() - _prof_t0) * 1000, cached=False
     )
     # 渲染失败说明（见 _emit_fail_note 注释；ENHANCE 2026-10-27 复用闭包）
     _emit_fail_note()
@@ -2034,6 +2153,22 @@ def _add_inline_chart(
             # title / Mermaid title（第 1/2 优先级）本就是干净图名，不处理。
             _lead_in = _clean_lead_in_title(_lead_in) if _lead_in else _lead_in
             if source_obj and isinstance(source_obj, dict):
+                # A3 建议 1 第三点（2026-11-03 遗留加固）：本地模板载荷数字与
+                # 正文零交集时导出日志 WARNING（只告警不阻断，披露标签仍是
+                # 第一道防线）。source_obj 未解析（坏 JSON/纯 mermaid 引语）
+                # 时静默跳过，不影响渲染路径。
+                try:
+                    warn_local_template_data_mismatch(
+                        source_obj,
+                        getattr(section_detail, "content", "") or "",
+                        ctype,
+                        _section_title,
+                    )
+                except Exception:  # 告警异常不得影响导出（观测层 fail-soft）
+                    logger.debug(
+                        "[图表矛盾告警] 检测异常（已忽略）: type=%s section=%s",
+                        ctype, _section_title, exc_info=True,
+                    )
                 title_text = (
                     source_obj.get("title")
                     or source_obj.get("caption")
@@ -2112,9 +2247,14 @@ def _add_inline_chart(
                     )
                     if fig_no:
                         _rewind_figure_number(_fig_parent, _project_id)
+                    # BUG-FIX 2026-11-06（单图渲染失败→后续同名图被吞）：图号回滚
+                    # 之外同步撤销图题登记，否则本章后续同名图被 _claim_chart_title
+                    # 判为「重复」而静默跳过，正文出现「有图题无图」的缺失。
+                    _unclaim_chart_title(_fig_parent, title_text, _project_id)
                     return False
                 if fig_no and not _rendered:
                     _rewind_figure_number(_fig_parent, _project_id)
+                    _unclaim_chart_title(_fig_parent, title_text, _project_id)
                 return _rendered
             # V6.1 无数据源：跳过图表（无降级原则）
             #   正文出现图表占位但章节无绑定图表数据时，不得伪造图表内容
@@ -2236,9 +2376,12 @@ def _add_inline_chart(
             )
             if fig_no:
                 _rewind_figure_number(_fig_parent, _project_id)
+            # BUG-FIX 2026-11-06：与主路径同口径，撤销图题登记防后续同名图被吞
+            _unclaim_chart_title(_fig_parent, _fb_title, _project_id)
             return False
         if fig_no and not _rendered_fb:
             _rewind_figure_number(_fig_parent, _project_id)
+            _unclaim_chart_title(_fig_parent, _fb_title, _project_id)
         return _rendered_fb
 
     # V6.1 无数据源且无法识别图表类型：跳过（无降级原则，不输出文本占位）
@@ -2470,29 +2613,26 @@ def _add_section_heading(doc, text: str, level: int, config: ExportConfig, numbe
     pf = p.paragraph_format
 
     # === L1~L4：标题样式 ===
+    # TD-3（2026-11-02）：同上，各分支死变量 `size = config.size_*` 清理，
+    # 字号统一由 _apply_font(_heading_size_for/size_body) 应用，行为不变。
     if level == 1:
-        size = config.size_title_1
         p.alignment = WD_ALIGN_PARAGRAPH.CENTER
         pf.space_before = Pt(24)
         pf.space_after = Pt(12)
     elif level == 2:
-        size = config.size_title_2
         p.alignment = WD_ALIGN_PARAGRAPH.LEFT
         pf.space_before = Pt(18)
         pf.space_after = Pt(6)
     elif level == 3:
-        size = config.size_title_3
         p.alignment = WD_ALIGN_PARAGRAPH.LEFT
         pf.space_before = Pt(12)
         pf.space_after = Pt(6)
     elif level == 4:
-        size = config.size_title_3
         p.alignment = WD_ALIGN_PARAGRAPH.LEFT
         pf.space_before = Pt(10)
         pf.space_after = Pt(4)
     # === L5+：正文样式（2026-09-04 修订） ===
     else:  # level >= 5
-        size = config.size_body
         p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
         pf.space_before = Pt(0)
         pf.space_after = Pt(0)
@@ -2848,10 +2988,34 @@ def _preload_chart_images_parallel(
             _http_service_available = False
 
     chart_tasks: list[tuple[int, str, str, object]] = []
+    _fence_preload_count = 0
     for section_id, section_detail in detail_index.items():
         if not section_detail or not section_detail.content:
             continue
         cached_types, hint_types = _get_cached_inline_chart_markers(section_detail)
+        # ENHANCE 2026-11-04（需求 10·围栏图表预渲染接线）：```mermaid /
+        # ```chart-json 围栏自带数据的图表此前不在预热范围——正文阶段全部
+        # 串行实时渲染（PIL 复杂甘特最坏 ~15s/图），大文档导出明显变慢。
+        # 现从正文提取围栏载荷，经同一 _add_inline_chart 内联路径预热：
+        # 载荷与正文阶段完全同源（同一 JSON 文本 → 同一 dict → 同一
+        # _strip_fig_no_for_cache 归一化键），正文阶段必命中 L1/磁盘缓存。
+        # 与下方 DB 字段循环天然不重叠：围栏自带数据的类型会被
+        # `chart_type in cached_types and chart_type not in hint_types` 跳过。
+        for _lang, _body, _marker_text in iter_chart_fences(section_detail.content):
+            if not _marker_text:
+                continue  # 坏块：正文阶段会被删除，无需预热
+            try:
+                _mt = json.loads(_marker_text)
+                _ftype = str(_mt.get("chart_type") or "").lower()
+                _desc = str(_mt.get("description") or "")
+            except (json.JSONDecodeError, TypeError, ValueError):
+                continue
+            if _ftype not in _CHART_TYPE_MAP:
+                continue
+            if not _desc.lstrip().startswith("{"):
+                continue  # 纯标题提示：数据来自 DB 字段，走下方循环预热
+            chart_tasks.append((section_id, _ftype, _desc, section_detail))
+            _fence_preload_count += 1
         for chart_type, (json_field, default_title) in _CHART_TYPE_MAP.items():
             # CHART-MARKER-UNIFY 2026-09-16：
             # - 标记内含真实数据的类型：内联渲染用标记内数据，预渲染载荷不同 → 跳过
@@ -2874,8 +3038,9 @@ def _preload_chart_images_parallel(
         max_workers = _adaptive_batch_size(len(chart_tasks))
 
     logger.info(
-        "并行预渲染 %d 个图表（线程池大小=%d, HTTP可用=%s）",
+        "并行预渲染 %d 个图表（围栏载荷=%d, 线程池大小=%d, HTTP可用=%s）",
         len(chart_tasks),
+        _fence_preload_count,
         max_workers,
         _http_service_available,
     )
@@ -4364,6 +4529,29 @@ def _write_tree_content_with_progress(
                         fs.get("title", "?"), fs.get("node_id"),
                     )
                 try:
+                    # BUG-FIX 2026-11-04（P2·重试轮缺图号/图题回滚）：主路径在
+                    # 节点渲染前拍图号计数器与图题登记双快照、失败还原
+                    # （2026-10-13 / 2026-10-26），重试轮漏接 —— 重试中途再次
+                    # 失败时正文元素被回滚，但已占用的图号与已登记的图题不还原
+                    # → 下一轮 _claim_chart_title 判「同章重复图题」静默跳过，
+                    # 成品该章有图题无图、图号断档（图1-1 后直接 图1-3）。
+                    # 与主路径同口径：渲染前双快照，失败同步还原。
+                    _r_fig_snap: dict[str, int] = {}
+                    _r_title_snap: dict[str, set[str]] = {}
+                    try:
+                        _r_fig_snap = _snapshot_figure_counter() or {}
+                    except Exception as _snap_err:
+                        logger.warning(
+                            "重试快照图号计数器失败（回滚将跳过还原）: node=%s err=%s",
+                            fs.get("node_id"), _snap_err,
+                        )
+                    try:
+                        _r_title_snap = _snapshot_chart_title_registry() or {}
+                    except Exception as _snap_err:
+                        logger.warning(
+                            "重试快照图题登记失败（回滚将跳过还原）: node=%s err=%s",
+                            fs.get("node_id"), _snap_err,
+                        )
                     # 重新获取章节详情（可能之前有临时IO错误）
                     section_detail = _get_section_detail(project_id, fs["node_id"])
                     if section_detail and section_detail.content:
@@ -4399,6 +4587,18 @@ def _write_tree_content_with_progress(
                     )
                     if _ph is not None:
                         _remove_body_elements(list(_body)[_mark:])
+                    try:
+                        _restore_figure_counter(_r_fig_snap)
+                    except Exception:
+                        logger.warning(
+                            "重试回滚还原图号计数器失败，忽略: node=%s", fs.get("node_id")
+                        )
+                    try:
+                        _restore_chart_title_registry(_r_title_snap)
+                    except Exception:
+                        logger.warning(
+                            "重试回滚还原图题登记失败，忽略: node=%s", fs.get("node_id")
+                        )
                     still_failed.append(fs)
 
             failed_sections = still_failed

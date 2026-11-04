@@ -1,9 +1,14 @@
 """P3 性能调优测试（2026-10-17）
 
 覆盖：
-  P3-1: 同代码 hash 去重缓存
   P3-2: 动态批量大小优化
   P3-3: 渲染耗时 profiling
+
+TD-1 清理（2026-11-02）：原 P3-1「同代码 hash 去重」测试类
+TestP3_1_HashDedup 随 export_chart_pipeline.py 死代码一并删除——该系列
+从未接线生产链路，同代码去重的等价能力由 export_cache L1 渲染缓存提供，
+其生产行为测试见 tests/test_perf_bottleneck_fixes.py（双参
+_get_cached_chart_render / _store_chart_render）。
 """
 
 import pytest
@@ -15,70 +20,29 @@ if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
 
-class TestP3_1_HashDedup:
-    """P3-1 同代码 hash 去重测试"""
+class TestL1RenderCacheEviction:
+    """TD-1 迁移（2026-11-02）：原 R-3 对 pipeline 死代码 hash 缓存的
+    容量淘汰断言，迁移到生产主链路实际消费的 export_cache L1 渲染缓存
+    （_store_chart_render 的 TTL + LRU 容量淘汰路径）。"""
 
-    def setup_method(self):
-        """每个测试前清空缓存"""
-        from app.services.export_chart_pipeline import clear_chart_hash_cache
-        clear_chart_hash_cache()
+    def test_lru_eviction_on_overflow(self, monkeypatch):
+        from io import BytesIO
+        from app.services import export_cache as ec
 
-    def test_chart_hash_generation(self):
-        """hash 生成：相同代码相同 hash"""
-        from app.services.export_chart_pipeline import _get_chart_hash
-        code = "graph TD\n    A-->B"
-        hash1 = _get_chart_hash(code)
-        hash2 = _get_chart_hash(code)
-        assert hash1 == hash2
-        assert len(hash1) == 40  # SHA1 长度
-
-    def test_chart_hash_different_codes(self):
-        """hash 生成：不同代码不同 hash"""
-        from app.services.export_chart_pipeline import _get_chart_hash
-        hash1 = _get_chart_hash("graph TD\n    A-->B")
-        hash2 = _get_chart_hash("graph TD\n    A-->C")
-        assert hash1 != hash2
-
-    def test_cache_miss_then_hit(self):
-        """缓存：先 miss 后 hit"""
-        from app.services.export_chart_pipeline import (
-            _get_cached_chart_render,
-            _cache_chart_render,
-        )
-        code = "graph TD\n    A-->B"
-        result = _get_cached_chart_render(code)
-        assert result is None
-        _cache_chart_render(code, b"rendered_data")
-        result = _get_cached_chart_render(code)
-        assert result == b"rendered_data"
-
-    def test_cache_different_codes_independent(self):
-        """缓存：不同代码独立"""
-        from app.services.export_chart_pipeline import (
-            _get_cached_chart_render,
-            _cache_chart_render,
-        )
-        code1 = "graph TD\n    A-->B"
-        code2 = "graph TD\n    A-->C"
-        _cache_chart_render(code1, b"data1")
-        _cache_chart_render(code2, b"data2")
-        assert _get_cached_chart_render(code1) == b"data1"
-        assert _get_cached_chart_render(code2) == b"data2"
-
-    def test_cache_stats(self):
-        """缓存统计"""
-        from app.services.export_chart_pipeline import (
-            _get_cached_chart_render,
-            _cache_chart_render,
-            get_chart_hash_cache_stats,
-        )
-        code = "graph TD\n    A-->B"
-        _get_cached_chart_render(code)
-        _cache_chart_render(code, b"data")
-        _get_cached_chart_render(code)
-        stats = get_chart_hash_cache_stats()
-        assert stats["hits"] == 1
-        assert stats["misses"] == 1
+        monkeypatch.setattr(ec, "_chart_render_cache_max", 2)
+        ec._chart_render_cache.clear()
+        payloads = ["payload-A", "payload-B", "payload-C"]
+        for p in payloads:
+            ec._store_chart_render(p, BytesIO(b"PNGDATA"), chart_type="flowchart")
+        # 容量上限 2：写入 3 条后淘汰最旧 1 条，仅剩 2 条
+        assert len(ec._chart_render_cache) == 2
+        # 最旧条目（payload-A）应已被淘汰
+        assert ec._get_cached_chart_render(payloads[0], "flowchart") is None
+        # 最新条目仍在，且返回独立 BytesIO 副本（X-9 语义）
+        hit = ec._get_cached_chart_render(payloads[2], "flowchart")
+        assert hit is not None
+        assert hit[0].read() == b"PNGDATA"
+        ec._chart_render_cache.clear()
 
 
 class TestP3_2_AdaptiveBatchSize:

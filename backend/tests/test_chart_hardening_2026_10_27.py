@@ -127,7 +127,14 @@ class TestMermaidHealthMonitor:
 
 class TestHealthEndpoint:
     def test_charts_health_endpoint(self, monkeypatch):
-        """GET /api/v1/charts/health 返回健康快照（200，零探测开销）。"""
+        """GET /charts/health 返回健康快照（200，零探测开销）。
+
+        BUG-FIX 2026-11-04（第 10 轮章节审计·路由双重前缀）：路由器自 prefix
+        收敛为 /charts，/api/v1 由 main.py 的 v1_router 统一提供；本测试用
+        自建 FastAPI 直挂 router，故路径为 /charts/health。真实 app 上的完整
+        路径 /api/v1/charts/health 由
+        test_chapter_round10_audit_2026_11_04.py::TestRealAppChartRoutes 锁定。
+        """
         from fastapi import FastAPI
         from fastapi.testclient import TestClient
 
@@ -141,7 +148,7 @@ class TestHealthEndpoint:
         app = FastAPI()
         app.include_router(router)
         tc = TestClient(app)
-        r = tc.get("/api/v1/charts/health")
+        r = tc.get("/charts/health")
         assert r.status_code == 200
         body = r.json()
         assert "docker" in body["backends"]

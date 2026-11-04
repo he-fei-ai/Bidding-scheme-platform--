@@ -1233,12 +1233,19 @@ MERMAID_GANTT_USER = """### 输入数据
 - **章节正文**（前 500 字）：{SECTION_CONTENT}
 - **评分标准**：{SCORING_STANDARD}
 - **行业背景**：{INDUSTRY_PROFILE}
-- **项目概述**：{SUMMARY}
+- **项目概述**：{PROJECT_OVERVIEW}
 - **编排结果**：{ARRANGE_INFO}
 
 ### 任务
 
 根据上述信息生成符合规范的 Mermaid 甘特图代码。请直接输出代码，无需额外说明。"""
+
+# UNIFY-R2a（2026-11-04）：概述槽位由 {SUMMARY} 改为 {PROJECT_OVERVIEW}——
+# 姊妹模板 MERMAID_FLOWCHART_USER 本就使用 {PROJECT_OVERVIEW}，且 chart 家族
+# （CHART_ARRANGE_USER / ILLUSTRATION_* / CHART_BATCH_ARRANGE_USER）全部使用
+# project_overview 拼法。旧名导致调用方写出 `summary=project_overview` 的
+# 错位适配（image_engine generate_mermaid_gantt），同名槽位跨模板复用 kwarg
+# 时极易踩错。实库核验零自定义行，seed 同步自动跟进，无 DB 迁移风险。
 
 MERMAID_GANTT_USER = _reg(
     "MERMAID_GANTT_USER", "配图", "甘特图生成（用户提示词）", MERMAID_GANTT_USER

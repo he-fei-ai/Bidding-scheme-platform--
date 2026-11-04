@@ -776,13 +776,31 @@ async def _startup():
         logger.warning("AI 配置服务初始化失败（不影响核心功能）: %s", e)
 
     # V2.1 优化：预热提示词缓存，避免首次请求时触发 DB 查询
+    # BUG-FIX-PROMPT-M3（2026-11-04）：原调 reload_prompt_cache() 仅使缓存失效，
+    # 从不加载——「预热完成」日志与事实相反，首个 AI 请求仍付一次全量冷查询。
+    # 改调 warm_prompt_cache() 在启动现场完成加载（含清洗/漂移检测/失败冷却语义）。
     try:
-        from .services.ai.prompts import reload_prompt_cache
+        from .services.ai.prompts import warm_prompt_cache
 
-        reload_prompt_cache()
-        logger.info("提示词缓存预热完成")
+        _warmed = warm_prompt_cache()
+        logger.info("提示词缓存预热完成: %d 个模板", _warmed)
     except Exception as e:
         logger.warning("提示词缓存预热失败（不影响核心功能）: %s", e)
+
+    # BUG-FIX-PROMPT-M4（2026-11-04，指标历史恒空）：start_auto_snapshot 自
+    # 2026-10-06 引入以来无任何生产调用方——/prompts/metrics/history 恒返回
+    # 空列表、/prompts/metrics/predict 恒报「历史数据不足」、月度报表趋势图
+    # 无从谈起。现于启动时接线（默认开启，PROMPT_METRICS_AUTOSNAPSHOT=false
+    # 可关闭；间隔沿用 PROMPT_METRICS_SNAPSHOT_INTERVAL，默认 300s）。
+    if os.environ.get("PROMPT_METRICS_AUTOSNAPSHOT", "true").lower() != "false":
+        try:
+            from .services.ai.prompts import start_auto_snapshot
+
+            start_auto_snapshot()
+            logger.info("提示词指标自动快照已启动（间隔 %s 秒）",
+                        os.getenv("PROMPT_METRICS_SNAPSHOT_INTERVAL", "300"))
+        except Exception as e:
+            logger.warning("提示词指标自动快照启动失败（不影响核心功能）: %s", e)
 
     # 一致性审计数据库表已收归 `db.init_db()`（上方第 514 行已调用）。
     # BUG-FIX 2026-09-14（中）：此处原先内联 DDL 且**硬编码** `backend/data/bid_assistant.sqlite3`，
@@ -955,6 +973,14 @@ async def _startup():
 # ENHANCE 2026-09-29：同上，shutdown 逻辑收进 _shutdown 由 lifespan 调用。
 async def _shutdown():
     """应用关闭：取消后台定时任务，避免事件循环关闭时残留未回收的 asyncio 任务"""
+    # BUG-FIX-PROMPT-M4：关闭指标自动快照定时线程（与 _startup 的 start_auto_snapshot 对偶）
+    try:
+        from .services.ai.prompts import stop_auto_snapshot
+
+        stop_auto_snapshot()
+    except Exception as e:
+        logger.warning("停止提示词指标自动快照失败（忽略）: %s", e)
+
     try:
         from .services.ai.ai_config_service import shutdown as _ai_config_shutdown
 
@@ -1030,6 +1056,22 @@ async def enhanced_health_check():
             "status": "error",
             "message": str(e),
         }
+
+
+@app.api_route(
+    "/api/v1/{rest:path}",
+    methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"],
+    include_in_schema=False,
+)
+async def api_v1_not_found(rest: str):
+    """未注册的 /api/v1 路径统一返回 JSON 404。
+
+    BUG-FIX 2026-11-04：SPA 静态资源挂载在 "/"，未匹配的 API 路径会落到
+    StaticFiles 并返回 405 Method Not Allowed（POST 到不存在的端点），
+    前端与契约测试无法区分「端点已下线」与「方法写错」。此兜底注册在
+    v1_router 之后、静态挂载之前，真实端点优先生效，仅未知路径返回 404。
+    """
+    raise HTTPException(status_code=404, detail="Not Found")
 
 
 frontend_dist = Path(__file__).resolve().parent.parent.parent / "frontend" / "dist"

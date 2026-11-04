@@ -75,6 +75,20 @@ TASK_CATALOG: dict[str, tuple[Callable[..., Any], bool]] = {}
 # 日志，而不是静默什么都不做，也不是把整个进程拖死。
 INLINE_BLOCKED_TASKS: frozenset[str] = frozenset({"tasks.content.generate_sections"})
 
+# LEFTOVER-4 判定 2026-11-02：正文批量的架构决策「守则化」登记。
+# 正文生成（tasks.content.generate_sections）**刻意不做 Web 侧 dispatch 接线**：
+#   1. SSE 主管线（routers/sse + generation_tasks + task_lock 'content-generation'）
+#      已承担实时生成、断线重连、进度上报的完整语义；
+#   2. 若再加一个 Celery 分发 API，同一 sections 集合会存在两条写路径（SSE 循环 vs
+#      worker 循环），task_lock 只能互斥不能合并语义，进度/SSE 事件/版本链都要双份
+#      维护——收益不明确，风险是正文互相覆盖；
+#   3. Celery 任务本体保持可用（运维显式起 worker 后手动入队做离线批量），其与
+#      SSE 的互斥（task_lock）与写库后三层缓存失效（invalidate_content_caches，
+#      FIX-2 2026-11-02）均已就绪，数据一致性无缺口。
+# 当前 Web 代码中实际接线 dispatch_task 的任务名（守卫测试
+# tests/test_task_dispatch_wiring_2026_11_02.py 扫描全库比对，增删须同步）：
+WEB_DISPATCHED_TASKS: frozenset[str] = frozenset({"tasks.file.parse_and_extract"})
+
 
 class _Conf:
     """`.conf.update(...)` 的空实现（兜底模式下配置项无处落地）。"""

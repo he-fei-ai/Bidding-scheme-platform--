@@ -7,7 +7,6 @@ from pathlib import Path
 import queue
 import threading
 import time
-from typing import Any
 import uuid
 from collections import OrderedDict
 from fastapi import APIRouter, Body, Depends, HTTPException, Request, Security
@@ -1014,6 +1013,21 @@ async def export_history(project_id: int, identity=Depends(verify_auth)):
 # ==================== 全局导出预设路由（无 project 前缀） ====================
 
 _presets_router = APIRouter(prefix='/export', tags=['export_presets'])
+
+
+@_presets_router.get('/render-profile', dependencies=[limit_per_endpoint])
+async def get_export_render_profile(identity=Depends(verify_auth)):
+    """图表渲染耗时统计（ENHANCE 2026-11-04·P3-3 profiling 接线）。
+
+    返回本进程内图表渲染的耗时摘要与最近记录（每图表一行：耗时/是否命中缓存），
+    供运维观测预渲染命中率与慢图定位。进程级内存数据，重启归零（最多 1000 条）。
+    """
+    from ..services.export import get_render_profile, get_render_profile_summary
+
+    return {
+        "summary": get_render_profile_summary(),
+        "recent": get_render_profile()[-100:],
+    }
 
 
 @_presets_router.get('/presets')

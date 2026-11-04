@@ -229,30 +229,53 @@ def _get_file_hash(file_path: str) -> str:
         return ""
 
 
-def _find_duplicate_upload(project_id: int, content: bytes) -> dict | None:
+def _find_duplicate_upload(project_id: int, content: bytes, *, digest: str | None = None) -> dict | None:
     """按内容 SHA-256 查找本项目已存在的重复上传（G8 去重）。
 
     Args:
         project_id: 项目 ID
         content: 待上传文件字节
+        digest: 调用方已算好的 SHA-256（save_upload 会复用同一哈希写库），
+                缺省时内部自算，避免重复计算。
 
     Returns:
         命中则返回 {id, filename, path, status}（dict，sqlite3.Row 物化），
-        未命中/异常返回 None。仅比较同项目且同文件大小的历史文件（先按
-        os.stat 大小过滤再做全量哈希，避免每次上传读遍所有旧文件）。
+        未命中/异常返回 None。
+
+    2026-11-02（B2 永久修复 R1）：改为**哈希等值优先**——先走
+    `WHERE project_id=? AND content_hash=?` 命中已落哈希的历史行（走
+    idx_uf_project_hash 索引，零磁盘读），取代此前"读遍全项目文件再逐个哈希"。
+    存量老行 content_hash 为 NULL/'' → 仅对这批行回退旧的「按大小过滤 + 读盘哈希」
+    扫描，向后兼容。二者都未命中才返回 None。
     """
-    if not content:
+    if not content and digest is None:
         return None
     try:
-        digest = hashlib.sha256(content).hexdigest()
-        target_size = len(content)
+        if digest is None:
+            digest = hashlib.sha256(content).hexdigest()
         with get_db(readonly=True) as conn:
-            rows = conn.execute(
+            # 快路径：已落哈希的行，等值命中即返回（无磁盘 I/O）。
+            hit = conn.execute(
                 "SELECT id, filename, path, status FROM uploaded_files "
-                "WHERE project_id = ? ORDER BY id",
+                "WHERE project_id = ? AND content_hash = ? ORDER BY id LIMIT 1",
+                (project_id, digest),
+            ).fetchone()
+            if hit is not None:
+                return {
+                    "id": hit["id"],
+                    "filename": hit["filename"],
+                    "path": str(hit["path"] or ""),
+                    "status": hit["status"],
+                }
+            # 慢路径：仅存量无哈希行，回退按大小过滤 + 读盘哈希（向后兼容）。
+            target_size = len(content)
+            legacy = conn.execute(
+                "SELECT id, filename, path, status FROM uploaded_files "
+                "WHERE project_id = ? AND (content_hash IS NULL OR content_hash = '') "
+                "ORDER BY id",
                 (project_id,),
             ).fetchall()
-        for row in rows:
+        for row in legacy:
             fp = str(row["path"] or "")
             if not fp:
                 continue
@@ -275,6 +298,7 @@ def _find_duplicate_upload(project_id: int, content: bytes) -> dict | None:
         return None
     except Exception:
         return None
+
 
 
 def _clear_parse_cache(file_path: str = "") -> None:
@@ -457,12 +481,19 @@ def reclaim_stale_parse_state(*, stale_minutes: int | None = None) -> dict[str, 
 
 
 def _create_parse_task(project_id: int, filename: str, file_type: str = ""):
-    """创建文件解析任务记录（持久化到数据库）"""
+    """创建文件解析任务记录（持久化到数据库）。
+
+    2026-11-02（B4 串写根因加固）：改为返回新任务行的自增 id。此前调用方只能靠
+    「project + filename + status='processing」模糊匹配去更新终态，同项目同名多行
+    （历史遗留的 stale processing 行 + 本次新行）时 UPDATE 会命中多行交叉误写。
+    拿到 id 后，save_upload 的同步终态更新可用 `WHERE id=?` 精确命中本行。
+    """
+    task_id: int | None = None
     try:
         from ..db import get_db
 
         with get_db() as conn:
-            conn.execute(
+            cur = conn.execute(
                 """INSERT INTO file_parse_tasks
                    (project_id, filename, file_type, status, progress, total_files,
                     completed_files, started_at, updated_at)
@@ -470,7 +501,8 @@ def _create_parse_task(project_id: int, filename: str, file_type: str = ""):
                            datetime('now', 'localtime'), datetime('now', 'localtime'))""",
                 (project_id, filename, file_type),
             )
-        logger.info("文件解析任务已创建: project=%d, file=%s", project_id, filename)
+            task_id = cur.lastrowid
+        logger.info("文件解析任务已创建: project=%d, file=%s, id=%s", project_id, filename, task_id)
     except Exception as e:
         # 2026-10-11 加固（P-3）：旧实现仅 warning 后 return，导致任务行缺失、
         # 状态端点无解析痕迹、前端进度条永远卡在 processing。
@@ -483,6 +515,65 @@ def _create_parse_task(project_id: int, filename: str, file_type: str = ""):
     # 放在写入之后（而不是之前）是为了保证本次任务行一定存在。
     if PARSE_TASK_RETENTION > 0:
         prune_parse_tasks(project_id)
+    return task_id
+
+
+def _link_parse_task_file(task_id: int | None, file_id: int | None) -> None:
+    """把已创建的任务行与落库的 uploaded_files 行做 id 关联（B4 file_id 回填）。
+
+    建文件行发生在提取之后，任务行那时还没有 file_id；此处补写，供异步 worker /
+    re_extract 用 file_id 精确命中本文件任务行。异常只告警：纯关联增强，
+    写不进去时更新链路仍可回退 filename 匹配。
+    """
+    if not task_id or not file_id:
+        return
+    try:
+        from ..db import get_db
+
+        with get_db() as conn:
+            conn.execute(
+                "UPDATE file_parse_tasks SET file_id = ?, updated_at = datetime('now', 'localtime') "
+                "WHERE id = ?",
+                (file_id, task_id),
+            )
+    except Exception as e:
+        logger.warning("任务行关联 file_id 失败 task=%s file=%s: %s", task_id, file_id, e)
+
+
+
+def _discard_parse_task(project_id: int, filename: str, *, task_id: int | None = None) -> None:
+    """删除本次上传刚创建、仍处 processing 的任务行（并发去重后到者回滚用）。
+
+    BUG-FIX 2026-11-02（B2）配套：save_upload 在上传锁内先建任务行、落盘，再在锁外
+    提取文本；若写锁内复核发现并发对端已提交同内容行，本上传判为 duplicate
+    后到者，需回滚。此时它创建的任务行不再代表任何真实解析工作，删除它以保证
+    「duplicate 结果不留 processing 残留」（test_no_processing_residue_after_duplicate
+    不变式）。异常只告警——任务表是可观测性通道，删不进去不该让上传回滚本身失败。
+
+    2026-11-02（B4）：优先按 task_id 精确删除本行；缺省回退
+    「project_id + filename + status='processing」（同名多行时可能多删，但后到者
+    回滚场景本就不该留任何 processing 同名残留，回退口径可接受）。
+    """
+    try:
+        from ..db import get_db
+
+        with get_db() as conn:
+            if task_id is not None:
+                conn.execute(
+                    "DELETE FROM file_parse_tasks WHERE id = ? AND status = 'processing'",
+                    (task_id,),
+                )
+            else:
+                conn.execute(
+                    "DELETE FROM file_parse_tasks "
+                    "WHERE project_id = ? AND filename = ? AND status = 'processing'",
+                    (project_id, filename),
+                )
+    except Exception as e:
+        logger.warning(
+            "删除后到者任务行失败 project=%d file=%s: %s", project_id, filename, e
+        )
+
 
 
 def _update_parse_task(
@@ -491,6 +582,9 @@ def _update_parse_task(
     progress: int = 0,
     error_message: str = "",
     filename: str = "",
+    *,
+    task_id: int | None = None,
+    file_id: int | None = None,
 ):
     """更新文件解析任务状态
 
@@ -498,13 +592,31 @@ def _update_parse_task(
     同一项目并发上传时 A 文件的完成/失败会串写到 B 文件的任务行（B 被误标为
     completed 或 failed，进度与错误信息全部错位）。现新增 `filename` 精确过滤，
     只更新本次上传对应的任务行；未传 filename 时保持旧的批量语义以兼容既有调用。
+
+    2026-11-02（B4 串写根因加固）：新增 `task_id` / `file_id` 关键字参数，命中精度
+    优先级 `task_id > file_id > filename`。filename 匹配在「同项目同名且都存在
+    processing 行」（如历史 stale 行未回收 + 本次同名新行）时仍会 UPDATE 多行交叉
+    误写；task_id 由 _create_parse_task 返回、同步路径直接持有，可精确锁定本行；
+    异步 worker 只持有 file_id，用 file_id 锁定。三者都缺省时回退旧批量语义。
+
+    2026-11-04（L1 加固）：当以 `file_id` 命中 **0 行**（历史未关联 file_id 的
+    遗留任务行）而调用方同时传了 `filename` 时，自动回退 filename 兜底，避免
+    「精确收尾失败 → 终态永久丢失」；该回退仅在 file_id 完全失配时触发，正常
+    派发路径（save_upload 图片 / async-reparse 端点均已 _link_parse_task_file）
+    仍走 file_id 精确命中，不回到 B4 串写风险面。
     """
     try:
         from ..db import get_db
 
         where = "project_id = ? AND status = 'processing'"
         tail: list = [project_id]
-        if filename:
+        if task_id is not None:
+            where += " AND id = ?"
+            tail.append(task_id)
+        elif file_id is not None:
+            where += " AND file_id = ?"
+            tail.append(file_id)
+        elif filename:
             where += " AND filename = ?"
             tail.append(filename)
 
@@ -519,7 +631,7 @@ def _update_parse_task(
                 # 无提示）与前端状态条因此在同一缺陷上失明。
                 # 说明：`error_message` 是本表唯一的消息通道，非致命警告也走它；
                 # 无提示时写入空串，保持「行内无消息 == 一切正常」的读法一致。
-                conn.execute(
+                _cur = conn.execute(
                     f"""UPDATE file_parse_tasks
                        SET status = ?, progress = ?, completed_files = 1,
                            error_message = ?,
@@ -529,7 +641,7 @@ def _update_parse_task(
                     (status, progress, error_message[:500], *tail),
                 )
             elif status == "failed":
-                conn.execute(
+                _cur = conn.execute(
                     f"""UPDATE file_parse_tasks
                        SET status = ?, progress = ?, error_message = ?,
                            completed_at = datetime('now', 'localtime'),
@@ -538,18 +650,45 @@ def _update_parse_task(
                     (status, progress, error_message[:500], *tail),
                 )
             else:
-                conn.execute(
+                _cur = conn.execute(
                     f"""UPDATE file_parse_tasks
                        SET status = ?, progress = ?,
                            updated_at = datetime('now', 'localtime')
                        WHERE {where}""",
                     (status, progress, *tail),
                 )
+            # L1 2026-11-04：file_id 失配（历史未关联行）→ filename 兜底。
+            # 仅在「file_id 精确命中 0 行且调用方带了 filename」时触发一次。
+            if (
+                task_id is None
+                and file_id is not None
+                and filename
+                and getattr(_cur, "rowcount", -1) == 0
+            ):
+                logger.warning(
+                    "任务行按 file_id=%s 精确收尾命中 0 行，回退 filename 兜底 "
+                    "(project=%d file=%s)：多为历史未关联行", file_id, project_id, filename,
+                )
+                conn.execute(
+                    f"""UPDATE file_parse_tasks
+                       SET status = ?, progress = ?, error_message = ?,
+                           completed_at = datetime('now', 'localtime'),
+                           updated_at = datetime('now', 'localtime')
+                       WHERE project_id = ? AND status = 'processing' AND filename = ?""",
+                    (status, progress, error_message[:500], project_id, filename),
+                )
     except Exception as e:
         logger.warning("更新文件解析任务失败: %s", e)
 
 
-def _force_parse_task_failed(project_id: int, filename: str, error_message: str) -> None:
+def _force_parse_task_failed(
+    project_id: int,
+    filename: str,
+    error_message: str,
+    *,
+    task_id: int | None = None,
+    file_id: int | None = None,
+) -> None:
     """把指定文件最近的解析任务行**强制**改写为 failed（可覆盖已写终态的行）。
 
     BUG-FIX 2026-10-15（F-1/F-2 解析失败静默成功）：`_update_parse_task` 的
@@ -564,23 +703,38 @@ def _force_parse_task_failed(project_id: int, filename: str, error_message: str)
     串写同一不变式），只碰本次上传/提取对应的那一行，避免误伤同项目其它文件的
     历史任务行。异常只告警：任务行是本表的「可观测性通道」，写不进去不该让
     上传主流程本身失败。
+
+    2026-11-02（B4）：命中精度同 _update_parse_task，优先 `task_id > file_id >
+    filename`，同步路径传 task_id 可根除同名多行交叉覆盖。
     """
     try:
         from ..db import get_db
 
+        where = "project_id = ?"
+        tail: list = [project_id]
+        if task_id is not None:
+            where += " AND id = ?"
+            tail.append(task_id)
+        elif file_id is not None:
+            where += " AND file_id = ?"
+            tail.append(file_id)
+        else:
+            where += " AND filename = ?"
+            tail.append(filename)
         with get_db() as conn:
             conn.execute(
-                """UPDATE file_parse_tasks
+                f"""UPDATE file_parse_tasks
                    SET status = 'failed', progress = 50, error_message = ?,
                        completed_at = datetime('now', 'localtime'),
                        updated_at = datetime('now', 'localtime')
-                   WHERE project_id = ? AND filename = ?""",
-                (error_message[:500], project_id, filename),
+                   WHERE {where}""",
+                (error_message[:500], *tail),
             )
     except Exception as e:
         logger.warning(
             "强制更新解析任务终态失败 project=%d file=%s: %s", project_id, filename, e
         )
+
 
 
 # ============================================================================
@@ -671,6 +825,11 @@ def save_upload(project_id: int, filename: str, content: bytes, file_role: str =
         logger.warning("上传文件名包含路径成分，已归一化为安全名称: %r", filename)
     filename = safe_filename
 
+    # 2026-11-02（B2 永久修复 R1）：内容 SHA-256 一次算好，贯穿「早期查重 /
+    # INSERT 落列 / 写锁内并发复核」三处复用，避免重复哈希。content 已在内存，
+    # 计算廉价。空内容仍算固定摘要但下游查重对空内容短路（见 _find_duplicate_upload）。
+    content_digest = hashlib.sha256(content).hexdigest()
+
     # 保存原始文件
     # BUG-FIX 2026-10-04（P2 并发竞态）："重命名去重→write_bytes" 必须在项目级互斥
     # 锁内原子完成，否则并发同名上传会选中同一目标路径互相覆盖（见 _get_upload_write_lock）。
@@ -680,7 +839,7 @@ def save_upload(project_id: int, filename: str, content: bytes, file_role: str =
         # 不落盘/不建任务/不插行，直接返回 duplicate（前端据此提示「文件已存在」）。
         # 仅同项目同大小文件参与比较（_find_duplicate_upload 内按 os.stat 过滤），
         # 正常路径零额外行为。查重本身异常降级为「不去重」，不影响上传。
-        _dup = _find_duplicate_upload(project_id, content)
+        _dup = _find_duplicate_upload(project_id, content, digest=content_digest)
         if _dup:
             # BUG-FIX 2026-10-28（P2 重传自愈）：若历史命中文件解析失败
             # （status='failed'），用户重传同一文件（最自然的修复动作）此前被判
@@ -689,19 +848,56 @@ def save_upload(project_id: int, filename: str, content: bytes, file_role: str =
             # 保持 duplicate 拦截（任务进行中，无需重复）。
             if _dup.get("status") == "failed":
                 logger.info(
-                    "上传去重命中解析失败文件，删除旧行后重传自愈 project=%d old_id=%d file=%s",
+                    "上传去重命中解析失败文件，删除全部同名内容失败行后重传自愈 "
+                    "project=%d dup_id=%s file=%s",
                     project_id, _dup.get("id"), filename,
                 )
+                # L2 2026-11-04：历史同内容可能积压多条 failed 行（反复失败重试后
+                # 成功），旧实现只删「最低 id 的那一行」，其余 failed 行残留 —— 下次
+                # 上传仍会命中它们、反复走无谓的自愈且占行。现一次删除全部
+                # 「content_hash 等值 failed 行」**以及**本次命中的 _dup 行（兼容
+                # 存量 content_hash 为 NULL 的旧行，其只能靠 id 命中），并统一清理
+                # 各行的物理文件与提取文本，杜绝孤儿。
+                _orphan_paths: list[str] = []
                 _dup_id = _dup.get("id")
-                if _dup_id is not None:
-                    try:
-                        with get_db() as conn:
+                try:
+                    with get_db() as conn:
+                        _del_rows = conn.execute(
+                            "SELECT id, path, extracted_text_path FROM uploaded_files "
+                            "WHERE project_id = ? AND status = 'failed' "
+                            "AND (content_hash = ? OR id = ?)",
+                            (project_id, content_digest, _dup_id),
+                        ).fetchall()
+                        if _del_rows:
+                            _del_ids = [r["id"] for r in _del_rows]
+                            _ph = ",".join("?" for _ in _del_ids)
                             conn.execute(
-                                "DELETE FROM uploaded_files WHERE id = ? AND project_id = ?",
-                                (_dup_id, project_id),
+                                f"DELETE FROM uploaded_files WHERE id IN ({_ph})",
+                                _del_ids,
                             )
-                    except Exception as _dup_e:  # noqa: BLE001 —— 删除失败不阻塞上传
-                        logger.warning("删除失败重复文件失败（继续上传）id=%s: %s", _dup_id, _dup_e)
+                            for _r in _del_rows:
+                                for _p in (_r["path"], _r["extracted_text_path"]):
+                                    if _p:
+                                        _orphan_paths.append(str(_p))
+                except Exception as _dup_e:  # noqa: BLE001 —— 删除失败不阻塞上传
+                    logger.warning(
+                        "删除失败重复文件失败（继续上传）dup_id=%s: %s", _dup_id, _dup_e
+                    )
+                # BUG-FIX 2026-11-02（B3 自愈留孤儿文件+改名 _1）：旧失败行删除后，
+                # 其物理文件与提取文本仍留在磁盘。原实现只删 DB 行不删文件，导致：
+                #   (a) 旧失败文件成为无 uploaded_files 行指向的孤儿（占盘且无法从界面清理）；
+                #   (b) 因同名文件仍在，下方 `file_path.exists()` 命中 → 重传被改名
+                #       xxx_1，与用户「同名覆盖重传」预期不符。
+                # 命中行按内容哈希匹配，其 path 指向的正是与本次相同内容的旧文件，
+                # 删除后同名重传可复用原名、干净自愈。删除失败只告警，不阻塞上传。
+                # （本分支整体处于 _get_upload_write_lock 内，删除与后续落盘原子。）
+                for _orphan in _orphan_paths:
+                    try:
+                        _op = Path(_orphan)
+                        if _op.exists():
+                            _op.unlink()
+                    except Exception as _oe:
+                        logger.warning("清理自愈旧文件失败 %s: %s", _orphan, _oe)
                 # 删除旧行后继续走正常落盘/建任务/插行路径（不 return）
             else:
                 logger.info(
@@ -734,7 +930,7 @@ def save_upload(project_id: int, filename: str, content: bytes, file_role: str =
         # 任务表停留在旧状态，前端无法感知保存失败。
         ext = Path(filename).suffix.lower()
         try:
-            _create_parse_task(project_id, filename, ext)
+            _task_id = _create_parse_task(project_id, filename, ext)
         except Exception as _task_err:
             # P-3 加固：任务行创建失败说明 DB 不可用，继续写入文件会导致后续
             # _update_parse_task UPDATE 0 行（终态丢失）。直接返回失败让上游感知。
@@ -749,7 +945,7 @@ def save_upload(project_id: int, filename: str, content: bytes, file_role: str =
             file_path.write_bytes(content)
         except Exception as e:
             logger.error("保存文件失败: %s, 错误: %s", filename, e)
-            _update_parse_task(project_id, "failed", 0, f"保存文件失败: {e}", filename)
+            _update_parse_task(project_id, "failed", 0, f"保存文件失败: {e}", filename, task_id=_task_id)
             return {
                 "status": "failed",
                 "message": f"保存文件失败: {e}",
@@ -764,7 +960,9 @@ def save_upload(project_id: int, filename: str, content: bytes, file_role: str =
     # 注意 IMAGE_EXTENSIONS 存的是带点的扩展名（".png"），ext 已是 Path.suffix（带点），
     # 直接 `ext in IMAGE_EXTENSIONS`，不要 lstrip('.')（否则永远匹配不到）。
     if ext in IMAGE_EXTENSIONS:
-        _img = _save_upload_image_async(project_id, filename, str(file_path), _img_role)
+        _img = _save_upload_image_async(
+            project_id, filename, str(file_path), _img_role, content_digest, _task_id
+        )
         if _img is not None:
             _text_cache_clear(project_id)
             return _img
@@ -782,7 +980,7 @@ def save_upload(project_id: int, filename: str, content: bytes, file_role: str =
             # ENHANCE 2026-10-06（R1）：任务行终态与文件状态同口径 —— 此前
             # 文件判 failed 但任务行仍写 completed，GET /tasks/files/status 的
             # recent_failed 恒为 0，批量上传的失败数被谎报为全成功
-            _update_parse_task(project_id, "failed", 100, message, filename)
+            _update_parse_task(project_id, "failed", 100, message, filename, task_id=_task_id)
         else:
             status = "success"
             message = ""
@@ -797,14 +995,15 @@ def save_upload(project_id: int, filename: str, content: bytes, file_role: str =
                 message = _parse_quality_error_message(str(file_path), extracted_text)
             # M-1 2026-10-15：把警告一并写进任务行（此前只写文件行）
             _update_parse_task(
-                project_id, "completed", 100, error_message=message, filename=filename
+                project_id, "completed", 100, error_message=message, filename=filename,
+                task_id=_task_id,
             )
     except Exception as e:
         extracted_text = ""
         status = "failed"
         message = f"文本提取失败: {e}"
         logger.error("文件 %s 文本提取失败: %s", filename, e)
-        _update_parse_task(project_id, "failed", 50, message, filename)
+        _update_parse_task(project_id, "failed", 50, message, filename, task_id=_task_id)
 
     # 保存提取文本（文件名含完整原名+扩展名，避免同名不同扩展名文件互相覆盖）
     text_filename = f"{Path(filename).name}.txt"
@@ -827,7 +1026,7 @@ def save_upload(project_id: int, filename: str, content: bytes, file_role: str =
             logger.error("保存提取文本失败: %s", e)
             status = "failed"
             message = f"写入提取文本失败: {e}"
-            _force_parse_task_failed(project_id, filename, message)
+            _force_parse_task_failed(project_id, filename, message, task_id=_task_id)
     else:
         logger.info("跳过空文本文件写入: %s (status=%s)", filename, status)
 
@@ -849,32 +1048,54 @@ def save_upload(project_id: int, filename: str, content: bytes, file_role: str =
     final_role = normalize_file_role(file_role, filename)
     demoted: list[int] = []
     needs_reanalysis = False
+
+    # 2026-11-02（B2 永久修复 R1）：并发去重击穿根因——上传锁只覆盖
+    # 「查重→建任务→落盘」，而 uploaded_files 的 INSERT 在锁之外（文本提取之后，
+    # 可能耗时数秒~OCR）。两个同内容并发上传各自锁内查重都看不到对方未提交的行
+    # → 双双越过 duplicate → 各插一行。上一轮只能在 INSERT 前补一次锁外内容扫描复核，
+    # 但复核是磁盘 I/O、进不了写锁，留下「双方复核都早于对方提交」的残余竞态。
+    # 现补了 content_hash 列，把判重下沉进 get_db 写锁事务内、用纯 DB 等值命中
+    # （SELECT ... WHERE content_hash=?，零磁盘 I/O，遵守锁内禁 I/O 约定）。写锁把
+    # 所有上传的「判重 + INSERT」串行化，后提交者必 saw 先提交者的哈希行 → 竞争态免疫。
+    # 空内容（b""）不参与去重，与 _find_duplicate_upload 早查口径一致。
+    dup_winner: dict | None = None
     try:
         with get_db() as conn:
-            # REVIEW-FIX 2026-10-04（M1）：main 互斥不变式必须同时覆盖上传写入路径。
-            # guess_file_role 对未命中关键词的非图片文件默认判 main，此前连传两份
-            # 「招标」文件会产生多 main 行，而 _pick_main_file 按 id 升序取首个 main，
-            # 用户以「重新上传」换主文件后下游摘要/评分/目录仍读旧主文件（与 BUG-3
-            # 同症状、不同入口）。降级与 INSERT 同处 get_db() 写锁事务内，与
-            # set_file_role 的互斥口径一致。
-            if final_role == "main":
-                demoted, needs_reanalysis = _demote_existing_mains(conn, project_id)
-            cursor = conn.execute(
-                """INSERT INTO uploaded_files
-                   (project_id, filename, path, file_type, file_role,
-                    status, extracted_text_path, message, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now', 'localtime'))""",
-                (
-                    project_id,
-                    filename,
-                    str(file_path),
-                    file_type,
-                    final_role,
-                    status,
-                    stored_text_path,
-                    message,
-                ),
-            )
+            if content:
+                _w = conn.execute(
+                    "SELECT id, filename FROM uploaded_files "
+                    "WHERE project_id = ? AND content_hash = ? AND status != 'failed' "
+                    "ORDER BY id LIMIT 1",
+                    (project_id, content_digest),
+                ).fetchone()
+                if _w is not None:
+                    dup_winner = {"id": _w["id"], "filename": _w["filename"]}
+            if dup_winner is None:
+                # REVIEW-FIX 2026-10-04（M1）：main 互斥不变式必须同时覆盖上传写入路径。
+                # guess_file_role 对未命中关键词的非图片文件默认判 main，此前连传两份
+                # 「招标」文件会产生多 main 行，而 _pick_main_file 按 id 升序取首个 main，
+                # 用户以「重新上传」换主文件后下游摘要/评分/目录仍读旧主文件（与 BUG-3
+                # 同症状、不同入口）。降级与 INSERT 同处 get_db() 写锁事务内，与
+                # set_file_role 的互斥口径一致。
+                if final_role == "main":
+                    demoted, needs_reanalysis = _demote_existing_mains(conn, project_id)
+                cursor = conn.execute(
+                    """INSERT INTO uploaded_files
+                       (project_id, filename, path, file_type, file_role,
+                        status, extracted_text_path, content_hash, message, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now', 'localtime'))""",
+                    (
+                        project_id,
+                        filename,
+                        str(file_path),
+                        file_type,
+                        final_role,
+                        status,
+                        stored_text_path,
+                        content_digest,
+                        message,
+                    ),
+                )
     except Exception as e:
         logger.error("保存文件记录到数据库失败: %s", e)
         # BUG-FIX 2026-09-18（中）：此前 DB 写入失败直接 return，但文件已在
@@ -887,18 +1108,49 @@ def save_upload(project_id: int, filename: str, content: bytes, file_role: str =
                     _orphan.unlink()
             except Exception as _ce:
                 logger.warning("清理孤儿文件失败 %s: %s", _orphan, _ce)
-        _update_parse_task(project_id, "failed", 0, f"保存文件记录失败: {e}", filename)
+        _update_parse_task(
+            project_id, "failed", 0, f"保存文件记录失败: {e}", filename, task_id=_task_id
+        )
         return {
             "status": "failed",
             "message": f"保存文件记录失败: {e}",
             "filename": filename,
         }
 
+    # 写锁内复核命中并发对端 → 本上传是后到者：回滚磁盘文件与任务行，返回 duplicate。
+    # 回滚在事务外执行（文件 I/O 不进写锁）；任务行删除按 task_id 精确命中。
+    if dup_winner is not None:
+        logger.info(
+            "并发上传内容重复，写锁内复核命中 project=%d file=%s -> 已存在 id=%d，回滚后到者",
+            project_id, filename, dup_winner["id"],
+        )
+        for _orphan in (file_path, text_path if text_written else None):
+            if not _orphan:
+                continue
+            try:
+                if _orphan.exists():
+                    _orphan.unlink()
+            except Exception as _ce:
+                logger.warning("清理后到者孤儿文件失败 %s: %s", _orphan, _ce)
+        _discard_parse_task(project_id, filename, task_id=_task_id)
+        _text_cache_clear(project_id)
+        return {
+            "status": "duplicate",
+            "message": f"文件内容已存在（{dup_winner['filename']}），未重复上传",
+            "filename": filename,
+            "file_id": dup_winner["id"],
+            "duplicate_of": dup_winner["id"],
+        }
+
     # 项目文本已变化，使合并文本缓存失效
     _text_cache_clear(project_id)
 
+    new_file_id = cursor.lastrowid
+    # B4：把任务行与新建文件行做 id 关联，供异步 worker / re_extract 用 file_id 精确命中。
+    _link_parse_task_file(_task_id, new_file_id)
+
     return {
-        "id": cursor.lastrowid,
+        "id": new_file_id,
         "filename": filename,
         "file_type": file_type,
         "file_role": final_role,
@@ -909,6 +1161,7 @@ def save_upload(project_id: int, filename: str, content: bytes, file_role: str =
         "demoted_file_ids": demoted,
         "needs_reanalysis": needs_reanalysis,
     }
+
 
 
 def _demote_existing_mains(conn, project_id: int) -> tuple[list[int], bool]:
@@ -952,8 +1205,13 @@ def _persist_file_extraction(
     R-3 2026-10-12：抽取为共用函数，save_upload 同步回退路径与 Celery 异步任务
     都调用它，杜绝两条链路再次出现口径漂移。
     """
-    if create_task_row:
-        _create_parse_task(project_id, filename, ext)
+    # B4（2026-11-02）：re_extract 路径（create_task_row=True）在此新建任务行，
+    # 捕获其 task_id 供终态精确收尾；celery 派发路径（False）不建行，其任务行已由
+    # save_upload 通过 _link_parse_task_file 关联 file_id，收尾用 file_id 命中，
+    # 彻底避免同名多行时的交叉误写。
+    _task_id_persist = (
+        _create_parse_task(project_id, filename, ext) if create_task_row else None
+    )
     with get_db() as conn:
         conn.execute(
             "UPDATE uploaded_files SET status = 'processing', "
@@ -1010,7 +1268,10 @@ def _persist_file_extraction(
     if _write_error is not None:
         # 任务行可能已被写为 completed（create_task_row=False 的派发路径），
         # 必须强制覆盖，否则会 UPDATE 0 行、状态端点继续谎报成功。
-        _force_parse_task_failed(project_id, filename, _write_error)
+        _force_parse_task_failed(
+            project_id, filename, _write_error,
+            task_id=_task_id_persist, file_id=file_id,
+        )
 
     stored_text_path = str(text_path) if text_written else ""
     with get_db() as conn:
@@ -1027,6 +1288,8 @@ def _persist_file_extraction(
         100 if _status == "success" else 50,
         error_message=_msg,
         filename=filename,
+        task_id=_task_id_persist,
+        file_id=file_id,
     )
     return _status
 
@@ -1067,7 +1330,8 @@ def _dispatch_async_parse(
 
 
 def _save_upload_image_async(
-    project_id: int, filename: str, file_path: str, final_role: str
+    project_id: int, filename: str, file_path: str, final_role: str,
+    content_digest: str = "", task_id: int | None = None,
 ) -> dict:
     """图片上传的异步解析快路径（R-3）。
 
@@ -1079,36 +1343,95 @@ def _save_upload_image_async(
 
     落库（降级旧 main + INSERT processing 行）与 save_upload 同步路径同口径，
     得到 file_id 后由任务或回退路径 UPDATE 终态。
+
+    2026-11-02（R1/B4）：新增 content_digest（图片内容 SHA-256，由 save_upload
+    传入）与 task_id（save_upload 已建的任务行 id）。INSERT 前在 get_db 写锁内用
+    content_hash 等值做并发去重（与 save_upload 同口径，锁内零磁盘 I/O）；INSERT
+    落 content_hash 列；成功后 _link_parse_task_file 关联任务行与本文件行，
+    供 worker / 回退路径用 file_id 精确收尾，避免同名串写。
     """
     ext = Path(filename).suffix.lower()
+    dup_winner: dict | None = None
     try:
         with get_db() as conn:
             demoted, needs_reanalysis = ([], False)
-            if final_role == "main":
-                demoted, needs_reanalysis = _demote_existing_mains(conn, project_id)
-            cursor = conn.execute(
-                """INSERT INTO uploaded_files
-                   (project_id, filename, path, file_type, file_role,
-                    status, extracted_text_path, message, updated_at)
-                   VALUES (?, ?, ?, ?, ?, 'processing', '', '',
-                           datetime('now', 'localtime'))""",
-                (
-                    project_id,
-                    filename,
-                    file_path,
-                    ext.lstrip("."),
-                    final_role,
-                ),
-            )
-            file_id = cursor.lastrowid
+            # R1：写锁内并发去重——图片 INSERT 在上传锁之外，两路同内容并发图片
+            # 各自早查都看不到对方未提交行，靠此处纯 DB content_hash 等值兜住竞争态。
+            if content_digest:
+                _w = conn.execute(
+                    "SELECT id, filename FROM uploaded_files "
+                    "WHERE project_id = ? AND content_hash = ? AND status != 'failed' "
+                    "ORDER BY id LIMIT 1",
+                    (project_id, content_digest),
+                ).fetchone()
+                if _w is not None:
+                    dup_winner = {"id": _w["id"], "filename": _w["filename"]}
+            if dup_winner is None:
+                if final_role == "main":
+                    demoted, needs_reanalysis = _demote_existing_mains(conn, project_id)
+                cursor = conn.execute(
+                    """INSERT INTO uploaded_files
+                       (project_id, filename, path, file_type, file_role,
+                        status, extracted_text_path, content_hash, message, updated_at)
+                       VALUES (?, ?, ?, ?, ?, 'processing', '', ?, '',
+                               datetime('now', 'localtime'))""",
+                    (
+                        project_id,
+                        filename,
+                        file_path,
+                        ext.lstrip("."),
+                        final_role,
+                        content_digest,
+                    ),
+                )
+                file_id = cursor.lastrowid
     except Exception as e:
         logger.error("图片上传落库失败: %s", e)
-        _update_parse_task(project_id, "failed", 0, f"保存文件记录失败: {e}", filename)
+        # BUG-FIX 2026-11-02（B1 孤儿图片）：与 save_upload 同步路径的 DB 写失败
+        # 回滚（见本文件 INSERT 失败分支 `for _orphan in (file_path, text_path)`）
+        # 同口径。图片物理文件在 save_upload 已 write_bytes 落盘后才进入本异步
+        # 快路径，此处 uploaded_files INSERT 失败若不回滚，磁盘上会残留没有任何
+        # DB 行指向的孤儿图片（反复失败持续占盘、且无法从界面清理）。补一次
+        # 尽力而为的删除：删除失败只告警，不影响错误返回。
+        try:
+            _orphan = Path(file_path)
+            if _orphan.exists():
+                _orphan.unlink()
+        except Exception as _ce:
+            logger.warning("清理孤儿图片文件失败 %s: %s", file_path, _ce)
+        _update_parse_task(
+            project_id, "failed", 0, f"保存文件记录失败: {e}", filename, task_id=task_id
+        )
         return {
             "status": "failed",
             "message": f"保存文件记录失败: {e}",
             "filename": filename,
         }
+
+    # 写锁内复核命中并发对端 → 本图片上传是后到者：回滚图片文件与任务行，返回 duplicate。
+    if dup_winner is not None:
+        logger.info(
+            "并发图片上传内容重复，写锁内复核命中 project=%d file=%s -> 已存在 id=%d，回滚后到者",
+            project_id, filename, dup_winner["id"],
+        )
+        try:
+            _op = Path(file_path)
+            if _op.exists():
+                _op.unlink()
+        except Exception as _ce:
+            logger.warning("清理后到者孤儿图片失败 %s: %s", file_path, _ce)
+        _discard_parse_task(project_id, filename, task_id=task_id)
+        _text_cache_clear(project_id)
+        return {
+            "status": "duplicate",
+            "message": f"文件内容已存在（{dup_winner['filename']}），未重复上传",
+            "filename": filename,
+            "file_id": dup_winner["id"],
+            "duplicate_of": dup_winner["id"],
+        }
+
+    # B4：关联任务行与本图片行，供 worker / 同步回退路径用 file_id 精确收尾。
+    _link_parse_task_file(task_id, file_id)
 
     dispatched = _dispatch_async_parse(project_id, file_path, filename, file_id, ext)
     via = dispatched.get("dispatched_via")
@@ -1145,7 +1468,10 @@ def _save_upload_image_async(
                         )
                 except Exception as _fe:
                     logger.error("图片回退失败状态落库失败 file=%s: %s", file_id, _fe)
-                _update_parse_task(project_id, "failed", 50, _fail_msg, filename)
+                _update_parse_task(
+                    project_id, "failed", 50, _fail_msg, filename,
+                    task_id=task_id, file_id=file_id,
+                )
         status, message = _read_uploaded_file_status(file_id)
         return {
             "id": file_id,
@@ -1269,6 +1595,64 @@ def _strip_invisible(text: str) -> str:
     return _INVISIBLE_RE.sub("", text)
 
 
+def _detect_utf16_pair_encoding(sample: bytes) -> str | None:
+    """从字节样本推断无 BOM 的 UTF-16 字节序（LE/BE），无法确认时返回 None。
+
+    BUG-FIX 2026-11-04（B-12-1b · gb18030 抢先误判无 BOM UTF-16）：
+    ``gb18030`` 几乎能"成功"解码任意字节流，因此纯中文 UTF-16BE（以及部分
+    UTF-16LE）文件会在 utf-8 失败、NUL 启发式不触发时被 gb18030 **无异常地**
+    解成乱码（实测："本项目为岳阳路市政道路改造工程…" → "Ⱨ禘㩎덜㎖…"），
+    后面的 utf-16 严格尝试永远不可达，乱码直接落库并判 success。
+
+    这里用 UTF-16 的字节成对结构做**解码前**判定：汉字在 UTF-16 中的高字节
+    落在 0x4E~0x9F，ASCII/NUL 为 0x00，全角标点为 0xFF，故高字节槽位（LE 为
+    奇数位、BE 为偶数位）的可信占比很高；GBK 文件的高字节槽位是任意字节，
+    占比显著偏低。要求样本中至少出现 2 个汉字高字节，避免纯 ASCII 误判。
+    """
+    usable = len(sample) - (len(sample) % 2)
+    if usable < 16:
+        return None
+    best_enc: str | None = None
+    best_score = 0.0
+    for enc, offset in (("utf-16-le", 1), ("utf-16-be", 0)):
+        hi = sample[offset:usable:2]
+        if not hi:
+            continue
+        cjk = sum(1 for b in hi if 0x4E <= b <= 0x9F)
+        if cjk < 2:
+            continue
+        plausible = sum(
+            1 for b in hi if b == 0x00 or 0x20 <= b <= 0x9F or b == 0xFF
+        )
+        score = plausible / len(hi)
+        if score >= 0.85 and score > best_score:
+            best_enc, best_score = enc, score
+    return best_enc
+
+
+def _is_clean_decoded_text(text: str) -> bool:
+    """判断解码结果是否像正常文本（无控制字符/私用区/替换符）。
+
+    UTF-16 结构性判定存在极端误判可能（例如二进制恰好满足高字节分布），
+    解码后再验一次：真实中文标书不会出现 C0/C1 控制字符、Unicode 私用区
+    字符或 U+FFFD。
+    """
+    if not text:
+        return False
+    for ch in text:
+        if ch in "\r\n\t":
+            continue
+        code = ord(ch)
+        if (
+            code < 0x20
+            or 0x7F <= code <= 0x9F
+            or 0xE000 <= code <= 0xF8FF
+            or ch == "\ufffd"
+        ):
+            return False
+    return True
+
+
 def _read_text_auto(file_path: str) -> str:
     """读取文本文件并自动处理编码
 
@@ -1322,11 +1706,44 @@ def _read_text_auto(file_path: str) -> str:
                     pass
     except OSError:
         pass
+    # BUG-FIX 2026-11-04（B-12-1c · gb18030 抢先误判无 BOM UTF-16）：
+    # gb18030 几乎能"无异常"解码任意字节流。纯中文 UTF-16BE（以及部分 LE）
+    # 文件若走到这里，会被 gb18030 成功解成乱码（实测 "本项目为岳阳路市政
+    # 道路改造工程…" → "Ⱨ禘㩎덜㎖…"），后面的 utf-16 严格尝试永远不可达。
+    # 解码前先用字节成对结构判定字节序，再验解码文本质量；两者都通过才采纳。
+    try:
+        with path.open("rb") as _f:
+            _pair_sample = _f.read(512)
+    except OSError:
+        _pair_sample = b""
+    _pair_encoding = _detect_utf16_pair_encoding(_pair_sample)
+    if _pair_encoding:
+        try:
+            _pair_text = path.read_text(encoding=_pair_encoding)
+        except (UnicodeDecodeError, UnicodeError):
+            _pair_text = None
+        if _pair_text is not None and _is_clean_decoded_text(_pair_text):
+            return _strip_invisible(_pair_text)
     # gb18030 是 GBK/GB2312 的超集，覆盖常见中文编码
     try:
         return _strip_invisible(path.read_text(encoding="gb18030"))
     except UnicodeDecodeError:
         pass
+    # BUG-FIX 2026-11-04（B-12-1 编码异常 · 无 BOM UTF-16 最后严格尝试）：
+    # 纯中文为主的 UTF-16LE/BE 文件 NUL 占比常低于 30%（上方奇偶零字节启发式
+    # 不触发），且其字节流对 utf-8 与 gb18030 都可能解码失败（实测复现：gb18030
+    # 严格解码抛 UnicodeDecodeError）。旧逻辑直接落到 errors="replace" 兜底，
+    # 产出整页 U+FFFD 乱码入库并被判 success —— 下游摘要/评分点/目录全部基于
+    # 乱码上下文生成且用户无感。现在兜底前用 utf-16-le / utf-16-be 严格解码
+    # 最后尝试一次：真实 UTF-16 文本可被完整救回；彻底损坏的二进制仍会抛
+    # （奇数字节长度 / 无效代理对），继续走既有 replace 兜底，行为向后兼容。
+    # 注意：该分支仅在 BOM 嗅探、utf-8、NUL 启发式、gb18030 全部失败后才可达，
+    # 真 UTF-8/GB 文件在更早分支已返回，不受影响。
+    for _u16 in ("utf-16-le", "utf-16-be"):
+        try:
+            return _strip_invisible(path.read_text(encoding=_u16))
+        except (UnicodeDecodeError, UnicodeError):
+            continue
     # 最终兜底：用替换符保留无法解码的字节，保证不中断上传流程
     # BUG-FIX 2026-10-08：此前 errors="ignore" 会静默丢弃字节，用户无感知数据丢失
     _fallback_text = path.read_text(encoding="utf-8", errors="replace")
@@ -2298,8 +2715,16 @@ def re_extract_text(project_id: int, file_id: int) -> dict:
     # 终态写回，而 re_extract 此前完全不碰任务表 —— GET /tasks/files/status 看到的
     # 永远是「上一次上传」的终态，重提取失败在该端点上不可感知（前端进度条一直显示
     # 上一次的 completed）。这里补上同口径的任务行，使两条写入路径状态一致。
+    #
+    # BUG-FIX 2026-11-04（B4a 串写根因 · 重提取入口漏网）：_create_parse_task 自
+    # 2026-11-02 起返回自增 id（save_upload / _persist_file_extraction 均已用 task_id
+    # 精确收尾），唯独此处**丢弃返回值**，终态仍走 filename 模糊匹配 —— 同项目同名
+    # 存在历史 stale processing 行（worker 崩溃 / 任务丢失后尚未被 reclaim 收敛）
+    # 时，_update_parse_task(..., filename=...) 会命中多行、把旧行一并改写成终态
+    # （串写）。现捕获 task_id 并贯穿本函数全部终态写入，与 save_upload 同口径。
+    _task_id = None
     try:
-        _create_parse_task(project_id, filename, Path(filename).suffix.lower())
+        _task_id = _create_parse_task(project_id, filename, Path(filename).suffix.lower())
     except Exception as _task_err:
         # P-3 加固：任务行创建失败说明 DB 不可用，继续重提取会导致后续
         # _update_parse_task UPDATE 0 行（终态丢失）。直接返回失败让上游感知。
@@ -2322,7 +2747,9 @@ def re_extract_text(project_id: int, file_id: int) -> dict:
             # BUG-FIX 2026-10-06（R1/G3）：任务行终态与文件状态同口径 ——
             # 此前文件判 failed 但任务行仍写 completed，GET /tasks/files/status
             # 的 recent_failed 恒为 0，重提取失败在任务端点不可感知。
-            _update_parse_task(project_id, "failed", 100, message, filename)
+            # BUG-FIX 2026-11-04（B4a）：按 task_id 精确命中本行，避免同名 stale
+            # processing 行被串写。
+            _update_parse_task(project_id, "failed", 100, message, filename, task_id=_task_id)
         else:
             status = "success"
             message = ""
@@ -2336,14 +2763,15 @@ def re_extract_text(project_id: int, file_id: int) -> dict:
                 # 与 save_upload 同口径回填提示。
                 message = _parse_quality_error_message(str(file_path), extracted_text)
             _update_parse_task(
-                project_id, "completed", 100, error_message=message, filename=filename
+                project_id, "completed", 100, error_message=message, filename=filename,
+                task_id=_task_id,
             )
     except Exception as e:
         extracted_text = ""
         status = "failed"
         message = f"文本提取失败: {e}"
         logger.error("文件 %s 重新提取文本失败: %s", filename, e)
-        _update_parse_task(project_id, "failed", 50, message, filename)
+        _update_parse_task(project_id, "failed", 50, message, filename, task_id=_task_id)
 
     project_dir = PROJECTS_DATA_DIR / str(project_id)
     texts_dir = project_dir / "texts"
@@ -2385,7 +2813,10 @@ def re_extract_text(project_id: int, file_id: int) -> dict:
             except Exception:  # pragma: no cover - 清理失败不影响主流程
                 pass
             logger.error("重新提取：写入提取文本失败 file_id=%s: %s", file_id, e)
-            _update_parse_task(project_id, "failed", 0, f"写入提取文本失败: {e}", filename)
+            _update_parse_task(
+                project_id, "failed", 0, f"写入提取文本失败: {e}", filename,
+                task_id=_task_id,
+            )
             # F-G FIX 2026-10-26（写盘失败口径不明确）：此前该分支直接 return，
             # DB 里 status/extracted_text_path 保持旧值——旧文本确实保住了，但
             # 前端只看到一次「失败」toast，刷新后又显示旧的「解析成功」，

@@ -1067,7 +1067,7 @@ def self_check_content(
         for k in diff["not_called"]:
             issues.append({"level": "warn", "type": "field_not_called",
                            "detail": f"字段未注入：{_field_label(k)}"})
-            needs_review.append({"type": "field_not_called", "detail": lbl})
+            needs_review.append({"type": "field_not_called", "detail": _field_label(k)})
 
     # 3) 前后一致性（与全局数据字典冲突）
     if dictionary:

@@ -91,8 +91,11 @@ def _clean_caches(tmp_path):
         E._inflight_renders.clear()
         E._inflight_results.clear()
     # 磁盘 L2 缓存也换成临时目录，避免历史产物命中干扰桩计数
+    # TD-3（2026-11-02）：export.py 不再 re-export ChartCache（未用 import 清理），
+    # 改从权威定义模块直接引用
+    from app.services.ai.mermaid_renderer import ChartCache
     orig_disk_cache = E._chart_cache
-    E._chart_cache = E.ChartCache(cache_dir=str(tmp_path / "charts"))
+    E._chart_cache = ChartCache(cache_dir=str(tmp_path / "charts"))
     yield
     E._chart_cache = orig_disk_cache
 

@@ -19,16 +19,18 @@
 
 在既有 `sections.scoring_point_id` 映射（目录生成时落库，`sse_db_ops.py:623`）
 之上，加一层**内容覆盖度**判定：把评分标准的词项与章节正文做重合度计算，
-给出 `unmapped / empty / weak / covered` 四态，并把**原始覆盖率数字**一并
-返回，让使用者自行判断阈值。
+给出 `unmapped / empty / weak / partial / covered` 五态（partial 为
+2026-11-02 TD-6 拆出的「中等覆盖」档，计数口径上仍并入 covered，向后
+兼容），并把**原始覆盖率数字**一并返回，让使用者自行判断阈值。
 
 ## 设计取舍（重要）
 
 1. **确定性、不调 AI**：纯字符 n-gram 重合度，零 AI 花费、零超时、可复现，
    也能在导出预检里低成本复用。语义级「是否真的答到了点子上」交给后续
    可选的 AI 层，不混进这个确定性基线里。
-2. **零假阳性优先**（本仓一贯取舍）：`weak` 阈值取得很低（默认 0.10），
-   只在「评分标准用词几乎完全没出现」时才告警；宁可漏报也不误报。
+2. **零假阳性优先**（本仓一贯取舍）：`weak` 阈值按实测标定（`COVERAGE_WEAK`，
+   当前 0.25——初版 0.10 过松、被 0.21 反例逃过告警后上调，见常量处标定记录），
+   只在「评分标准用词基本没出现」时才告警；宁可漏报也不误报。
    原始 coverage 数字始终返回，用户可自行按更严标准解读。
 3. **必须先 strip 伪评分项**：`extract_scoring_points` 在权重异常时会插入
    `__weight_warning__` 伪项（见 `utils/scoring_points.py`），不剔除会凭空
@@ -109,10 +111,10 @@ def _coverage(standard: str, content: str) -> float:
         return 0.0
     hit = 0
     for t in std_terms:
-        if len(t) <= 2:
-            if t in content_norm:
-                hit += 1
-        elif t in content_norm:
+        # TD-5(2026-11-02)：短词/长词两条分支条件与动作完全等价（死代码），
+        # 合并为单一子串匹配 —— 行为不变，只是不再误导读者以为
+        # 短词与长词有不同匹配策略。
+        if t in content_norm:
             hit += 1
     return hit / len(std_terms)
 
@@ -125,7 +127,7 @@ class ScoringGap:
     name: str
     weight: str = ""
     standard: str = ""
-    status: str = "covered"  # unmapped | empty | weak | covered
+    status: str = "covered"  # unmapped | empty | weak | partial | covered
     coverage: float = 0.0
     section_ids: list[int] = field(default_factory=list)
     section_titles: list[str] = field(default_factory=list)
@@ -159,8 +161,12 @@ class ComplianceReport:
 
     @property
     def gaps(self) -> list[ScoringGap]:
-        """只含非 covered 项，便于直接当「问题清单」展示。"""
-        return [g for g in self.all_points if g.status != "covered"]
+        """只含非 covered/partial 项，便于直接当「问题清单」展示。
+
+        TD-6(2026-11-02)：partial 在旧实现里就是 covered，不进问题清单；
+        拆出 partial 态后保持该口径不变，避免老消费者凭空多出一列「问题」。
+        """
+        return [g for g in self.all_points if g.status not in ("covered", "partial")]
 
     def by_status(self, status: str) -> list[ScoringGap]:
         return [g for g in self.all_points if g.status == status]
@@ -177,7 +183,10 @@ class ComplianceReport:
             "unmapped": len(self.by_status("unmapped")),
             "empty": len(self.by_status("empty")),
             "weak": len(self.by_status("weak")),
-            "covered": len(self.by_status("covered")),
+            # TD-6(2026-11-02) 向后兼容：covered 仍含 partial（老消费者读
+            # covered 不会少算），partial 单列供新前端细分。
+            "covered": len(self.by_status("covered")) + len(self.by_status("partial")),
+            "partial": len(self.by_status("partial")),
             "gaps": [g.to_dict() for g in self.gaps],
             "warnings": self.warnings,
         }
@@ -296,7 +305,11 @@ def audit_scoring_compliance(
                 gap.status = "covered"
                 gap.detail = f"覆盖率 {cov:.1%}"
             else:
-                gap.status = "covered"
+                # TD-6(2026-11-02)：中等覆盖带此前判 covered，只改 detail
+                # 文案，状态与计数里不可见，COVERAGE_COVERED 阈值形同虚设。
+                # 现单列 partial 态供新前端细分；「问题清单」口径不变
+                # （partial 仍不进 gaps，与旧行为一致——旧前端把它当 covered）。
+                gap.status = "partial"
                 gap.detail = f"覆盖率 {cov:.1%}（中等，建议人工复核）"
         report.all_points.append(gap)
     return report
@@ -326,7 +339,8 @@ def save_report(report: ComplianceReport) -> None:
                 len(report.by_status("unmapped")),
                 len(report.by_status("empty")),
                 len(report.by_status("weak")),
-                len(report.by_status("covered")),
+                # 落库列与历史口径一致：covered 含 partial（TD-6，见 to_dict）
+                len(report.by_status("covered")) + len(report.by_status("partial")),
                 payload,
                 report.status,
             ),

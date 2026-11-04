@@ -22,7 +22,10 @@ from ..services.ai.chart_orchestrator import (
 from ..services.chart_auto_orchestration import auto_orchestrate_section
 
 logger = logging.getLogger(__name__)
-router = APIRouter(prefix="/api/v1/charts", tags=["charts-orchestration"])
+# BUG-FIX 2026-11-04（P1·路由双重前缀）：同 charts.py —— 旧值使前端四个智能
+# 编排入口（orchestrate / generate-payloads / generate-payload /
+# auto-orchestrate-section）全部注册在 /api/v1/api/v1/charts/* 而不可达。
+router = APIRouter(prefix="/charts", tags=["charts-orchestration"])
 
 
 # ============================================================

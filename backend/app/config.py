@@ -944,6 +944,9 @@ PROMPT_SANITIZE_DEFAULT = (
 # 注入风险自动包裹阈值：detect_injection_risk 得分达到该值即用
 # <<<USER_DATA_START/END>>> 包裹变量值。设为 0 表示始终包裹（会破坏需解析的
 # JSON/Mermaid 载荷，不建议）；设为很大的值（如 999）等于关闭自动包裹。
+# UNIFY-R5（2026-11-04 接线）：本项此前零引用（设置后无任何效果），现作为
+# prompts._security.sanitize_for_injection 的 wrap_on_risk 默认来源——
+# 调用方显式传参优先于本配置；默认 3 与函数历史默认一致，行为零变化。
 PROMPT_INJECTION_WRAP_THRESHOLD = int(
     os.environ.get("PROMPT_INJECTION_WRAP_THRESHOLD", "3")
 )

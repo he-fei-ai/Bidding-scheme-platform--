@@ -780,9 +780,10 @@ def value_normalization_rules(policy: str = DEFAULT_FACTS_POLICY) -> str:
     )
 
 
-def fact_extract_system_prompt(policy: str = DEFAULT_FACTS_POLICY) -> str:
-    """全局事实提取的 system 提示词正本。"""
-    return f"""# 全局事实变量提取专家
+# BUG-FIX-PROMPT-E10（2026-11-03）：注册表正本收编于 _integrate_batch3.py
+# （FACTS_EXTRACT_SYSTEM，占位符 {value_normalization_rules}），本常量与其逐字
+# 一致，注册表/DB 不可用时回退（行为零变化）。
+_FACTS_EXTRACT_SYSTEM_FB = """# 全局事实变量提取专家
 
 ## 角色
 你是招投标方案编制专家，从项目文档中提取**确定性事实变量**，用于保障后续各章节 AI 生成内容的前后一致性。
@@ -807,13 +808,27 @@ def fact_extract_system_prompt(policy: str = DEFAULT_FACTS_POLICY) -> str:
 - **不要输出 label**：中文标签由后端字典统一维护
 
 ## 值规范化规则（关键，必须严格遵守）
-{value_normalization_rules(policy)}
+{value_normalization_rules}
 
 ## 输出格式
 ```json
-{{"projectName":"...","constructionLocation":"...","scheduleDuration":"..."}}
+{"projectName":"...","constructionLocation":"...","scheduleDuration":"..."}
 ```
 直接输出 JSON 对象（dict），key 使用驼峰命名，value 为字符串，严禁附加任何解释。"""
+
+
+def fact_extract_system_prompt(policy: str = DEFAULT_FACTS_POLICY) -> str:
+    """全局事实提取的 system 提示词正本。"""
+    try:
+        from .ai.prompts import get_prompt, render_prompt
+        tpl = get_prompt("FACTS_EXTRACT_SYSTEM")
+        if tpl is None:
+            tpl = _FACTS_EXTRACT_SYSTEM_FB
+        return render_prompt(tpl, value_normalization_rules=value_normalization_rules(policy))
+    except Exception:
+        return _FACTS_EXTRACT_SYSTEM_FB.replace(
+            "{value_normalization_rules}", value_normalization_rules(policy)
+        )
 
 
 # ============================================================

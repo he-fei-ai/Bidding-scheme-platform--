@@ -37,7 +37,9 @@ const SKIPPED_REASON_LABELS: Record<string, string> = {
   chart_fence_exists: "正文已包含图表，已自动去重跳过（防止双图与图号虚跳）",
   validation_failed: "图表载荷校验未通过，已容错跳过（不写入坏块、不占图号）",
   payload_generation_failed: "图表载荷生成失败，已跳过",
+  no_real_data_local: "正文未提供可提取的真实数据（工期/人数/工序），本地模板兜底图已跳过（宁缺毋假，防止示例数据与正文矛盾）",
   content_empty_fallback_chart_field: "正文为空，图表数据已降级保存到章节图表字段",
+  chart_marker_exists_fallback_chart_field: "正文已有同类型图表标记，围栏不再重复插入，图表数据已保存到章节图表字段（防双图）",
   unsupported_chart_type: "暂不支持该图表类型",
   section_not_found: "章节不存在",
 };

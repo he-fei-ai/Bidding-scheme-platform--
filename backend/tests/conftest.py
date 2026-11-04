@@ -1,9 +1,9 @@
+import atexit
 import os
+from pathlib import Path
 import shutil
 import sys
 import tempfile
-import atexit
-from pathlib import Path
 
 
 # BUG-FIX 2026-10-17（TD-1 根因修复）：在任何 app 模块被导入之前（包括 conftest
@@ -48,6 +48,7 @@ atexit.register(_cleanup_test_data_dir)
 # 使 TestClient 集成测试与直接调用服务的单测都拿到完整 schema
 from app.db import init_db  # noqa: E402
 
+
 init_db()
 
 
@@ -65,6 +66,9 @@ init_db()
 # =====================================================================
 import inspect as _inspect  # noqa: E402
 import re as _re  # noqa: E402
+
+import pytest as _pytest  # noqa: E402
+
 
 _ORIG_GETSOURCE = _inspect.getsource
 
@@ -152,6 +156,28 @@ def pytest_collection_modifyitems(session, config, items):
         os.environ.pop(_key, None)
 
 
+@_pytest.fixture(autouse=True)
+def _clean_functional_switch_env():
+    """每用例 setup 前兜底清除功能开关污染（2026-11-02 补齐收集期清理的盲区）。
+
+    根因：上面的 pytest_collection_modifyitems 只在收集后清一次，但 pop 使键回到
+    「未设置」态；而 app/main.py 在测试模式下用 load_dotenv(override=False)
+    （只填空不覆盖）——任何测试在**执行期**才首次 `from app.main import app`
+    （如 test_consistency_round6 的 _client() 惰性导入），.env 里的
+    CONSISTENCY_PATCH_REPAIR_ENABLED=1 等功能开关就会被重新填回 os.environ，
+    污染其后所有测试的 _env_flag() 判定（实证：round6→facts_audit 组合下
+    _audit_one_group 从整节重写切到 JSON 补丁路径，假 provider 返回纯文本 →
+    generate_patches 解析失败 → 2 个用例假阴性）。
+    修复：autouse function 作用域 fixture 在每个用例 setup 时再清一遍，把
+    「默认关」确立为逐用例基线。需要开关为 True 的测试均在测试体内用
+    monkeypatch.setenv/delenv 显式控制（fixture setup 先于测试体执行，不受
+    本清理影响），与 conftest 既有设计原则一致。
+    """
+    for _key in _FUNCTIONAL_SWITCH_PREFIXES:
+        os.environ.pop(_key, None)
+    yield
+
+
 # =====================================================================
 # 认证开关隔离加固（2026-10-28）：消除 test_prompts_hardening_2026_09_29 的
 # patch("app.services.auth_service.AUTH_ENABLED", True) 在特定收集顺序下残留。
@@ -167,7 +193,6 @@ def pytest_collection_modifyitems(session, config, items):
 # 修复：每用例前后快照并强制还原两模块的 AUTH_ENABLED，使依赖该全局开关的测试
 # 与收集顺序彻底解耦（与既有 _FUNCTIONAL_SWITCH_PREFIXES 清理同一思路）。
 # =====================================================================
-import pytest as _pytest  # noqa: E402
 
 
 @_pytest.fixture(autouse=True)

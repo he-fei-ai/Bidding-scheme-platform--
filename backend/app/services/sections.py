@@ -303,7 +303,12 @@ def _strip_body_heading_numbering(conn, section_ids: list[int]) -> int:
     if not section_ids:
         return 0
     try:
-        from .content_cleaning import strip_heading_numbering_from_content
+        from .content_cleaning import (
+            has_deep_heading_numbering,
+            normalize_deep_heading_numbering,
+            strip_heading_numbering_from_content,
+        )
+        from ..config import CONTENT_DEEP_HEADING_RENUMBER_ENABLED
     except Exception as _imp_err:  # pragma: no cover - 循环导入/可选依赖兜底
         logger.debug("[正文编号净化] 跳过（导入失败）: %s", _imp_err)
         return 0
@@ -312,12 +317,35 @@ def _strip_body_heading_numbering(conn, section_ids: list[int]) -> int:
         if _cid is None:
             continue
         _row = conn.execute(
-            "SELECT id, content FROM sections WHERE id = ?", (_cid,)
+            "SELECT id, content, title FROM sections WHERE id = ?", (_cid,)
         ).fetchone()
         if not _row or not _row["content"]:
             continue
-        _new_content = strip_heading_numbering_from_content(_row["content"])
-        if _new_content == _row["content"]:
+        _orig = _row["content"]
+        _new_content = strip_heading_numbering_from_content(_orig)
+        # BUG-FIX 2026-11-05（编号冲突 · 重排/改名后 L5+ 深层编号陈旧）：
+        # strip_heading_numbering_from_content 依赖 Markdown `#` 标记，而落库正文的
+        # `#` 已被 ContentCleaner._remove_markdown_headings 剥除（content_cleaning
+        # L2874/2994）→ 对标准保存内容恒为 no-op（该函数 docstring 亦自陈
+        # 「落库后的 content 已无 #，故对 L5+ 无效」，L2030）。于是章节重排/
+        # 改名后，正文里 L5+ 深层编号（≥3 段小数，如 3.1.2.1）仍是**生成那一刻
+        # 的树位置号**，而导出端对 L5+ 原样输出 raw_line（export.py:1575-1583）
+        # → 文档出现「H2=三、进度管理，其下却挂 3.1.2.1」的编号冲突。
+        # 与保存路径（routers/sse/sse_db_ops.py::_save_section_to_db）同口径：
+        # 用 normalize_deep_heading_numbering 把深层编号**重锚到当前章节路径**
+        # （开关与落库侧一致），L1~L4 仍由导出端按目录树统一重编号，不受影响。
+        if (
+            CONTENT_DEEP_HEADING_RENUMBER_ENABLED
+            and has_deep_heading_numbering(_new_content)
+        ):
+            try:
+                _path = get_section_path(_cid)
+                _new_content = normalize_deep_heading_numbering(
+                    _new_content, _path or "", context_title=_row["title"] or ""
+                )
+            except Exception as _re_err:
+                logger.debug("[正文编号净化] 深层重编号跳过（不阻断）: %s", _re_err)
+        if _new_content == _orig:
             continue
         _wc = _count_words(_new_content)
         conn.execute(
@@ -327,7 +355,7 @@ def _strip_body_heading_numbering(conn, section_ids: list[int]) -> int:
         )
         _changed += 1
     if _changed:
-        logger.info("[正文编号净化] 剥离 %d 个章节正文的内嵌标题编号", _changed)
+        logger.info("[正文编号净化] 剥离/重锚 %d 个章节正文的内嵌标题编号", _changed)
     return _changed
 
 
@@ -505,6 +533,12 @@ def update_section(section_id: int, data: SectionUpdate) -> Section | None:
         # （sse_content.update_section(SectionUpdate(content=...))）与前端编辑保存后，
         # 目录字数列/达标判定与正文实际字数不一致。口径对齐兜底扩写的裸 SQL（已同步）。
         if "content" in updates:
+            # 口径声明（章节编写第八轮遗留 C.3，2026-11-03 落注）：本分支是
+            # 「手动编辑保存」路径 —— 用户显式提交的正文按原文保留，**不经
+            # 清洗器**（ContentCleaner 只针对 AI 生成残留，清用户手写内容
+            # 属于破坏作者意图）；SSE 生成落库链路已在 2026-10-27 前置
+            # ContentCleaner 清洗（_save_section_to_db）。两条写入口径刻意
+            # 不同，勿"统一"成同一条。
             _content_new = updates.get("content") or ""
             _wc = _count_words(_content_new)
             conn.execute(
@@ -804,14 +838,35 @@ def build_tree(project_id: int) -> list[SectionTreeNode]:
             }
 
     if wc_map:
+        # C.1 加固（2026-11-03，章节编写第八轮遗留）：原实现「readonly 锁外
+        # 预计算 wc_map → 写锁内盲写同一批值」存在陈旧回填窗口——预计算与
+        # 写入之间若并发写更新了正文（update_section 写 content+v2 与新
+        # word_count），本回填会用 v1 的旧字数覆盖新值，且覆盖后 word_count
+        # 非 0 不再满足脏行条件，**不会自愈**。现改为写锁临界区内重读
+        # content 再计算再写，读-改-写整体原子；树响应仍用 readonly 快照
+        # 的 wc_map（反映本次读取时点，与树内容一致）。锁内代价：对脏行
+        # （通常仅存量补齐首建时的少数行）多一次 SELECT + 数行 UPDATE，
+        # 远低于 _db_write_lock_timeout 预算。
         try:
             with get_db() as wconn:
+                _placeholders = ",".join("?" * len(dirty_ids))
+                _fresh_rows = wconn.execute(
+                    f"SELECT id, content FROM sections WHERE id IN ({_placeholders})",
+                    dirty_ids,
+                ).fetchall()
                 wconn.executemany(
                     "UPDATE sections SET word_count = ?, readable_word_count = ? WHERE id = ?",
-                    [(wc, rwc, sid) for sid, (wc, rwc) in wc_map.items()],
+                    [
+                        (
+                            _count_words(cr["content"] or ""),
+                            _count_readable_words(cr["content"] or ""),
+                            cr["id"],
+                        )
+                        for cr in _fresh_rows
+                    ],
                 )
         except Exception as e:
-            # 回填失败不影响树正确性（本次已重算），下次重建重试
+            # 回填失败不影响树正确性（本次响应已用快照重算），下次重建重试
             logger.warning("word_count 惰性回填失败（忽略）: %s", e)
 
     by_id: dict[int, SectionTreeNode] = {}
@@ -1401,8 +1456,15 @@ def get_section_path(section_id: int) -> str:
     # 一次性获取项目下所有章节（按层级组织）
     with get_db(readonly=True) as conn:
         rows = conn.execute(
+            # BUG-FIX 2026-11-04（P3·兄弟排序键单一权威化）：同文件 build_tree
+            # 已统一 sibling_sort_key = (sort_order, id)（2026-10-18 契约），
+            # 此处仍按 (sort_order, created_at) 排序 —— 同父下 sort_order 重复
+            # （find_duplicate_sibling_sort_orders 已承认此类脏数据）时，
+            # get_section_path 按 created_at 定位序号、build_tree/导出按 id 决胜，
+            # 同一章节拿到两套路径号：落库深层编号锚定与重排净化用的编号，
+            # 与前端树/DOCX 导出编号漂移。
             "SELECT id, parent_id, title, sort_order, created_at FROM sections "
-            "WHERE project_id = ? ORDER BY sort_order, created_at",
+            "WHERE project_id = ? ORDER BY COALESCE(sort_order, 0), id",
             (project_id,),
         ).fetchall()
 
@@ -1418,11 +1480,11 @@ def get_section_path(section_id: int) -> str:
         pid = r["parent_id"]
         parent_map[sid] = pid
         siblings_by_parent.setdefault(pid, []).append(sid)
-        sort_lookup[sid] = (r["sort_order"] or 0, r["created_at"] or "")
+        sort_lookup[sid] = (r["sort_order"] or 0, sid)
 
     # 对每个父节点下的子节点按 sort_order 排序（O(N log N)，键计算 O(N)）
     for pid in siblings_by_parent:
-        siblings_by_parent[pid].sort(key=lambda sid: sort_lookup.get(sid, (0, "")))
+        siblings_by_parent[pid].sort(key=lambda sid: sort_lookup.get(sid, (0, 0)))
 
     # 自底向上收集每一层的「同级序号」，再自顶向下用共用拼接算法生成路径号。
     # BUG-FIX 2026-10-13（L1 · 编号命名空间单一事实源）：拼接算法收敛到

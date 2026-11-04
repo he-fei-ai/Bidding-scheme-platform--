@@ -4,7 +4,7 @@ import type {
   Project, ProjectCreate, ProjectUpdate, ProjectList,
   FileInfo, AnalysisResult, UploadResult, FileParsingStatus,
   SectionTreeNode, Section, SectionCreate, SectionUpdate,
-  ExportConfig, DocumentCheckResult, ExportRecord, AIConfig, RotationStatus, KnownProvider, PromptTemplate,
+  ExportConfig, DocumentCheckResult, ExportRecord, ExportResult, AIConfig, RotationStatus, KnownProvider, PromptTemplate,
   PromptVersionMeta, PromptVersionDetail,
   ExportPresetCatalog,
   RejectionStartRequest, RejectionCheckTask, RejectionCheckItem,
@@ -186,6 +186,20 @@ function toSSEFullUrl(path: string): string {
     return `${SSE_BASE_URL}${path}${authParam}`;
   }
   return `${path}${authParam}`;
+}
+
+/** 将 /api/v1/... 相对路径补齐后端源前缀（不带 token，鉴权由调用方 _appendAuthToken 负责）。
+ *  B-2 修复（2026-11-04 导出模块加固轮）：导出下载/历史/PDF/HTML 通道此前全部用
+ *  裸相对路径，而 SSE 通道走 toSSEFullUrl（含 VITE_API_BASE_URL）。一旦跨域部署
+ *  （VITE_API_BASE_URL 非空），SSE 能通而 <a href> 下载与 fetch 下载打到前端源
+ *  → 404，同一模块两条通道分叉。现统一复用同一后端源；未配置时输出与历史完全
+ *  一致（空前缀 = 相对路径），向后兼容。
+ */
+function toApiFullUrl(path: string): string {
+  if (SSE_BASE_URL) {
+    return `${SSE_BASE_URL}${path}`;
+  }
+  return path;
 }
 
 /** 目录生成模式（易标规格二.2，ENHANCE 2026-10-05 / P-4）：
@@ -1584,25 +1598,9 @@ export function generateContentSSEUrl(
   return toSSEFullUrl(`/api/v1/projects/${projectId}/sections/generate-content?${params.toString()}`);
 }
 
-export function createContentEventSource(
-  projectId: number,
-  writingLength: string = "standard",
-  regenerateIds?: number[],
-  rootSectionId?: number | null,
-  regenerateMissing?: boolean,
-  level2Default?: number,
-  useOrchestration?: boolean,
-  useWordSampling?: boolean,
-  useFallbackExpand?: boolean,
-  useConsistencyAudit?: boolean,
-  concurrency?: number,
-  orchOptions?: ContentOrchOptions,
-  useWordAdjust?: boolean | null,
-  generationMode?: ContentGenerationMode,
-): EventSource {
-  const url = generateContentSSEUrl(projectId, writingLength, regenerateIds, rootSectionId, regenerateMissing, level2Default, useOrchestration, useWordSampling, useFallbackExpand, useConsistencyAudit, concurrency, orchOptions, useWordAdjust, generationMode);
-  return new EventSource(url, { withCredentials: false });
-}
+// CHART-MANUAL-REMOVAL 2026-11-04：已移除 createContentEventSource（零调用方死函数；
+// 正文/图表 SSE 统一走 fetch+ReadableStream 自实现的 createContentStream，
+// 支持重连退避与 isHttpError 快失败，原生 EventSource 无重连控制能力）。
 
 /**
  * 用 fetch + ReadableStream 替代 EventSource，消除 Chrome DevTools ERR_ABORTED 日志噪音
@@ -2088,73 +2086,13 @@ export async function setSectionWordCountTier(
   return res.data;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Image Engine
-// 已实现的后端路由：
-//   - POST /{section_id}/generate-flowchart  ✅
-//   - POST /{section_id}/generate-gantt      ✅
-//   - POST /{section_id}/generate-illustration ✅
-//   - POST /{section_id}/arrange-architecture ✅
-//   - POST /{section_id}/generate-architecture ✅
-//   - POST /{section_id}/arrange-labor       ✅
-//   - POST /{section_id}/generate-labor      ✅
-//   - POST /{section_id}/arrange-comparison  ✅
-//   - POST /{section_id}/generate-comparison ✅
-//
-// 未实现：
-//   - POST /{section_id}/arrange-flowchart   ✅ (已实现)
-//
-// arrangeFlowchart() 暂未被页面调用，保留供后续扩展
-// 后端路由: POST /projects/{id}/sections/{section_id}/arrange-flowchart
-// ─────────────────────────────────────────────────────────────────────────────
-export async function arrangeFlowchart(projectId: number, sectionId: number): Promise<{ need_arrange: boolean; reason: string }> {
-  const res = await http.post(`/projects/${projectId}/sections/${sectionId}/arrange-flowchart`);
-  return res.data;
-}
-
-export async function arrangeArchitecture(projectId: number, sectionId: number): Promise<{ need_arrange: boolean; reason: string }> {
-  const res = await http.post(`/projects/${projectId}/sections/${sectionId}/arrange-architecture`);
-  return res.data;
-}
-
-export async function generateArchitecture(projectId: number, sectionId: number): Promise<{
-  tree: Record<string, unknown>; mermaid: string;
-}> {
-  const res = await http.post(`/projects/${projectId}/sections/${sectionId}/generate-architecture`);
-  return res.data;
-}
-
-export async function arrangeLabor(projectId: number, sectionId: number): Promise<{ need_arrange: boolean; reason: string }> {
-  const res = await http.post(`/projects/${projectId}/sections/${sectionId}/arrange-labor`);
-  return res.data;
-}
-
-export async function generateLabor(projectId: number, sectionId: number, writingLength: string = "standard"): Promise<{
-  labor_data: Record<string, unknown>; valid: boolean;
-}> {
-  const res = await http.post(`/projects/${projectId}/sections/${sectionId}/generate-labor?writing_length=${encodeURIComponent(writingLength)}`);
-  return res.data;
-}
-
-export async function arrangeComparison(projectId: number, sectionId: number): Promise<{ need_arrange: boolean; reason: string }> {
-  const res = await http.post(`/projects/${projectId}/sections/${sectionId}/arrange-comparison`);
-  return res.data;
-}
-
-export async function generateComparison(projectId: number, sectionId: number): Promise<{ mermaid_code: string; valid: boolean }> {
-  const res = await http.post(`/projects/${projectId}/sections/${sectionId}/generate-comparison`);
-  return res.data;
-}
-
-export async function generateFlowchart(projectId: number, sectionId: number): Promise<{ mermaid_code: string; valid: boolean }> {
-  const res = await http.post(`/projects/${projectId}/sections/${sectionId}/generate-flowchart`);
-  return res.data;
-}
-
-export async function generateGantt(projectId: number, sectionId: number): Promise<{ mermaid_code: string; valid: boolean }> {
-  const res = await http.post(`/projects/${projectId}/sections/${sectionId}/generate-gantt`);
-  return res.data;
-}
+// CHART-MANUAL-REMOVAL 2026-11-04：已移除「Image Engine」人工图表 API 块
+// （arrangeFlowchart / arrangeArchitecture / generateArchitecture / arrangeLabor /
+//   generateLabor / arrangeComparison / generateComparison / generateFlowchart /
+//   generateGantt / createContentEventSource）——产品口径：图表全部自动生成
+// （正文内联 ```mermaid / ```chart-json 围栏 + SSE 自动编排），不设人工配图/
+// 生图入口；对应后端 9 个端点已同批删除（routers/sections.py）。
+// 图表展示走 ContentPreview 的围栏渲染与 section.*_json 字段绑定。
 
 // 图表全部自动生成（正文内联围栏代码块），已移除人工配图 generate-illustration 前端 API。
 
@@ -2180,11 +2118,12 @@ export async function getExportPresets(): Promise<ExportPresetCatalog> {
   return res.data;
 }
 
-export async function exportDocx(projectId: number, config?: ExportConfig): Promise<{  filename: string; file_path: string; file_size: number; export_id?: number; check: DocumentCheckResult; download_url?: string | null; relative_path?: string;
-}> {
-  const res = await httpPostLong<{
-    filename: string; file_path: string; file_size: number; export_id?: number; check: DocumentCheckResult; download_url?: string | null; relative_path?: string;
-  }>(`/projects/${projectId}/export/docx`, config || {});
+// E-3（2026-11-04 导出模块加固轮）：返回类型收敛为 types.ExportResult——
+// 此前字段在函数签名与 httpPostLong 泛型两处手写内联（与 ExportResult 三份平行），
+// 后端每加一个响应字段都要同步改三处，漏改即隐性类型漂移。ExportResult 已含
+// 全部字段（2026-10-11 P3 + 本轮补 record_failed），行为零变化。
+export async function exportDocx(projectId: number, config?: ExportConfig): Promise<ExportResult> {
+  const res = await httpPostLong<ExportResult>(`/projects/${projectId}/export/docx`, config || {});
   return res.data;
 }
 
@@ -2386,6 +2325,16 @@ export function exportDocxStream(
               const r = await fetch(resumeUrl, { headers: { Accept: "text/event-stream" }, signal });
               if (r.ok && r.body) {
                 await runConsume(r.body);
+              } else {
+                // E-2（2026-11-04 导出模块加固轮）：resume 非 2xx 此前被静默吞掉，
+                // 用户只看到泛化的「后台执行」提示，无从区分「journal 过期/跨 worker」
+                // 与网络故障。补一条 log 事件（调用方仅 console.debug，不进 UI 状态，
+                // 零行为变化、纯观测面补齐）。
+                onProgress({
+                  event: "log",
+                  level: "warn",
+                  content: `导出流续传失败（HTTP ${r.status}），请稍后在导出历史中查看结果`,
+                });
               }
             } catch (e) {
               if (aborted) {
@@ -2452,11 +2401,12 @@ function _appendAuthToken(baseUrl: string): string {
 }
 
 export function getExportDownloadUrl(projectId: number, exportId: number): string {
-  return _appendAuthToken(`/api/v1/projects/${projectId}/export/download/${exportId}`);
+  // B-2：经 toApiFullUrl 补后端源（跨域部署与 SSE 通道一致；未配置时与旧输出逐字相同）
+  return _appendAuthToken(toApiFullUrl(`/api/v1/projects/${projectId}/export/download/${exportId}`));
 }
 
 export function getLatestExportUrl(projectId: number): string {
-  return _appendAuthToken(`/api/v1/projects/${projectId}/export/latest`);
+  return _appendAuthToken(toApiFullUrl(`/api/v1/projects/${projectId}/export/latest`));
 }
 
 /**
@@ -2467,9 +2417,28 @@ export function getLatestExportUrl(projectId: number): string {
  * 鉴权与下载端点一致：?token= 查询参数（JwtAuthMiddleware 支持）。
  * @throws Error message 为后端 detail（已含安装/配置指引），调用方直接 message.error
  */
+// E-1（2026-11-04 导出模块加固轮）：fetch 下载通道超时兜底。
+// 裸 fetch 无超时：后端 LibreOffice 转换 hang / 网络黑洞时 Promise 永不 settle，
+// 页面「PDF」「导出 HTML」按钮永久 loading。PDF 转换服务端上限 180s（含排队余量
+// 取 300s）；HTML 组装为纯内存操作取 120s。AbortSignal 不可用的旧环境退化为
+// 无超时（与历史行为一致，不新增失败面）。
+const EXPORT_PDF_FETCH_TIMEOUT_MS = 300_000;
+const EXPORT_HTML_FETCH_TIMEOUT_MS = 120_000;
+
+function _exportFetchSignal(timeoutMs: number): AbortSignal | undefined {
+  try {
+    if (typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function") {
+      return AbortSignal.timeout(timeoutMs);
+    }
+  } catch {
+    /* ignore：退化为无超时 */
+  }
+  return undefined;
+}
+
 export async function exportPdf(projectId: number, exportId: number): Promise<void> {
-  const url = _appendAuthToken(`/api/v1/projects/${projectId}/export/pdf/${exportId}`);
-  const resp = await fetch(url);
+  const url = _appendAuthToken(toApiFullUrl(`/api/v1/projects/${projectId}/export/pdf/${exportId}`));
+  const resp = await fetch(url, { signal: _exportFetchSignal(EXPORT_PDF_FETCH_TIMEOUT_MS) });
   if (!resp.ok) {
     let detail = `HTTP ${resp.status}`;
     try {
@@ -2518,11 +2487,12 @@ export async function exportPdf(projectId: number, exportId: number): Promise<vo
  * @throws Error message 为后端 detail，调用方直接 message.error
  */
 export async function exportHtml(projectId: number, config?: ExportConfig): Promise<void> {
-  const url = _appendAuthToken(`/api/v1/projects/${projectId}/export/html`);
+  const url = _appendAuthToken(toApiFullUrl(`/api/v1/projects/${projectId}/export/html`));
   const resp = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json", Accept: "text/html" },
     body: JSON.stringify(config || {}),
+    signal: _exportFetchSignal(EXPORT_HTML_FETCH_TIMEOUT_MS),
   });
   if (!resp.ok) {
     let detail = `HTTP ${resp.status}`;
@@ -2787,10 +2757,12 @@ export function resolveImageTaskSrc(task: ImageGenTask): string {
   return "";
 }
 
-export async function fetchModels(apiKey: string, baseUrl: string, provider: string = ""): Promise<{ models: string[]; suggest_alternatives?: Array<{ name: string; base_url: string; description: string }> }> {
+export async function fetchModels(apiKey: string, baseUrl: string, provider: string = "", providerType: string = ""): Promise<{ models: string[]; suggest_alternatives?: Array<{ name: string; base_url: string; description: string }> }> {
   // BUG-FIX 2026-10-16：透传 provider，后端对「已配置厂商的脱敏占位符密钥」
   // 按厂商隔离解析（此前 /ai/models 只能回落到主配置密钥）。第三参可选，旧调用点不受影响。
-  const res = await http.post<{ models: string[]; suggest_alternatives?: Array<{ name: string; base_url: string; description: string }> }>("/ai/models", { api_key: apiKey, base_url: baseUrl, provider });
+  // G-C（2026-11-04）：第四参显式协议类型（anthropic_compatible 时后端补
+  // x-api-key 头），网关域名场景拉模型列表不再 401。旧调用点不传时行为不变。
+  const res = await http.post<{ models: string[]; suggest_alternatives?: Array<{ name: string; base_url: string; description: string }> }>("/ai/models", { api_key: apiKey, base_url: baseUrl, provider, provider_type: providerType });
   return res.data;
 }
 
@@ -2820,6 +2792,11 @@ export async function getTextProviderConfig(providerName: string): Promise<TextP
 // 不含服务端状态 is_active），此前误用响应类型 TextProviderConfig 导致调用方需强转、tsc 报错。
 export async function saveTextProviderConfig(payload: TextProviderSavePayload): Promise<void> {
   await http.put(`/ai/provider-configs/${encodeURIComponent(payload.provider_name)}`, payload);
+}
+
+// G-E（2026-11-04）：删除指定厂商的文本模型配置。当前激活中的厂商后端返回 409。
+export async function deleteTextProviderConfig(providerName: string): Promise<void> {
+  await http.delete(`/ai/provider-configs/${encodeURIComponent(providerName)}`);
 }
 
 // 文本：激活厂商配置（同步到主表）
@@ -2866,6 +2843,7 @@ export async function fetchModelInfo(data: {
 export async function testAIConnection(config: {
   provider: string; api_key: string; model: string; base_url: string;
   max_tokens?: number; temperature?: number;
+  provider_type?: string; // G-C（2026-11-04）：显式协议类型，探针与真实生成同 wire 格式
 }): Promise<{ status: string; message: string }> {
   const res = await http.post("/ai/test", config);
   return res.data;
@@ -3503,6 +3481,29 @@ export async function getPromptTemplates(language: string = "zh-CN"): Promise<{
 
 // ========== 全文一致性审计 ==========
 
+/**
+ * G-1（2026-11-02）：规则冲突的严重度**判定依据**。
+ *
+ * 由后端 `consistency_rules.severity_rationale`（与 `assess_severity` 共用同一
+ * 实现体，不构成第二套判定标准）派生，随 `POST /consistency/audit` 响应的
+ * `conflicts[].fact_evidence` 下发，并追加 `instance_count` / `section_ids`。
+ * 遗留项 L5（2026-11-03）：依据已随冲突行**落库**，`GET /consistency/conflicts`
+ * 回放同样下发该字段 —— 重新进入页面后依据浮层依然可用。AI 发现等
+ * 非规则链路恒为 null。消费方须按可选处理（老后端同样没有）。
+ */
+export interface ConflictEvidence {
+  severity: string;
+  /** 命中分支的人话解释（如「关键事实，一冲突即判严重」） */
+  reason: string;
+  critical_fact: boolean;
+  distinct_count: number;
+  distinct_values: string[];
+  section_count: number | null;
+  thresholds: { high_distinct_gt: number; low_max_sections: number };
+  instance_count: number;
+  section_ids: number[];
+}
+
 export interface Conflict {
   conflict_id: string;
   fact_name: string;
@@ -3534,6 +3535,13 @@ export interface Conflict {
   created_at?: string;
   resolved_value?: string | null;
   resolved_at?: string | null;
+  /**
+   * G-1（2026-11-02）：严重度判定依据。审计执行响应
+   * （`runConsistencyAudit` 的 `conflicts[]`）恒带；遗留项 L5（2026-11-03）
+   * 落库后 `GET /consistency/conflicts` 回放同样下发。AI 发现、老后端、
+   * 历史行无此字段（undefined/null）。消费方按可选处理。
+   */
+  fact_evidence?: ConflictEvidence | null;
 }
 
 export interface AuditResult {
@@ -3606,8 +3614,22 @@ export interface ConsistencyMetrics {
   [key: string]: number;
 }
 
-export async function getConsistencyMetrics(): Promise<{ status: string; metrics: ConsistencyMetrics }> {
-  const res = await http.get<{ status: string; metrics: ConsistencyMetrics }>(`/consistency/metrics`);
+/**
+ * G-3（2026-11-02）：响应在 `metrics` 之外**纯新增**两个顶层键——
+ * `since`（本进程启动时刻）与 `notes`（口径说明）。计数器是进程内累计、
+ * 重启归零，缺起点则「audit_failed=3」无法解读；多进程部署下各进程独立
+ * 计数，快照仅反映当前 API 进程。老后端不返回时两者为 undefined，
+ * 消费方须回退为不展示（行为与改造前一致）。
+ */
+export interface ConsistencyMetricsResponse {
+  status: string;
+  metrics: ConsistencyMetrics;
+  since?: string;
+  notes?: string;
+}
+
+export async function getConsistencyMetrics(): Promise<ConsistencyMetricsResponse> {
+  const res = await http.get<ConsistencyMetricsResponse>(`/consistency/metrics`);
   return res.data;
 }
 
@@ -3742,6 +3764,15 @@ export interface AutoFixReport {
   scoped_section_ids?: number[];
   /** 无章节来源、闸门无法生效时的回退说明 */
   scope_fallback_reason?: string;
+  /**
+   * F-1（2026-11-02·假成功治理）：`written_sections` = **实际落库**的章节数
+   * （逐条 UPDATE 校验 rowcount 后统计）；`changed_sections` 与其同值。
+   * `scope_missing_section_ids` = 冲突来源声明了、但本项目里查不到的章节 id
+   * （被项目过滤/已删除/正文为空），此前静默丢失，用户看到「改了一半」无从知道原因。
+   * 均为纯新增键，老后端不返回时 undefined（回退看 `changed_sections`）。
+   */
+  written_sections?: number;
+  scope_missing_section_ids?: number[];
   message: string;
 }
 
@@ -3778,14 +3809,30 @@ export interface AiRepairReport {
   dry_run: boolean;
   project_id: number;
   facts_used: number;
+  /**
+   * F-2（2026-11-02）：口径**收窄为规则冲突条数**（此前混入 AI 语义发现，
+   * 虚高「待修复冲突数」且这些条目注定无法收敛）。
+   */
   conflicts_used: number;
+  /** F-2（2026-11-02）：本轮识别到的 AI 语义发现条数（仅参考，不参与补丁与收敛） */
+  ai_findings_used?: number;
   batches: number;
   patches: unknown[];
   applied: AiRepairPatchResult[];
   rejected: AiRepairPatchResult[];
   sections: { section_id: string; title: string; applied: number; rejected: number }[];
   unresolved: { section_id: string; reason: string }[];
-  conflict_states: { resolved: number; still_open: number } | null;
+  /**
+   * F-1 同类（2026-11-02·落文 rowcount）：`written_sections` = 实际落库章节数；
+   * `unwritten` = 计划改写但 UPDATE 未命中（章节被删除/重建）的明细。
+   */
+  written_sections?: number;
+  unwritten?: { section_id: string; reason: string }[];
+  /**
+   * F-2（2026-11-02）：`not_verifiable` = 无结构化取值、不可自动收敛的条目数
+   * （AI 语义发现属此类），此前混计入 `still_open` 导致「仍待处理」永远降不到 0。
+   */
+  conflict_states: { resolved: number; still_open: number; not_verifiable?: number } | null;
   errors: string[];
   message: string;
 }
@@ -3898,8 +3945,16 @@ export interface AuditSummary {
   unresolved_ai_findings?: number;
   resolved_ai_findings?: number;
   /**
-   * 最近一次审计的来源（`rule` / `ai`）。`consistency_audit_log` 无来源列，
-   * 后端按 `conflicts_json` 里的 `conflict_id` 前缀确定性推断（两侧永不交叉）。
+   * TD-9（2026-11-02）：已解决侧补齐规则冲突计数，使两侧口径对称——
+   * `resolved_rule_conflicts + resolved_ai_findings == resolved_conflicts`。
+   * 纯新增字段，既有字段不变；老后端不返回时为 undefined，「已解决」卡片
+   * 回退为不拆分展示。
+   */
+  resolved_rule_conflicts?: number;
+  /**
+   * 最近一次审计的来源（`rule` / `ai`）。T2 根治（2026-10-16）后
+   * `consistency_audit_log` 有专用 `source_kind` 列（两条写入路径直接落列，
+   * 老库由迁移补列回填），后端摘要直接读取。
    * 用户据此能区分「最近审计时间」来自「开始审计」按钮，还是正文生成收尾的
    * AI 审计 —— 两者结论性质完全不同（前者可自动修复，后者需人工核对）。
    */
@@ -3935,12 +3990,23 @@ ejected / unresolved 此前被声明为
 eport.errors?.length。
    */
   max_turns?: number;
-  conflict_states: { resolved: number; still_open: number } | null;
+  /** F-2（2026-11-02）：not_verifiable = 不可自动收敛条目数（AI 语义发现类），单列计数 */
+  conflict_states: { resolved: number; still_open: number; not_verifiable?: number } | null;
   changed_sections?: { id: number; title: string }[];
   applied?: unknown[];
   rejected?: unknown[];
   unresolved?: { section_id: string; reason: string }[];
   errors?: string[];
+  /**
+   * F-2 / F-1 同类（2026-11-02，与 AI 补丁链路报告同构，均为纯新增键）：
+   * `conflicts_used` 只算规则冲突；`ai_findings_used` 为参考区条目数；
+   * `written_sections` 为**实际落库**章节数（UPDATE rowcount 校验后）；
+   * `not_written_sections` 为 Agent 改了但落库未命中的明细。
+   */
+  conflicts_used?: number;
+  ai_findings_used?: number;
+  written_sections?: number;
+  not_written_sections?: { section_id: string; title?: string; reason: string }[];
   message: string;
 }
 

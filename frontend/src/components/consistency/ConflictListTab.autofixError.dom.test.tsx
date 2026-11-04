@@ -60,11 +60,16 @@ const getAuditSummaryMock = vi.fn(async () => ({
 }));
 
 // 关键：让 applyAutoFix 抛 400（模拟后端 FIX-5 守卫 / 网关异常）
-const applyAutoFixMock = vi.fn(async () => {
-  const err: Record<string, unknown> = new Error("Request failed");
-  err.response = { status: 400, data: { detail: "AI 语义发现没有结构化取值，无法自动统一" } };
-  throw err;
-});
+// 2026-11-02：mock 带上真实签名参数 —— 既让 mock.calls 元组类型正确
+// （此前零参推断使 `mock.calls[0]` 解构报 TS2493），也让类型检查全绿。
+const applyAutoFixMock = vi.fn(
+  async (_conflictId: string, _projectId: number, _newValue: string) => {
+    const err = Object.assign(new Error("Request failed"), {
+      response: { status: 400, data: { detail: "AI 语义发现没有结构化取值，无法自动统一" } },
+    });
+    throw err;
+  },
+);
 
 vi.mock("../../api", () => ({
   getConflicts: getConflictsMock,

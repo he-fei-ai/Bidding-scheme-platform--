@@ -102,6 +102,26 @@ def _save_section_to_db(
 
     """
 
+    # BUG-FIX 2026-11-05（遗留2·写锁争用）：`get_section_path` 需读整个项目章节表。
+    # 旧实现把它放在 `with get_db()` **写事务内**调用，SQLite rollback-journal 模式下
+    # 写事务持有 RESERVED 锁，会阻塞其它连接的共享读 → 偶发 "database is locked"，
+    # 深层编号净化被静默跳过（降级）。把路径查询**提前到写事务外**（此处仍为纯读、
+    # 各自独立只读连接），只在「completed 且内容含深层编号」时付这份开销；失败仍
+    # 优雅降级（_pre_path="" 且 _path_failed=True → 事务内跳过 normalize，与旧行为一致）。
+    _pre_path: str = ""
+    _path_failed = False
+    if status == "completed" and content and CONTENT_DEEP_HEADING_RENUMBER_ENABLED:
+        try:
+            from ...services.content_cleaning import has_deep_heading_numbering
+
+            if has_deep_heading_numbering(content):
+                from ...services.sections import get_section_path
+
+                _pre_path = get_section_path(section_id)
+        except Exception as _exc:
+            logger.debug("[SSE] 深层标题路径预取失败（降级，不阻塞落库）: %s", _exc)
+            _path_failed = True
+
     with get_db() as conn:
 
         if status == "completed":
@@ -122,9 +142,18 @@ def _save_section_to_db(
                     _section_title = _title_row["title"] if _title_row else ""
                     from ...services.content_cleaning import (
                         ContentCleaner,
-                        has_deep_heading_numbering,
                         normalize_deep_heading_numbering,
                     )
+                    from ...utils import normalize_newlines
+
+                    # BUG-FIX 2026-11-04（P3-7·CRLF 归一缺口）：归一此前只在
+                    # clean_generated_content 入口与压缩链做，主链落库不归一 ——
+                    # AI 网关返回 CRLF 时 DB 存 \r\n，且 normalize_deep_heading_
+                    # numbering 重写行（无 \r）与保留行（含 \r）行尾混合；SSE 预览/
+                    # extract_section_charts 的 _marker/word_count 双口径均消费
+                    # 原始 DB 文本。与 get_section 读出口径（services.sections）
+                    # 对称：入口归一一次。
+                    content = normalize_newlines(content)
 
                     # 2026-10-26（遗留问题 1）：落库前正文标题净化开关。
                     # 导出端只对 L1~L4 重编号，L5+（≥3 段小数）保留 AI 原文编号，
@@ -133,19 +162,13 @@ def _save_section_to_db(
                     # 2026-10-27 修复：编号锚定之后，标题**文本**里的占位泛化名
                     # （「专项6」）与「（2）」式冲突后缀仍会原样落库，故同一开关
                     # 下再净化标题文本（见 content_cleaning._sanitize_heading_body）。
-                    # 先用正则快速预判：无深层编号的章节不触发 get_section_path
-                    # （该函数会读整个项目章节表，避免每次落库都付这份开销）。
-                    if CONTENT_DEEP_HEADING_RENUMBER_ENABLED:
+                    # 章节路径已在**写事务外**预取（_pre_path，见函数首部），
+                    # 此处仅调用净化，不再触碰 get_section_path，避免写锁内读全表
+                    # 造成 database is locked（_path_failed 置位时跳过，与旧降级一致）。
+                    if CONTENT_DEEP_HEADING_RENUMBER_ENABLED and not _path_failed:
                         try:
-                            from ...services.sections import get_section_path
-
-                            _section_path = (
-                                get_section_path(section_id)
-                                if has_deep_heading_numbering(content)
-                                else ""
-                            )
                             content = normalize_deep_heading_numbering(
-                                content, _section_path or "", context_title=_section_title
+                                content, _pre_path or "", context_title=_section_title
                             )
                         except Exception as _path_exc:
                             logger.debug(
@@ -170,6 +193,54 @@ def _save_section_to_db(
                 (content, word_count, readable_word_count, section_id),
 
             )
+
+            # BUG-FIX 2026-11-04（P2·图表载荷残留）：重生成/补全生成重写正文后，
+            # 新正文可能不再含任何图表内联标记（``<<CHART:…>>``/围栏），而上一轮
+            # 生成的 *_json 载荷仍残留 → 导出端按「字段有值且正文无内联标记 →
+            # 章节末尾补图」渲染出与全新内容无关的旧图（图文数据矛盾），build_tree
+            # 的 has_* 图表标志也继续为真。按新正文的内联标记类型集清理不再被
+            # 引用的类型字段。时序安全：本轮图表编排发生在落库**之后**
+            # （chart_worker → sse_charts 写字段/插围栏），不会误删本轮新载荷；
+            # 「降级落库」路径（字段有值但正文无标记）由其自身在保存后写入，
+            # 同样不受影响。检测失败时保守跳过清理（保留旧载荷，与历史行为一致）。
+            try:
+                from ...services.export_chart_pipeline import _detect_inline_chart_markers
+
+                _inline_types, _hint_types = _detect_inline_chart_markers(content)
+            except Exception as _detect_e:
+                logger.debug(
+                    "[SSE] 内联图表标记检测失败（跳过 *_json 残留清理）: %s", _detect_e
+                )
+                _inline_types = None
+            if _inline_types is not None:
+                try:
+                    from ...services.chart_auto_orchestration import CHART_FIELD_MAP
+
+                    _chart_row = conn.execute(
+                        f"SELECT {', '.join(CHART_FIELD_MAP.values())} FROM sections WHERE id = ?",
+                        (section_id,),
+                    ).fetchone()
+                    if _chart_row:
+                        _stale_fields = [
+                            _field
+                            for _t, _field in CHART_FIELD_MAP.items()
+                            if (_chart_row[_field] or "").strip()
+                            and _t not in _inline_types
+                        ]
+                        if _stale_fields:
+                            conn.execute(
+                                "UPDATE sections SET "
+                                + ", ".join(f"{_f} = ''" for _f in _stale_fields)
+                                + ", updated_at = datetime('now', 'localtime') WHERE id = ?",
+                                (section_id,),
+                            )
+                            logger.info(
+                                "[SSE] 已清理重写正文不再引用的旧图表载荷 section=%d fields=%s",
+                                section_id,
+                                ",".join(_stale_fields),
+                            )
+                except Exception as _stale_e:
+                    logger.debug("[SSE] *_json 残留清理失败（忽略）: %s", _stale_e)
 
         elif status == "failed":
 
@@ -1018,7 +1089,9 @@ def _clear_and_save_outline(project_id: int, outline: list) -> list:
         try:
 
             _rows = conn.execute(
-                "SELECT id, parent_id, level, title, content, status, target_words FROM sections "
+                "SELECT id, parent_id, level, title, content, status, target_words, "
+                "flowchart_json, gantt_json, architecture_json, labor_json, "
+                "comparison_json, layout_json, timeline_json FROM sections "
                 "WHERE project_id = ?",
                 (project_id,),
             ).fetchall()
@@ -1041,11 +1114,29 @@ def _clear_and_save_outline(project_id: int, outline: list) -> list:
                 if not _r["content"]:
                     continue
                 _k = (int(_r["level"] or 1), str(_r["title"] or ""))
+                # BUG-FIX 2026-11-04（P2·图表载荷保全）：快照旧只含正文/状态/字数
+                # 预算，DELETE 随行删除的 *_json 图表载荷（自动编排/人工修订产物）
+                # 回填时全部丢失且无日志 → 用户感知「目录没动，图没了」。随行
+                # 快照 7 类图表字段，回填时一并恢复。
+                _charts = {
+                    _f: _r[_f]
+                    for _f in (
+                        "flowchart_json",
+                        "gantt_json",
+                        "architecture_json",
+                        "labor_json",
+                        "comparison_json",
+                        "layout_json",
+                        "timeline_json",
+                    )
+                    if (_r[_f] or "").strip()
+                }
                 _prev_content.setdefault(_k, []).append(
                     {
                         "content": _r["content"],
                         "status": _r["status"],
                         "target_words": _r["target_words"],
+                        "charts": _charts,
                         "path": _row_path(_r),
                     }
                 )
@@ -1227,16 +1318,22 @@ def _clear_and_save_outline(project_id: int, outline: list) -> list:
                     # BUG-FIX 2026-09-29：回填正文时同步 word_count 列——此前只写
                     # content/status/target_words，DB 的 word_count 停留在 NULL，
                     # build_tree/list_sections 从 DB 读该列，目录重建后前端字数显示 0。
+                    # BUG-FIX 2026-11-04：一并恢复快照的非空 *_json 图表载荷
+                    # （与上方快照扩展配套；字段集固定，无注入面）。
+                    _charts = _prev.get("charts") or {}
+                    _chart_sets = "".join(f"{_f} = ?, " for _f in _charts)
                     conn.execute(
                         "UPDATE sections SET content = ?, status = ?, word_count = ?, "
                         "readable_word_count = ?, "
-                        "target_words = COALESCE(target_words, ?), "
+                        + _chart_sets
+                        + "target_words = COALESCE(target_words, ?), "
                         "updated_at = datetime('now', 'localtime') WHERE id = ?",
                         (
                             _prev["content"],
                             _node_status,
                             _count_words(_prev["content"]),
                             _count_readable_words(_prev["content"]),
+                            *_charts.values(),
                             _prev.get("target_words"),
                             new_id,
                         ),

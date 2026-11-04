@@ -80,10 +80,10 @@ def bump_ai_config_version() -> None:
 
 
 def get_ai_config_version() -> int:
-    """璇诲彇褰撳嶇疆鐗堟湰鍙凤紱(If-Match / ETag 鍙傚墠绯诲垪鍙?)。
+    """读取当前配置版本号（供 If-Match / ETag 乐观锁系列使用）。
 
-    鍐欏叆鍚庨€掑鏃?bump_ai_config_version() 鍚庡悓鏍烽€掑+1锛屼簨浠跺彲浠ユ彁绀猴紝
-    浠庢湁涓€涓暟鎹?瀵?-1鈥?杩斿洖 0(涓嶈祫婧愭垨鍐欏叆涔嬪悗杩斿洖 1)。
+    每次配置写入后经 bump_ai_config_version() 递增 +1；无库资源或表缺失时
+    返回 0，写入之后返回 ≥1。异常一律吞掉返回 0，不阻断读路径。
     """
     try:
         v = _read_config_version()
@@ -96,7 +96,7 @@ _KEY_ROTATED_AT_STATE_KEY = 'ai_config_key_rotated_at'
 
 
 def get_key_rotated_at() -> str | None:
-    """璇诲彇 API Key 鐢?鐨?鏃犵骇鏃堕暱(ISO-8601, 鍐欑幇鍔?ai_config_state)"""
+    """读取 API Key 最近一次轮转的时间戳（ISO-8601，存于 ai_config_state）"""
     try:
         with get_db(readonly=True) as conn:
             row = conn.execute(
@@ -109,7 +109,7 @@ def get_key_rotated_at() -> str | None:
 
 
 def set_key_rotated_at(ts: str) -> None:
-    """璁哄API Key 鏃犵骇鏃堕暱"""
+    """记录 API Key 最近一次轮转的时间戳"""
     try:
         with get_db() as conn:
             conn.execute(
@@ -119,13 +119,14 @@ def set_key_rotated_at(ts: str) -> None:
             )
             conn.commit()
     except Exception as e:
-        logger.debug("璁哄 API Key 鏃犵骇鏃堕暱澶辰触: %s", e)
+        logger.debug("记录 API Key 轮转时间戳失败: %s", e)
 
 
 def get_key_rotation_status(interval_days: int | None = None) -> dict:
-    """API Key 鏃犵骇鏃ユ湰鏁?澶勭悊(鍙栧嵄绀猴紝 鏃犵骇缁欎簨/鏄?鍙栧嵄)。
+    """API Key 轮转到期状态计算（只读展示，不修改任何状态）。
 
-    鈻?锛?interval_days 涓嶈兘杩斿洖鍒嗘壘鍙?鐨勫墠绔犵粰鏄?AI_KEY_ROTATION_DAYS(榛樿 90 鏃?)锛?
+    返回：key_rotated_at / rotation_interval_days（可经参数或环境变量
+    AI_KEY_ROTATION_DAYS 覆盖，默认 90 天）/ days_since_rotation / rotation_due。
     """
     try:
         interval = int(interval_days or os.getenv('AI_KEY_ROTATION_DAYS', '90'))
@@ -168,9 +169,12 @@ _HEALTH_CACHE_TTL_FAIL = 15.0
 _HEALTH_CACHE_MAX_ENTRIES = 64
 
 
-def _health_cache_key(base_url: str, model: str, api_key: str) -> str:
+def _health_cache_key(base_url: str, model: str, api_key: str, provider_type: str = "") -> str:
     fingerprint = hashlib.sha256((api_key or "").encode("utf-8")).hexdigest()[:12]
-    return f"{(base_url or '').rstrip('/')}|{model or ''}|{fingerprint}"
+    # G-A（2026-11-04）：协议类型入键 —— 同一 URL/密钥在 openai_compatible 与
+    # anthropic_compatible 下探活端点不同（/chat/completions vs /messages），
+    # 旧键会把一种协议的结论误配给另一种。
+    return f"{(base_url or '').rstrip('/')}|{model or ''}|{fingerprint}|{provider_type or ''}"
 
 
 def _health_cache_get(key: str) -> bool | None:
@@ -325,8 +329,19 @@ def _make_provider(
     max_retries: int = 2,
     rate_limit_per_min: int = 0,
     concurrency: int = 0,
+    provider_type: str = "",
 ) -> Any:
-    """根据配置创建对应的 Provider 实例"""
+    """根据配置创建对应的 Provider 实例
+
+    G-1（2026-11-03，模型路由错误）：此前实现类**只**由 detect_provider_type(base_url)
+    的 URL 关键词启发式决定，配置里显式保存的 provider/provider_type 从未被读取——
+    经第三方网关代理的 Anthropic/DeepSeek 协议端点（URL 不含厂商关键词）一律被
+    路由成 openai_compatible，请求 wire 格式错误（/chat/completions vs /messages）。
+    现规则：URL 启发式识别出的**具体**类型优先（防止库内被默认值污染的配置反转
+    正确路由）；仅当启发式落空（openai_compatible）且显式类型是具体协议
+    （deepseek / anthropic_compatible）时，才采纳显式类型。行为向后兼容：
+    provider_type 为空或等于启发式结果时与旧行为完全一致。
+    """
     # 终极防御：model 为空时用厂商默认值兜底，避免 Agnes 等 API 返回
     # "Model name not specified (HTTP 400)"
     if not model:
@@ -334,6 +349,12 @@ def _make_provider(
         logger.warning("_make_provider: model 为空，使用默认值 '%s'", model)
 
     p = detect_provider_type(base_url)
+    if p == "openai_compatible" and provider_type in ("deepseek", "anthropic_compatible"):
+        p = provider_type
+        logger.info(
+            "_make_provider: URL 启发式未识别，采纳显式配置类型 %s (base_url=%s)",
+            provider_type, base_url,
+        )
 
     if p == "deepseek":
         from .providers.deepseek import DeepSeekProvider
@@ -950,6 +971,8 @@ def create_provider(config: dict | None = None) -> Any:
         max_retries=config.get("max_retries", 2),
         rate_limit_per_min=config.get("rate_limit_per_min", 0),
         concurrency=config.get("concurrency", 0),
+        # G-1（2026-11-03）：把配置里显式保存的协议类型传入（非白名单值自动忽略）
+        provider_type=config.get("provider", ""),
     )
 
 
@@ -1039,10 +1062,11 @@ def create_provider_with_fallback(config: dict | None = None) -> tuple[Any, str]
 
         try:
             # 尝试健康检查（短 TTL 缓存：命中则跳过重复 HTTP 探活）
-            cache_key = _health_cache_key(url, model_to_use, key)
+            _entry_type = entry.get("provider", "") or ""
+            cache_key = _health_cache_key(url, model_to_use, key, _entry_type)
             cached_ok = _health_cache_get(cache_key)
             if cached_ok is None:
-                healthy = _quick_health_check(url, key, model_to_use, timeout)
+                healthy = _quick_health_check(url, key, model_to_use, timeout, _entry_type)
                 _health_cache_put(cache_key, healthy)
             else:
                 healthy = cached_ok
@@ -1059,7 +1083,11 @@ def create_provider_with_fallback(config: dict | None = None) -> tuple[Any, str]
                         else config.get("temperature", 0.7)
                     ),
                     timeout=entry.get("timeout") or config.get("timeout", 120),
-                    max_retries=2,
+                    # G-3（2026-11-03，重试口径统一）：此前同步降级链硬编码
+                    # max_retries=2，而 create_provider 读 config —— 同一份配置在
+                    # 降级/未降级两条路径上重试预算不一致（违反 AI 调用重试统一口径）。
+                    # 现与主路径同口径：条目级优先，回落主配置，默认 2 不变。
+                    max_retries=entry.get("max_retries") or config.get("max_retries", 2),
                     # P1-CFG（2026-10-14）：条目自带并发/限流时优先（厂商隔离配置
                     # 语义），否则沿用主配置。此前此处硬编码丢弃，导致用户在
                     # Profile / 主配置里设的 rate_limit_per_min 与 concurrency
@@ -1067,6 +1095,8 @@ def create_provider_with_fallback(config: dict | None = None) -> tuple[Any, str]
                     # 却生效）——同一份配置在不同代码路径上行为不一致。
                     rate_limit_per_min=entry.get("rate_limit_per_min") or config.get("rate_limit_per_min", 0),
                     concurrency=entry.get("concurrency") or config.get("concurrency", 0),
+                    # G-1（2026-11-03）：透传条目显式协议类型（网关 URL 路由）
+                    provider_type=entry.get("provider", ""),
                 )
                 is_primary = (url == primary_url) or entry.get("is_primary", False)
                 source = "" if is_primary else entry["name"]
@@ -1094,13 +1124,61 @@ def create_provider_with_fallback(config: dict | None = None) -> tuple[Any, str]
         max_tokens=config.get("max_tokens", 32768),
         temperature=config.get("temperature", 0.7),
         timeout=timeout,
-        max_retries=2,
+        # G-3（2026-11-03）：与主路径同口径读取 max_retries（默认 2 不变）
+        max_retries=config.get("max_retries", 2),
         rate_limit_per_min=config.get("rate_limit_per_min", 0),
         concurrency=config.get("concurrency", 0),
+        # G-1（2026-11-03）：主配置显式类型透传
+        provider_type=config.get("provider", ""),
     ), ""
 
 
-def _quick_health_check(base_url: str, api_key: str, model: str, timeout: int) -> bool:
+def _probe_request_for_protocol(
+    provider_type: str, base_url: str, api_key: str, model: str
+) -> tuple[str, dict, dict]:
+    """G-A（2026-11-04，探活协议盲区）：按 provider 协议构造探活请求。
+
+    背景：`AnthropicCompatibleProvider.chat()` 实际请求 `{base_url}/messages`
+    （x-api-key 头 + Anthropic payload），而探活此前硬编码 POST
+    `{base_url}/chat/completions`（Bearer + OpenAI payload）——对
+    anthropic_compatible 端点必然 404/405，后果：
+      1. 主配置为 Anthropic 协议时，每次 AI 调用先白等全链探活超时再回退主配置；
+      2. 备选 Anthropic 厂商在降级链上永远探活失败、永不被选中
+        （G-1 修复了路由类型，但探活未跟上，降级链对该协议仍是盲的）。
+
+    返回 (url, headers, json_payload)；openai_compatible/deepseek 行为与
+    旧实现逐字节一致（向后兼容）。
+    """
+    if provider_type == "anthropic_compatible":
+        url = base_url.rstrip("/") + "/messages"
+        headers = {
+            "x-api-key": api_key or "",
+            "anthropic-version": "2023-06-01",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": model,
+            "max_tokens": 4,
+            "messages": [{"role": "user", "content": "hi"}],
+        }
+        return url, headers, payload
+    # 默认：OpenAI 兼容 wire 格式（含 deepseek —— 其官方 API 也是 /chat/completions）
+    url = base_url.rstrip("/") + "/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": "请回复'OK'"}],
+        "max_tokens": 4,
+    }
+    return url, headers, payload
+
+
+def _quick_health_check(
+    base_url: str, api_key: str, model: str, timeout: int, provider_type: str = ""
+) -> bool:
     """快速 HTTP 健康检查（同步版）"""
     import httpx
 
@@ -1124,15 +1202,10 @@ def _quick_health_check(base_url: str, api_key: str, model: str, timeout: int) -
             timeout=httpx.Timeout(_probe_timeout, connect=_probe_connect),
             **build_httpx_proxy_settings(),
         ) as client:
-            resp = client.post(
-                base_url.rstrip("/") + "/chat/completions",
-                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                json={
-                    "model": model,
-                    "messages": [{"role": "user", "content": "请回复'OK'"}],
-                    "max_tokens": 4,
-                },
+            url, headers, payload = _probe_request_for_protocol(
+                provider_type, base_url, api_key, model
             )
+            resp = client.post(url, headers=headers, json=payload)
             # TD-3（2026-10-06）：429（限流）此前被视为健康，会选中该厂商后在真正
             # 调用时被拒；与异步 get_working_provider 的 429=跳过 语义对齐。
             # 失败结论走 _health_cache 15s 短 TTL，厂商恢复后能尽快重选。
@@ -1188,14 +1261,15 @@ async def get_working_provider(primary_config: dict) -> tuple[Any, str]:
             # SSE 每次生成都要按链长逐个 POST 探活（8s 超时），主配置瞬断时会放大
             # 成 N×8s 的串行等待。复用同一份 `_HEALTH_CACHE`（成功 60s / 失败 15s，
             # 键含 sha256 密钥指纹），配置变更时由 bump_ai_config_version 一并清空。
-            cache_key = _health_cache_key(url, model, key)
+            _entry_type = entry.get("provider", "") or ""
+            cache_key = _health_cache_key(url, model, key, _entry_type)
             cached_ok = _health_cache_get(cache_key)
             if cached_ok is not None:
                 if not cached_ok:
                     logger.debug("Provider %s 命中探活失败缓存，跳过", entry.get("name", url))
                     continue
             else:
-                ok = await _async_quick_health_check(url, key, model)
+                ok = await _async_quick_health_check(url, key, model, _entry_type)
                 _health_cache_put(cache_key, ok)
                 if not ok:
                     continue
@@ -1214,10 +1288,13 @@ async def get_working_provider(primary_config: dict) -> tuple[Any, str]:
                     else primary_config.get("temperature", 0.7)
                 ),
                 timeout=entry.get("timeout") or timeout,
-                max_retries=2,
+                # G-3（2026-11-03）：异步降级链与同步链/主路径同口径读取 max_retries
+                max_retries=entry.get("max_retries") or primary_config.get("max_retries", 2),
                 # P1-CFG（2026-10-14）：与同步链对齐，不再丢弃限流/并发配置。
                 rate_limit_per_min=entry.get("rate_limit_per_min") or primary_config.get("rate_limit_per_min", 0),
                 concurrency=entry.get("concurrency") or primary_config.get("concurrency", 0),
+                # G-1（2026-11-03）：透传条目显式协议类型（网关 URL 路由）
+                provider_type=entry.get("provider", ""),
             )
             return provider, source
         except Exception as e:
@@ -1242,18 +1319,25 @@ async def get_working_provider(primary_config: dict) -> tuple[Any, str]:
         max_tokens=primary_config.get("max_tokens", 32768),
         temperature=primary_config.get("temperature", 0.7),
         timeout=timeout,
-        max_retries=2,
+        # G-3（2026-11-03）：与主路径同口径读取 max_retries（默认 2 不变）
+        max_retries=primary_config.get("max_retries", 2),
         rate_limit_per_min=primary_config.get("rate_limit_per_min", 0),
         concurrency=primary_config.get("concurrency", 0),
+        # G-1（2026-11-03）：主配置显式类型透传
+        provider_type=primary_config.get("provider", ""),
     ), ""
 
 
-async def _async_quick_health_check(base_url: str, api_key: str, model: str) -> bool:
+async def _async_quick_health_check(
+    base_url: str, api_key: str, model: str, provider_type: str = ""
+) -> bool:
     """异步探活（get_working_provider 专用）。
 
     200 = 可用；401/429 = 不可用（与同步链「仅 200 视为健康」的口径一致，
     此前异步链只在 401/429 时 continue，其余非 200（如 5xx）会 fallthrough 到
     链尾，浪费一次 5~8s 超时）；异常 = 不可用。
+    G-A（2026-11-04）：请求构造收敛到 _probe_request_for_protocol，
+    anthropic_compatible 走 /messages + x-api-key，与同步链同口径。
     """
     import httpx
 
@@ -1261,15 +1345,10 @@ async def _async_quick_health_check(base_url: str, api_key: str, model: str) -> 
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(8, connect=5, read=8), **build_httpx_proxy_settings()
         ) as client:
-            resp = await client.post(
-                base_url.rstrip("/") + "/chat/completions",
-                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                json={
-                    "model": model,
-                    "messages": [{"role": "user", "content": "hi"}],
-                    "max_tokens": 4,
-                },
+            url, headers, payload = _probe_request_for_protocol(
+                provider_type, base_url, api_key, model
             )
+            resp = await client.post(url, headers=headers, json=payload)
     except Exception:
         return False
     if resp.status_code == 200:

@@ -154,9 +154,30 @@ def collect_illustration_targets(
 # 载荷构建 / 校验
 # ============================================================
 
+def infer_mermaid_code_type(code: str) -> str:
+    """按 Mermaid 代码首行推断图表类型（gantt / flowchart，未识别归 flowchart）。
+
+    F4 修复 2026-11-03（需求 3·AI 生成 Mermaid 载荷）：旧 build_mermaid_payload
+    硬编码 type="flowchart"，gantt 代码被当 flowchart——图题兜底名错挂
+    「流程图」（需求 8·图题规范失真）、gantt 专属校验通道（任务行/日期格式
+    检查）永不触发。按代码首行判定；平台 Mermaid 载荷实际只产出
+    flowchart/gantt 两类代码（comparison/layout/timeline 走 chart-json），
+    未识别语法保守归 flowchart（校验宽松通道，不误杀）。
+    """
+    first = (code or "").strip().split("\n", 1)[0].strip().lower()
+    if first.startswith("gantt"):
+        return "gantt"
+    return "flowchart"
+
+
 def build_mermaid_payload(code: str, title: str) -> dict[str, Any]:
-    """构建 mermaid 载荷（与 chart_auto_orchestration.build_chart_fence 同构）。"""
-    return {"type": "flowchart", "title": title or "流程图", "code": code}
+    """构建 mermaid 载荷（type 按代码推断，与 chart_auto_orchestration.build_chart_fence 同构）。"""
+    mtype = infer_mermaid_code_type(code)
+    return {
+        "type": mtype,
+        "title": title or ("甘特图" if mtype == "gantt" else "流程图"),
+        "code": code,
+    }
 
 
 def build_chart_payload(chart_type: str, title: str, data: dict) -> dict[str, Any]:
@@ -224,7 +245,8 @@ async def _validate_mermaid_payload(
 
         payload = build_mermaid_payload(code, title)
         ok, errors, fixed, _mutated, _ctx = validate_chart_for_ai_pipeline(
-            "flowchart", payload, verbose=False, section_title=title
+            str(payload.get("type") or "flowchart"),
+            payload, verbose=False, section_title=title,
         )
         if ok:
             return True, "", str((fixed or {}).get("code") or code)
@@ -239,7 +261,8 @@ async def _validate_mermaid_payload(
 
             payload = build_mermaid_payload(repaired, title)
             ok, errors, fixed, _mutated, _ctx = validate_chart_for_ai_pipeline(
-                "flowchart", payload, verbose=False, section_title=title
+                str(payload.get("type") or "flowchart"),
+                payload, verbose=False, section_title=title,
             )
             if ok:
                 return True, "", str((fixed or {}).get("code") or repaired)
@@ -297,7 +320,9 @@ async def execute_illustration_phase(
     from ..chart_auto_orchestration import (
         build_chart_fence,
         content_has_chart_fence,
+        content_has_chart_marker_type,
         insert_fence_at_paragraph,
+        section_to_dict,
     )
     from ..sections import get_section as _get_section
     from ..sections import update_section as _update_section
@@ -325,7 +350,13 @@ async def execute_illustration_phase(
             "reason": "",
         }
         try:
-            section = get_sec(target.section_id)
+            # section_to_dict（BUG-FIX 2026-11-04·P1）：服务层 get_section 返回
+            # pydantic Section，旧实现在下方 `section.get("content")`（未包 try）
+            # 处 AttributeError 直接炸出循环 → 配图阶段整体崩溃、正文零图表、
+            # illustration_phase_done 事件永不发送（前端配图进度悬挂）。
+            # 归一为 dict 后，本函数 docstring 的「失败隔离：单图失败只跳过该图」
+            # 才在生产注入路径下成立。
+            section = section_to_dict(get_sec(target.section_id))
         except Exception as e:
             item["reason"] = f"get_section_failed: {e}"
             result["items"].append(item)
@@ -338,9 +369,22 @@ async def execute_illustration_phase(
             continue
 
         content = str(section.get("content") or "")
-        # 去重：正文已有图表围栏时不再插入（防重入 / 防图号虚跳）
+        # 去重双检（F2 同口径 2026-11-03·需求 11·防双图/图号虚跳）：正文已有
+        # 图表围栏，或已有**同类型** ``<<CHART:...>>`` 内联标记时不再插入——
+        # 导出侧把标记与围栏都渲染成图，并存即同章两张同类图。按类型判定，
+        # 不同类型的标记与围栏并存是合理形态，互不阻止。
+        _target_type = ""
+        if target.kind == "chart":
+            _target_type = str(target.payload.get("chart_type") or "").strip().lower()
+        elif target.kind == "mermaid":
+            _target_type = infer_mermaid_code_type(str(target.payload.get("code") or ""))
         if content_has_chart_fence(content):
             item["reason"] = "chart_fence_exists"
+            result["items"].append(item)
+            result["skipped"] += 1
+            continue
+        if _target_type and content_has_chart_marker_type(content, _target_type):
+            item["reason"] = "chart_marker_exists"
             result["items"].append(item)
             result["skipped"] += 1
             continue
@@ -360,10 +404,11 @@ async def execute_illustration_phase(
                 payload = build_mermaid_payload(
                     code, str(target.payload.get("title") or target.title)
                 )
-                lead_in, fence = build_chart_fence("flowchart", payload)
+                mtype = str(payload.get("type") or "flowchart")
+                lead_in, fence = build_chart_fence(mtype, payload)
                 new_content = _insert(
                     insert_fence_at_paragraph, content, fence, lead_in,
-                    target.title, "flowchart",
+                    target.title, mtype,
                 )
             elif target.kind == "chart":
                 ctype = str(target.payload.get("chart_type") or "")

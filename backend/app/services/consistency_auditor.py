@@ -42,6 +42,11 @@ class Conflict:
     severity: str  # high/medium/low
     description: str
     suggested_fix: str | None = None
+    #: G-1(2026-11-02) 判定依据（实例数/命中章节/去重取值/命中的严重度分支）。
+    #: 遗留项 L5(2026-11-03)：随冲突行落库（evidence_json），并在 GET /conflicts
+    #: 回放下发为 fact_evidence —— 用户次日回看冲突列表仍能打开依据浮层。
+    #: AI 发现等非规则链路产生的冲突为 None（落库为 NULL）。
+    evidence: dict | None = None
 
 
 @dataclass
@@ -79,13 +84,26 @@ class ConsistencyAuditor:
         # 并允许标签词与数值之间隔「为/是/约」（「合同工期为 450 日历天」）。
         "工期": r"(?:工期|周期|天数|天)\s*[:：]?\s*(?:为|是|约)*\s*(\d+)\s*(?:个)?\s*(?:日历天|自然日|工作日|天)",
         # BUG-FIX 2026-10-09（P1·金额单位丢失 → 误报 + 修复建议有害）：原式
-        # `(?:...)\s*[:：]?\s*([\d,\.]+)\s*(?:万元|元|百万|千万)?` 只捕获**数字**、
+        # `(?:...)\s*[:：]?\s*([\d,\.]+)\s*(万元|亿元|百万|千万)?` 只捕获**数字**、
         # 把单位留在非捕获组里统统丢弃。于是「合同价 1200 万元」与「造价 12000000 元」
         # 被抽成 ["1200","12000000"] —— 实为同一金额却判成冲突（误报）；采纳修复
         # 建议后还会把 12000000 替换成 1200，正文金额被改小一万倍。
         # 现把单位一并捕获进第 2 组，判等前由 `rules.normalize_amount_to_yuan`
         # 统一换算到「元」基准（见 `_distinct_values`）。
-        "金额": r"(?:金额|造价|预算|报价|合同价)\s*[:：]?\s*([\d,\.]+)\s*(万元|亿元|百万|千万|万|元)?",
+        #
+        # BUG-FIX 2026-11-04（第 11 轮·漏报·高频标签与间隔词）：
+        #   1. 标签组只有 5 个词，语料探针实测「合同价格 1200万元」「合同总价
+        #      1200万元」「投标总价 1200万元」「中标价 1200万元」全部漏抽 ——
+        #      「总价」是招标文件里出现频率最高的金额标签之一。现补
+        #      `合同价格?`（同时覆盖「合同价」与「合同价格」）、`投标报价`、
+        #      `中标价`、`总价`（后缀式标签「合同总价/投标总价/含税总价」由
+        #      `总价` 尾部匹配自然覆盖）。安全边界不变：仍要求数值后跟单位，
+        #      裸数字（「共 1200 项」）照旧不抽。
+        #   2. 标签与数值之间补 `(?:为|是|约)*` 间隔词 —— 工期分支 2026-10-10、
+        #      人员分支 2026-10-13 都已补齐，金额分支漏了同一处理，导致
+        #      「合同价为 1200万元」「造价约 900万元」整类写法缺席。
+        #   同步：`rules.FACT_KEYWORDS[金额]` 已补齐新标签词（闸门 ≥ 抽取）。
+        "金额": r"(?:金额|造价|预算|报价|合同价格?|投标报价|中标价|总价)\s*[:：]?\s*(?:为|是|约)*\s*([\d,\.]+)\s*(万元|亿元|百万|千万|万|元)?",
         # BUG-FIX 2026-10-04（正则不分岗位 → 结构性误报）：原式
         # `(?:项目经理|技术人员|管理人员|人员)\s*[:：]?\s*(\d+)\s*人` 把**不同岗位**的
         # 人数统统归到同一个事实名「人员数量」。于是正文里一句「项目经理 1 人、
@@ -147,7 +165,15 @@ class ConsistencyAuditor:
         # 全部抽不出 —— 资质等级是关键事实（一冲突即 high），整类事实近乎失效。
         # 现支持 甲/乙/丙级 与 一/二/三/四级，并允许中间隔 总承包/专业/施工/工程
         # 这类资格类型词（可多个连用）。
-        "资质等级": r"(?:资质|级别|等级)\s*[:：]?\s*(?:总承包|专业|施工|工程|承包)*\s*([甲乙丙]+级?|[一二三四]级)",
+        #
+        # BUG-FIX 2026-11-04（第 11 轮·漏报·特级与间隔词）：
+        #   1. 值组补「特级」——「施工总承包特级」是建筑业最高频的最高等级
+        #      表述，原式 `[甲乙丙]+级?|[一二三四]级` 完全不认，语料探针实测
+        #      「企业资质：施工总承包特级」漏抽。特级是一冲突即 high 的关键
+        #      事实取值，缺席等于该档资质矛盾零设防。
+        #   2. 标签与值之间补 `(?:为|是|约)*` 间隔词（与工期/人员/金额分支
+        #      同口径）——「资质等级为一级」此前漏抽。
+        "资质等级": r"(?:资质|级别|等级)\s*[:：]?\s*(?:为|是|约)*\s*(?:总承包|专业|施工|工程|承包)*\s*([甲乙丙]+级?|[一二三四]级|特级)",
         "质量标准": r"(?:质量|标准|等级)\s*[:：]?\s*(合格|优良|优秀)",
         # BUG-FIX 2026-09-29（正则过宽 → 结构性误报）：原式
         # `(?:安全|事故|伤亡)\s*[:：]?\s*([^,\n]+?)(?:\n|$)` 把冒号做成可选、
@@ -221,6 +247,55 @@ class ConsistencyAuditor:
                     )
 
         return facts
+
+    #: 基准值**裸形态**抽取（BUG-FIX 2026-11-04·第 11 轮·P1 双轨制失效）：
+    #: 真实库 `analysis.global_facts_json` 中 schedule/quality/safety 基准值是
+    #: **裸短语**（实测样本「617日历天」「180日历天」「一次性验收合格」），
+    #: 而上方 `FACT_PATTERNS` 要求「标签词在数值前」（正文防误抽的安全设计）。
+    #: 结果：基准摄取（`_collect_fact_instances` 对 raw_value 走
+    #: `extract_facts_from_text`）对这些值**一个都抽不出** —— 已确认事实基准
+    #: 对审计器整体不可见，「正文写错工期也报不出冲突」，2026-09-29 双轨制的
+    #: 核心主张对真实数据形态整条落空（生产只读探针：9 条三类别基准，旧口径
+    #: 可见 0 条；修复后 6 条可见，见第 11 轮报告 §6）。
+    #:
+    #: 本表只收录**取值形态锚定**的两类（无标签也不误抽）：
+    #:   - 工期：数字 + 时间单位（「617日历天」→"617"）；
+    #:   - 质量标准：闭集词（「一次性验收合格」→"合格"）。
+    #: **有意不收录** 安全标准（自由短语）：不同表述的兼容语句（基准「零死亡、
+    #: 零重伤」vs 正文「安全生产目标：杜绝重大伤亡事故」）会被短语级判异打成
+    #: 噪声冲突 —— 恰是 2026-09-29 专项消除过的「安全标准噪声」类，不能借
+    #: 基准摄取绕回来；带标签的安全基准（「安全生产目标：零死亡」）走标准
+    #: 抽取路径本就可见。宁可漏报不误报。
+    BASELINE_BARE_VALUE_PATTERNS: ClassVar[dict[str, str]] = {
+        # 取值段：数字 + 可选「个」+ 时间单位（与 FACT_PATTERNS["工期"] 取值段一致）
+        rules.FACT_DURATION: r"(\d+)\s*(?:个)?\s*(?:日历天|自然日|工作日|天)",
+        # 质量标准取值是闭集
+        rules.FACT_QUALITY: r"(合格|优良|优秀)",
+    }
+
+    def extract_baseline_fact_value(self, text: str, fact_name: str) -> str | None:
+        """从**已确认基准值**中提取可与正文比较的事实取值（裸形态兜底）。
+
+        先走与正文同一套 `extract_facts_from_text`（基准值若自带标签词——
+        手工补录「建设工期：450 日历天」——与正文完全同口径）；抽不出时按
+        `BASELINE_BARE_VALUE_PATTERNS` 的无标签取值段兜底（「617日历天」→
+        "617"，仅限取值形态锚定的工期/质量标准两类，见常量注释）。
+
+        Returns:
+            取值字符串；该事实无可比取值时 None（调用方按「不可见」处理）。
+        """
+        text = str(text or "").strip()
+        if not text:
+            return None
+        for fv in self.extract_facts_from_text(text):
+            if fv.name == fact_name and fv.value:
+                return fv.value
+        bare_pattern = self.BASELINE_BARE_VALUE_PATTERNS.get(fact_name)
+        if bare_pattern:
+            match = re.search(bare_pattern, text)
+            if match:
+                return str(match.group(1)).strip()
+        return None
 
     def _collect_fact_instances(self, project_id: int) -> dict[str, list[dict]]:
         """抽取项目全量事实实例（基准 + 摘要 + 各章节）。
@@ -303,12 +378,24 @@ class ConsistencyAuditor:
                 continue
             # 关键：基准值走**与正文同一套抽取口径**（extract_facts_from_text），
             # 否则“建设工期：450 日历天”这种整句无法与正文抽出的“450”直接比较。
-            for fv in self.extract_facts_from_text(raw_value):
-                if fv.name != fact_name:
-                    continue
+            baseline_values = [
+                fv.value
+                for fv in self.extract_facts_from_text(raw_value)
+                if fv.name == fact_name and fv.value
+            ]
+            # BUG-FIX 2026-11-04（第 11 轮·P1 双轨制失效）：真实库的基准值是
+            # 裸短语（「617日历天」「一次性验收合格」），上面的带标签抽取一个
+            # 都抽不出 → 基准对审计器整体不可见、正文写错工期也报不出冲突。
+            # 现按 `extract_baseline_fact_value` 做无标签取值段兜底（安全面可控：
+            # 基准值已确认、已剔除占位，误抽面远小于正文；正文抽取口径不动）。
+            if not baseline_values:
+                bare = self.extract_baseline_fact_value(raw_value, fact_name)
+                if bare:
+                    baseline_values = [bare]
+            for value in baseline_values:
                 all_facts.setdefault(fact_name, []).append(
                     {
-                        "value": fv.value,
+                        "value": value,
                         "source": "global_facts (已确认事实基准)",
                         "section_id": None,
                     }
@@ -393,6 +480,21 @@ class ConsistencyAuditor:
                 fact_name, values, section_count=section_count
             )
 
+            # G-1(2026-11-02)：判定依据。由 assess_severity 的同一入参派生
+            # （rules.severity_rationale 与 assess_severity 共用单一实现体，
+            # 不构成第二套判定标准），不改任何判定逻辑。
+            evidence = rules.severity_rationale(
+                fact_name, distinct_values, section_count=section_count
+            )
+            evidence["instance_count"] = len(instances)
+            evidence["section_ids"] = sorted(
+                {
+                    inst["section_id"]
+                    for inst in instances
+                    if inst.get("section_id") is not None
+                }
+            )
+
             conflict = Conflict(
                 # BUG-FIX 2026-09-18（高）：原 conflict_id 为
                 # `f"conflict_{fact_name}_{%Y%m%d%H%M%S}"` —— ①不含 project_id，
@@ -409,6 +511,7 @@ class ConsistencyAuditor:
                 sources=[inst["source"] for inst in instances],
                 severity=severity,
                 description=self._describe_conflict(fact_name, values),
+                evidence=evidence,
             )
             conflicts.append(conflict)
 
@@ -538,11 +641,15 @@ class ConsistencyAuditor:
             # 口径不对称（AI 路径只清 `AI-%`，确定性路径却清全部）导致用户
             # 点一次「开始审计」，生成时的 AI 发现就全部消失。现与 AI 路径
             # 对齐：**各清各的**，`AI-%` 行由下一轮生成时审计自行轮换。
+            # TD-1 / LIKE 单一事实来源（2026-11-02）：谓词与 AI 前缀模式统一引用
+            # `rules.RESOLVED_SQL_*` / `rules.AI_CONFLICT_ID_LIKE`，不再在本模块
+            # 各条 SQL 里手写 `COALESCE(resolved, 0)` 与 `'AI-%'`（前缀一旦调整，
+            # 硬编码会静默失配 → AI 发现被当成规则冲突清理/折叠/复用）。
             conn.execute(
                 "DELETE FROM consistency_conflicts "
-                "WHERE project_id = ? AND COALESCE(resolved, 0) = 0 "
-                "AND conflict_id NOT LIKE 'AI-%'",
-                (project_id,),
+                "WHERE project_id = ? AND " + rules.RESOLVED_SQL_OPEN + " "
+                "AND conflict_id NOT LIKE ?",
+                (project_id, rules.AI_CONFLICT_ID_LIKE),
             )
 
             # 2) 已解决历史折叠：每个 fact_name 只保留最新一行（避免历史无限累加）
@@ -558,26 +665,26 @@ class ConsistencyAuditor:
                                                id DESC
                                   ) AS rn
                            FROM consistency_conflicts
-                           WHERE project_id = ? AND COALESCE(resolved, 0) = 1
-                                 AND conflict_id NOT LIKE 'AI-%'
+                           WHERE project_id = ? AND """ + rules.RESOLVED_SQL_RESOLVED + """
+                                 AND conflict_id NOT LIKE ?
                        ) WHERE rn = 1""",
-                    (project_id,),
+                    (project_id, rules.AI_CONFLICT_ID_LIKE),
                 ).fetchall()
             ]
             if keep_ids:
                 placeholders = ",".join("?" for _ in keep_ids)
                 conn.execute(
                     "DELETE FROM consistency_conflicts "
-                    "WHERE project_id = ? AND COALESCE(resolved, 0) = 1 "
+                    "WHERE project_id = ? AND " + rules.RESOLVED_SQL_RESOLVED + " "
                     f"AND conflict_id NOT IN ({placeholders})",
                     (project_id, *keep_ids),
                 )
             else:
                 conn.execute(
                     "DELETE FROM consistency_conflicts "
-                    "WHERE project_id = ? AND COALESCE(resolved, 0) = 1 "
-                    "AND conflict_id NOT LIKE 'AI-%'",
-                    (project_id,),
+                    "WHERE project_id = ? AND " + rules.RESOLVED_SQL_RESOLVED + " "
+                    "AND conflict_id NOT LIKE ?",
+                    (project_id, rules.AI_CONFLICT_ID_LIKE),
                 )
             # {fact_name: 实际落库的 conflict_id} —— 复用行时与生成 ID 不同，
             # 由调用方回写进 Conflict 对象（见 `detect_conflicts` 的说明）。
@@ -597,15 +704,17 @@ class ConsistencyAuditor:
                 # `AI-%` 可从根本上杜绝「AI 已解决历史被确定性冲突重新打开」。
                 reused = conn.execute(
                     "SELECT conflict_id FROM consistency_conflicts "
-                    "WHERE project_id = ? AND fact_name = ? AND COALESCE(resolved, 0) = 1 "
-                    "AND conflict_id NOT LIKE 'AI-%' LIMIT 1",
-                    (project_id, conflict.fact_name),
+                    "WHERE project_id = ? AND fact_name = ? AND "
+                    + rules.RESOLVED_SQL_RESOLVED + " "
+                    "AND conflict_id NOT LIKE ? LIMIT 1",
+                    (project_id, conflict.fact_name, rules.AI_CONFLICT_ID_LIKE),
                 ).fetchone()
                 if reused is not None:
                     conn.execute(
                         """UPDATE consistency_conflicts
                            SET values_json = ?, sources_json = ?, severity = ?,
-                               description = ?, resolved = 0, resolved_value = NULL,
+                               description = ?, evidence_json = ?,
+                               resolved = 0, resolved_value = NULL,
                                resolved_at = NULL, created_at = ?
                            WHERE conflict_id = ? AND project_id = ?""",
                         (
@@ -613,6 +722,9 @@ class ConsistencyAuditor:
                             sources_json,
                             severity,
                             conflict.description,
+                            # L5(2026-11-03)：复用行同样覆写最新依据（审计重跑
+                            # 后依据可能与历史不同步，一律以本次为准）。
+                            self._json_serialize(conflict.evidence) if conflict.evidence is not None else None,
                             now_str,
                             reused["conflict_id"],
                             project_id,
@@ -624,8 +736,8 @@ class ConsistencyAuditor:
                 conn.execute(
                     """INSERT INTO consistency_conflicts
                        (project_id, conflict_id, fact_name, values_json,
-                        sources_json, severity, description, created_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                        sources_json, severity, description, evidence_json, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         project_id,
                         conflict.conflict_id,
@@ -634,6 +746,8 @@ class ConsistencyAuditor:
                         sources_json,
                         severity,
                         conflict.description,
+                        # L5(2026-11-03)：G-1 判定依据随行落库（None → NULL）。
+                        self._json_serialize(conflict.evidence) if conflict.evidence is not None else None,
                         now_str,
                     ),
                 )
@@ -836,8 +950,12 @@ class ConsistencyAuditor:
             dry_run: 只预览要改什么，不写库、不改冲突状态
 
         Returns:
-            修复报告，含 `success` / `changed_sections` / `total_replacements` /
-            `sections`（逐章节命中数）/ `skipped`（跳过原因）/ `message`。
+            修复报告，含 `success` / `changed_sections`（实际落库章节数）/
+            `written_sections`（与 `changed_sections` 同值，2026-11-02 起为显式的
+            "真实写库数"字段，`dry_run` 下恒为 0）/ `total_replacements` /
+            `sections`（逐章节命中数）/ `skipped`（跳过原因）/
+            `scope_missing_section_ids`（限定范围下本项目查不到的来源章节）/ `message`。
+            `dry_run` 时 `changed_sections` 表示"将要修改的章节数"。
         """
         report: dict = {
             "success": False,
@@ -847,9 +965,11 @@ class ConsistencyAuditor:
             "replaced_values": [],
             "sections": [],
             "changed_sections": 0,
+            "written_sections": 0,
             "total_replacements": 0,
             "skipped": [],
             "filtered": [],
+            "scope_missing_section_ids": [],
             "message": "",
         }
 
@@ -904,14 +1024,31 @@ class ConsistencyAuditor:
                 )
                 if scope_limited:
                     placeholders = ",".join("?" for _ in source_section_ids)
+                    # BUG-FIX 2026-11-02（F-1·P1 跨项目假成功）：此前限定范围分支的
+                    # SELECT **缺 `project_id = ?` 过滤**，只按 `id IN (...)` 取行。
+                    # 而 `sources_json` 里的 `section_<id>` 可能已经不属于本项目
+                    # （陈旧来源、外部/脚本写入、将来出现跨项目迁移）。因为下面的
+                    # UPDATE 带了 `AND project_id = ?`，跨项目章节会被 UPDATE 静默
+                    # 命中 0 行 —— 于是正文一个字没改，`changed_sections` 却按
+                    # SELECT 条数回「已修改 N 个章节」，冲突随即被标为已解决：
+                    # 问题被**隐藏**而不是解决（与 2026-09-14 修的"只标解决不落文"
+                    # 同一类事故，只是触发面更窄）。
+                    # 现与全文分支（见下方 `WHERE project_id = ?`）同口径补上项目过滤。
                     sections = conn.execute(
                         "SELECT id, title, content FROM sections "
-                        "WHERE id IN (" + placeholders + ") "
+                        "WHERE project_id = ? AND id IN (" + placeholders + ") "
                         "AND content IS NOT NULL AND content != '' "
                         "ORDER BY sort_order, id",
-                        (*source_section_ids,),
+                        (project_id, *source_section_ids),
                     ).fetchall()
                     report["scoped_section_ids"] = source_section_ids
+                    # ENHANCE 2026-11-02（F-1·可解释性）：把「来源声明了但本项目查不到」
+                    # 的章节 ID 显式记入报告（含正文为空的），便于排查"修复只改了一半"
+                    # 究竟是被项目过滤掉了还是本来就没内容。纯新增字段，不影响判定。
+                    _found_ids = {int(s["id"]) for s in sections}
+                    report["scope_missing_section_ids"] = [
+                        sid for sid in source_section_ids if sid not in _found_ids
+                    ]
                 else:
                     sections = conn.execute(
                         "SELECT id, title, content FROM sections "
@@ -1014,25 +1151,57 @@ class ConsistencyAuditor:
                     return report
 
                 now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                for section_id, _title, new_content in planned:
-                    conn.execute(
+                # BUG-FIX 2026-11-02（F-1·P1 落文不校验 rowcount → 假成功）：
+                # 此前 `UPDATE sections` 执行后从不取 `cursor.rowcount`，直接按
+                # `planned` 条数宣布"已修改 N 个章节"、失效缓存、并把冲突标成
+                # `resolved=1`。一旦计划里的章节在 SELECT 与 UPDATE 之间被删除、
+                # 或（配合上面补的项目过滤）因任何原因未被本条 UPDATE 命中，
+                # 正文没改，冲突却被关闭 —— 用户看到"修复成功"，问题被隐藏。
+                # 现逐条取 rowcount 累计真实落库数，只有 `written == len(planned)`
+                # 才允许标已解决；否则把差额记入 `skipped`、冲突保持未解决、
+                # 缓存只对实际写入的章节失效。
+                applied_ids: list[int] = []
+                for section_id, title, new_content in planned:
+                    cur = conn.execute(
                         "UPDATE sections SET content = ?, updated_at = ? "
                         "WHERE id = ? AND project_id = ?",
                         (new_content, now, section_id, project_id),
+                    )
+                    if cur.rowcount:
+                        applied_ids.append(section_id)
+                    else:
+                        report["skipped"].append({
+                            "section_id": section_id,
+                            "title": title,
+                            "reason": "章节不属于本项目或已被删除，UPDATE 未命中任何行",
+                        })
+                report["written_sections"] = len(applied_ids)
+                report["changed_sections"] = len(applied_ids)
+                # 有章节没落库时，逐章节明细与替换处数同步剔除未写入项，
+                # 保证 `sections` / `total_replacements` / `changed_sections`
+                # 三者口径一致（都只算真正写进正文的部分）。
+                if len(applied_ids) != len(planned):
+                    _written = set(applied_ids)
+                    report["sections"] = [
+                        s for s in report["sections"] if s["section_id"] in _written
+                    ]
+                    report["total_replacements"] = sum(
+                        int(s.get("replacements") or 0) for s in report["sections"]
                     )
 
                 # BUG-FIX 2026-09-18（P1）：裸 SQL 直写正文后必须失效三层缓存
                 # （内存 1h / Redis 30min / build_tree 60s），否则“重新生成”会
                 # 命中修复前的旧正文缓存并回写覆盖，修复成果静默丢失。
+                # BUG-FIX 2026-11-02（F-1）：只失效**实际写入**的章节，
+                # 不再拿 `planned` 全量打靶（避免把缓存失效扩散到未改动的项目外章节）。
                 from .sections import invalidate_content_caches
-                invalidate_content_caches(
-                    project_id, [sid for sid, _t, _c in planned]
-                )
+                if applied_ids:
+                    invalidate_content_caches(project_id, applied_ids)
 
                 # 只有确实落文成功、且没有章节被跳过，才把冲突标为已解决
                 if report["skipped"]:
                     report["message"] = (
-                        f"已修改 {len(planned)} 个章节、共 {report['total_replacements']} 处；"
+                        f"已修改 {len(applied_ids)} 个章节、共 {report['total_replacements']} 处；"
                         f"另有 {len(report['skipped'])} 个章节未能安全替换，"
                         "冲突保持未解决，请人工处理"
                     )
@@ -1046,7 +1215,7 @@ class ConsistencyAuditor:
                 )
                 report["success"] = True
                 report["message"] = (
-                    f"已修改 {len(planned)} 个章节、共 {report['total_replacements']} 处，"
+                    f"已修改 {len(applied_ids)} 个章节、共 {report['total_replacements']} 处，"
                     f"统一为：{new_value}"
                 )
                 if report["filtered"]:
@@ -1057,7 +1226,7 @@ class ConsistencyAuditor:
                 logger.info(
                     "一致性修复落文成功: conflict=%s, 章节=%d, 替换=%d",
                     conflict_id,
-                    len(planned),
+                    len(applied_ids),
                     report["total_replacements"],
                 )
                 return report
@@ -1117,7 +1286,12 @@ class ConsistencyAuditor:
             # **不能带 0 值冒充「审计了 0 章节 0 事实」**。调用方（路由层）此前
             # 无条件回 `status='ok'`，前端弹「审计完成，发现 0 处冲突」——
             # 实际是审计在第一步就崩了。现回 failed，路由层据此回 500。
-            return AuditResult(
+            # BUG-FIX 2026-11-04（B-13-2 · 审计失败不留痕）：失败分支此前只
+            # 返回 failed 结果、不写 consistency_audit_log，导致前端「最近审计」
+            # 仍显示上一次成功记录，用户无法判断本次到底是「无冲突」还是「崩了」。
+            # 失败态同样落一行日志（status='failed'），日志写入自身失败只记 error，
+            # 不覆盖原始失败结果。
+            failed = AuditResult(
                 project_id=project_id,
                 total_sections=0,
                 facts_extracted=0,
@@ -1125,6 +1299,11 @@ class ConsistencyAuditor:
                 audit_time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 status=rules.AUDIT_STATUS_FAILED,
             )
+            try:
+                self._save_audit_log(project_id, failed)
+            except Exception as log_err:  # noqa: BLE001
+                logger.error("审计失败态日志写入失败: %s", log_err)
+            return failed
 
     def _save_audit_log(self, project_id: int, result: AuditResult):
         """保存审计日志"""

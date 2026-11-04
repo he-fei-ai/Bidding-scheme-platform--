@@ -29,6 +29,37 @@ router = APIRouter(
     dependencies=[Depends(get_current_user)],
 )
 
+# BUG-FIX-PROMPT-E10（2026-11-03）：原行内硬编码副本收编进提示词注册表
+# （TEMPLATE_EXTRACT_SYSTEM，见 _integrate.py），本常量与其逐字一致，
+# 注册表/DB 不可用时回退（行为零变化）。
+_TEMPLATE_EXTRACT_SYSTEM_FB = """# 已有方案目录结构提取
+
+## 角色
+你是标书结构分析专家，从历史标书文本中提取目录结构。
+
+## 任务
+提取文档中的完整目录结构，输出为三级嵌套 JSON 格式。
+
+## 规则
+1. 识别文档中的标题层级（如"第一节"、"一、"、"1、"、"1.1"等）
+2. 一级标题对应 level=1（如"第一节 项目概述"）
+3. 二级标题对应 level=2（如"一、项目概况"）
+4. 三级标题对应 level=3（如"1、项目概况"）
+5. 三级以下合并到三级内容中
+6. 只提取有实际内容的标题，跳过目录页、封面、签字页
+7. 每个节点包含 title、level、children（三级为空数组）
+
+## 输出格式
+```json
+[{"title":"项目概述","level":1,"children":[{"title":"项目概况","level":2,"children":[{"title":"工程名称","level":3,"children":[]}]}]}]
+```
+
+直接输出 JSON 数组，严禁附加解释。"""
+
+# E10 遗留加固：user 前缀模板（原行内 f-string 正本），与 TEMPLATE_EXTRACT_USER
+# 注册文本逐字一致，注册表/DB 不可用时回退（行为零变化）。
+_TEMPLATE_EXTRACT_USER_FB = '请从以下标书文本中提取目录结构：\n\n{truncated}'
+
 @router.post('/upload')
 async def upload_template(project_id: int, file: UploadFile=File(...)):
     """上传历史标书文件作为模板"""
@@ -79,9 +110,27 @@ async def extract_template_outline(project_id: int, template_id: int):
         provider = create_provider(ai_config)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f'AI 配置异常: {e}') from e
-    extract_sys = '# 已有方案目录结构提取\n\n## 角色\n你是标书结构分析专家，从历史标书文本中提取目录结构。\n\n## 任务\n提取文档中的完整目录结构，输出为三级嵌套 JSON 格式。\n\n## 规则\n1. 识别文档中的标题层级（如"第一节"、"一、"、"1、"、"1.1"等）\n2. 一级标题对应 level=1（如"第一节 项目概述"）\n3. 二级标题对应 level=2（如"一、项目概况"）\n4. 三级标题对应 level=3（如"1、项目概况"）\n5. 三级以下合并到三级内容中\n6. 只提取有实际内容的标题，跳过目录页、封面、签字页\n7. 每个节点包含 title、level、children（三级为空数组）\n\n## 输出格式\n```json\n[{"title":"项目概述","level":1,"children":[{"title":"项目概况","level":2,"children":[{"title":"工程名称","level":3,"children":[]}]}]}]\n```\n\n直接输出 JSON 数组，严禁附加解释。'
+    # BUG-FIX-PROMPT-E10（2026-11-03）：system 与 user 前缀均注册化（DB 可覆盖），
+    # 回退常量与 _integrate.py 注册文本逐字一致，行为零变化。
+    try:
+        from ..services.ai.prompts import get_prompt, render_prompt
+    except Exception:
+        get_prompt = None
+        render_prompt = None
+    extract_sys = None
+    extract_user_tpl = None
+    if get_prompt is not None:
+        extract_sys = get_prompt("TEMPLATE_EXTRACT_SYSTEM")
+        extract_user_tpl = get_prompt("TEMPLATE_EXTRACT_USER")
+    if extract_sys is None:
+        extract_sys = _TEMPLATE_EXTRACT_SYSTEM_FB
     truncated = text[:30000]
-    extract_user = f'请从以下标书文本中提取目录结构：\n\n{truncated}'
+    if extract_user_tpl is None:
+        extract_user_tpl = _TEMPLATE_EXTRACT_USER_FB
+    if render_prompt is not None:
+        extract_user = render_prompt(extract_user_tpl, truncated=truncated)
+    else:
+        extract_user = _TEMPLATE_EXTRACT_USER_FB.replace("{truncated}", truncated)
     try:
         # R-2 2026-10-12：改走统一 runner（provider 由上方 try 预构造后传入，
         # 保留「AI 配置异常 → 500」的原始语义，与 facts.py 口径一致）。

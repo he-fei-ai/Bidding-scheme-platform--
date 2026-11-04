@@ -284,6 +284,62 @@ def _normalize_facts(items: list, fallback_text: str = "", policy: str = _DEFAUL
 _extract_schedule_value = extract_schedule_value
 
 
+# ========== 事实链路提示词 fallback（BUG-FIX-PROMPT-E10，2026-11-03） ==========
+# 以下文本与 _integrate_batch3.py 对应 key 的注册文本逐字一致；注册表可用时
+# 以 get_prompt() 结果为准（DB 可覆盖），不可用时回退本常量（原硬编码文本）。
+
+_FACTS_KB_SUPPLEMENT_SYS_FB = (
+    "你是招投标方案全局事实变量补充助手。请从参考知识库素材中提取"
+    "『技术方案正文需要统一采用』的确定性事实（人员、工期、设备型号、"
+    "质保期、响应时间、服务承诺、技术参数等）。"
+    "只提取素材中有明确依据的事实；素材未提到的严禁编造；"
+    "只返回 JSON 对象（dict），key 用英文驼峰，value 为字符串。"
+)
+_FACTS_KB_SUPPLEMENT_USER_FB = """以下是参考知识库素材（历史项目文档/企业级规范，仅作事实补源）：
+
+{kb_material}
+
+请从上述知识库素材中补充提取全局事实变量：
+1. 只提取素材中有明确依据的确定性事实；
+2. 与招标文件/Step02 解析结果冲突时，不要覆盖已确认的值（基线以招标为准）；
+3. 素材没有明确值时严禁编造；没有可补充内容时返回空 JSON 对象 {}；
+4. 输出 JSON 对象（dict），严禁附加解释。"""
+_FACTS_TPL_SUPPLEMENT_SYS_FB = (
+    "你是招投标方案全局事实变量补充助手。请从『既有方案/历史标书模板』"
+    "素材中提取『技术方案正文需要统一采用』的确定性事实（人员、工期、"
+    "设备型号、质保期、响应时间、服务承诺、技术参数、统一配置口径等）。"
+    "既有方案中已经落地的安排、既有承诺、统一配置优先沉淀为事实；"
+    "只提取素材中有明确依据的事实；素材未提到的严禁编造；"
+    "只返回 JSON 对象（dict），key 用英文驼峰，value 为字符串。"
+)
+_FACTS_TPL_SUPPLEMENT_USER_FB = """以下是项目已上传的既有方案/模板素材（仅作事实补源）：
+
+{tpl_material}
+
+请从上述既有方案素材中补充提取全局事实变量：
+1. 只提取素材中有明确依据的确定性事实；原方案已写成的实际安排、既有承诺优先；
+2. 与招标文件/Step02 解析结果冲突时，不要覆盖已确认的值（基线以招标为准）；
+3. 素材没有明确值时严禁编造；没有可补充内容时返回空 JSON 对象 {}；
+4. 输出 JSON 对象（dict），严禁附加解释。"""
+_FACTS_AUDIT_SYS_FB = """# 事实一致性审计
+
+## 角色
+你是标书内容审计专家，检查正文内容是否与事实变量一致。
+
+## 审计规则
+逐条检查事实变量在正文中是否出现矛盾或不一致的情况：
+1. 如果事实变量在正文中有对应描述且一致 → 标记为 `consistent`
+2. 如果事实变量在正文中有对应描述但矛盾 → 标记为 `inconsistent`，并说明矛盾处
+3. 如果事实变量在正文中没有对应描述 → 标记为 `missing`
+
+## 输出格式
+```json
+[{"fact_key":"...","fact_label":"...","fact_value":"...","status":"consistent|inconsistent|missing","detail":"..."}]
+```
+
+直接输出 JSON 数组。"""
+
+
 _coerce_fact_audit_list = coerce_audit_list
 """审计结果包装解包（正本在 facts_service）。原 BUG-FIX 2026-09-18（中）：
 模型常用 {"items":[...]} 包装，只接受裸 list 会整体丢弃→前端把「0 条问题」
@@ -919,22 +975,22 @@ async def generate_facts(project_id: int, body: FactsGenerateRequest | None = No
 
             _kb_material = _render_kb_material(_kb_items)
             if _kb_material:
-                _kb_sys = (
-                    "你是招投标方案全局事实变量补充助手。请从参考知识库素材中提取"
-                    "『技术方案正文需要统一采用』的确定性事实（人员、工期、设备型号、"
-                    "质保期、响应时间、服务承诺、技术参数等）。"
-                    "只提取素材中有明确依据的事实；素材未提到的严禁编造；"
-                    "只返回 JSON 对象（dict），key 用英文驼峰，value 为字符串。"
-                )
-                _kb_user = f"""以下是参考知识库素材（历史项目文档/企业级规范，仅作事实补源）：
-
-{_kb_material}
-
-请从上述知识库素材中补充提取全局事实变量：
-1. 只提取素材中有明确依据的确定性事实；
-2. 与招标文件/Step02 解析结果冲突时，不要覆盖已确认的值（基线以招标为准）；
-3. 素材没有明确值时严禁编造；没有可补充内容时返回空 JSON 对象 {{}}；
-4. 输出 JSON 对象（dict），严禁附加解释。"""
+                # BUG-FIX-PROMPT-E10（2026-11-03）：收编进提示词注册表（DB 可覆盖）。
+                # 回退常量与 _integrate_batch3.py 注册文本逐字一致，行为零变化。
+                try:
+                    from ..services.ai.prompts import get_prompt, render_prompt
+                    _kb_sys = get_prompt("FACTS_KB_SUPPLEMENT_SYSTEM")
+                    if _kb_sys is None:
+                        _kb_sys = _FACTS_KB_SUPPLEMENT_SYS_FB
+                    _kb_tpl = get_prompt("FACTS_KB_SUPPLEMENT_USER")
+                    if _kb_tpl is None:
+                        _kb_tpl = _FACTS_KB_SUPPLEMENT_USER_FB
+                    _kb_user = render_prompt(_kb_tpl, kb_material=_kb_material)
+                except Exception:
+                    _kb_sys = _FACTS_KB_SUPPLEMENT_SYS_FB
+                    _kb_user = _FACTS_KB_SUPPLEMENT_USER_FB.replace(
+                        "{kb_material}", _kb_material
+                    )
                 _kb_result, _ = await run_json_extraction(
                     [
                         AIMessage(role="system", content=_kb_sys),
@@ -1034,23 +1090,22 @@ async def generate_facts(project_id: int, body: FactsGenerateRequest | None = No
 
             _tpl_material = _render_template_material(_tpl_rows)
             if _tpl_material:
-                _tpl_sys = (
-                    "你是招投标方案全局事实变量补充助手。请从『既有方案/历史标书模板』"
-                    "素材中提取『技术方案正文需要统一采用』的确定性事实（人员、工期、"
-                    "设备型号、质保期、响应时间、服务承诺、技术参数、统一配置口径等）。"
-                    "既有方案中已经落地的安排、既有承诺、统一配置优先沉淀为事实；"
-                    "只提取素材中有明确依据的事实；素材未提到的严禁编造；"
-                    "只返回 JSON 对象（dict），key 用英文驼峰，value 为字符串。"
-                )
-                _tpl_user = f"""以下是项目已上传的既有方案/模板素材（仅作事实补源）：
-
-{_tpl_material}
-
-请从上述既有方案素材中补充提取全局事实变量：
-1. 只提取素材中有明确依据的确定性事实；原方案已写成的实际安排、既有承诺优先；
-2. 与招标文件/Step02 解析结果冲突时，不要覆盖已确认的值（基线以招标为准）；
-3. 素材没有明确值时严禁编造；没有可补充内容时返回空 JSON 对象 {{}}；
-4. 输出 JSON 对象（dict），严禁附加解释。"""
+                # BUG-FIX-PROMPT-E10（2026-11-03）：收编进提示词注册表（DB 可覆盖）。
+                # 回退常量与 _integrate_batch3.py 注册文本逐字一致，行为零变化。
+                try:
+                    from ..services.ai.prompts import get_prompt, render_prompt
+                    _tpl_sys = get_prompt("FACTS_TPL_SUPPLEMENT_SYSTEM")
+                    if _tpl_sys is None:
+                        _tpl_sys = _FACTS_TPL_SUPPLEMENT_SYS_FB
+                    _tpl_tpl = get_prompt("FACTS_TPL_SUPPLEMENT_USER")
+                    if _tpl_tpl is None:
+                        _tpl_tpl = _FACTS_TPL_SUPPLEMENT_USER_FB
+                    _tpl_user = render_prompt(_tpl_tpl, tpl_material=_tpl_material)
+                except Exception:
+                    _tpl_sys = _FACTS_TPL_SUPPLEMENT_SYS_FB
+                    _tpl_user = _FACTS_TPL_SUPPLEMENT_USER_FB.replace(
+                        "{tpl_material}", _tpl_material
+                    )
                 _tpl_result, _ = await run_json_extraction(
                     [
                         AIMessage(role="system", content=_tpl_sys),
@@ -1292,23 +1347,15 @@ async def audit_facts_consistency(project_id: int, current_user: Annotated[Any, 
     ai_config = get_ai_config()
     provider = create_provider(ai_config)
 
-    audit_sys = """# 事实一致性审计
-
-## 角色
-你是标书内容审计专家，检查正文内容是否与事实变量一致。
-
-## 审计规则
-逐条检查事实变量在正文中是否出现矛盾或不一致的情况：
-1. 如果事实变量在正文中有对应描述且一致 → 标记为 `consistent`
-2. 如果事实变量在正文中有对应描述但矛盾 → 标记为 `inconsistent`，并说明矛盾处
-3. 如果事实变量在正文中没有对应描述 → 标记为 `missing`
-
-## 输出格式
-```json
-[{"fact_key":"...","fact_label":"...","fact_value":"...","status":"consistent|inconsistent|missing","detail":"..."}]
-```
-
-直接输出 JSON 数组。"""
+    # BUG-FIX-PROMPT-E10（2026-11-03）：收编进提示词注册表（DB 可覆盖）。
+    # 回退常量 _FACTS_AUDIT_SYS_FB 与 _integrate_batch3.py 注册文本逐字一致。
+    try:
+        from ..services.ai.prompts import get_prompt
+        audit_sys = get_prompt("FACTS_AUDIT_SYSTEM")
+    except Exception:
+        audit_sys = None
+    if audit_sys is None:
+        audit_sys = _FACTS_AUDIT_SYS_FB
 
     _sem = asyncio.Semaphore(max(1, AUDIT_GROUP_CONCURRENCY))
 

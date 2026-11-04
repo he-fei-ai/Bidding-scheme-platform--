@@ -364,9 +364,20 @@ def test_force_parse_task_failed_has_no_processing_filter():
 
     注意：只检查 SQL 字面量本身，不检查函数源码整体 —— docstring 里会解释性地
     引用 `status = 'processing'` 这个过滤条件，直接子串匹配会误报。
+
+    2026-11-02（B4）：WHERE 由「project_id 固定 + 动态精确键」拼装，SQL 模板本身
+    不再内联 `filename = ?`。断言随之更新：SQL 仍无 processing 过滤、写 failed，
+    精确性改由源码动态 WHERE 的 `id = ?` / `file_id = ?` / `filename = ?` 分支保证。
     """
+    src = _func_src("_force_parse_task_failed")
     sql = _func_sql("_force_parse_task_failed")
     assert "status = 'processing'" not in sql, "加了 processing 过滤就无法覆盖已写终态"
     assert "status = 'failed'" in sql, "必须写入 failed 终态"
-    assert "filename = ?" in sql, "必须按 filename 精确过滤，避免串写同项目其它文件"
+    # 精确命中：动态 WHERE 必须提供 task_id / file_id / filename 三种精确键之一，
+    # 根除旧实现按单一 filename 匹配时同名多行交叉串写的缺陷。
+    assert 'where = "project_id = ?"' in src, "WHERE 必须以 project_id 起始再叠精确键"
+    assert "AND id = ?" in src, "必须支持 task_id 精确命中"
+    assert "AND file_id = ?" in src, "必须支持 file_id 精确命中"
+    assert "AND filename = ?" in src, "缺省回退仍需按 filename 精确过滤"
+
 

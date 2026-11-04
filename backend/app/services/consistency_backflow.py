@@ -64,10 +64,20 @@ _PROPOSAL_KEY_PREFIX = "audit_"
 
 
 def _open_conflicts(conn, project_id: int) -> list[dict]:
+    # TD-1（2026-11-02·口径统一）：`resolved` 列可空（`db.py`
+    # `resolved INTEGER DEFAULT 0`），裸写 `resolved = 0` 在 SQL 三值逻辑下会
+    # 把 `NULL` 行判为 false —— 于是同一条冲突在冲突列表（`COALESCE`）里看得见，
+    # 却对事实回流隐形。现统一引用 `rules.RESOLVED_SQL_OPEN` 单一事实来源。
+    #
+    # 同批补上 AI 语义发现的排除：`AI-` 前缀行的 `values_json` 恒为 `'[]'`，
+    # 调用方 `build_fact_proposals` 里 `if not conflict["values"]: continue`
+    # 本就会跳过（行为逐字不变），此处提前在 SQL 层滤掉，少取一批无用的行、
+    # 也让"回流只服务于有结构化取值的规则冲突"这层意图显式化。
     rows = conn.execute(
         "SELECT conflict_id, fact_name, values_json FROM consistency_conflicts "
-        "WHERE project_id = ? AND resolved = 0 ORDER BY id",
-        (project_id,),
+        "WHERE project_id = ? AND " + rules.RESOLVED_SQL_OPEN + " "
+        "AND conflict_id NOT LIKE ? ORDER BY id",
+        (project_id, rules.AI_CONFLICT_ID_LIKE),
     ).fetchall()
     out = []
     for row in rows:
@@ -85,9 +95,19 @@ def _open_conflicts(conn, project_id: int) -> list[dict]:
     return out
 
 
-def _existing_fact_markers(project_id: int) -> set:
-    """既有事实的 label + 归一化 value 集合，用于候选去重。"""
+def _existing_fact_markers(project_id: int) -> tuple[set, list[dict]]:
+    """既有事实的 label + 归一化 value 集合（与事实项列表本身），用于候选去重。
+
+    BUG-FIX 2026-11-04（第 11 轮·B-1）：此前只返回 markers 集合，`propose_facts`
+    的去重（以及采纳门 `_find_baseline_conflict` 的等价判定）只能按**原文归一**
+    比较 —— 而审计器对基准值的实际比对口径是「先过同一套正则抽取、再归一」
+    （`_collect_fact_instances` 里 `extract_facts_from_text(raw_value)`），两套
+    口径对「基准 450日历天 vs 正文/候选 450」给出**相反**结论：审计器视为同值
+    （都抽出 450），回流链路却按原文归一判异（"450|天" ≠ "450|"）。现把事实
+    项列表一并返回，供两处共用抽取感知判等（见 `_value_equivalent`）。
+    """
     markers: set = set()
+    items: list[dict] = []
     # PERF（2026-10-17）：纯读改 readonly 连接，不再在 to_thread 里抢全局写锁
     # （与 `consistency_auditor._collect_fact_instances` 2026-10-08 的修复同源）。
     # 本函数与 `propose_facts` 都在事实回流 Tab 的「重新扫描」热路径上，用写连接
@@ -104,16 +124,47 @@ def _existing_fact_markers(project_id: int) -> set:
             "SELECT global_facts_json FROM analysis WHERE project_id = ?", (project_id,)
         ).fetchone()
         if row is None:
-            return markers
+            return markers, items
         facts_json = row["global_facts_json"]
-    for item in parse_stored_items(facts_json):
+    items = parse_stored_items(facts_json)
+    for item in items:
         label = str(item.get("label") or item.get("key") or "").strip()
         if label:
             markers.add(label)
         value = normalize_fact_value(item.get("value"))
         if value:
             markers.add(f"v:{value}")
-    return markers
+    return markers, items
+
+
+def _value_equivalent(candidate_value: str, existing_value: str, fact_name: str) -> bool:
+    """候选值与既有事实值是否**在审计器口径下等价**（B-1，2026-11-04）。
+
+    审计器（`_collect_fact_instances`）对基准值先做「带标签抽取 → 裸值兜底」
+    （`extract_baseline_fact_value`），再与正文抽取值按「金额换算 / 通用归一」
+    判等。回流链路此前跳过这两步、直接对原文做归一比较，于是「基准 450日历天
+    vs 候选 450」被误判为冲突 —— 采纳门给出「与既有事实取值不同，请先确定
+    唯一取值」的误导性拒绝（docstring 声称的「450 与 450 日历天 视为同值不拦」
+    与实现相反，探针钉于 `tests/test_consistency_backflow_round11_2026_11_04.py`）。
+
+    对齐口径：两侧都走审计器同款 `extract_baseline_fact_value`（带标签优先、
+    裸值兜底，双向对称）；任一侧抽不出可比取值时该侧回退原文参与归一比较
+    （保守：不放宽旧拦截面，只修正审计器明确视为同值的误拦）。
+    """
+    candidate_text = str(candidate_value or "").strip()
+    existing_text = str(existing_value or "").strip()
+    if not candidate_text or not existing_text:
+        return False
+    if candidate_text == existing_text:
+        return True
+    auditor = ConsistencyAuditor()
+    candidate_pool_value = auditor.extract_baseline_fact_value(candidate_text, fact_name)
+    existing_pool_value = auditor.extract_baseline_fact_value(existing_text, fact_name)
+    distinct = ConsistencyAuditor._distinct_values(
+        [candidate_pool_value or candidate_text, existing_pool_value or existing_text],
+        fact_name=fact_name,
+    )
+    return len(distinct) <= 1
 
 
 def propose_facts(project_id: int, min_occurrences: int = 3) -> dict:
@@ -137,7 +188,7 @@ def propose_facts(project_id: int, min_occurrences: int = 3) -> dict:
     with get_db(readonly=True) as conn:
         content_by_id = _load_all_project_content(conn, project_id)
         conflicts = _open_conflicts(conn, project_id)
-    existing = _existing_fact_markers(project_id)
+    existing, existing_items = _existing_fact_markers(project_id)
 
     proposals: list[dict] = []
     seen: set = set()
@@ -164,6 +215,25 @@ def propose_facts(project_id: int, min_occurrences: int = 3) -> dict:
         # 冲突里占多数的取值 = 候选值
         winner = max(tally, key=lambda v: (tally[v], len(v)))
         if winner in existing or f"v:{normalize_fact_value(winner)}" in existing:
+            continue
+        # B-1（2026-11-04）：与既有基准事实**审计口径等价**的候选不再提出 ——
+        # 旧去重按原文归一（"450|天" ≠ "450|"），而采纳门 `_find_baseline_conflict`
+        # 按审计口径判等会放行同值候选……不对——修复前采纳门与去重同用原文
+        # 归一，两边一致地误判为冲突并在采纳时拒绝（用户看到候选→采纳→
+        # 「0 条新增 + 与既有事实取值不同」的误导循环）。现两头都对齐审计器
+        # 口径：等价候选在扫描阶段就被识别为「已被既有事实覆盖」，不进候选。
+        covered_by_existing = False
+        for item in existing_items:
+            if not isinstance(item, dict):
+                continue
+            # 只对审计器真正会拿去比的基准类别条目做抽取感知判等
+            # （非基准类别的既有事实不参与审计比对，不应抑制候选）。
+            if rules.FACT_BASELINE_CATEGORIES.get(str(item.get("category") or "")) != fact_name:
+                continue
+            if _value_equivalent(winner, str(item.get("value") or ""), fact_name):
+                covered_by_existing = True
+                break
+        if covered_by_existing:
             continue
         markers_k = (fact_name, winner)
         if markers_k in seen:
@@ -333,6 +403,11 @@ def _find_baseline_conflict(items: list[dict], candidate: dict) -> dict | None:
     """找出清单中与候选**同基准类别且取值不同**的事实项（无则返回 None）。
 
     非基准类别（如 ``basic``）直接放行：审计器不拿它们互比，多条同 label 并存合法。
+
+    取值等价判定（B-1，2026-11-04）：走 `_value_equivalent` —— 与审计器同口径
+    （先对既有值做同一套正则抽取，再按「金额换算/通用归一」判等）。旧实现对
+    原文直接归一比较，把审计器明确视为同值的「基准 450日历天 vs 候选 450」
+    误判成冲突并拒绝采纳（docstring 声称「视为同值不拦」，实测相反）。
     """
     categories = rules.FACT_BASELINE_CATEGORIES
     category = str(candidate.get("category") or "")
@@ -348,8 +423,7 @@ def _find_baseline_conflict(items: list[dict], candidate: dict) -> dict | None:
         existing_value = str(item.get("value") or "")
         if not existing_value:
             continue
-        # 复用审计器的取值等价判定（金额换算/工期归一都在里面，唯一实现）
-        if len(ConsistencyAuditor._distinct_values([existing_value, candidate_value], fact_name=baseline_fact_name)) > 1:
+        if not _value_equivalent(candidate_value, existing_value, baseline_fact_name):
             return item
     return None
 

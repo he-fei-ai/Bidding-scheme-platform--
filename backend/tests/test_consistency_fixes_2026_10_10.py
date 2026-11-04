@@ -138,7 +138,10 @@ class TestPersonnelFactGate:
         "text,needle,expected",
         [
             ("本项目共 20 人参与施工。", "20", True),
-            ("后勤人员：30 人。", "30", True),
+            # 2026-11-04 第 11 轮：后勤人员已入岗位表（独立分桶，归「后勤人员数量」），
+            # 通用「人员数量」不再认领其取值；通用归集语义由仍未列举的「保洁人员」代表。
+            ("保洁人员：30 人。", "30", True),
+            ("后勤人员：30 人。", "30", False),
             ("共 20 名施工人员到场。", "20", True),
             ("钢筋直径 20 mm。", "20", False),
             ("构件编号 20 号。", "20", False),
@@ -405,7 +408,11 @@ class TestCrossRolePersonnelGuard:
         [
             ("本项目人员 20 人。", True),
             ("本项目组织人员 20 人。", True),
-            ("后勤人员：30 人。", True),
+            # 2026-11-04 第 11 轮：后勤人员已入岗位表（独立分桶「后勤人员数量」），
+            # 通用「人员数量」不再认领其取值（跨岗位保护面随之扩大到显式岗位）；
+            # 通用归集语义由仍未列举的「保洁人员」代表（见本文件上方参数组）。
+            ("后勤人员：30 人。", False),
+            ("保洁人员：30 人。", True),
             ("技术人员 20 人", False),
             ("技术人员约 20 人", False),
             ("管理人员 5 人", False),
@@ -894,7 +901,10 @@ class TestRepairRefreshScopeEndToEnd:
                 (pid, f"cf_{pid}", "工期", json.dumps(["45", "450"]), "[]", "high", ""),
             )
 
-        async def fake_generate_patches(provider, *, sections, conflicts_text, facts_text):
+        async def fake_generate_patches(provider, *, sections, conflicts_text, facts_text,
+                                        ai_findings_text=""):
+            # F-2（2026-11-02）契约扩展：`generate_patches` 新增可选 kwarg
+            # `ai_findings_text`（AI 语义发现参考区），桩签名同步。
             return (
                 [
                     {
@@ -952,7 +962,10 @@ class TestRepairRefreshScopeEndToEnd:
                 (pid, f"cf_{pid}", "工期", json.dumps(["45", "450"]), "[]", "high", ""),
             )
 
-        async def fake_generate_patches(provider, *, sections, conflicts_text, facts_text):
+        async def fake_generate_patches(provider, *, sections, conflicts_text, facts_text,
+                                        ai_findings_text=""):
+            # F-2（2026-11-02）契约扩展：`generate_patches` 新增可选 kwarg
+            # `ai_findings_text`（AI 语义发现参考区），桩签名同步。
             return (
                 [
                     {

@@ -18,12 +18,9 @@ import hashlib
 import json
 from io import BytesIO
 import logging
-import os
-from pathlib import Path
 import re
 import threading
 import time
-import uuid
 
 from ..config import PROJECTS_DATA_DIR
 from .ai.mermaid_renderer import ChartCache
@@ -65,22 +62,24 @@ def _get_cached_chart_render(payload_str: str, chart_type: str) -> tuple[BytesIO
     """
     global _chart_render_cache_hits, _chart_render_cache_misses
     cache_key = hashlib.sha256(f"{chart_type}|{payload_str}".encode("utf-8")).hexdigest()
+    # BUG-FIX 2026-11-04（P2·计数器竞态）：命中/未命中计数原先在锁外 `+=`，
+    # 并发导出时计数丢失（与 mermaid_renderer.ChartCache.get 已修复的同款问题）。
+    # 现 TTL 判定与计数统一收进锁内，命中路径在锁内提前返回。
     with _chart_render_cache_lock:
         entry = _chart_render_cache.get(cache_key)
-    if entry:
-        data, size, ts = entry
-        if time.time() - ts < _chart_render_cache_ttl:
+        if entry and time.time() - entry[2] < _chart_render_cache_ttl:
             _chart_render_cache_hits += 1
+            data, size, _ts = entry
             # BUG-FIX 2026-10-13（P1·L1 缓存共享流竞态）：原实现直接把缓存条目里的
             # BytesIO 对象返回给调用方，多项目并发命中同一条目时两个调用方交替
             # seek(0)/read()，共享光标互相打断 → 一方读到空/半截字节 → 图片插入
             # 失败 → 正文留占位符且图号虚跳。改为返回独立副本，缓存条目保持只读。
             # X-9 增强：缓存条目直接存 bytes，命中路径只有一次 BytesIO 构造开销。
             return BytesIO(data), size
-        # TTL 过期
-        with _chart_render_cache_lock:
+        if entry:
+            # TTL 过期
             _chart_render_cache.pop(cache_key, None)
-    _chart_render_cache_misses += 1
+        _chart_render_cache_misses += 1
     return None
 
 
@@ -278,6 +277,35 @@ def _claim_chart_title(
         return False
     used.add(key)
     return True
+
+
+def _unclaim_chart_title(
+    parent_section: str, title: str, project_id: int | None = None
+) -> None:
+    """撤销一条图题登记（单张图表渲染失败时调用，与 _rewind_figure_number 同生共死）。
+
+    BUG-FIX 2026-11-06（单图渲染失败→后续同名图被吞）：`_claim_chart_title` 在
+    **渲染前**登记图题；但单张图表渲染失败只回滚图号（_rewind_figure_number），
+    **不回滚图题登记**。后果：本章后续同名图被 `_claim_chart_title` 判为
+    「重复」而静默跳过 —— 该图题首次出现即失败（文档无图），后续本可渲染的
+    同名图也被吞掉，正文出现「有图题无图」的缺失（比 F-2/B-4 重复图题问题更隐蔽）。
+
+    本函数把指定 (章, 图题) 从会话登记中移除，使后续同名图可重新登记。口径与
+    `_claim_chart_title` 完全对称：同一 `_fig_chapter` 归一 + `_chart_title_key`
+    归一；上下文缺席（单元测试 / 非导出链路直接调用）一律空操作。
+    空桶随之移除，避免 set 残留。
+    """
+    ctx = _used_chart_titles_ctx_var.get()
+    if ctx is None:
+        return
+    key = _chart_title_key(title)
+    chapter = _fig_chapter(parent_section) or "default"
+    bucket = _figure_counter_key(chapter, project_id)
+    used = ctx.get(bucket)
+    if used is not None:
+        used.discard(key)
+        if not used:
+            ctx.pop(bucket, None)
 
 
 def _reset_chart_title_registry(project_id: int | None = None):
@@ -515,6 +543,7 @@ __all__ = [
     "_used_chart_titles_ctx_var",
     "_chart_title_key",
     "_claim_chart_title",
+    "_unclaim_chart_title",
     "_reset_chart_title_registry",
     "_drop_fig_no",
     "_strip_fig_no_for_cache",

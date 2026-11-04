@@ -290,6 +290,16 @@ class ExportConfig(BaseModel):
     heading_level1_page_break: bool = False  # 一级标题另起一页
     # 正文首行缩进（字符）
     body_first_line_indent_chars: float = 2.0
+    # 遗留项 1（2026-11-04 导出加固轮·公式渲染）：正文 LaTeX 公式（$...$ 行内 /
+    # $$...$$ 独立）渲染为 Word 原生公式对象（OMML）。默认 False = 与历史行为
+    # 一致（公式以含定界符的纯文本写出）；开启后经 latex2mathml + mathml2omml
+    # 纯转换（依赖缺失/语法非法/价格符号误配一律按原文本回填，零内容丢失）。
+    render_math_omml: bool = False
+    # 遗留项 5（同轮·HTML 图表预渲染）：HTML 导出前预热图表渲染缓存，使 HTML
+    # 产物嵌入真实图表（否则仅嵌入既有持久渲染件，其余为占位符）。默认 False
+    # 保持 GAP-1 设计（HTML 链路不触发实时渲染）；开启会增加导出耗时（等同
+    # DOCX 预渲染段），预渲染失败不影响 HTML 生成（按占位符继续）。
+    html_preload_charts: bool = False
 
 
 class Export(BaseModel):

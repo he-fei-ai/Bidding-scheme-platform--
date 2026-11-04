@@ -21,17 +21,16 @@ backend/app/services/ai/prompts/
 ├── content.py         # 6 个：正文编排（系统/用户）/ 正文续写
 ├── mermaid.py         # 6 个：Mermaid 图（修复/排版/流程图/甘特图）
 ├── charts.py          # 11 个：图表（架构/劳动力/对比/布局/时间线 × 编排+生成 + 通用修复兜底 CHART_DATA_FIX）
-├── illustration.py    # 2 个：ILLUSTRATION_ARRANGE_SYSTEM / ILLUSTRATION_PLAN_SYSTEM
 ├── checks.py          # 10 个：废标提取/对照/三轮流程(分析/初稿/定稿)/错别字/逻辑/合并/一致性补丁
 ├── knowledge.py       # 3 个：知识库（提取/匹配/目录增强）
 ├── scheme_extraction.py # 10 个：方案抽取（模板/章节/技术参数/工艺…）
 ├── industry.py        # 1 个：行业树（INDUSTRY_GENERATE_CHILDREN_SYSTEM）
 ├── _integrate.py      # 12 个：历史收编批次一
-├── _integrate_batch2.py # 21 个：历史收编批次二
+├── _integrate_batch2.py # 19 个：历史收编批次二
 └── _integrate_batch3.py # 13 个：历史收编批次三
 ```
 
-合计 **108 个**提示词常量（子模块 + 收编 `_integrate*.py` + 3 个 SHARED_* 共享规则；
+合计 **104 个**提示词常量（子模块 + 收编 `_integrate*.py` + 3 个 SHARED_* 共享规则；
 注册到管理界面只读展示，可经 `{shared:NAME}` 注入其他提示词）。
 
 > **数量以代码为准**：本节分项树曾长期落后于实际（2026-10-23 复核时
@@ -163,7 +162,6 @@ grep -rn 'get_prompt("KEY_NAME")' app/
 | **目录生成** | [outline.py](file:///j:/%E7%BC%96%E7%A8%8B/%E6%8B%9B%E6%8A%95%E6%A0%87%E5%B8%AE%E5%B9%B3%E5%8F%B0/backend/app/services/ai/prompts/outline.py) | workflows.py: one_shot/step/children/review/supplement/merge/children_framework |
 | **正文生成** | [content.py](file:///j:/%E7%BC%96%E7%A8%8B/%E6%8B%9B%E6%8A%95%E6%A0%87%E5%B8%AE%E5%B9%B3%E5%8F%B0/backend/app/services/ai/prompts/content.py) | workflows.py: orchestration/generation/continue |
 | **图表编排** | [mermaid.py](file:///j:/%E7%BC%96%E7%A8%8B/%E6%8B%9B%E6%8A%95%E6%A0%87%E5%B8%AE%E5%B9%B3%E5%8F%B0/backend/app/services/ai/prompts/mermaid.py) + [charts.py](file:///j:/%E7%BC%96%E7%A8%8B/%E6%8B%9B%E6%8A%95%E6%A0%87%E5%B8%AE%E5%B9%B3%E5%8F%B0/backend/app/services/ai/prompts/charts.py) | image_engine.py: 各 ARRANGE_/GENERATE_/REPAIR 系列 |
-| **配图方案** | [illustration.py](file:///j:/%E7%BC%96%E7%A8%8B/%E6%8B%9B%E6%8A%95%E6%A0%87%E5%B8%AE%E5%B9%B3%E5%8F%B0/backend/app/services/ai/prompts/illustration.py) | image_engine.py: ILLUSTRATION_PLAN_SYSTEM |
 | **废标检查** | [checks.py](file:///j:/%E7%BC%96%E7%A8%8B/%E6%8B%9B%E6%8A%95%E6%A0%87%E5%B8%AE%E5%B9%B3%E5%8F%B0/backend/app/services/ai/prompts/checks.py) | rejection.py: REJECTION_*/SPELLING_*/LOGIC_* |
 | **知识库** | [knowledge.py](file:///j:/%E7%BC%96%E7%A8%8B/%E6%8B%9B%E6%8A%95%E6%A0%87%E5%B8%AE%E5%B9%B3%E5%8F%B0/backend/app/services/ai/prompts/knowledge.py) | knowledge.py: KB_* |
 | **行业树** | [industry.py](file:///j:/%E7%BC%96%E7%A8%8B/%E6%8B%9B%E6%8A%95%E6%A0%87%E5%B8%AE%E5%B9%B3%E5%9F%B0/backend/app/services/ai/prompts/industry.py) | industry_tree.py: INDUSTRY_GENERATE_CHILDREN_SYSTEM |

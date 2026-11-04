@@ -80,9 +80,18 @@ class _FakeAuditProvider:
         try:
             if self.delay:
                 await asyncio.sleep(self.delay)
-            system = str(getattr(messages[0], "content", ""))
             user = str(getattr(messages[1], "content", ""))
-            if "擅长发现正文中的矛盾" in system:
+            # 2026-11-02 测试隔离修复：旧实现用 system 提示词文案
+            # （"擅长发现正文中的矛盾"）区分审计/修复调用。提示词可被用户在 DB
+            # 编辑（get_prompt DB 优先），组合运行（如先跑持有 TestClient 的
+            # 其它文件）时 DB 版文案不含该锚点 → 审计调用被误判为修复调用，
+            # 返回 repair_text → JSON 提取失败 → 假阴性。改为依赖测试自身已
+            # 断言的结构性契约：审计 user 提示词含「第 N/M 组」分组标记
+            # （见 _group_index_from_prompt 与 L335 断言），修复 user 提示词
+            # 含「【当前正文】」锚点（见 _extract_current_body），两不重叠。
+            _is_repair_call = "【当前正文】" in user
+            _is_audit_call = (not _is_repair_call) and _group_index_from_prompt(user) > 0
+            if _is_audit_call:
                 self.audit_prompts.append(user)
                 index = _group_index_from_prompt(user)
                 if self.fail_group == index:

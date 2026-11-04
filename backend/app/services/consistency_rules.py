@@ -254,17 +254,69 @@ def assess_severity(
         `high` / `medium` / `low`
     """
     values = list(distinct_values or [])
+    return _assess_severity_with_reason(fact_name, values, section_count=section_count)[0]
+
+
+def severity_rationale(
+    fact_name: Any,
+    distinct_values: Any,
+    *,
+    section_count: int | None = None,
+) -> dict:
+    """G-1(2026-11-02)：返回严重度判定的**依据**（人话 reason + 关键入参）。
+
+    审计此前只下发 `severity`，不给出「该事实由哪几条实例、在哪些章节、
+    以何标准命中」，误报排查只能读代码。本函数与 :func:`assess_severity`
+    共用同一个内部实现（``_assess_severity_with_reason``），**不构成第二套
+    判定标准**，也不改动任何判定行为。
+    """
+    values = list(distinct_values or [])
+    severity, reason = _assess_severity_with_reason(
+        fact_name, values, section_count=section_count
+    )
+    return {
+        "severity": severity,
+        "reason": reason,
+        "critical_fact": is_critical_fact(fact_name),
+        "distinct_count": len(values),
+        "distinct_values": values,
+        "section_count": section_count,
+        "thresholds": {
+            "high_distinct_gt": SEVERITY_HIGH_DISTINCT_THRESHOLD,
+            "low_max_sections": SEVERITY_LOW_MAX_SECTIONS,
+        },
+    }
+
+
+def _assess_severity_with_reason(
+    fact_name: Any,
+    values: list,
+    *,
+    section_count: int | None = None,
+) -> tuple[str, str]:
+    """assess_severity 的唯一实现体，附带返回命中分支的人话解释。"""
     if is_critical_fact(fact_name):
-        return SEVERITY_HIGH
+        return SEVERITY_HIGH, (
+            f"「{fact_name}」是关键事实（工期/金额/资质等级），一冲突即判严重"
+        )
     if len(values) > SEVERITY_HIGH_DISTINCT_THRESHOLD:
-        return SEVERITY_HIGH
+        return SEVERITY_HIGH, (
+            f"不同取值 {len(values)} 种 > {SEVERITY_HIGH_DISTINCT_THRESHOLD}"
+            "（表述分歧过大）"
+        )
     if (
         section_count is not None
         and len(values) == SEVERITY_HIGH_DISTINCT_THRESHOLD
         and section_count <= SEVERITY_LOW_MAX_SECTIONS
     ):
-        return SEVERITY_LOW
-    return SEVERITY_MEDIUM
+        return SEVERITY_LOW, (
+            f"恰好 {SEVERITY_HIGH_DISTINCT_THRESHOLD} 种取值且只落在 "
+            f"{section_count} 个正文章节（正文内部自洽，仅与基准/摘要有偏差）"
+        )
+    return SEVERITY_MEDIUM, (
+        f"{len(values)} 种取值、落在 {section_count if section_count is not None else '未知'} "
+        "个正文章节，未命中关键事实或单点偏差分支"
+    )
 
 
 def personnel_fact_name(role: str) -> str:
@@ -287,9 +339,19 @@ def personnel_fact_name(role: str) -> str:
 #: 事实名 → 抽取正则前缀里的「标签词」集合。
 #: 与 `consistency_auditor.FACT_PATTERNS` 的标签组保持同一口径；
 #: `人员数量` 的岗位前缀单独由 `personnel_fact_keywords` 动态推导。
+#:
+#: BUG-FIX 2026-11-04（第 11 轮）：金额组补齐同轮扩入抽取正则的新标签词
+#: （合同价格/合同总价/投标总价/投标报价/中标价/总价）——闸门词集必须
+#: 覆盖抽取能见到的全部标签，否则「抽取认得、autofix 就近校验拦下」的
+#: 口径裂缝会重新打开（用户采纳建议后提示「未出现标签词」却明明写着）。
 FACT_KEYWORDS: dict[str, frozenset[str]] = {
     FACT_DURATION: frozenset({"工期", "周期", "天数"}),
-    FACT_AMOUNT: frozenset({"金额", "造价", "预算", "报价", "合同价"}),
+    FACT_AMOUNT: frozenset(
+        {
+            "金额", "造价", "预算", "报价", "合同价", "合同价格",
+            "合同总价", "投标价", "投标报价", "投标总价", "中标价", "总价",
+        }
+    ),
     FACT_QUALIFICATION: frozenset({"资质", "级别"}),
     FACT_QUALITY: frozenset({"质量"}),
     FACT_SAFETY: frozenset({"安全生产目标", "安全管理目标", "事故控制", "事故发生率", "伤亡控制"}),
@@ -298,14 +360,37 @@ FACT_KEYWORDS: dict[str, frozenset[str]] = {
 #: 「人员数量」及其岗位变体额外可匹配的通用标签词
 PERSONNEL_GENERIC_KEYWORDS: frozenset[str] = frozenset({"人员", "人"})
 
-#: 岗位前缀 → 通用人员标签词（与 :data:`PERSONNEL_GENERIC_KEYWORDS` 并集使用）
+#: 岗位前缀 → 通用人员标签词（与 :data:`PERSONNEL_GENERIC_KEYWORDS` 并集使用）。
+#:
+#: BUG-FIX 2026-11-04（第 11 轮·漏报·常见现场岗位整类缺席）：原表只有 6 个岗位，
+#: 语料探针实测「安全员 2 人」「质检员约 3 人」「资料员 1 人」这类投标文件
+#: 高频岗位**一个都抽不出** —— 人员类冲突对这些岗位完全不设防（写错人数
+#: 也不报冲突）。现按「岗位词 + 数字 + 人 + 单位守卫」的既有安全框架补齐
+#: 常见现场/职能岗位；抽取与闸门两侧共用本常量派生（R-13 等宽约束由代码
+#: 保证），无需另行对齐。顺序保持「具体长词在前」的既有惯例。
 PERSONNEL_ROLE_PREFIXES: tuple[str, ...] = (
     "项目经理",
     "技术负责人",
+    "安全负责人",
+    "质量负责人",
     "技术人员",
     "管理人员",
     "作业人员",
     "施工人员",
+    "运维人员",
+    "安装人员",
+    "检测人员",
+    "后勤人员",
+    # 现场五大员等高频岗位（2 字岗位词放后面，避免截断上面的长词匹配）
+    "技术员",
+    "安全员",
+    "质检员",
+    "质量员",
+    "材料员",
+    "资料员",
+    "测量员",
+    "试验员",
+    "施工员",
 )
 
 #: 标签词长度下限：比它短的标签词（如「人」「天」「级」）**不参与**就近判定。
@@ -655,6 +740,25 @@ def conflict_state(resolved: Any) -> str:
         return CONFLICT_STATE_OPEN
 
 
+# ---------------------------------------------------------------------------
+# resolved / 来源的 SQL 谓词片段（TD-1，2026-11-02）
+# ---------------------------------------------------------------------------
+#
+# `consistency_conflicts.resolved` 的建表列是 **可空** 的
+# （`db.py`：`resolved INTEGER DEFAULT 0`）。应用内两条写入路径都显式写 0/1，
+# 但一旦老库补列、或外部/脚本写入产生 `NULL`，裸写 `resolved = 0` 的四条 SQL
+# （`agent_repair.build_agent_workspace`、`consistency_repair._load_context` /
+# `refresh_conflict_states`、`consistency_backflow._open_conflicts`）会因
+# SQL 三值逻辑把它判为 false —— 于是同一条冲突在冲突列表（`COALESCE`）里看得见，
+# 却对 AI 修复、Agent 修复、事实回流**全部隐形**，用户看到的现象是
+# 「列表里有一条待处理，点 AI 修复却说没有未解决冲突」。
+#
+# 现把两个谓词收成单一事实来源，所有模块引用同一份，避免再次出现口径分裂
+# （不改表结构，向后兼容）。AI 来源的 LIKE 模式见下方 `AI_CONFLICT_ID_LIKE`。
+RESOLVED_SQL_OPEN = "COALESCE(resolved, 0) = 0"
+RESOLVED_SQL_RESOLVED = "COALESCE(resolved, 0) = 1"
+
+
 # ============================================================================
 # 冲突来源（conflict_source）—— 同一张表里的两条审计链路
 # ============================================================================
@@ -688,6 +792,13 @@ CONFLICT_SOURCE_AI = "ai"
 #: AI 语义审计写入的 `conflict_id` 前缀（与
 #: `ai/workflows_expand._persist_ai_audit_findings` 的生成规则保持严格一致）。
 AI_CONFLICT_ID_PREFIX = "AI-"
+
+#: AI 语义发现的 SQL `LIKE` 模式（与上方前缀**严格同源**）。
+#:
+#: 此前 `routers/consistency.py` 的摘要统计（:797）与审计器内部的清理/折叠/
+#: 复用三处各自拼 `AI_CONFLICT_ID_PREFIX + "%"`，一旦前缀调整就会静默失配 ——
+#: 表现是「AI 发现被当成规则冲突计入分级卡片」。现统一引用本常量。
+AI_CONFLICT_ID_LIKE = AI_CONFLICT_ID_PREFIX + "%"
 
 #: 冲突来源 → 展示文案/配色（随规则快照下发，前端「AI 发现」标签用）。
 CONFLICT_SOURCE_META: dict[str, dict[str, str]] = {

@@ -172,8 +172,10 @@ class TestEmptyValueConflictsNotFalselyResolved:
                 },
             )
 
-        assert states == {"resolved": 0, "still_open": 1}, (
-            "空取值冲突无法验证收敛，必须保持未解决并计入 still_open"
+        # F-2(2026-11-02) 口径拆分：不可验证条目单列 not_verifiable，不再混进
+        # still_open；**落库行为不变**（保持未解决、不写 resolved_at）。
+        assert states == {"resolved": 0, "still_open": 0, "not_verifiable": 1}, (
+            "空取值冲突无法验证收敛，必须保持未解决并单列计入 not_verifiable"
         )
         row = _conflict_row(cid)
         assert row is not None and row["resolved"] == 0
@@ -188,8 +190,9 @@ class TestEmptyValueConflictsNotFalselyResolved:
         with get_db() as conn:
             states = refresh_conflict_states(conn, pid, {1: "本工程工期 45 天"})
 
-        # 可验证冲突：45 仍在、30 不在 → distinct present = 1 → 已解决
-        assert states == {"resolved": 1, "still_open": 1}
+        # 可验证冲突：45 仍在、30 不在 → distinct present = 1 → 已解决；
+        # AI 发现单列 not_verifiable（F-2，2026-11-02）
+        assert states == {"resolved": 1, "still_open": 0, "not_verifiable": 1}
         assert _conflict_row(ai_cid)["resolved"] == 0
         assert _conflict_row(det_cid)["resolved"] == 1
 
@@ -199,14 +202,14 @@ class TestEmptyValueConflictsNotFalselyResolved:
         blank_cid = _seed_conflict(pid, conflict_id=f"conflict_{pid}_blank", values='["", "  "]')
         with get_db() as conn:
             states = refresh_conflict_states(conn, pid, {1: "任意正文"})
-        assert states["still_open"] == 1 and states["resolved"] == 0
+        assert states["not_verifiable"] == 1 and states["resolved"] == 0
         assert _conflict_row(blank_cid)["resolved"] == 0
 
         pid2 = _new_project("R6-A-坏JSON")
         bad_cid = _seed_conflict(pid2, conflict_id=f"conflict_{pid2}_bad", values="not-json")
         with get_db() as conn:
             states2 = refresh_conflict_states(conn, pid2, {1: "任意正文"})
-        assert states2["still_open"] == 1 and states2["resolved"] == 0
+        assert states2["not_verifiable"] == 1 and states2["resolved"] == 0
         assert _conflict_row(bad_cid)["resolved"] == 0
 
 
@@ -664,13 +667,22 @@ class TestBackflowBaselineConflictGuard:
         )
 
     def test_guard_matches_auditor_verdict(self):
-        """结构约束：拦不拦必须与审计器的等价判定一致（单一判据）。"""
-        from app.services.consistency_backflow import plan_fact_merge
+        """结构约束：拦不拦必须与审计器的等价判定一致（单一判据）。
+
+        2026-11-04 第 11 轮更新：判据从「原文归一 `_distinct_values`」改为
+        `_value_equivalent`（审计器基准摄取口径：带标签抽取优先、裸值兜底）。
+        旧第三行「450 vs 450 日历天 → 拦」的依据（原文归一判异）与审计器对
+        **基准共存**的真实语义不符：审计器对基准值先做抽取（裸「450」无可比
+        取值、「450 日历天」裸值兜底抽出 450），两值并存不会互判冲突，不该拦
+        （与同文件「450 vs 450日历天 视为同值」的 docstring 声称一致）。
+        真异值（450 vs 60）仍拦（两侧都无可比取值 → 回退原文归一，保守）。
+        """
+        from app.services.consistency_backflow import _value_equivalent, plan_fact_merge
 
         for existing_value, new_value, should_block in [
             ("450", "450", False),
             ("450", "60", True),
-            ("450", "450 日历天", True),  # 审计器判为异值 → 一并入库必然互判冲突
+            ("450", "450 日历天", False),  # 审计器口径下同值（450）→ 一并入库不互判冲突
         ]:
             _items, added, skipped = plan_fact_merge(
                 [{"key": "a", "label": "工期", "value": existing_value, "category": "schedule"}],
@@ -685,9 +697,9 @@ class TestBackflowBaselineConflictGuard:
             )
             blocked = bool(skipped) or added == 0
             assert blocked is should_block, f"{existing_value} vs {new_value}"
-            # 与审计器自身判定逐条对齐
-            distinct = AUDITOR._distinct_values([existing_value, new_value], fact_name="工期")
-            assert (len(distinct) > 1) is should_block
+            # 与审计器自身判定逐条对齐（B-1：基准摄取口径，双向对称）
+            equivalent = _value_equivalent(new_value, existing_value, "工期")
+            assert equivalent is (not should_block), f"{existing_value} vs {new_value}"
 
 
 # ============================================================================

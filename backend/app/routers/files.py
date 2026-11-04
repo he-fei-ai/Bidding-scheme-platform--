@@ -115,9 +115,14 @@ async def upload_file(project_id: int, file: UploadFile=File(...), file_role: st
         raise _upload_http_error('文件内容为空', 'file_empty')
     try:
         result = await asyncio.to_thread(file_service.save_upload, project_id, file.filename, content, file_role)
-        if result.get('status') == 'success':
+        if result.get('status') in ('success', 'processing'):
             # PERF 2026-09-18（P2）：update_step 是同步 DB 写（拿全局写锁），
             # 直调会阻塞事件循环——上传高峰期卡住所有并发 SSE/请求。
+            # L3 2026-11-04：图片等 OCR 格式走异步解析，上传响应即时返回
+            # status='processing'（文件已入库）。此前仅 'success' 推进步骤，
+            # 纯图片项目 current_step 永远停在 1 —— 上传动作明明已完成，
+            # 前端向导/步骤指示却停在「未上传」。'processing' 同样意味着
+            # 文件已落库（解析在途是独立状态），应推进步骤 2。
             await asyncio.to_thread(update_step, project_id, 2)
         return result
     except Exception as e:
@@ -251,7 +256,7 @@ async def async_reparse_file(project_id: int, file_id: int, current_user: Annota
 
         from ..celery_app import dispatch_task
         from ..db import get_db
-        from ..services.files import _create_parse_task
+        from ..services.files import _create_parse_task, _link_parse_task_file
 
         def _read_uploaded_file():
             with get_db(readonly=True) as conn:
@@ -282,9 +287,18 @@ async def async_reparse_file(project_id: int, file_id: int, current_user: Annota
         # `asyncio.to_thread` 的，这里是那次修复的漏网之鱼。
         # 大项目并发上传时会拖慢所有 SSE 心跳（正文/大纲生成共用同一事件循环）。
         # 现把写操作同样移入线程池。
-        await asyncio.to_thread(
+        #
+        # BUG-FIX 2026-11-04（B4b 任务行孤儿 · 端点漏网）：此前 _create_parse_task
+        # 的返回值被丢弃，任务行的 file_id 恒为 NULL。worker 经
+        # _persist_file_extraction(create_task_row=False) 收尾时按 file_id 精确
+        # 更新（WHERE status='processing' AND file_id=?）命中 **0 行**，任务行永久
+        # 停在 processing（孤儿），GET /tasks/files/status 永远显示「正在解析」
+        # 直到 beat 的 reclaim_stale_parse_state 数十分钟后收敛。现捕获 task_id
+        # 并立即 _link_parse_task_file，使 worker 的 file_id 收尾能精确命中本行。
+        _endpoint_task_id = await asyncio.to_thread(
             _create_parse_task, project_id, filename, Path(filename).suffix.lower()
         )
+        await asyncio.to_thread(_link_parse_task_file, _endpoint_task_id, file_id)
 
         dispatched = await asyncio.to_thread(
             dispatch_task,

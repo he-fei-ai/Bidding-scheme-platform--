@@ -1,6 +1,8 @@
 import { Table } from "antd";
 import { useEffect, useRef, useState, useCallback, useMemo } from "react";
 import React from "react";
+import { LocalTemplateGuard, leadInDisclosesLocalTemplate } from "./LocalTemplateGuard";
+import { ChartJsonEditor } from "./ChartJsonEditor";
 
 /** 生成唯一 SVG 元素 ID，避免同页面多图表 gradient ID 冲突 */
 let _svgIdCounter = 0;
@@ -22,6 +24,11 @@ interface ContentPreviewProps {
    * 数据缺失时只显示中性占位提示，**绝不伪造图表内容**。
    */
   sectionCharts?: SectionChartMap | null;
+  /**
+   * 编辑 chart-json 围栏载荷：lineStart/lineEnd 为围栏行区间（0-based，含端点），
+   * jsonStr 为新 JSON 文本。由页面层实现并按行区间重写章节正文围栏体。
+   */
+  onEditChartFence?: (lineStart: number, lineEnd: number, jsonStr: string) => void;
 }
 
 const CHART_TYPE_LIST = [
@@ -1374,7 +1381,18 @@ function resolveSectionChart(
   return null;
 }
 
-function ChartBlock({ text, sectionCharts }: { text: string; sectionCharts?: SectionChartMap | null }) {
+function ChartBlock({
+  text,
+  sectionCharts,
+  fenceRange,
+  onEditChartFence,
+}: {
+  text: string;
+  sectionCharts?: SectionChartMap | null;
+  fenceRange?: [number, number];
+  onEditChartFence?: (lineStart: number, lineEnd: number, jsonStr: string) => void;
+}) {
+  const [editorOpen, setEditorOpen] = useState(false);
   const parsed = parseChartPayload(text);
   let { type, data } = parsed;
 
@@ -1383,38 +1401,76 @@ function ChartBlock({ text, sectionCharts }: { text: string; sectionCharts?: Sec
     const label = CHART_TYPE_LABELS[type] || "配图";
     if (!chart) return <ChartPendingNotice title={parsed.title || label} />;
     if (chart.mermaid) {
-      return (
+      const mermaidBlock = (
         <MermaidInlineBlock
           code={chart.mermaid}
           title={(chart.data && chart.data.title) || parsed.title || label}
         />
+      );
+      // mermaid 型 hint 数据若带 source="local" 同样披露（无编辑入口）
+      return chart.data && chart.data.source === "local" ? (
+        <LocalTemplateGuard>{mermaidBlock}</LocalTemplateGuard>
+      ) : (
+        mermaidBlock
       );
     }
     data = chart.data;
     type = chart.type || type;
   }
 
-  switch (type) {
-    case "gantt":
-      return <GanttBlock data={data} />;
-    case "flowchart":
-      return <FlowchartBlock data={data} />;
-    case "architecture":
-      return <ArchitectureBlock data={data} />;
-    case "labor":
-      return <LaborBlock data={data} />;
-    case "comparison":
-      return <ComparisonBlock data={data} />;
-    case "layout":
-      return <LayoutBlock data={data} />;
-    case "timeline":
-      return <TimelineBlock data={data} />;
-    default:
-      return <ChartJsonFallback data={data} title={data?.title || type} />;
+  const isLocal = !!(data && data.source === "local");
+  const canEdit = isLocal && !!fenceRange && !!onEditChartFence;
+
+  const body = (() => {
+    switch (type) {
+      case "gantt":
+        return <GanttBlock data={data} />;
+      case "flowchart":
+        return <FlowchartBlock data={data} />;
+      case "architecture":
+        return <ArchitectureBlock data={data} />;
+      case "labor":
+        return <LaborBlock data={data} />;
+      case "comparison":
+        return <ComparisonBlock data={data} />;
+      case "layout":
+        return <LayoutBlock data={data} />;
+      case "timeline":
+        return <TimelineBlock data={data} />;
+      default:
+        return <ChartJsonFallback data={data} title={data?.title || type} />;
+    }
+  })();
+
+  if (isLocal) {
+    return (
+      <LocalTemplateGuard onEdit={canEdit ? () => setEditorOpen(true) : undefined}>
+        {body}
+        {canEdit && (
+          <ChartJsonEditor
+            open={editorOpen}
+            initial={JSON.stringify(data, null, 2)}
+            onCancel={() => setEditorOpen(false)}
+            onOk={(next) => {
+              onEditChartFence!(fenceRange![0], fenceRange![1], next);
+              setEditorOpen(false);
+            }}
+          />
+        )}
+      </LocalTemplateGuard>
+    );
   }
+  return body;
 }
 
-type PreviewBlock = { type: "table" | "chart" | "text" | "mermaid"; value: string };
+type PreviewBlock = {
+  type: "table" | "chart" | "text" | "mermaid";
+  value: string;
+  /** 图表来源标记（从 chart-json 载荷 source 或 mermaid 引导语括注推断） */
+  source?: "ai" | "local";
+  /** 围栏在原 content 中的 [起始行, 闭合行]（0-based，含端点）；仅图表块有 */
+  fenceRange?: [number, number];
+};
 
 /** 图表围栏起始行：与后端 content_cleaning.CHART_FENCE_OPEN_PATTERN 同口径
  *  （支持 ``` / ~~~ 两种围栏与 chart-json / chart_json / chartjson 三种标签）。 */
@@ -1495,12 +1551,31 @@ function parseContent(content: string): PreviewBlock[] {
       if (closed) {
         if (payload) {
           if (/^mermaid$/.test(lang)) {
-            blocks.push({ type: "mermaid", value: payload });
+            // mermaid 围栏内无 source 键，后端把披露写在引导语里；
+            // 回看前一个 text 块的最后非空行是否含「（模板示例数据…）」括注
+            const prevText = blocks[blocks.length - 1];
+            const disclosed =
+              !!prevText &&
+              prevText.type === "text" &&
+              leadInDisclosesLocalTemplate(
+                prevText.value.split("\n").filter(Boolean).pop(),
+              );
+            blocks.push({
+              type: "mermaid",
+              value: payload,
+              source: disclosed ? "local" : undefined,
+              fenceRange: [i, j],
+            });
           } else {
             try {
               const obj = JSON.parse(payload);
               // 归一成后端/parseChartPayload 认识的标记形态，交给既有 ChartBlock 通道
-              blocks.push({ type: "chart", value: `<<CHART:${JSON.stringify(obj)}>>` });
+              // fenceRange 透传围栏行区间，供 JSON 编辑定位；source 由 ChartBlock 从 data 读取
+              blocks.push({
+                type: "chart",
+                value: `<<CHART:${JSON.stringify(obj)}>>`,
+                fenceRange: [i, j],
+              });
             } catch {
               // 载荷非法：绝不把 JSON 源码当正文显示（与后端"坏块删除"口径一致）
               i = j + 1;
@@ -1577,7 +1652,11 @@ function parseContent(content: string): PreviewBlock[] {
   return blocks;
 }
 
-export default React.memo(function ContentPreview({ content, sectionCharts }: ContentPreviewProps) {
+export default React.memo(function ContentPreview({
+  content,
+  sectionCharts,
+  onEditChartFence,
+}: ContentPreviewProps) {
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const [showScrollTopBtn, setShowScrollTopBtn] = useState(false);
 
@@ -1636,12 +1715,26 @@ export default React.memo(function ContentPreview({ content, sectionCharts }: Co
             return <TableBlock key={idx} text={block.value} />;
           }
           if (block.type === "chart") {
-            return <ChartBlock key={idx} text={block.value} sectionCharts={sectionCharts} />;
+            return (
+              <ChartBlock
+                key={idx}
+                text={block.value}
+                sectionCharts={sectionCharts}
+                fenceRange={block.fenceRange}
+                onEditChartFence={onEditChartFence}
+              />
+            );
           }
           if (block.type === "mermaid") {
             // BUG-FIX 2026-10-08（P0）：正文围栏里的 mermaid 源码直接出图，
             // 不再以 pre-wrap 文本显示给用户。
-            return <MermaidInlineBlock key={idx} code={block.value} title="" />;
+            const mermaidNode = <MermaidInlineBlock key={idx} code={block.value} title="" />;
+            // 引导语披露为「模板数据」的 mermaid 块同样打标签（P0，无编辑入口）
+            return block.source === "local" ? (
+              <LocalTemplateGuard key={idx}>{mermaidNode}</LocalTemplateGuard>
+            ) : (
+              mermaidNode
+            );
           }
           return (
             <p key={idx} style={{ margin: "6px 0", whiteSpace: "pre-wrap", textAlign: "justify" }}>

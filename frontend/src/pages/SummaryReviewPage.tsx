@@ -92,6 +92,9 @@ export default function SummaryReviewPage() {
   // ENHANCE 2026-10-26（R9，专项方案解析接入）：此前后端已具备五类专项提取与
   // 目录模板推荐，前端完全无入口（死链路）。现补状态并与目录生成共享同一份结果。
   const [schemeExtraction, setSchemeExtraction] = useState<SchemeExtractionResult>({});
+  // 遗留项 L1（2026-11-03）：「已解析」显式状态位。null=尚未拉到分析（回退
+  // Object.keys 隐式判定，兼容老后端）；true/false=后端权威下发。
+  const [schemeExtracted, setSchemeExtracted] = useState<boolean | null>(null);
   const [generatingScheme, setGeneratingScheme] = useState(false);
   const [outlineTemplate, setOutlineTemplate] = useState<SchemeOutlineTemplateResult | null>(null);
   const [schemeTab, setSchemeTab] = useState("project_overview");
@@ -165,6 +168,8 @@ export default function SummaryReviewPage() {
       // 推荐目录模板（与目录生成自动选型同源），刷新页面不丢「将用哪个模板」。
       const se = a.scheme_extraction || {};
       setSchemeExtraction(se);
+      // L1：优先消费后端显式状态位；老后端无该字段时回退 keys 判定。
+      setSchemeExtracted(a.scheme_extracted ?? Object.keys(se).length > 0);
       if (Object.keys(se).length > 0) {
         try {
           setOutlineTemplate(await fetchSchemeOutlineTemplate(projectId));
@@ -420,6 +425,8 @@ export default function SummaryReviewPage() {
       const r = await generateSchemeExtraction(projectId);
       const data = r.scheme_extraction || {};
       setSchemeExtraction(data);
+      // L1：本轮刚执行过解析动作，无论结果是否为空都视为「已解析」。
+      setSchemeExtracted(true);
       const failed = Object.entries(data).filter(
         ([, v]) => v && !Array.isArray(v) && typeof v === "object" && "error" in (v as any),
       );
@@ -852,7 +859,9 @@ export default function SummaryReviewPage() {
             loading={generatingScheme}
             onClick={handleGenerateSchemeExtraction}
           >
-            {Object.keys(schemeExtraction || {}).length > 0 ? "重新解析" : "开始解析"}
+            {/* L1（2026-11-03）：「已解析」判定改为后端显式状态位优先，
+                老后端（无 scheme_extracted 字段）回退 keys 隐式判定。 */}
+            {(schemeExtracted ?? Object.keys(schemeExtraction || {}).length > 0) ? "重新解析" : "开始解析"}
           </Button>
         }
       >

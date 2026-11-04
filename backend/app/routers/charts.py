@@ -21,7 +21,12 @@ from ..services.charts import auto_select_direction, render_single_chain_flow_sy
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/api/v1/charts", tags=["charts"])
+# BUG-FIX 2026-11-04（P1·路由双重前缀）：本前缀会被 main.py 的
+# `v1_router = APIRouter(prefix="/api/v1")` 再叠加一次，旧值 "/api/v1/charts"
+# 使全部路由实际注册在 /api/v1/api/v1/charts/* —— 前端/文档调用的
+# /api/v1/charts/* 恒 404/405（测试用自建 FastAPI 直挂路由，掩盖了该缺陷）。
+# 与其余路由器同构：只写业务前缀，/api/v1 由父级统一提供。
+router = APIRouter(prefix="/charts", tags=["charts"])
 
 
 @router.get("/health")

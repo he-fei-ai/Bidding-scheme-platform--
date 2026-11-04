@@ -287,17 +287,26 @@ def validate_gantt_plan(plan: Any) -> tuple[bool, list[str]]:
             return False, errors
 
         # 检查任务ID重复
+        # FIX 2026-11-03（遗留加固）：任务名兼容第三键 ``task``——
+        # validate_chart_for_ai_pipeline 对 Mermaid gantt 载荷解析合并的
+        # tasks（mermaid_gantt._parse_mermaid_gantt）键名为 ``task``
+        # （{section, task, time, start, end}），旧实现只认 id/name →
+        # 全部任务判 None → 「重复的任务ID: None」恒失败。F4 激活 gantt
+        # 专属校验通道后该不兼容在编排闭环暴露（本地模板 gantt 恒被拒）。
+        def _task_key(t: dict):
+            return t.get("id") or t.get("name") or t.get("task")
+
         seen_ids = set()
         for task in tasks:
             if not isinstance(task, dict):
                 continue
-            task_id = task.get("id") or task.get("name")
+            task_id = _task_key(task)
             if task_id in seen_ids:
                 errors.append(f"检测到重复的任务ID: {task_id}")
             seen_ids.add(task_id)
 
         # 检查依赖关系是否存在于任务中（简化版）
-        task_ids = set(str(t.get("id") or t.get("name")) for t in tasks if isinstance(t, dict))
+        task_ids = set(str(_task_key(t)) for t in tasks if isinstance(t, dict))
         for task in tasks:
             if not isinstance(task, dict):
                 continue
@@ -339,7 +348,11 @@ def validate_flowchart_structure(data: Any) -> tuple[bool, list[str]]:
             return False, errors
 
         # 检查节点ID仅含ASCII
-        ascii_allowed = re.compile(r"^[\w\s]+$")
+        # BUG-FIX 2026-11-04（P2·正则口径不符）：Python 的 `\w` 默认匹配 Unicode
+        # （中文属于 \w），旧正则 `^[\w\s]+$` 对中文 ID 恒放行，与注释/错误文案
+        # 「仅含ASCII」不符；中文 ID 进入 flowchart_json_to_mermaid 会产出
+        # 中文节点标识符，依赖下游 sanitizer 转写。现加 re.ASCII 收紧为真 ASCII。
+        ascii_allowed = re.compile(r"^[\w\s]+$", re.ASCII)
         node_ids = set()
         for node in nodes:
             if not isinstance(node, dict):
