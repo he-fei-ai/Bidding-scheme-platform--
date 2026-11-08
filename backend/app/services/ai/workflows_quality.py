@@ -915,11 +915,21 @@ async def review_outline_with_autofix(
         for round_idx in range(max_repair_rounds):
             logger.info("目录审核未通过，尝试第 %d/%d 轮自修复", round_idx + 1, max_repair_rounds)
 
-            repair_prompt = (
+            # 收编批次 7（2026-11-08）：目录自修复提示词走注册表（DB 可覆盖），
+            # fallback 与原 f-string 逐字一致，行为零变化。
+            _issues_json = json.dumps(result.get('issues', []), ensure_ascii=False)
+            _suggestions_json = json.dumps(result.get('suggestions', []), ensure_ascii=False)
+            repair_prompt = get_prompt(
+                "OUTLINE_REPAIR_USER",
+                issues_json=_issues_json,
+                suggestions_json=_suggestions_json,
+                current_outline=current_outline,
+                scoring_points=scoring_points,
+            ) or (
                 f"你是一个标书目录修复专家。以下目录审核未通过，请根据审核意见修复目录。\n\n"
                 f"【审核结果】\n"
-                f"issues: {json.dumps(result.get('issues', []), ensure_ascii=False)}\n"
-                f"suggestions: {json.dumps(result.get('suggestions', []), ensure_ascii=False)}\n\n"
+                f"issues: {_issues_json}\n"
+                f"suggestions: {_suggestions_json}\n\n"
                 f"【当前目录】\n{current_outline}\n\n"
                 f"【评分点列表】\n{scoring_points}\n\n"
                 f"请直接输出修复后的完整目录 JSON 数组，保持三级结构不变，"
@@ -930,7 +940,8 @@ async def review_outline_with_autofix(
                 repair_messages = [
                     AIMessage(
                         role="system",
-                        content="你是一个标书目录修复专家，擅长根据审核意见修复目录结构。请直接输出修复后的 JSON 数组。",
+                        content=get_prompt("OUTLINE_REPAIR_SYSTEM")
+                        or "你是一个标书目录修复专家，擅长根据审核意见修复目录结构。请直接输出修复后的 JSON 数组。",
                     ),
                     AIMessage(role="user", content=repair_prompt),
                 ]

@@ -1,4 +1,4 @@
-"""行业树提示词（1 个提示词）
+"""行业树提示词（2 个提示词）
 
 用于行业树子节点生成。
 """
@@ -44,4 +44,39 @@ INDUSTRY_GENERATE_CHILDREN_SYSTEM = _reg(
     "行业树",
     "行业树子节点生成（系统提示词）",
     INDUSTRY_GENERATE_CHILDREN_SYSTEM,
+)
+
+# ENHANCE 2026-11-08（收编批次 5）：industry_tree.match_industry_by_ai 的 user 侧
+# 提示词此前为调用点内联 f-string，绕过注册表（管理页不可见/不可覆盖/无版本），
+# 与 system 侧（INDUSTRY_MATCH_SYSTEM，_integrate.py）不对称。现收编为
+# INDUSTRY_MATCH_USER，调用方 get_prompt 渲染 + 逐字一致硬编码 fallback。
+#
+# 注意：f-string 中的 `{{"node_id"...}}` 在此写为单花括号 `{"node_id"...}`——
+# 该形态不匹配 _VARIABLE_PATTERN（要求 { 后紧跟字母开头 ≥2 字符），渲染时
+# 不会被当作占位符替换，逐字一致地进入发给模型的文本。
+INDUSTRY_MATCH_USER = """
+请根据以下项目描述，从行业树中匹配最合适的{top_k}个行业节点。
+
+项目描述：{text}
+
+行业树摘要（叶子节点）：
+{tree_summary}
+
+请按置信度排序返回 JSON 数组：
+[
+  {"node_id": "节点ID", "node_name": "节点名称", "confidence": 0.95, "reason": "匹配原因"},
+  ...
+]
+
+要求：
+1. confidence 范围 0-1，表示匹配程度
+2. 至少返回 1 个结果，最多返回 {top_k} 个
+3. 如果没有合适匹配，返回空数组 []
+"""
+
+INDUSTRY_MATCH_USER = _reg(
+    "INDUSTRY_MATCH_USER",
+    "行业树",
+    "行业树语义匹配（用户提示词）",
+    INDUSTRY_MATCH_USER,
 )

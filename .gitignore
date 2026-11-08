@@ -87,6 +87,13 @@ frontend/_find_sse.py
 _*.py
 !__init__.py
 _*.ps1
+# BUG-FIX-PROMPT-P0（2026-11-08）：_*.py 全局规则误伤提示词包正式子模块
+# （_cache/_registry/_context/_governance/_security/_shared/_cost/_output_repair/
+# _notifications/_integrate/_integrate_batch2/3/4）。这些以 _ 开头的 .py 是
+# app/services/ai/prompts 的核心模块代码，必须入库；此前它们被 _*.py 忽略，
+# 导致 __init__.py 导入 _integrate_batch2/3/4 时 ImportError → 整个
+# app.services.ai 无法导入 → 后端启动崩溃。此处精准豁免该目录下的 _*.py。
+!backend/app/services/ai/prompts/_*.py
 
 # ACL 恢复/备份产物（勿提交）
 .acl-recovery/

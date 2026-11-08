@@ -338,6 +338,22 @@ _FACTS_AUDIT_SYS_FB = """# 事实一致性审计
 ```
 
 直接输出 JSON 数组。"""
+# 收编批次 6（2026-11-08）：全局事实提取 user 侧提示词 fallback（单段/分段）。
+# 与 _integrate_batch6.py 注册文本逐字一致；注册表/DB 不可用时回退（行为零变化）。
+_FACTS_EXTRACT_USER_FB = """请从以下项目文档中提取全局事实变量：
+
+{source_text}
+{outline_block}
+{chapter_scope_block}
+{step02_block}{summary_block}{scoring_block}
+
+请提取所有可确定的事实变量，输出 JSON 对象（dict）。"""
+_FACTS_EXTRACT_SEGMENT_USER_FB = """请从以下项目文档中提取全局事实变量（这是第 {seg_index}/{seg_total} 个分段，只提取本分段有明确依据的事实；本分段没有提及不代表整份文档没有提及，不要因某项信息未在本段出现而放弃提取）：
+
+{seg}
+{outline_block}
+{chapter_scope_block}{extract_tail}"""
+
 
 
 _coerce_fact_audit_list = coerce_audit_list
@@ -804,25 +820,49 @@ async def generate_facts(project_id: int, body: FactsGenerateRequest | None = No
     # 不决定值）。开关默认关=不追加，提示词与历史逐字一致。
     chapter_scope_block = chapter_subject_scope_block() if chapter_scope_enabled() else ""
 
-    extract_user = f"""请从以下项目文档中提取全局事实变量：
+    # 收编批次 6（2026-11-08）：user 侧提取提示词收编进注册表（DB 可覆盖），
+    # 与 system 侧 FACTS_EXTRACT_SYSTEM 对称。动态块（Step02/摘要/评分点）作为
+    # 变量注入；fallback 常量与 _integrate_batch6.py 注册文本逐字一致，DB 无行
+    # 时行为零变化。source_text 为招标全文（下游数据），原样注入以保逐字一致。
+    _step02_block = (
+        "\n\n以下是 Step02 关键解析结果（作为补充事实来源，与文档冲突时以文档为准）：\n"
+        + "\n\n".join(step02_parts)
+    ) if step02_parts else ""
+    _summary_block = f"\n\n参考摘要：{summary[:800]}" if summary else ""
+    _scoring_block = f"\n参考评分点：{scoring_points[:800]}" if scoring_points else ""
+    try:
+        from ..services.ai.prompts import get_prompt, render_prompt
 
-{source_text}
-{outline_block}
-{chapter_scope_block}
-"""
-    if step02_parts:
-        extract_user += (
-            "\n\n以下是 Step02 关键解析结果（作为补充事实来源，与文档冲突时以文档为准）：\n"
-            + "\n\n".join(step02_parts)
+        _etpl = get_prompt("FACTS_EXTRACT_USER")
+        if _etpl:
+            extract_user = render_prompt(
+                _etpl,
+                source_text=source_text,
+                outline_block=outline_block,
+                chapter_scope_block=chapter_scope_block,
+                step02_block=_step02_block,
+                summary_block=_summary_block,
+                scoring_block=_scoring_block,
+            )
+        else:
+            extract_user = (
+                _FACTS_EXTRACT_USER_FB.replace("{source_text}", source_text)
+                .replace("{outline_block}", outline_block)
+                .replace("{chapter_scope_block}", chapter_scope_block)
+                .replace("{step02_block}", _step02_block)
+                .replace("{summary_block}", _summary_block)
+                .replace("{scoring_block}", _scoring_block)
+            )
+    except Exception:
+        extract_user = (
+            _FACTS_EXTRACT_USER_FB.replace("{source_text}", source_text)
+            .replace("{outline_block}", outline_block)
+            .replace("{chapter_scope_block}", chapter_scope_block)
+            .replace("{step02_block}", _step02_block)
+            .replace("{summary_block}", _summary_block)
+            .replace("{scoring_block}", _scoring_block)
         )
-    if summary:
-        extract_user += f"\n\n参考摘要：{summary[:800]}"
-    if scoring_points:
-        extract_user += f"\n参考评分点：{scoring_points[:800]}"
 
-    extract_user += """
-
-请提取所有可确定的事实变量，输出 JSON 对象（dict）。"""
     # 尾部补充来源（Step02/摘要/评分点+输出指令）单独抽出：分段提取时
     # 每个分段复用同一段尾部，与单段路径的提示词尾部完全一致。
     # BUG-FIX（2026-10-28 跨模块深度探索 F10）：`str.index` 在标记未命中时抛
@@ -862,11 +902,40 @@ async def generate_facts(project_id: int, body: FactsGenerateRequest | None = No
             seen_keys: dict[str, int] = {}
             _failed_segments = 0
             for _idx, _seg in enumerate(segments, 1):
-                _seg_user = (
-                    f"请从以下项目文档中提取全局事实变量（这是第 {_idx}/{len(segments)} 个分段，"
-                    "只提取本分段有明确依据的事实；本分段没有提及不代表整份文档没有提及，"
-                    f"不要因某项信息未在本段出现而放弃提取）：\n\n{_seg}\n{outline_block}\n{chapter_scope_block}{extract_tail}"
-                )
+                # 收编批次 6（2026-11-08）：分段 user 提示词走注册表（DB 可覆盖），
+                # 与单段 FACTS_EXTRACT_USER 同批收编；fallback 逐字一致，行为零变化。
+                try:
+                    from ..services.ai.prompts import get_prompt, render_prompt
+
+                    _seg_tpl = get_prompt("FACTS_EXTRACT_SEGMENT_USER")
+                    if _seg_tpl:
+                        _seg_user = render_prompt(
+                            _seg_tpl,
+                            seg_index=_idx,
+                            seg_total=len(segments),
+                            seg=_seg,
+                            outline_block=outline_block,
+                            chapter_scope_block=chapter_scope_block,
+                            extract_tail=extract_tail,
+                        )
+                    else:
+                        _seg_user = (
+                            _FACTS_EXTRACT_SEGMENT_USER_FB.replace("{seg_index}", str(_idx))
+                            .replace("{seg_total}", str(len(segments)))
+                            .replace("{seg}", _seg)
+                            .replace("{outline_block}", outline_block)
+                            .replace("{chapter_scope_block}", chapter_scope_block)
+                            .replace("{extract_tail}", extract_tail)
+                        )
+                except Exception:
+                    _seg_user = (
+                        _FACTS_EXTRACT_SEGMENT_USER_FB.replace("{seg_index}", str(_idx))
+                        .replace("{seg_total}", str(len(segments)))
+                        .replace("{seg}", _seg)
+                        .replace("{outline_block}", outline_block)
+                        .replace("{chapter_scope_block}", chapter_scope_block)
+                        .replace("{extract_tail}", extract_tail)
+                    )
                 try:
                     _seg_result, _ = await run_json_extraction(
                         [

@@ -15,7 +15,7 @@ import threading
 import time
 
 from ..db import get_db, safe_update
-from .ai.prompts import get_prompt
+from .ai.prompts import get_prompt, sanitize_prompt_value
 from .ai.provider_factory import create_provider, get_ai_config
 from .ai.providers.base import AIMessage
 from .ai.workflows import collect_json_response
@@ -1329,10 +1329,28 @@ async def match_industry_by_ai(text: str, top_k: int = 5) -> list[dict]:
             [f"- {n['id']}: {n['name']} - {n.get('description', '')}" for n in leaf_nodes[:50]],
         )
 
-        user_prompt = f"""
+        # BUG-FIX-PROMPT-U1（2026-11-08，user 侧收编 + 提示词注入防御）：
+        # 原实现为调用点内联 f-string（绕过注册表，管理页不可见/不可覆盖），
+        # 且 text（用户输入的项目描述）未做元标记中和——与 knowledge/rejection
+        # 的 sanitize_prompt_value 口径不一致，存在提示词注入面。现收编为
+        # INDUSTRY_MATCH_USER（DB 可覆盖），text 经 sanitize 后注入；get_prompt
+        # 异常/返回空时回退下方逐字一致的硬编码 f-string（行为零变化）。
+        safe_text = sanitize_prompt_value(text)
+        user_prompt = None
+        try:
+            user_prompt = get_prompt(
+                "INDUSTRY_MATCH_USER",
+                top_k=top_k,
+                text=safe_text,
+                tree_summary=tree_summary,
+            )
+        except Exception:
+            user_prompt = None
+        if user_prompt is None or not user_prompt.strip():
+            user_prompt = f"""
 请根据以下项目描述，从行业树中匹配最合适的{top_k}个行业节点。
 
-项目描述：{text}
+项目描述：{safe_text}
 
 行业树摘要（叶子节点）：
 {tree_summary}

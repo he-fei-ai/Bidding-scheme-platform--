@@ -988,6 +988,21 @@ async def _run_text_round(provider: Any, prompt_key: str, user_prompt: str, time
     return ""
 
 
+def _render_user(key: str, *, fallback, **kwargs) -> str:
+    """收编 user 侧提示词（BUG-FIX-PROMPT-U1，2026-11-08）。
+
+    优先 ``get_prompt(key, **kwargs)`` 渲染（DB 可覆盖、管理页可见/可版本化）；
+    注册表/DB 异常或返回空时回退 ``fallback()``（逐字一致的硬编码，行为零变化）。
+    """
+    try:
+        out = get_prompt(key, **kwargs)
+        if out and out.strip():
+            return out
+    except Exception:
+        pass
+    return fallback()
+
+
 async def _run_rejection_single_round(
     provider: Any,
     bid_doc: dict,
@@ -1002,14 +1017,22 @@ async def _run_rejection_single_round(
         # SECURITY-FIX 2026-10-06：chunk 为投标文件原文（用户/外部内容），
         # 手动拼入 user_prompt 前做元标记中和。
         safe_chunk = sanitize_prompt_value(chunk)
-        user_prompt = f"""{fp_instruction}
+        user_prompt = _render_user(
+            "REJECTION_CHECK_USER",
+            fp_instruction=fp_instruction,
+            items_json=json.dumps(coded_items, ensure_ascii=False, indent=2),
+            chunk_index=idx + 1,
+            total_chunks=len(chunks),
+            safe_chunk=safe_chunk,
+            fallback=lambda: f"""{fp_instruction}
 检查项清单：
 {json.dumps(coded_items, ensure_ascii=False, indent=2)}
 
 投标文件（第 {idx + 1}/{len(chunks)} 段）：
 {safe_chunk}
 
-请逐条对照检查项审查本段内容。"""
+请逐条对照检查项审查本段内容。""",
+        )
         messages = [
             AIMessage(role="system", content=sys_prompt),
             AIMessage(role="user", content=user_prompt),
@@ -1049,14 +1072,20 @@ async def _run_rejection_three_rounds(
     # ---- 第一轮：范围分析 ----
     _report("第一轮：分析检查范围...")
     outline = _extract_outline_hint(text)
-    analysis_prompt = f"""{fp_instruction}
+    analysis_prompt = _render_user(
+        "REJECTION_ANALYSIS_USER",
+        fp_instruction=fp_instruction,
+        items_json=items_json,
+        outline=outline,
+        fallback=lambda: f"""{fp_instruction}
 检查项清单：
 {items_json}
 
 投标文件的目录与章节结构线索：
 {outline}
 
-请分析本次可纳入电子文件检查的范围。"""
+请分析本次可纳入电子文件检查的范围。""",
+    )
     analysis = await _run_text_round(
         provider, "REJECTION_ANALYSIS_SYSTEM", analysis_prompt, _ANALYSIS_TIMEOUT
     )
@@ -1070,7 +1099,15 @@ async def _run_rejection_three_rounds(
     total_chunks = len(chunks)
     for idx, chunk in enumerate(chunks):
         _report(f"第二轮：逐项检查 {idx + 1}/{total_chunks}...")
-        draft_prompt = f"""{fp_instruction}
+        draft_prompt = _render_user(
+            "REJECTION_DRAFT_USER",
+            fp_instruction=fp_instruction,
+            items_json=items_json,
+            analysis=analysis,
+            chunk_index=idx + 1,
+            total_chunks=total_chunks,
+            chunk=chunk,
+            fallback=lambda: f"""{fp_instruction}
 检查项清单：
 {items_json}
 
@@ -1080,7 +1117,8 @@ async def _run_rejection_three_rounds(
 投标文件（第 {idx + 1}/{total_chunks} 段）：
 {chunk}
 
-请基于上述范围，逐项检查本段内容，按约定 Markdown 格式输出初步风险清单。"""
+请基于上述范围，逐项检查本段内容，按约定 Markdown 格式输出初步风险清单。""",
+        )
         part = await _run_text_round(
             provider, "REJECTION_DRAFT_SYSTEM", draft_prompt, _DRAFT_TIMEOUT
         )
@@ -1097,7 +1135,13 @@ async def _run_rejection_three_rounds(
 
     # ---- 第三轮：去重定稿（严格 JSON）----
     _report("第三轮：去重定稿...")
-    final_prompt = f"""{fp_instruction}
+    final_prompt = _render_user(
+        "REJECTION_FINAL_USER",
+        fp_instruction=fp_instruction,
+        items_json=items_json,
+        analysis=analysis,
+        draft=draft,
+        fallback=lambda: f"""{fp_instruction}
 检查项清单：
 {items_json}
 
@@ -1107,7 +1151,8 @@ async def _run_rejection_three_rounds(
 第二轮初步风险清单：
 {draft}
 
-请按定稿规则去重合并、删除不合格条目，并输出最终 JSON 数组。"""
+请按定稿规则去重合并、删除不合格条目，并输出最终 JSON 数组。""",
+    )
     messages = [
         AIMessage(role="system", content=get_prompt("REJECTION_FINAL_SYSTEM")),
         AIMessage(role="user", content=final_prompt),

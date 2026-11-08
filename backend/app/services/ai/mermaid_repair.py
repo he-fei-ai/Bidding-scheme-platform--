@@ -138,9 +138,19 @@ async def repair_mermaid_with_ai(
         from .prompts import get_prompt as _gp
         sys_prompt = _gp("MERMAID_REPAIR_PROMPT") or _REPAIR_SYSTEM_PROMPT
         # 构建修复提示词
+        # ENHANCE 2026-11-08（收编批次 7）：user 侧走注册表（DB 可覆盖）；
+        # fallback 与原 f-string 逐字一致，行为零变化。
         messages = [
             {"role": "system", "content": sys_prompt},
-            {"role": "user", "content": f"请修复以下 Mermaid 代码：\n\n{current_code}\n\n错误信息：{syntax_error}"},
+            {
+                "role": "user",
+                "content": _gp(
+                    "MERMAID_REPAIR_DIRECT_USER",
+                    current_code=current_code,
+                    syntax_error=syntax_error,
+                )
+                or f"请修复以下 Mermaid 代码：\n\n{current_code}\n\n错误信息：{syntax_error}",
+            },
         ]
 
         # 调用 AI

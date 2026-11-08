@@ -219,6 +219,29 @@ def _collect_provided() -> dict[str, set[str]]:
     }
     provided.setdefault("CONTENT_ORCHESTRATION_LEGACY_USER", set())
     provided["CONTENT_ORCHESTRATION_LEGACY_USER"] |= _orch_full_vars
+    # ENHANCE 2026-11-08（收编批次 5）：rejection 的 4 处 user 提示词经
+    # _render_user(key, **kwargs) 转发渲染，AST 无法静态推断 kwargs→get_prompt 的
+    # 变量映射（与 CONTENT_ORCHESTRATION_LEGACY_USER 同理），手动标记提供范围，
+    # 防止误报「占位符从未被注入点提供」。
+    _rejection_user_vars = {
+        "REJECTION_CHECK_USER": {
+            "FP_INSTRUCTION", "ITEMS_JSON", "CHUNK_INDEX", "TOTAL_CHUNKS", "SAFE_CHUNK",
+        },
+        "REJECTION_ANALYSIS_USER": {"FP_INSTRUCTION", "ITEMS_JSON", "OUTLINE"},
+        "REJECTION_DRAFT_USER": {
+            "FP_INSTRUCTION", "ITEMS_JSON", "ANALYSIS", "CHUNK_INDEX", "TOTAL_CHUNKS", "CHUNK",
+        },
+        "REJECTION_FINAL_USER": {"FP_INSTRUCTION", "ITEMS_JSON", "ANALYSIS", "DRAFT"},
+    }
+    for _k, _vars in _rejection_user_vars.items():
+        provided.setdefault(_k, set())
+        provided[_k] |= _vars
+    # ENHANCE 2026-11-08（收编批次 7）：mermaid_repair.py 用 `from .prompts import
+    # get_prompt as _gp` 别名调用，AST 无法把 _gp 识别为 get_prompt（别名不具名），
+    # 其 user 侧变量（current_code/syntax_error）无法静态收集——手动标记提供范围，
+    # 防止误报「占位符从未被注入点提供」。
+    provided.setdefault("MERMAID_REPAIR_DIRECT_USER", set())
+    provided["MERMAID_REPAIR_DIRECT_USER"] |= {"CURRENT_CODE", "SYNTAX_ERROR"}
     return provided
 
 

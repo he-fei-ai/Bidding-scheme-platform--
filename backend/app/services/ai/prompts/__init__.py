@@ -63,6 +63,12 @@ from . import (
     # 可研模块 14 个 build_* 提示词函数，收编进注册表（调用方同步接线，
     # 保留逐字一致的硬编码 fallback，DB 无行时行为零变化）。
     _integrate_batch4,
+    # ENHANCE 2026-11-08（收编批次 6）：全局事实提取 user 侧提示词（单段/分段）
+    # 收编进注册表，与 FACTS_EXTRACT_SYSTEM 对称；调用方 routers/facts.py 同步接线。
+    _integrate_batch6,
+    # ENHANCE 2026-11-08（收编批次 7）：目录自修复 system+user 与 Mermaid 直修
+    # user 侧收编进注册表；调用方 workflows_quality.py / mermaid_repair.py 接线。
+    _integrate_batch7,
     _security,
     _shared,
     analysis,

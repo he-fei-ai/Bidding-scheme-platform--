@@ -492,10 +492,26 @@ async def _step_extract_supplement(
         batch_text = "\n\n".join(f"[块 {b['index']}]\n{b['text']}" for b in batch)
         # SECURITY-FIX 2026-10-06：batch_text 为用户上传文档内容，做元标记中和。
         safe_batch = sanitize_prompt_value(batch_text)
-        user_prompt = f"""行业：{industry or '通用'}
+        # BUG-FIX-PROMPT-U1（2026-11-08，user 侧收编）：原实现为调用点内联
+        # f-string（绕过注册表，管理页不可见/不可覆盖），现收编为
+        # KB_EXTRACT_ITEMS_USER（DB 可覆盖），get_prompt 渲染 + 逐字一致
+        # 硬编码 fallback（行为零变化）。
+        existing_titles_json = json.dumps(list(existing_titles)[:50], ensure_ascii=False)
+        user_prompt = None
+        try:
+            user_prompt = get_prompt(
+                "KB_EXTRACT_ITEMS_USER",
+                industry=industry or "通用",
+                existing_titles_json=existing_titles_json,
+                safe_batch=safe_batch,
+            )
+        except Exception:
+            user_prompt = None
+        if user_prompt is None:
+            user_prompt = f"""行业：{industry or '通用'}
 
 已提取的条目标题（避免重复）：
-{json.dumps(list(existing_titles)[:50], ensure_ascii=False)}
+{existing_titles_json}
 
 请从以下文档块中提取**尚未被覆盖的**知识条目：
 

@@ -1,4 +1,4 @@
-"""废标检查与文本检查提示词（10 个提示词）
+"""废标检查与文本检查提示词（14 个提示词）
 
 用于废标条款提取、对照检查（三轮：范围分析 / 初稿 / 定稿）、错别字检查、逻辑检查、结果合并。
 
@@ -164,6 +164,82 @@ REJECTION_FINAL_SYSTEM = _reg(
     "废标检查",
     "废标检查·第三轮定稿（系统提示词）",
     REJECTION_FINAL_SYSTEM,
+)
+
+# ENHANCE 2026-11-08（收编批次 5）：rejection.py 的 4 处 user 侧提示词此前为
+# 调用点内联 f-string（绕过注册表），与 system 侧（REJECTION_CHECK_SYSTEM /
+# REJECTION_ANALYSIS_SYSTEM / REJECTION_DRAFT_SYSTEM / REJECTION_FINAL_SYSTEM）
+# 不对称。现收编为 REJECTION_*_USER，调用方 get_prompt 渲染 + 逐字一致
+# 硬编码 fallback（行为零变化）。
+#
+# 注意：f-string 中的 `{idx + 1}/{len(chunks)}` 收编为占位符
+# `{chunk_index}/{total_chunks}`——调用方预计算后注入，渲染结果逐字一致。
+
+REJECTION_CHECK_USER = """{fp_instruction}
+检查项清单：
+{items_json}
+
+投标文件（第 {chunk_index}/{total_chunks} 段）：
+{safe_chunk}
+
+请逐条对照检查项审查本段内容。"""
+
+REJECTION_CHECK_USER = _reg(
+    "REJECTION_CHECK_USER", "废标检查", "废标条款对照审查（用户提示词）", REJECTION_CHECK_USER
+)
+
+REJECTION_ANALYSIS_USER = """{fp_instruction}
+检查项清单：
+{items_json}
+
+投标文件的目录与章节结构线索：
+{outline}
+
+请分析本次可纳入电子文件检查的范围。"""
+
+REJECTION_ANALYSIS_USER = _reg(
+    "REJECTION_ANALYSIS_USER",
+    "废标检查",
+    "废标检查·第一轮范围分析（用户提示词）",
+    REJECTION_ANALYSIS_USER,
+)
+
+REJECTION_DRAFT_USER = """{fp_instruction}
+检查项清单：
+{items_json}
+
+第一轮范围分析结论：
+{analysis}
+
+投标文件（第 {chunk_index}/{total_chunks} 段）：
+{chunk}
+
+请基于上述范围，逐项检查本段内容，按约定 Markdown 格式输出初步风险清单。"""
+
+REJECTION_DRAFT_USER = _reg(
+    "REJECTION_DRAFT_USER",
+    "废标检查",
+    "废标检查·第二轮逐项检查初稿（用户提示词）",
+    REJECTION_DRAFT_USER,
+)
+
+REJECTION_FINAL_USER = """{fp_instruction}
+检查项清单：
+{items_json}
+
+第一轮范围分析结论：
+{analysis}
+
+第二轮初步风险清单：
+{draft}
+
+请按定稿规则去重合并、删除不合格条目，并输出最终 JSON 数组。"""
+
+REJECTION_FINAL_USER = _reg(
+    "REJECTION_FINAL_USER",
+    "废标检查",
+    "废标检查·第三轮定稿（用户提示词）",
+    REJECTION_FINAL_USER,
 )
 
 SPELLING_CHECK_SYSTEM = """你是中文校对专家，擅长识别标书中的错别字、用词不当、标点错误。

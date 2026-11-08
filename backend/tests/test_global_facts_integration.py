@@ -33,8 +33,14 @@ def test_env_switches_enabled(monkeypatch):
     load_dotenv 污染。验证的是 .env 配置正确性（通过读取 .env 文件确认值存在）。
     """
     # 读取 .env 文件确认配置值（不污染 os.environ）
+    # 加固（2026-11-08）：.env 缺失（CI/本地未配置）时优雅 skip 而非硬失败——
+    # 该测试验证的是「.env 配置正确性」，无 .env 即无从验证；.env 存在但开关
+    # 未启用时仍保持 fail（配置不正确，需人工启用）。
+    _env_file = BACKEND_DIR / ".env"
+    if not _env_file.exists():
+        pytest.skip("缺少 backend/.env，无法验证功能开关配置（部署配置未就绪）")
     from dotenv import dotenv_values
-    env_values = dotenv_values(BACKEND_DIR / ".env")
+    env_values = dotenv_values(_env_file)
 
     switches = {
         "FACTS_ORCHESTRATED_SELECT_ENABLED": env_values.get("FACTS_ORCHESTRATED_SELECT_ENABLED", "0"),

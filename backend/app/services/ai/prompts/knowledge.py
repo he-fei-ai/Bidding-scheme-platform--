@@ -1,4 +1,4 @@
-"""知识库提示词（3 个提示词）
+"""知识库提示词（4 个提示词）
 
 用于知识库条目提取、匹配、目录增强。
 """
@@ -95,4 +95,29 @@ KB_OUTLINE_ENHANCE_SYSTEM = """你是招投标方案目录优化专家。请基�
 
 KB_OUTLINE_ENHANCE_SYSTEM = _reg(
     "KB_OUTLINE_ENHANCE_SYSTEM", "知识库", "目录增强（系统提示词）", KB_OUTLINE_ENHANCE_SYSTEM
+)
+
+# ENHANCE 2026-11-08（收编批次 5）：knowledge._step_extract_supplement 的 user 侧
+# 提示词此前为调用点内联 f-string（绕过注册表），与 system 侧
+# （KB_EXTRACT_ITEMS_SYSTEM）不对称。现收编为 KB_EXTRACT_ITEMS_USER，调用方
+# get_prompt 渲染 + 逐字一致硬编码 fallback。
+#
+# 注意：f-string 中的 `{json.dumps(...)}` 表达式收编为占位符
+# `{existing_titles_json}`——调用方预计算 JSON 字符串后注入，渲染结果逐字一致。
+KB_EXTRACT_ITEMS_USER = """行业：{industry}
+
+已提取的条目标题（避免重复）：
+{existing_titles_json}
+
+请从以下文档块中提取**尚未被覆盖的**知识条目：
+
+{safe_batch}
+
+只返回新增的条目，避免与已提取的重复。"""
+
+KB_EXTRACT_ITEMS_USER = _reg(
+    "KB_EXTRACT_ITEMS_USER",
+    "知识库",
+    "知识条目补充提取（用户提示词）",
+    KB_EXTRACT_ITEMS_USER,
 )
